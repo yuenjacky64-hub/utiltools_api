@@ -46,6 +46,37 @@ class DateTimeControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/utils/datetime/convert - should treat a blank inputFormat as auto-detect")
+    void shouldTreatBlankInputFormatAsAutoDetect() throws Exception {
+        String blankBody = """
+                {
+                    "input": "1000000000",
+                    "inputFormat": "   ",
+                    "targetTimeZone": "UTC"
+                }
+                """;
+        String omittedBody = """
+                {
+                    "input": "1000000000",
+                    "targetTimeZone": "UTC"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/convert")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(blankBody))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.epochMillis").value(1000000000000L));
+
+        mockMvc.perform(post("/api/v1/utils/datetime/convert")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(omittedBody))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.epochMillis").value(1000000000000L));
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/datetime/diff - should calculate duration between two dates")
     void shouldCalculateDifference() throws Exception {
         String body = """
