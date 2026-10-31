@@ -161,6 +161,10 @@ class DateTimeServiceTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Limit must be between 1 and 200, got: 201");
 
+        assertThatThrownBy(() -> dateTimeService.listTimeZones(null, -5))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Limit must be between 1 and 200, got: -5");
+
         assertThat(dateTimeService.listTimeZones(null, 1).timeZones()).hasSize(1);
         assertThat(dateTimeService.listTimeZones(null, 200).timeZones()).hasSize(200);
     }
