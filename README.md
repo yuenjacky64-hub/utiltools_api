@@ -37,7 +37,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 
 | Tool | Base Path | Core Capabilities |
 | :--- | :--- | :--- |
-| **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, duration diff calculation, current global time |
+| **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration diff calculation, current global time |
 | **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, UUID v4 batch generation |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation |
 
@@ -59,7 +59,7 @@ flowchart TD
 - **Framework**: **Spring Boot 4** (`spring-boot-starter-web`, `spring-boot-starter-validation`)
 - **JSON Processing**: Jackson (`ObjectMapper`) & Jayway `json-path`
 - **Documentation**: OpenAPI 3.0 & Swagger UI (`springdoc-openapi-starter-webmvc-ui`)
-- **Testing**: JUnit 5, MockMvc, AssertJ (100% test pass rate across 32 unit and integration tests)
+- **Testing**: JUnit 5, MockMvc, AssertJ (100% test pass rate across 48 unit and integration tests)
 
 ---
 
@@ -120,6 +120,7 @@ utiltools_api/
 | :--- | :--- | :--- |
 | `POST` | `/api/v1/utils/datetime/convert` | Convert epoch timestamp or ISO string to target timezone & pattern |
 | `POST` | `/api/v1/utils/datetime/diff` | Calculate duration & difference between two datetime points |
+| `POST` | `/api/v1/utils/datetime/shift` | Add or subtract a duration in a target IANA timezone (DST- and month-end-aware) |
 | `GET` | `/api/v1/utils/datetime/current` | Fetch current time in UTC and target timezone |
 | `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-256, SHA-512, MD5) or HMAC |
 | `POST` | `/api/v1/utils/crypto/base64` | Encode or decode standard / URL-safe Base64 strings |
@@ -226,6 +227,72 @@ curl "http://localhost:8080/api/v1/utils/datetime/current?timeZone=Asia/Taipei"
     "utc": "2026-10-30T16:50:38.802177453Z",
     "local": "2026-10-31T00:50:38.802177453+08:00",
     "timeZone": "Asia/Taipei"
+  },
+  "timestamp": "2026-10-30T16:50:38.802324893Z"
+}
+```
+
+#### D. Shift a Datetime (DST-aware)
+Applies a signed `amount` of `unit` (`YEARS`, `MONTHS`, `WEEKS`, `DAYS`, `HOURS`, `MINUTES`, `SECONDS`) to `input`
+using calendar arithmetic inside `targetTimeZone`, so month-end clamping and daylight-saving transitions are handled
+for you. `amount = 0` is rejected; negative amounts subtract. Optional `customPattern` (e.g. `dd MMM yyyy HH:mm z`)
+overrides the default ISO-8601 rendering of `formattedTarget`.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/datetime/shift \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "2026-01-31T12:00:00Z",
+    "targetTimeZone": "UTC",
+    "amount": 1,
+    "unit": "MONTHS"
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "DateTime shifted successfully",
+  "data": {
+    "epochMillis": 1772280000000,
+    "epochSeconds": 1772280000,
+    "isoUtc": "2026-02-28T12:00:00Z",
+    "targetTimeZone": "UTC",
+    "formattedTarget": "2026-02-28T12:00:00Z",
+    "appliedAmount": 1,
+    "appliedUnit": "MONTHS"
+  },
+  "timestamp": "2026-10-30T16:50:38.802324893Z"
+}
+```
+
+January 31 + 1 month clamps to February 28. DST is applied in the target zone, so a spring-forward gap is skipped
+rather than silently shifting an hour:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/datetime/shift \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "2026-03-08T01:30:00-05:00",
+    "targetTimeZone": "America/New_York",
+    "amount": 1,
+    "unit": "HOURS"
+  }'
+```
+
+```json
+{
+  "success": true,
+  "message": "DateTime shifted successfully",
+  "data": {
+    "epochMillis": 1772955000000,
+    "epochSeconds": 1772955000,
+    "isoUtc": "2026-03-08T07:30:00Z",
+    "targetTimeZone": "America/New_York",
+    "formattedTarget": "2026-03-08T03:30:00-04:00",
+    "appliedAmount": 1,
+    "appliedUnit": "HOURS"
   },
   "timestamp": "2026-10-30T16:50:38.802324893Z"
 }
@@ -511,8 +578,8 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 ```
 
 ### Test Suite Summary:
-- **`DateTimeServiceTest`**: Epoch parsing, timezone shifts, duration math, boundary checks.
-- **`DateTimeControllerTest`**: Full HTTP endpoint testing with MockMvc.
+- **`DateTimeServiceTest`**: Epoch parsing, timezone shifts, duration math, DST-aware shift arithmetic (month-end clamping, spring-forward, fall-back), boundary checks.
+- **`DateTimeControllerTest`**: Full HTTP endpoint testing with MockMvc, including shift validation and error envelopes.
 - **`CryptoServiceTest`**: Standard hashing vectors, HMAC calculations, Base64 encode/decode, UUID generation.
 - **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries.
