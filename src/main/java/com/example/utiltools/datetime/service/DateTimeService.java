@@ -5,6 +5,8 @@ import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
+import com.example.utiltools.datetime.dto.TimeZoneInfo;
+import com.example.utiltools.datetime.dto.TimeZoneListResponse;
 import org.springframework.stereotype.Service;
 
 import java.time.DateTimeException;
@@ -14,12 +16,18 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 @Service
 public class DateTimeService {
 
     private static final Pattern NUMERIC_PATTERN = Pattern.compile("^-?\\d+$");
+    private static final DateTimeFormatter OFFSET_FORMATTER = DateTimeFormatter.ofPattern("xxx");
+    private static final int MAX_TIMEZONE_LIMIT = 200;
 
     public DateTimeConvertResponse convert(DateTimeConvertRequest request) {
         Instant instant = parseInstant(request.input());
@@ -76,6 +84,41 @@ public class DateTimeService {
                 DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(localZdt),
                 zoneId.getId()
         );
+    }
+
+    public TimeZoneListResponse listTimeZones(String prefix, int limit) {
+        if (limit < 1 || limit > MAX_TIMEZONE_LIMIT) {
+            throw new IllegalArgumentException("Limit must be between 1 and 200, got: " + limit);
+        }
+
+        String applied = (prefix == null) ? "" : prefix.trim();
+        String needle = applied.toLowerCase(Locale.ROOT);
+
+        Set<String> availableIds = ZoneId.getAvailableZoneIds();
+        List<String> matched = new ArrayList<>();
+        for (String id : availableIds) {
+            if (id.toLowerCase(Locale.ROOT).startsWith(needle)) {
+                matched.add(id);
+            }
+        }
+        matched.sort(String::compareTo);
+
+        int total = matched.size();
+        List<String> selected = matched.subList(0, Math.min(limit, total));
+
+        Instant now = Instant.now();
+        List<TimeZoneInfo> entries = new ArrayList<>(selected.size());
+        for (String id : selected) {
+            ZonedDateTime zonedDateTime = now.atZone(ZoneId.of(id));
+            entries.add(new TimeZoneInfo(
+                    id,
+                    OFFSET_FORMATTER.format(zonedDateTime),
+                    zonedDateTime.getOffset().getTotalSeconds(),
+                    DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(zonedDateTime.withNano(0))
+            ));
+        }
+
+        return new TimeZoneListResponse(applied, limit, total, entries);
     }
 
     private Instant parseInstant(String input) {

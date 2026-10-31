@@ -6,6 +6,7 @@ import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
+import com.example.utiltools.datetime.dto.TimeZoneListResponse;
 import com.example.utiltools.datetime.service.DateTimeService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -48,5 +49,14 @@ public class DateTimeController {
             @RequestParam(value = "timeZone", required = false, defaultValue = "UTC") String timeZone) {
         CurrentTimeResponse result = dateTimeService.getCurrentTime(timeZone);
         return ApiResponse.success(result, "Current time retrieved successfully");
+    }
+
+    @GetMapping("/timezones")
+    @Operation(summary = "List supported IANA timezones", description = "Returns a bounded, lexicographically sorted catalog of IANA timezone IDs with current UTC offset and local datetime; optionally filtered by case-insensitive prefix")
+    public ApiResponse<TimeZoneListResponse> timezones(
+            @RequestParam(value = "prefix", required = false) String prefix,
+            @RequestParam(value = "limit", required = false, defaultValue = "50") int limit) {
+        TimeZoneListResponse result = dateTimeService.listTimeZones(prefix, limit);
+        return ApiResponse.success(result, "Timezones retrieved successfully");
     }
 }
