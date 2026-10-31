@@ -11,6 +11,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
@@ -77,13 +78,17 @@ class AuditJournalServiceTest {
     @DisplayName("a late transition after a terminal state throws IllegalStateException")
     void lateSucceedThrows() {
         AuditEntry entry = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-12345678");
-        journal.fail(entry.id(), "BAD_REQUEST");
+        AuditEntry failed = journal.fail(entry.id(), "BAD_REQUEST");
+        Instant completedAt = failed.completedAt();
 
         assertThatThrownBy(() -> journal.succeed(entry.id(), hashResponse()))
                 .isInstanceOf(IllegalStateException.class);
-        assertThat(journal.find(entry.id()).orElseThrow().state()).isEqualTo(JournalState.FAILED);
-        assertThat(journal.find(entry.id()).orElseThrow().completedAt())
-                .isEqualTo(journal.find(entry.id()).orElseThrow().completedAt());
+
+        AuditEntry after = journal.find(entry.id()).orElseThrow();
+        assertThat(after.state()).isEqualTo(JournalState.FAILED);
+        assertThat(after.completedAt()).isEqualTo(completedAt);
+        assertThat(after.result()).isNull();
+        assertThat(after.errorCode()).isEqualTo("BAD_REQUEST");
     }
 
     @Test
@@ -120,6 +125,25 @@ class AuditJournalServiceTest {
         assertThat(entry.request().get("secretKey").asText()).isEqualTo("***");
         assertThat(entry.request().get("content").asText()).isEqualTo("Hello World");
         assertThat(entry.request().toString()).doesNotContain("super-secret-key");
+    }
+
+    @Test
+    @DisplayName("an oversized request payload is neither retained nor re-served")
+    void shouldNotRetainOversizedPayload() {
+        AuditJournalService bounded = new AuditJournalService(new ObjectMapper(), 3, 64);
+        String huge = "x".repeat(4096);
+        HashRequest oversized = new HashRequest("SHA-256", huge, "super-secret-key");
+
+        AuditEntry entry = bounded.begin(OperationType.CRYPTO_HASH, oversized, "req-oversized1");
+
+        assertThat(entry.replayable()).isFalse();
+        assertThat(entry.request().has("omitted")).isTrue();
+        assertThat(entry.request().toString()).doesNotContain(huge);
+        assertThat(entry.request().toString()).doesNotContain("super-secret-key");
+        assertThat(bounded.find(entry.id()).orElseThrow().request().toString())
+                .isEqualTo(entry.request().toString());
+        assertThat(bounded.list(10, null)).allSatisfy(listed ->
+                assertThat(listed.request().toString()).doesNotContain(huge));
     }
 
     @Test

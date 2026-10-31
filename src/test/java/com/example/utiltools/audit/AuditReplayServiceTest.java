@@ -125,6 +125,25 @@ class AuditReplayServiceTest {
     }
 
     @Test
+    @DisplayName("a journal transition fault never masks the operation outcome")
+    void journalTransitionFaultDoesNotMaskOutcome() {
+        AuditJournalService faulty = org.mockito.Mockito.mock(AuditJournalService.class);
+        AuditEntry pending = new AuditEntry("entry-1", "req-replay01", OperationType.CRYPTO_HASH,
+                JournalState.PENDING, Instant.now(), null, null, null, null, true, null);
+        org.mockito.Mockito.when(faulty.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-replay01"))
+                .thenReturn(pending);
+        org.mockito.Mockito.when(faulty.succeed(org.mockito.ArgumentMatchers.eq("entry-1"),
+                        org.mockito.ArgumentMatchers.any()))
+                .thenThrow(new IllegalStateException("entry entry-1 was evicted"));
+        AuditedOperations faultyOperations = new AuditedOperations(new DateTimeService(), new CryptoService(),
+                new JsonService(objectMapper), faulty);
+
+        HashResponse response = faultyOperations.hash(hashRequest());
+
+        assertThat(response.digest()).isEqualTo(new CryptoService().hash(hashRequest()).digest());
+    }
+
+    @Test
     @DisplayName("the entry request view never exposes the original secret key")
     void shouldNotExposeSecretsInReplayResponse() {
         auditedOperations.hash(new HashRequest("SHA-256", "Hello World", "top-secret"));

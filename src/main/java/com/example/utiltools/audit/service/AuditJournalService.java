@@ -59,8 +59,8 @@ public class AuditJournalService {
      */
     public AuditEntry begin(OperationType operation, Object request, String requestId) {
         JsonNode tree = objectMapper.valueToTree(request);
-        JsonNode redacted = redact(tree);
         boolean replayable = tree != null && tree.toString().length() <= maxReplayBytes;
+        JsonNode storedRequest = tree == null ? null : (replayable ? redact(tree) : withheldPayload());
 
         synchronized (lock) {
             while (entries.size() >= maxEntries) {
@@ -68,10 +68,22 @@ public class AuditJournalService {
             }
             String id = UUID.randomUUID().toString();
             AuditEntry base = new AuditEntry(id, requestId, operation, JournalState.PENDING,
-                    Instant.now(), null, redacted, null, null, replayable, null);
+                    Instant.now(), null, storedRequest, null, null, replayable, null);
             entries.put(id, new JournalRecord(base, replayable ? request : null, null));
             return base;
         }
+    }
+
+    /**
+     * Stand-in stored in place of a request that exceeds {@code utiltools.audit.max-replay-bytes}:
+     * neither the original nor the redacted tree is retained, so an oversized body can never be
+     * re-served by {@link #list} or {@link #find}.
+     */
+    private JsonNode withheldPayload() {
+        ObjectNode placeholder = objectMapper.createObjectNode();
+        placeholder.put("omitted", true);
+        placeholder.put("reason", "request payload exceeds utiltools.audit.max-replay-bytes");
+        return placeholder;
     }
 
     /** PENDING -> SUCCEEDED. */

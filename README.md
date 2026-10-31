@@ -449,10 +449,18 @@ verified against the original outcome without ever mutating the original entry.
 `PENDING → FAILED` are legal; late or duplicate transitions throw `IllegalStateException`.
 
 **Bounds:** the journal keeps at most `utiltools.audit.max-entries` entries (default `200`,
-oldest evicted first). Requests are stored privately for replay and are **redacted** in every
-response (`secretKey`, `content` and similar secret fields never leave the server); entries whose
-stored request exceeds `utiltools.audit.max-replay-bytes` (default `65536`) are marked
-non-replayable.
+oldest evicted first).
+
+**Redaction:** in every response the request view replaces the *values* of the secret fields
+`secretKey`, `secret`, `password`, `token` and `authorization` (matched case-insensitively, at any
+depth) with `"***"`. Field names are preserved and every other field — including `content`,
+`json`, `input` and `timeZone` — is echoed verbatim, so avoid putting secrets in non-secret fields.
+The raw request is stored privately for replay and is never serialized by `list`, `find` or
+`replay`.
+
+**Oversized payloads:** a request whose JSON exceeds `utiltools.audit.max-replay-bytes` (default
+`65536`) is **not retained** — the entry keeps only an `omitted` marker instead of the payload and
+is flagged `"replayable": false`, so replaying it answers `409 REPLAY_CONFLICT`.
 
 ### A. List journal entries
 
@@ -471,7 +479,7 @@ curl "http://localhost:8080/api/v1/utils/audit/entries?limit=5&state=FAILED"
       "state": "FAILED",
       "createdAt": "2026-10-31T00:51:02.114Z",
       "completedAt": "2026-10-31T00:51:02.119Z",
-      "request": { "algorithm": "NOPE-1", "content": "***" },
+      "request": { "algorithm": "NOPE-1", "content": "Hello World", "secretKey": "***" },
       "result": null,
       "errorCode": "BAD_REQUEST",
       "replayable": true,
@@ -484,7 +492,8 @@ curl "http://localhost:8080/api/v1/utils/audit/entries?limit=5&state=FAILED"
 ```
 
 `state` accepts `PENDING`, `SUCCEEDED`, `FAILED` (omit for all); `limit` is clamped to the
-configured bound.
+configured bound. Any other `state` value or a non-numeric `limit` answers `400 BAD_REQUEST` in the
+standard envelope rather than `500`.
 
 ### B. Fetch a single entry
 

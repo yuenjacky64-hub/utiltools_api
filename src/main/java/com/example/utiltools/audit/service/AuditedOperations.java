@@ -117,16 +117,38 @@ public class AuditedOperations {
 
     private <T> T record(OperationType operation, Object request, Supplier<T> call) {
         AuditEntry entry = journal.begin(operation, request, RequestContext.get());
+        T result;
         try {
-            T result = call.get();
-            journal.succeed(entry.id(), result);
-            return result;
+            result = call.get();
         } catch (IllegalArgumentException e) {
-            journal.fail(entry.id(), BAD_REQUEST);
+            recordFailure(entry.id(), BAD_REQUEST);
             throw e;
         } catch (RuntimeException e) {
-            journal.fail(entry.id(), INTERNAL_SERVER_ERROR);
+            recordFailure(entry.id(), INTERNAL_SERVER_ERROR);
             throw e;
+        }
+        recordSuccess(entry.id(), result);
+        return result;
+    }
+
+    /**
+     * A journal transition fault (entry evicted by a concurrent burst, or already advanced) is
+     * swallowed: the operation outcome is what the caller asked for and must never be masked by
+     * the journal writing 500s over a success or over a legitimate {@code BAD_REQUEST}.
+     */
+    private void recordSuccess(String id, Object result) {
+        try {
+            journal.succeed(id, result);
+        } catch (RuntimeException e) {
+            // best effort: the journal must not change the operation outcome
+        }
+    }
+
+    private void recordFailure(String id, String errorCode) {
+        try {
+            journal.fail(id, errorCode);
+        } catch (RuntimeException e) {
+            // best effort: the original exception is rethrown by the caller
         }
     }
 

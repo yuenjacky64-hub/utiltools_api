@@ -8,6 +8,7 @@ import com.example.utiltools.audit.service.AuditJournalService;
 import com.example.utiltools.audit.service.AuditReplayService;
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.GlobalExceptionHandler;
+import com.example.utiltools.crypto.controller.CryptoController;
 import com.example.utiltools.common.RequestContext;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
@@ -19,6 +20,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.http.MediaType;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
@@ -35,7 +37,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import java.util.List;
 import java.util.Map;
 
-@WebMvcTest(AuditController.class)
+@WebMvcTest({AuditController.class, CryptoController.class})
 @Import({AuditJournalService.class, AuditedOperations.class, AuditReplayService.class,
         CryptoService.class, DateTimeService.class, JsonService.class, GlobalExceptionHandler.class})
 @TestPropertySource(properties = {"utiltools.audit.max-entries=200", "utiltools.audit.max-replay-bytes=65536"})
@@ -156,16 +158,41 @@ class AuditControllerTest {
     }
 
     @Test
-    @DisplayName("unsupported hash algorithm - FAILED entry carries BAD_REQUEST and the same request id")
+    @DisplayName("GET /api/v1/utils/audit/entries?state=BANANA - invalid enum value returns 400 BAD_REQUEST")
+    void invalidStateParameterReturnsBadRequest() throws Exception {
+        mockMvc.perform(get("/api/v1/utils/audit/entries").param("state", "BANANA")
+                        .header("X-Request-Id", "audit-badstate1"))
+                .andExpect(status().isBadRequest())
+                .andExpect(header().string("X-Request-Id", "audit-badstate1"))
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.requestId").value("audit-badstate1"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/audit/entries?limit=abc - non-numeric limit returns 400 BAD_REQUEST")
+    void nonNumericLimitReturnsBadRequest() throws Exception {
+        mockMvc.perform(get("/api/v1/utils/audit/entries").param("limit", "abc")
+                        .header("X-Request-Id", "audit-badlimit1"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.requestId").value("audit-badlimit1"));
+    }
+
+    @Test
+    @DisplayName("POSTing an unsupported hash algorithm over HTTP - 400 envelope plus one FAILED entry with the same request id")
     void failedHashIsListedWithBadRequestErrorCode() throws Exception {
-        RequestContext.set("failed-hash-hdr1");
-        try {
-            assertThatThrownBy(() -> auditedOperations.hash(new HashRequest("NOPE-1", "Hello World", null)))
-                    .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining("Unsupported hash algorithm");
-        } finally {
-            RequestContext.clear();
-        }
+        mockMvc.perform(post("/api/v1/utils/crypto/hash")
+                        .header("X-Request-Id", "failed-hash-hdr1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"algorithm": "NOPE-1", "content": "Hello World"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(header().string("X-Request-Id", "failed-hash-hdr1"))
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.requestId").value("failed-hash-hdr1"));
 
         MvcResult listed = mockMvc.perform(get("/api/v1/utils/audit/entries").param("state", "FAILED")
                         .header("X-Request-Id", "failed-hash-hdr1"))
