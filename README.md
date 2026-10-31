@@ -441,9 +441,10 @@ curl -X POST http://localhost:8080/api/v1/utils/json/query \
 ## 🚦 Rate Limiting
 
 Every `/api/v1/utils/**` request passes through `RateLimitFilter` before Spring MVC. A
-`SlidingWindowRateLimiter` keeps a per-client deque of admitted timestamps and admits a call only
-while fewer than `requests-per-window` of them fall inside the trailing `window-ms` window. Admission
-is atomic per client, so concurrent requests can never exceed the budget.
+`SlidingWindowRateLimiter` keeps a fixed-size per-client ring buffer (`long[requests-per-window]`) of
+admitted timestamps and admits a call only while fewer than `requests-per-window` of them fall inside
+the trailing `window-ms` window. Admission is atomic per client, so concurrent requests can never
+exceed the budget.
 
 Rejected requests receive HTTP `429` with the unified envelope and never reach a controller:
 

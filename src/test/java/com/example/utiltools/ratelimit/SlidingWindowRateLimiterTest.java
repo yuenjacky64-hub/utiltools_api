@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -254,5 +255,105 @@ class SlidingWindowRateLimiterTest {
         assertThat(limiter.trackedClients()).isZero();
         assertThat(limiter.isEnabled()).isFalse();
         assertThat(limiter.properties().requestsPerWindow()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("cleanup racing an admission never drops an active bucket's counter")
+    void cleanupRacingAdmissionNeverDropsActiveCounter() throws Exception {
+        int limit = 50;
+        SlidingWindowRateLimiter limiter = limiter(limit, 100L, 100);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        try {
+            for (int round = 0; round < 200; round++) {
+                // The bucket is idle for >= 2 windows, so a cleanup pass may legitimately remove it
+                // -- but never after an admission already recorded an in-window event.
+                clock.advance(Duration.ofMillis(250));
+                CountDownLatch start = new CountDownLatch(1);
+
+                Future<Integer> admitted = pool.submit(() -> {
+                    start.await();
+                    int allowed = 0;
+                    for (int i = 0; i < limit + 5; i++) {
+                        SlidingWindowRateLimiter.Admission admission = limiter.tryAcquire("victim");
+                        assertThat(admission.remaining()).isGreaterThanOrEqualTo(0L);
+                        if (admission.allowed()) {
+                            allowed++;
+                        }
+                    }
+                    return allowed;
+                });
+                Future<?> cleanup = pool.submit(() -> {
+                    start.await();
+                    for (int i = 0; i < 32; i++) {
+                        assertThat(limiter.evictIdleBuckets()).isGreaterThanOrEqualTo(0);
+                    }
+                    return null;
+                });
+
+                start.countDown();
+                assertThat(admitted.get(30, TimeUnit.SECONDS)).isEqualTo(limit);
+                cleanup.get(30, TimeUnit.SECONDS);
+                // Either the idle bucket was removed before the burst (fresh budget) or it was kept
+                // with its recorded events: in both cases exactly `limit` admissions, never more.
+                assertThat(limiter.trackedClients()).isEqualTo(1);
+                assertThat(limiter.tryAcquire("victim").allowed()).isFalse();
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    @DisplayName("cap eviction racing admissions keeps the map bounded and counters truthful")
+    void capEvictionRacingAdmissionsKeepsCountersTruthful() throws Exception {
+        int cap = 4;
+        int limit = 20;
+        int threads = 8;
+        SlidingWindowRateLimiter limiter = limiter(limit, 60_000L, cap);
+        assertThat(limiter.tryAcquire("victim").allowed()).isTrue();
+
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threads);
+        AtomicInteger overCap = new AtomicInteger();
+        AtomicInteger negativeRemaining = new AtomicInteger();
+        AtomicInteger victimAdmitted = new AtomicInteger();
+
+        for (int t = 0; t < threads; t++) {
+            int id = t;
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    for (int i = 0; i < 400; i++) {
+                        String key = id == 0 ? "victim" : "spoof-" + id + "-" + i;
+                        SlidingWindowRateLimiter.Admission admission = limiter.tryAcquire(key);
+                        if (limiter.trackedClients() > cap) {
+                            overCap.incrementAndGet();
+                        }
+                        if (admission.remaining() < 0) {
+                            negativeRemaining.incrementAndGet();
+                        }
+                        if (id == 0 && admission.allowed()) {
+                            victimAdmitted.incrementAndGet();
+                        }
+                    }
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+
+        start.countDown();
+        assertThat(done.await(30, TimeUnit.SECONDS)).isTrue();
+        pool.shutdownNow();
+
+        assertThat(overCap.get()).isZero();
+        assertThat(negativeRemaining.get()).isZero();
+        assertThat(limiter.trackedClients()).isLessThanOrEqualTo(cap);
+        // The active client keeps its true in-window count (one pre-admission + limit - 1).
+        assertThat(victimAdmitted.get()).isEqualTo(limit - 1);
     }
 }

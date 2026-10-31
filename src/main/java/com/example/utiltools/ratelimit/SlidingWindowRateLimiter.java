@@ -1,8 +1,6 @@
 package com.example.utiltools.ratelimit;
 
 import java.time.Clock;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
@@ -20,6 +18,11 @@ import org.springframework.stereotype.Component;
  * <p>Tracked keys are hard-bounded by {@code max-tracked-clients}: a new key evicts the oldest
  * bucket whose last event already left the window, and is rejected without insertion when every
  * tracked bucket is active.</p>
+ *
+ * <p>Lock order is always {@code mapLock} → bucket lock, never the reverse. Each eviction path
+ * decides <em>and</em> removes inside one bucket-lock critical section (invariant I6), and the
+ * admission path re-validates under the bucket lock that the instance it locked is still the mapped
+ * one (invariant I8), so an admission can never be recorded into an orphaned bucket.</p>
  */
 @Component
 public class SlidingWindowRateLimiter {
@@ -28,6 +31,13 @@ public class SlidingWindowRateLimiter {
     public static final String RATE_LIMITED = "RATE_LIMITED";
 
     private static final String UNKNOWN_CLIENT = "unknown";
+
+    /**
+     * Bound on mapping re-validation retries. A retry is only possible when the bucket was evicted
+     * between lookup and lock acquisition, which requires it to have held no in-window event, so the
+     * loop converges immediately in practice.
+     */
+    private static final int MAX_MAPPING_ATTEMPTS = 8;
 
     /**
      * Outcome of one admission attempt.
@@ -69,38 +79,50 @@ public class SlidingWindowRateLimiter {
         String key = normaliseKey(clientKey);
         long now = clock.millis();
 
-        Bucket bucket = buckets.get(key);
-        if (bucket == null) {
-            bucket = registerBucket(key, now);
+        for (int attempt = 0; attempt < MAX_MAPPING_ATTEMPTS; attempt++) {
+            Bucket bucket = buckets.get(key);
             if (bucket == null) {
-                // Every tracked bucket holds an in-window event: reject without inserting.
-                return new Admission(false, limit, 0L,
-                        Math.max(1L, ceilDiv(windowMs, 1000L)),
-                        ceilDiv(now + windowMs, 1000L));
+                bucket = registerBucket(key, now);
+                if (bucket == null) {
+                    // Every tracked bucket holds an in-window event: reject without inserting.
+                    return new Admission(false, limit, 0L,
+                            Math.max(1L, ceilDiv(windowMs, 1000L)),
+                            ceilDiv(now + windowMs, 1000L));
+                }
             }
-        }
 
-        bucket.lock.lock();
-        try {
-            // Clock-regression guard: never move a bucket's window backwards.
-            long effectiveNow = Math.max(now, bucket.lastEventMillis);
-            purgeExpired(bucket, effectiveNow, windowMs);
+            bucket.lock.lock();
+            try {
+                // I8: an eviction path may have removed this instance before the lock was acquired.
+                // Writing to it would be lost, silently restoring consumed budget, so retry instead.
+                if (buckets.get(key) != bucket) {
+                    continue;
+                }
 
-            if (bucket.size >= limit) {
+                // Clock-regression guard: never move a bucket's window backwards.
+                long effectiveNow = Math.max(now, bucket.lastEventMillis);
+                purgeExpired(bucket, effectiveNow, windowMs);
+
+                if (bucket.size >= limit) {
+                    long resetAt = bucket.timestamps[bucket.start] + windowMs;
+                    return new Admission(false, limit, 0L,
+                            Math.max(1L, ceilDiv(resetAt - effectiveNow, 1000L)),
+                            ceilDiv(resetAt, 1000L));
+                }
+
+                record(bucket, effectiveNow);
+                bucket.lastEventMillis = effectiveNow;
+                long remaining = Math.max(0L, limit - bucket.size);
                 long resetAt = bucket.timestamps[bucket.start] + windowMs;
-                return new Admission(false, limit, 0L,
-                        Math.max(1L, ceilDiv(resetAt - effectiveNow, 1000L)),
-                        ceilDiv(resetAt, 1000L));
+                return new Admission(true, limit, remaining, 0L, ceilDiv(resetAt, 1000L));
+            } finally {
+                bucket.lock.unlock();
             }
-
-            record(bucket, effectiveNow);
-            bucket.lastEventMillis = effectiveNow;
-            long remaining = Math.max(0L, limit - bucket.size);
-            long resetAt = bucket.timestamps[bucket.start] + windowMs;
-            return new Admission(true, limit, remaining, 0L, ceilDiv(resetAt, 1000L));
-        } finally {
-            bucket.lock.unlock();
         }
+
+        // Unreachable for any real clock: repeated eviction of a bucket that had no in-window event
+        // loses no admission, so the fail-open branch keeps a live client from being penalised.
+        return new Admission(true, limit, Math.max(0L, limit - 1L), 0L, ceilDiv(now + windowMs, 1000L));
     }
 
     /** Number of currently tracked client buckets (bounded by {@code max-tracked-clients}). */
@@ -119,21 +141,18 @@ public class SlidingWindowRateLimiter {
         int removed = 0;
         mapLock.lock();
         try {
-            List<String> idleKeys = new ArrayList<>();
             for (Map.Entry<String, Bucket> entry : buckets.entrySet()) {
                 Bucket bucket = entry.getValue();
                 bucket.lock.lock();
                 try {
-                    if (bucket.lastEventMillis <= idleThreshold) {
-                        idleKeys.add(entry.getKey());
+                    // I6: the idle decision and the removal share one bucket-lock critical section,
+                    // so no admission can record an in-window event in between.
+                    if (bucket.lastEventMillis <= idleThreshold
+                            && buckets.remove(entry.getKey(), bucket)) {
+                        removed++;
                     }
                 } finally {
                     bucket.lock.unlock();
-                }
-            }
-            for (String idleKey : idleKeys) {
-                if (buckets.remove(idleKey) != null) {
-                    removed++;
                 }
             }
         } finally {
@@ -144,6 +163,8 @@ public class SlidingWindowRateLimiter {
 
     /**
      * Removes at most one bucket whose last event already left the window: the oldest idle one.
+     * This is the cap-eviction primitive used by {@link #registerBucket(String, long)} when the map
+     * is saturated.
      *
      * @param now reference instant in epoch millis
      * @return {@code true} when a bucket was removed
@@ -173,7 +194,7 @@ public class SlidingWindowRateLimiter {
                 return existing;
             }
             if (buckets.size() >= properties.maxTrackedClients()) {
-                removeOldestExpiredBucketLocked(now);
+                evictOldestExpiredBucket(now);   // reentrant mapLock
             }
             if (buckets.size() >= properties.maxTrackedClients()) {
                 return null;
@@ -189,23 +210,43 @@ public class SlidingWindowRateLimiter {
         }
     }
 
-    /** Removes the {@code mapLock}-protected oldest bucket that has no in-window event left. */
+    /**
+     * Removes the {@code mapLock}-protected oldest bucket that has no in-window event left. The
+     * {@code lastEventMillis} sample and the removal are both taken under the candidate's bucket
+     * lock, so a bucket that recorded an event in between is never evicted.
+     */
     private boolean removeOldestExpiredBucketLocked(long now) {
         long expiredThreshold = now - properties.windowMs();
         String oldestKey = null;
+        Bucket oldestBucket = null;
         long oldestLastEvent = Long.MAX_VALUE;
         for (Map.Entry<String, Bucket> entry : buckets.entrySet()) {
-            long lastEvent = entry.getValue().lastEventMillis;
-            if (lastEvent <= expiredThreshold && lastEvent < oldestLastEvent) {
-                oldestLastEvent = lastEvent;
-                oldestKey = entry.getKey();
+            Bucket bucket = entry.getValue();
+            bucket.lock.lock();
+            try {
+                long lastEvent = bucket.lastEventMillis;
+                if (lastEvent <= expiredThreshold && lastEvent < oldestLastEvent) {
+                    oldestLastEvent = lastEvent;
+                    oldestKey = entry.getKey();
+                    oldestBucket = bucket;
+                }
+            } finally {
+                bucket.lock.unlock();
             }
         }
-        if (oldestKey == null) {
+        if (oldestBucket == null) {
             return false;
         }
-        buckets.remove(oldestKey);
-        return true;
+        oldestBucket.lock.lock();
+        try {
+            // Re-validate under the bucket lock: an admission may have landed after the sample.
+            if (oldestBucket.lastEventMillis > expiredThreshold) {
+                return false;
+            }
+            return buckets.remove(oldestKey, oldestBucket);
+        } finally {
+            oldestBucket.lock.unlock();
+        }
     }
 
     private static void purgeExpired(Bucket bucket, long now, long windowMs) {
