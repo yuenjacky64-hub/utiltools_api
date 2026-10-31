@@ -34,6 +34,18 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
     }
 
+    @ExceptionHandler(AuditEntryNotFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleAuditEntryNotFoundException(AuditEntryNotFoundException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "NOT_FOUND", null);
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
+    }
+
+    @ExceptionHandler(ReplayConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleReplayConflictException(ReplayConflictException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "REPLAY_CONFLICT", null);
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ApiResponse<Void>> handleGeneralException(Exception ex) {
         ApiResponse<Void> response = ApiResponse.error("An unexpected error occurred: " + ex.getMessage(), "INTERNAL_SERVER_ERROR", null);
