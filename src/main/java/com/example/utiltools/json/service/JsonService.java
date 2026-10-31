@@ -2,19 +2,27 @@ package com.example.utiltools.json.service;
 
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
+import com.example.utiltools.json.dto.JsonPatchOperation;
+import com.example.utiltools.json.dto.JsonPatchRequest;
+import com.example.utiltools.json.dto.JsonPatchResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
+import com.example.utiltools.json.exception.JsonPatchRollbackException;
 import com.fasterxml.jackson.core.JsonLocation;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.jayway.jsonpath.InvalidPathException;
 import com.jayway.jsonpath.JsonPath;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 
 @Service
 public class JsonService {
@@ -62,6 +70,375 @@ public class JsonService {
             throw new IllegalArgumentException("Invalid JSONPath syntax: " + e.getMessage(), e);
         } catch (Exception e) {
             throw new IllegalArgumentException("Failed to evaluate JSONPath: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Applies an ordered RFC 6902-style operation list to a deep copy of the caller's document.
+     * All-or-nothing: on the first failing operation every previously applied change is reverted in
+     * reverse order and {@link JsonPatchRollbackException} carries the full transition audit.
+     */
+    public JsonPatchResponse patch(JsonPatchRequest request) {
+        JsonNode original;
+        try {
+            original = objectMapper.readTree(request.json());
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException("Invalid JSON content: " + e.getOriginalMessage(), e);
+        }
+        if (original == null) {
+            throw new IllegalArgumentException("Invalid JSON content: document is empty");
+        }
+
+        PatchDocument doc = new PatchDocument(original.deepCopy());
+        boolean dryRun = Boolean.TRUE.equals(request.dryRun());
+
+        List<JsonPatchOperation> inputs = request.operations();
+        List<JsonPatchOperation> audit = new ArrayList<>(inputs.size());
+        for (int i = 0; i < inputs.size(); i++) {
+            JsonPatchOperation input = inputs.get(i);
+            String op = input == null ? null : trimToNull(input.op());
+            String path = input == null ? null : trimToNull(input.path());
+            String from = input == null ? null : trimToNull(input.from());
+            JsonNode value = input == null ? null : deepCopyOrNull(input.value());
+            // Caller-supplied index / status / snapshots / error are ignored: the service re-derives them.
+            audit.add(new JsonPatchOperation(i, op, path, from, value,
+                    JsonPatchOperation.PENDING, null, null, null));
+        }
+
+        List<Runnable> inverses = new ArrayList<>(audit.size());
+        for (int i = 0; i < audit.size(); i++) {
+            JsonPatchOperation entry = audit.get(i);
+            JsonNode before = deepCopyOrNull(doc.resolveQuietly(entry.path()));
+            try {
+                inverses.add(applyOperation(doc, entry));
+                JsonNode after = deepCopyOrNull(doc.resolveQuietly(entry.path()));
+                audit.set(i, entry.withAudit(dryRun ? JsonPatchOperation.VALIDATED
+                        : JsonPatchOperation.APPLIED, before, after, null));
+            } catch (PatchFailure | IllegalArgumentException e) {
+                String reason = e.getMessage() == null ? "Operation failed" : e.getMessage();
+                audit.set(i, entry.withAudit(JsonPatchOperation.FAILED, before, null, reason));
+
+                int rolledBack = 0;
+                for (int j = i - 1; j >= 0; j--) {
+                    JsonPatchOperation previous = audit.get(j);
+                    if (!JsonPatchOperation.APPLIED.equals(previous.status())
+                            && !JsonPatchOperation.VALIDATED.equals(previous.status())) {
+                        continue;
+                    }
+                    String inverseError = null;
+                    try {
+                        inverses.get(j).run();
+                    } catch (Exception ignored) {
+                        // A failing inverse must never surface as a 500 or leak a half-patched document.
+                        inverseError = "Rollback failed: " + ignored.getMessage();
+                    }
+                    rolledBack++;
+                    audit.set(j, previous.withAudit(JsonPatchOperation.ROLLED_BACK,
+                            previous.beforeValue(), deepCopyOrNull(doc.resolveQuietly(previous.path())),
+                            inverseError));
+                }
+                throw new JsonPatchRollbackException(i, entry.op(), entry.path(), rolledBack, audit, reason);
+            }
+        }
+
+        int applied = dryRun ? 0 : audit.size();
+        return new JsonPatchResponse(dryRun ? null : doc.root(), applied, 0, dryRun, List.copyOf(audit));
+    }
+
+    private Runnable applyOperation(PatchDocument doc, JsonPatchOperation entry) {
+        String op = entry.op();
+        String path = entry.path();
+        if (op == null || op.isBlank()) {
+            throw new PatchFailure("Unknown operation: " + op);
+        }
+        return switch (op) {
+            case "add" -> doc.addNode(path, entry.value());
+            case "remove" -> doc.removeNode(path);
+            case "replace" -> doc.replaceNode(path, entry.value());
+            case "test" -> doc.testNode(path, entry.value());
+            case "move" -> doc.moveNode(entry.from(), path);
+            case "copy" -> doc.copyNode(entry.from(), path);
+            default -> throw new PatchFailure("Unknown operation: " + op);
+        };
+    }
+
+    private static String trimToNull(String value) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        return trimmed.isEmpty() ? "" : trimmed;
+    }
+
+    private static JsonNode deepCopyOrNull(JsonNode node) {
+        if (node == null || node.isMissingNode()) {
+            return null;
+        }
+        return node.deepCopy();
+    }
+
+    /** Working copy holder: a {@link JsonNode} reference cannot be reassigned from a helper. */
+    private static final class PatchDocument {
+
+        private JsonNode root;
+
+        private PatchDocument(JsonNode root) {
+            this.root = root;
+        }
+
+        private JsonNode root() {
+            return root;
+        }
+
+        private JsonNode resolveQuietly(String pointer) {
+            try {
+                return resolve(pointer);
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+
+        private JsonNode resolve(String pointer) {
+            List<String> tokens = parsePointer(pointer);
+            JsonNode current = root;
+            for (String token : tokens) {
+                current = child(current, token);
+                if (current == null) {
+                    return null;
+                }
+            }
+            return current;
+        }
+
+        private JsonNode child(JsonNode node, String token) {
+            if (node instanceof ObjectNode objectNode) {
+                return objectNode.get(token);
+            }
+            if (node instanceof ArrayNode arrayNode) {
+                return arrayNode.get(parseIndex(token, arrayNode.size(), false));
+            }
+            return null;
+        }
+
+        private JsonNode requireParent(List<String> tokens, String pointer) {
+            JsonNode current = root;
+            for (int i = 0; i < tokens.size() - 1; i++) {
+                current = child(current, tokens.get(i));
+                if (current == null) {
+                    throw new PatchFailure("Missing path: " + pointer);
+                }
+            }
+            return current;
+        }
+
+        private Runnable addNode(String pointer, JsonNode value) {
+            if (value == null) {
+                throw new PatchFailure("'value' is required for add/replace/test");
+            }
+            List<String> tokens = parsePointer(pointer);
+            JsonNode added = value.deepCopy();
+            if (tokens.isEmpty()) {
+                JsonNode previous = root;
+                root = added;
+                return () -> root = previous;
+            }
+            JsonNode parent = requireParent(tokens, pointer);
+            String last = tokens.get(tokens.size() - 1);
+            if (parent instanceof ObjectNode objectNode) {
+                JsonNode previous = deepCopyOrNull(objectNode.get(last));
+                objectNode.set(last, added);
+                if (previous == null) {
+                    return () -> objectNode.remove(last);
+                }
+                return () -> objectNode.set(last, previous);
+            }
+            if (parent instanceof ArrayNode arrayNode) {
+                int index = parseIndex(last, arrayNode.size(), true);
+                JsonNode previous = index < arrayNode.size() ? deepCopyOrNull(arrayNode.get(index)) : null;
+                arrayNode.insert(index, added);
+                if (previous == null) {
+                    return () -> arrayNode.remove(index);
+                }
+                return () -> arrayNode.set(index, previous);
+            }
+            throw new PatchFailure("Missing path: " + pointer);
+        }
+
+        private Runnable removeNode(String pointer) {
+            List<String> tokens = parsePointer(pointer);
+            if (tokens.isEmpty()) {
+                throw new PatchFailure("Cannot remove the root document");
+            }
+            JsonNode parent = requireParent(tokens, pointer);
+            String last = tokens.get(tokens.size() - 1);
+            if (parent instanceof ObjectNode objectNode) {
+                JsonNode removed = objectNode.remove(last);
+                if (removed == null) {
+                    throw new PatchFailure("Missing path: " + pointer);
+                }
+                JsonNode snapshot = removed.deepCopy();
+                return () -> objectNode.set(last, snapshot);
+            }
+            if (parent instanceof ArrayNode arrayNode) {
+                int index = parseIndex(last, arrayNode.size(), false);
+                JsonNode snapshot = arrayNode.get(index).deepCopy();
+                arrayNode.remove(index);
+                return () -> arrayNode.insert(index, snapshot);
+            }
+            throw new PatchFailure("Missing path: " + pointer);
+        }
+
+        private Runnable replaceNode(String pointer, JsonNode value) {
+            if (value == null) {
+                throw new PatchFailure("'value' is required for add/replace/test");
+            }
+            List<String> tokens = parsePointer(pointer);
+            JsonNode replacement = value.deepCopy();
+            if (tokens.isEmpty()) {
+                JsonNode previous = root;
+                root = replacement;
+                return () -> root = previous;
+            }
+            JsonNode parent = requireParent(tokens, pointer);
+            String last = tokens.get(tokens.size() - 1);
+            if (parent instanceof ObjectNode objectNode) {
+                JsonNode previous = objectNode.get(last);
+                if (previous == null) {
+                    throw new PatchFailure("Missing path: " + pointer);
+                }
+                JsonNode snapshot = previous.deepCopy();
+                objectNode.set(last, replacement);
+                return () -> objectNode.set(last, snapshot);
+            }
+            if (parent instanceof ArrayNode arrayNode) {
+                int index = parseIndex(last, arrayNode.size(), false);
+                JsonNode snapshot = arrayNode.get(index).deepCopy();
+                arrayNode.set(index, replacement);
+                return () -> arrayNode.set(index, snapshot);
+            }
+            throw new PatchFailure("Missing path: " + pointer);
+        }
+
+        private Runnable testNode(String pointer, JsonNode value) {
+            if (value == null) {
+                throw new PatchFailure("'value' is required for add/replace/test");
+            }
+            JsonNode target = resolve(pointer);
+            if (target == null) {
+                throw new PatchFailure("Missing path: " + pointer);
+            }
+            if (!target.equals(value)) {
+                throw new PatchFailure("Test operation failed at " + pointer);
+            }
+            return () -> {
+            };
+        }
+
+        private Runnable moveNode(String from, String path) {
+            if (from == null || from.isBlank()) {
+                throw new PatchFailure("'from' is required for move/copy");
+            }
+            if (path == null || path.isBlank()) {
+                throw new PatchFailure("Malformed JSON Pointer: pointer must not be null or blank");
+            }
+            if (path.equals(from) || path.startsWith(from + "/")) {
+                throw new PatchFailure("Cannot move a node into its own descendant");
+            }
+            JsonNode source = resolve(from);
+            if (source == null) {
+                throw new PatchFailure("Missing path: " + from);
+            }
+            JsonNode moved = source.deepCopy();
+            validateAddTarget(path);
+            removeNode(from);
+            Runnable addInverse = addNode(path, moved);
+            return () -> {
+                addInverse.run();
+                addNode(from, moved.deepCopy());
+            };
+        }
+
+        private Runnable copyNode(String from, String path) {
+            if (from == null || from.isBlank()) {
+                throw new PatchFailure("'from' is required for move/copy");
+            }
+            JsonNode source = resolve(from);
+            if (source == null) {
+                throw new PatchFailure("Missing path: " + from);
+            }
+            return addNode(path, source.deepCopy());
+        }
+
+        private void validateAddTarget(String pointer) {
+            List<String> tokens = parsePointer(pointer);
+            if (tokens.isEmpty()) {
+                return;
+            }
+            JsonNode parent = requireParent(tokens, pointer);
+            String last = tokens.get(tokens.size() - 1);
+            if (parent instanceof ObjectNode) {
+                return;
+            }
+            if (parent instanceof ArrayNode arrayNode) {
+                parseIndex(last, arrayNode.size(), true);
+                return;
+            }
+            throw new PatchFailure("Missing path: " + pointer);
+        }
+
+        /** RFC 6901 pointer parsing with {@code ~1 -> /} then {@code ~0 -> ~} unescaping. */
+        private static List<String> parsePointer(String pointer) {
+            if (pointer == null) {
+                throw new PatchFailure("Malformed JSON Pointer: pointer must not be null or blank");
+            }
+            if (pointer.isEmpty()) {
+                return List.of();
+            }
+            if (pointer.isBlank()) {
+                throw new PatchFailure("Malformed JSON Pointer: pointer must not be null or blank");
+            }
+            if (!pointer.startsWith("/")) {
+                throw new PatchFailure("Malformed JSON Pointer: " + pointer);
+            }
+            String[] raw = pointer.substring(1).split("/", -1);
+            List<String> tokens = new ArrayList<>(raw.length);
+            for (String token : raw) {
+                if (token.matches(".*~(?![01]).*")) {
+                    throw new PatchFailure("Malformed JSON Pointer: " + pointer);
+                }
+                tokens.add(token.replace("~1", "/").replace("~0", "~"));
+            }
+            return tokens;
+        }
+
+        private static int parseIndex(String token, int size, boolean allowAppend) {
+            if ("-".equals(token)) {
+                if (allowAppend) {
+                    return size;
+                }
+                throw new PatchFailure("Invalid array index: -");
+            }
+            if (!token.matches("0|[1-9][0-9]*")) {
+                throw new PatchFailure("Invalid array index: " + token);
+            }
+            int index;
+            try {
+                index = Integer.parseInt(token);
+            } catch (NumberFormatException e) {
+                throw new PatchFailure("Array index out of bounds: " + token);
+            }
+            if (allowAppend ? index > size : index >= size) {
+                throw new PatchFailure("Array index out of bounds: " + token);
+            }
+            return index;
+        }
+    }
+
+    /** Internal operation failure carrier: the message is the audit reason surfaced to the caller. */
+    private static final class PatchFailure extends RuntimeException {
+
+        private PatchFailure(String message) {
+            super(message);
         }
     }
 }
