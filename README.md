@@ -2,7 +2,7 @@
 
 [![Java](https://img.shields.io/badge/Java-21%20LTS-orange.svg?logo=openjdk)](https://openjdk.org/projects/jdk/21/)
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4%20(3.4.2)-brightgreen.svg?logo=springboot)](https://spring.io/projects/spring-boot)
-[![Build & Tests](https://img.shields.io/badge/Tests-32%20Passed%20(100%25)-success.svg)](https://junit.org/junit5/)
+[![Build & Tests](https://img.shields.io/badge/Tests-41%20Passed%20(100%25)-success.svg)](https://junit.org/junit5/)
 [![OpenAPI](https://img.shields.io/badge/OpenAPI-3.0%20%2F%20Swagger%20UI-blue.svg?logo=swagger)](http://localhost:8080/swagger-ui/index.html)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
@@ -22,6 +22,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
   - [1. DateTime & Timezone Utility](#1-datetime--timezone-utility)
   - [2. Cryptography & Encoding Utility](#2-cryptography--encoding-utility)
   - [3. JSON & Data Processor Utility](#3-json--data-processor-utility)
+  - [4. Batch Hash Jobs (async)](#4-batch-hash-jobs-async)
 - [Unified Response & Error Handling](#-unified-response--error-handling)
 - [Interactive API Documentation (Swagger UI)](#-interactive-api-documentation-swagger-ui)
 - [Quick Start Guide](#-quick-start-guide)
@@ -127,6 +128,8 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/format` | Pretty-print or minify JSON strings |
 | `POST` | `/api/v1/utils/json/validate` | Check JSON syntax validity and report exact syntax error line/col |
 | `POST` | `/api/v1/utils/json/query` | Evaluate JSONPath queries and extract matching nodes |
+| `POST` | `/api/v1/utils/jobs/hash` | Submit a bounded async batch-hash job; `202` with a job id, idempotent via `idempotencyKey` |
+| `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `COMPLETED` / `FAILED` |
 
 ---
 
@@ -428,6 +431,107 @@ curl -X POST http://localhost:8080/api/v1/utils/json/query \
 
 ---
 
+### 4. Batch Hash Jobs (async)
+
+Hash up to **1000 items** in the background instead of blocking one HTTP request per item. Submission is
+accepted immediately with **202** and a `jobId`; you then poll `GET /api/v1/utils/jobs/{jobId}` until the job
+reaches `COMPLETED` or `FAILED`. Every item is hashed with the same `CryptoService.hash` used by
+`POST /api/v1/utils/crypto/hash`, and results are returned in **input order**.
+
+Jobs live in the JVM heap only: this API is **single-instance and in-memory**, so a restart (or a revert)
+discards all jobs and idempotency keys — clients then get `404 JOB_NOT_FOUND` and must resubmit.
+
+#### A. Submit a batch (202 Accepted)
+
+`idempotencyKey` is optional. When present, duplicate **or concurrent** submissions with the same key return the
+same `jobId` and cause exactly one execution.
+
+```bash
+curl -i -X POST http://localhost:8080/api/v1/utils/jobs/hash \
+  -H "Content-Type: application/json" \
+  -d '{
+    "algorithm": "SHA-256",
+    "items": ["Hello World", "Second payload", "Third payload"],
+    "idempotencyKey": "batch-2026-10-31-001"
+  }'
+```
+
+**Response — `202 Accepted`:**
+```json
+{
+  "success": true,
+  "message": "Batch hash job accepted",
+  "data": {
+    "jobId": "3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3",
+    "idempotencyKey": "batch-2026-10-31-001",
+    "status": "QUEUED",
+    "itemCount": 3,
+    "createdAt": "2026-10-31T19:12:04.418273Z"
+  },
+  "timestamp": "2026-10-31T19:12:04.418503Z"
+}
+```
+
+#### B. Poll the job snapshot
+
+```bash
+curl http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3
+```
+
+**Response — `200 OK`, `COMPLETED` (results in input order):**
+```json
+{
+  "success": true,
+  "message": "Job status retrieved",
+  "data": {
+    "jobId": "3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3",
+    "idempotencyKey": "batch-2026-10-31-001",
+    "status": "COMPLETED",
+    "itemCount": 3,
+    "results": [
+      { "algorithm": "SHA-256", "digest": "a591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e", "isHmac": false },
+      { "algorithm": "SHA-256", "digest": "0f3c1bb2f0e0f7f9a9b5bd0bb4d5f1a2f9a0c3d7e0b1a2c3d4e5f60718293a4b", "isHmac": false },
+      { "algorithm": "SHA-256", "digest": "7d1a5c9e2b8f43061c7d9e0a3b5c8d1e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c", "isHmac": false }
+    ],
+    "createdAt": "2026-10-31T19:12:04.418273Z",
+    "startedAt": "2026-10-31T19:12:04.420118Z",
+    "completedAt": "2026-10-31T19:12:04.421907Z"
+  },
+  "timestamp": "2026-10-31T19:12:05.012775Z"
+}
+```
+
+The state machine is strictly `QUEUED → RUNNING → COMPLETED | FAILED`. A `FAILED` job carries a non-null
+`error` and a `completedAt`, and never blocks later jobs.
+
+#### C. Failure modes
+
+| Situation | HTTP | `error` | What to do |
+| :--- | :--- | :--- | :--- |
+| Bounded executor queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry with the **same** `idempotencyKey` once capacity frees; the rejected submission leaves no job or idempotency residue |
+| Unknown or already-evicted `jobId` | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Resubmit the batch |
+| Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit |
+| Blank/empty `items` | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Send a non-empty list of non-blank strings (max 1000) |
+
+#### D. Batch job configuration
+
+```properties
+# Batch hash jobs (bounded async execution)
+utiltools.jobs.worker-count=2
+utiltools.jobs.queue-capacity=100
+utiltools.jobs.retention-seconds=300
+utiltools.jobs.cleanup-interval-ms=60000
+```
+
+| Property | Default | Meaning |
+| :--- | :--- | :--- |
+| `utiltools.jobs.worker-count` | `2` | Worker threads hashing batches; bounds CPU-wide concurrency |
+| `utiltools.jobs.queue-capacity` | `100` | `ArrayBlockingQueue` slots for accepted-but-not-started jobs; full queue ⇒ `429 QUEUE_FULL` (`AbortPolicy`) |
+| `utiltools.jobs.retention-seconds` | `300` | How long a `COMPLETED`/`FAILED` job (plus its idempotency key) is kept before eviction |
+| `utiltools.jobs.cleanup-interval-ms` | `60000` | Interval of the scheduled eviction pass (`@EnableScheduling`); `QUEUED`/`RUNNING` jobs are never evicted |
+
+---
+
 ## 🛡 Unified Response & Error Handling
 
 When client input fails validation or business rules, `@RestControllerAdvice` formats a clean, standardized error response:
@@ -450,6 +554,8 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Missing required fields (`@NotBlank`, `@NotNull`, etc.) |
 | `400 BAD_REQUEST` | `BAD_REQUEST` | Invalid timezone ID, unsupported hash algorithm, corrupt Base64 |
 | `400 BAD_REQUEST` | `BAD_REQUEST` | Malformed HTTP request body |
+| `404 NOT_FOUND` | `JOB_NOT_FOUND` | Unknown or evicted batch job id |
+| `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Batch job queue is saturated; retry after capacity frees |
 | `500 INTERNAL_SERVER_ERROR` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |
 
 ---
@@ -517,5 +623,7 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries.
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite.
+- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety.
+- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202, 400, 404 `JOB_NOT_FOUND`, 429 `QUEUE_FULL`).
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.
 - **`UtiltoolsApiApplicationTests`**: Spring ApplicationContext loading verification.
