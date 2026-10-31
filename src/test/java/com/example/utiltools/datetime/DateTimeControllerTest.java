@@ -94,4 +94,102 @@ class DateTimeControllerTest {
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/convert - should honor explicit EPOCH_SECONDS")
+    void shouldHonorExplicitEpochSeconds() throws Exception {
+        String body = """
+                {
+                    "input": "1730335200",
+                    "inputFormat": "EPOCH_SECONDS",
+                    "targetTimeZone": "UTC"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/convert")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.epochMillis").value(1730335200000L))
+                .andExpect(jsonPath("$.data.epochSeconds").value(1730335200L));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/convert - should honor explicit EPOCH_MILLIS")
+    void shouldHonorExplicitEpochMillis() throws Exception {
+        String body = """
+                {
+                    "input": "1730335200000",
+                    "inputFormat": "EPOCH_MILLIS",
+                    "targetTimeZone": "UTC"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/convert")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.epochMillis").value(1730335200000L));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/convert - should reject ISO-8601 input under forced EPOCH_MILLIS")
+    void shouldRejectIsoInputUnderForcedEpochMillis() throws Exception {
+        String body = """
+                {
+                    "input": "2024-10-31T09:40:00+09:00",
+                    "inputFormat": "EPOCH_MILLIS",
+                    "targetTimeZone": "UTC"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/convert")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("does not match inputFormat EPOCH_MILLIS")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/convert - should reject unknown inputFormat with allowed values")
+    void shouldRejectUnknownInputFormat() throws Exception {
+        String body = """
+                {
+                    "input": "1730335200000",
+                    "inputFormat": "BOGUS"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/convert")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]").value(org.hamcrest.Matchers.containsString("EPOCH_SECONDS")))
+                .andExpect(jsonPath("$.details[0]").value(org.hamcrest.Matchers.containsString("EPOCH_MILLIS")))
+                .andExpect(jsonPath("$.details[0]").value(org.hamcrest.Matchers.containsString("ISO_8601")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/convert - should answer 400 (not 500) for out-of-range epoch seconds")
+    void shouldRejectOutOfRangeEpochSecondsWith400() throws Exception {
+        String body = """
+                {
+                    "input": "9223372036854775807",
+                    "inputFormat": "EPOCH_SECONDS"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/convert")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+    }
 }

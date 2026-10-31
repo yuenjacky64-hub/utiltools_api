@@ -152,6 +152,7 @@ Supports:
 - Epoch milliseconds (e.g., `1730335200000`)
 - Epoch seconds (e.g., `1730335200`)
 - ISO-8601 strings (e.g., `2026-01-01T15:00:00Z`)
+- Optional `inputFormat` request field to force the interpretation of `input` — one of `EPOCH_SECONDS`, `EPOCH_MILLIS`, `ISO_8601` (case-insensitive). Omit it, send `null`, or send a blank string to keep auto-detection (numeric values are treated as epoch millis when the digit count exceeds 11, otherwise as epoch seconds).
 - Target IANA timezones (e.g., `Asia/Tokyo`, `America/New_York`, `Europe/London`, `UTC`)
 - Optional custom formatting pattern (e.g., `yyyy-MM-dd HH:mm:ss`)
 
@@ -177,6 +178,78 @@ curl -X POST http://localhost:8080/api/v1/utils/datetime/convert \
     "targetTimeZone": "Asia/Tokyo",
     "formattedTarget": "2024-10-31 09:40:00"
   },
+  "timestamp": "2026-10-30T16:50:38.707903775Z"
+}
+```
+
+**Force the input format (optional `inputFormat`):**
+
+`inputFormat` pins the interpretation of `input` instead of relying on digit-count auto-detection. It is useful when the units are ambiguous — for example `1000000000` is auto-detected as epoch **seconds** (2001-09-09T01:46:40Z), while `"inputFormat": "EPOCH_MILLIS"` reads it as epoch millis (1970-01-12T13:46:40Z). Allowed values (case-insensitive) are `EPOCH_SECONDS`, `EPOCH_MILLIS` and `ISO_8601`.
+
+```bash
+# EPOCH_SECONDS: a 10-digit value is read as seconds
+curl -X POST http://localhost:8080/api/v1/utils/datetime/convert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "1730335200",
+    "inputFormat": "EPOCH_SECONDS",
+    "targetTimeZone": "Asia/Tokyo"
+  }'
+
+# EPOCH_MILLIS: a 13-digit value (or a pre-1973 value) is read as milliseconds
+curl -X POST http://localhost:8080/api/v1/utils/datetime/convert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "1730335200000",
+    "inputFormat": "EPOCH_MILLIS",
+    "targetTimeZone": "Asia/Tokyo"
+  }'
+
+# ISO_8601: numeric heuristics are bypassed entirely
+curl -X POST http://localhost:8080/api/v1/utils/datetime/convert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "2024-10-31T09:40:00+09:00",
+    "inputFormat": "ISO_8601",
+    "targetTimeZone": "Asia/Tokyo"
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "DateTime converted successfully",
+  "data": {
+    "epochMillis": 1730335200000,
+    "epochSeconds": 1730335200,
+    "isoUtc": "2024-10-31T00:40:00Z",
+    "targetTimeZone": "Asia/Tokyo",
+    "formattedTarget": "2024-10-31T09:40:00+09:00"
+  },
+  "timestamp": "2026-10-30T16:50:38.707903775Z"
+}
+```
+
+If `input` does not match the forced `inputFormat` (an ISO-8601 string sent with `EPOCH_MILLIS`, a numeric value sent with `ISO_8601`, or a value outside the representable range) the endpoint answers HTTP 400 with `error` = `BAD_REQUEST`. An unrecognised `inputFormat` answers HTTP 400 with `error` = `VALIDATION_ERROR` and the allowed values in `details`:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/datetime/convert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "1730335200000",
+    "inputFormat": "BOGUS"
+  }'
+```
+
+```json
+{
+  "success": false,
+  "message": "Validation failed",
+  "error": "VALIDATION_ERROR",
+  "details": [
+    "inputFormat must be one of EPOCH_SECONDS, EPOCH_MILLIS, ISO_8601"
+  ],
   "timestamp": "2026-10-30T16:50:38.707903775Z"
 }
 ```
