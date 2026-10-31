@@ -231,7 +231,7 @@ curl -X POST http://localhost:8080/api/v1/utils/datetime/convert \
 }
 ```
 
-If `input` does not match the forced `inputFormat` (an ISO-8601 string sent with `EPOCH_MILLIS`, a numeric value sent with `ISO_8601`, or a value outside the representable range) the endpoint answers HTTP 400 with `error` = `BAD_REQUEST`. An unrecognised `inputFormat` answers HTTP 400 with `error` = `VALIDATION_ERROR` and the allowed values in `details`:
+If `input` does not match the forced `inputFormat` (an ISO-8601 string sent with `EPOCH_MILLIS`, a numeric value sent with `ISO_8601`, or a value outside the representable range, since the response also reports `epochMillis` and `EPOCH_SECONDS` therefore accepts at most `±9223372036854775`) the endpoint answers HTTP 400 with `error` = `BAD_REQUEST`. An unrecognised `inputFormat` answers HTTP 400 with `error` = `VALIDATION_ERROR` and the allowed values in `details`:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/utils/datetime/convert \

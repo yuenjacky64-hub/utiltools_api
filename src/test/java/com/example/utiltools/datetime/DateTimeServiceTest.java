@@ -149,6 +149,31 @@ class DateTimeServiceTest {
     }
 
     @Test
+    @DisplayName("Should raise IllegalArgumentException for forced epoch seconds that overflow epoch millis")
+    void shouldReturnIllegalArgumentForForcedSecondsOutsideMillisRange() {
+        // 9223372036854776 s is a valid Instant (year 292278994) but toEpochMilli() would overflow
+        DateTimeConvertRequest request =
+                new DateTimeConvertRequest("9223372036854776", "UTC", null, "EPOCH_SECONDS");
+
+        assertThatThrownBy(() -> dateTimeService.convert(request))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not match inputFormat EPOCH_SECONDS")
+                .hasMessageContaining("epoch milliseconds");
+    }
+
+    @Test
+    @DisplayName("Should convert forced epoch seconds at the epoch-millis boundary")
+    void shouldConvertForcedEpochSecondsAtMillisBoundary() {
+        DateTimeConvertRequest upper =
+                new DateTimeConvertRequest("9223372036854775", "UTC", null, "EPOCH_SECONDS");
+        DateTimeConvertRequest lower =
+                new DateTimeConvertRequest("-9223372036854775", "UTC", null, "EPOCH_SECONDS");
+
+        assertThat(dateTimeService.convert(upper).epochMillis()).isEqualTo(9223372036854775000L);
+        assertThat(dateTimeService.convert(lower).epochMillis()).isEqualTo(-9223372036854775000L);
+    }
+
+    @Test
     @DisplayName("Should reject non-numeric input for forced EPOCH_MILLIS")
     void shouldRejectNonNumericMillis() {
         DateTimeConvertRequest request = new DateTimeConvertRequest("12.5", "UTC", null, "EPOCH_MILLIS");

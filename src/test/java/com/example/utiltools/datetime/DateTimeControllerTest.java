@@ -223,4 +223,22 @@ class DateTimeControllerTest {
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/convert - should answer 400 (not 500) for forced seconds overflowing epoch millis")
+    void shouldRejectForcedSecondsOutsideMillisRangeWith400() throws Exception {
+        String body = """
+                {
+                    "input": "9223372036854776",
+                    "inputFormat": "EPOCH_SECONDS"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/convert")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+    }
 }

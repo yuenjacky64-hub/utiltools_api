@@ -26,6 +26,9 @@ public class DateTimeService {
     private static final String FORMAT_EPOCH_MILLIS = "EPOCH_MILLIS";
     private static final String FORMAT_ISO_8601 = "ISO_8601";
 
+    /** Largest absolute epoch-seconds value whose millisecond form still fits in a {@code long}. */
+    private static final long MAX_EPOCH_SECONDS_FOR_MILLIS = 9_223_372_036_854_775L;
+
     public DateTimeConvertResponse convert(DateTimeConvertRequest request) {
         Instant instant = parseInstant(request.input(), request.inputFormat());
         ZoneId zoneId = parseZoneId(request.targetTimeZone());
@@ -44,7 +47,7 @@ public class DateTimeService {
         }
 
         return new DateTimeConvertResponse(
-                instant.toEpochMilli(),
+                toEpochMillis(instant, request.input(), request.inputFormat()),
                 instant.getEpochSecond(),
                 DateTimeFormatter.ISO_INSTANT.format(instant),
                 zoneId.getId(),
@@ -155,10 +158,32 @@ public class DateTimeService {
         } catch (NumberFormatException e) {
             throw mismatch(originalInput, format, expected, e);
         }
+        if (seconds && (numericValue > MAX_EPOCH_SECONDS_FOR_MILLIS || numericValue < -MAX_EPOCH_SECONDS_FOR_MILLIS)) {
+            throw mismatch(originalInput, format, expected + " representable as epoch milliseconds");
+        }
         try {
             return seconds ? Instant.ofEpochSecond(numericValue) : Instant.ofEpochMilli(numericValue);
         } catch (DateTimeException e) {
             throw mismatch(originalInput, format, expected, e);
+        }
+    }
+
+    /**
+     * Converts to epoch millis, mapping the {@link ArithmeticException} thrown by
+     * {@link Instant#toEpochMilli()} for instants outside the {@code long} millisecond range onto the
+     * documented 400 {@code BAD_REQUEST} path instead of letting it escape as a 500.
+     */
+    private long toEpochMillis(Instant instant, String originalInput, String inputFormat) {
+        try {
+            return instant.toEpochMilli();
+        } catch (ArithmeticException e) {
+            String format = normalizeFormat(inputFormat);
+            String expected = "an instant representable in epoch milliseconds";
+            if (format != null) {
+                throw mismatch(originalInput, format, expected, e);
+            }
+            throw new IllegalArgumentException("Datetime " + originalInput + " is outside the epoch-millis range: expected "
+                    + expected, e);
         }
     }
 
