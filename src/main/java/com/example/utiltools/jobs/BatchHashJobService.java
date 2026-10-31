@@ -82,16 +82,20 @@ public class BatchHashJobService {
             }
             jobs.put(job.jobId, job);
 
-            // Snapshot taken at registration, before enqueue, so the 202 body always reports the
-            // accepted state (QUEUED) even if a worker thread starts and finishes immediately.
+            // Snapshot taken at registration, before enqueue, so the 202 body of a *first*
+            // submission always reports the accepted state (QUEUED) even if a worker thread starts
+            // and finishes immediately. A duplicate submission (fast path above) instead returns the
+            // current live snapshot of the already-registered job, which may already be COMPLETED.
             BatchHashJobResponse accepted = snapshot(job);
 
             try {
                 executor.execute(() -> executeJob(job));
             } catch (RejectedExecutionException e) {
+                // Rollback must undo BOTH registrations: the idempotency index stores job ids
+                // (String), so the conditional remove must be given the id, not the job object.
                 jobs.remove(job.jobId, job);
                 if (key != null) {
-                    idempotencyIndex.remove(key, job);
+                    idempotencyIndex.remove(key, job.jobId);
                 }
                 throw new JobQueueFullException("Hash job queue is full (worker-count=" + workerCount
                         + ", queue-capacity=" + queueCapacity + "); retry after capacity frees");

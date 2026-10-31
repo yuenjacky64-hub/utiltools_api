@@ -7,13 +7,13 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
@@ -114,23 +114,32 @@ class BatchHashJobServiceTest {
         assertThat(enteredHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
 
         // Job B fills the single queue slot.
-        service.submit(new BatchHashRequest("SHA-256", List.of("b"), null, null));
+        BatchHashJobResponse jobB = service.submit(new BatchHashRequest("SHA-256", List.of("b"), null, null));
+
+        Set<String> registeredBefore = registryKeys("jobs");
+        assertThat(registeredBefore).containsExactlyInAnyOrder(jobA.jobId(), jobB.jobId());
 
         // Job C must be rejected by the AbortPolicy; no jobId is ever handed out.
         assertThatThrownBy(() -> service.submit(new BatchHashRequest("SHA-256", List.of("c"), null, "retry-key")))
                 .isInstanceOf(JobQueueFullException.class)
                 .hasMessageContaining("queue-capacity=1");
-        assertThatThrownBy(() -> service.getJob(UUID.randomUUID().toString()))
-                .isInstanceOf(JobNotFoundException.class);
 
-        // Drain: a rejected submission left neither a job nor an idempotency mapping behind.
+        // No residue: the rejected submission left neither a job row nor its idempotency mapping.
+        assertThat(registryKeys("jobs")).isEqualTo(registeredBefore);
+        assertThat(registryKeys("idempotencyIndex")).doesNotContain("retry-key");
+
+        // Drain job A and job B, then the same key must be accepted as a brand-new job.
         releaseHash.countDown();
         awaitStatus(jobA.jobId(), JobStatus.COMPLETED);
+        awaitStatus(jobB.jobId(), JobStatus.COMPLETED);
 
         BatchHashJobResponse retried = service.submit(new BatchHashRequest("SHA-256", List.of("c"), null, "retry-key"));
-        assertThat(retried.jobId()).isNotBlank();
+        assertThat(retried.jobId()).isNotBlank().isNotIn(jobA.jobId(), jobB.jobId());
+        assertThat(retried.status()).isEqualTo(JobStatus.QUEUED);
         BatchHashJobResponse retriedCompleted = awaitStatus(retried.jobId(), JobStatus.COMPLETED);
         assertThat(retriedCompleted.results()).hasSize(1);
+        assertThat(retriedCompleted.idempotencyKey()).isEqualTo("retry-key");
+        assertThat(registryKeys("idempotencyIndex")).contains("retry-key");
     }
 
     @Test
@@ -188,6 +197,23 @@ class BatchHashJobServiceTest {
 
         releaseHash.countDown();
         assertThat(awaitStatus(running.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+    }
+
+    /**
+     * Snapshot of the keys of a private registry map ({@code jobs} / {@code idempotencyIndex}).
+     * Reflection keeps the production class free of test-only accessors while still letting the
+     * saturation test prove that a rejected submission leaves no job or idempotency residue.
+     */
+    private Set<String> registryKeys(String fieldName) {
+        try {
+            Field field = BatchHashJobService.class.getDeclaredField(fieldName);
+            field.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            Map<String, ?> map = (Map<String, ?>) field.get(service);
+            return Set.copyOf(map.keySet());
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Cannot read BatchHashJobService." + fieldName, e);
+        }
     }
 
     private BatchHashJobResponse awaitStatus(String jobId, JobStatus expected) {

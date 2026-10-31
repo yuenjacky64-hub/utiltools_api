@@ -444,7 +444,9 @@ discards all jobs and idempotency keys — clients then get `404 JOB_NOT_FOUND` 
 #### A. Submit a batch (202 Accepted)
 
 `idempotencyKey` is optional. When present, duplicate **or concurrent** submissions with the same key return the
-same `jobId` and cause exactly one execution.
+same `jobId` and cause exactly one execution. A *first* submission always reports `"status": "QUEUED"` (the state
+it was accepted in, captured before enqueue); a *duplicate* submission returns the current live snapshot of the
+existing job instead, so its `status` may already be `RUNNING`, `COMPLETED` or `FAILED`.
 
 ```bash
 curl -i -X POST http://localhost:8080/api/v1/utils/jobs/hash \
@@ -508,7 +510,7 @@ The state machine is strictly `QUEUED → RUNNING → COMPLETED | FAILED`. A `FA
 
 | Situation | HTTP | `error` | What to do |
 | :--- | :--- | :--- | :--- |
-| Bounded executor queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry with the **same** `idempotencyKey` once capacity frees; the rejected submission leaves no job or idempotency residue |
+| Bounded executor queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry with the **same** `idempotencyKey` once capacity frees. The rejected submission is rolled back atomically — its job row **and** its idempotency mapping are both removed, so it leaves no residue and the retry with that key starts a brand-new job |
 | Unknown or already-evicted `jobId` | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Resubmit the batch |
 | Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit |
 | Blank/empty `items` | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Send a non-empty list of non-blank strings (max 1000) |
