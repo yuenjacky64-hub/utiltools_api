@@ -351,12 +351,15 @@ curl "http://localhost:8080/api/v1/utils/crypto/uuid?count=2&compact=true"
 ### 3. JSON & Data Processor Utility
 
 #### A. Format / Pretty-Print or Minify JSON
+`indent` is optional: it must be an integer in **1-8**, defaults to **2** spaces per nesting level when omitted, and is ignored when `minify` is `true`. Values outside 1-8 are rejected with HTTP 400 and `error` `VALIDATION_ERROR`.
+
 ```bash
 curl -X POST http://localhost:8080/api/v1/utils/json/format \
   -H "Content-Type: application/json" \
   -d '{
     "json": "{\"user\":{\"id\":101,\"name\":\"Alice\"}}",
-    "minify": false
+    "minify": false,
+    "indent": 4
   }'
 ```
 
@@ -366,8 +369,8 @@ curl -X POST http://localhost:8080/api/v1/utils/json/format \
   "success": true,
   "message": "JSON formatted successfully",
   "data": {
-    "formattedJson": "{\n  \"user\" : {\n    \"id\" : 101,\n    \"name\" : \"Alice\"\n  }\n}",
-    "sizeBytes": 57
+    "formattedJson": "{\n    \"user\" : {\n        \"id\" : 101,\n        \"name\" : \"Alice\"\n    }\n}",
+    "sizeBytes": 69
   },
   "timestamp": "2026-10-30T16:50:38.987061888Z"
 }
