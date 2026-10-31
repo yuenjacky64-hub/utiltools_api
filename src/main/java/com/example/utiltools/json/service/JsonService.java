@@ -6,23 +6,38 @@ import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
+import com.example.utiltools.resilience.AuditTrail;
+import com.example.utiltools.resilience.CircuitBreaker;
+import com.example.utiltools.resilience.CircuitBreakerConfig;
 import com.fasterxml.jackson.core.JsonLocation;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jayway.jsonpath.InvalidPathException;
 import com.jayway.jsonpath.JsonPath;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 
 @Service
 public class JsonService {
 
+    private static final int DEFAULT_AUDIT_CAPACITY = 1024;
+
     private final ObjectMapper objectMapper;
+    private final CircuitBreaker circuitBreaker;
 
     public JsonService(ObjectMapper objectMapper) {
+        this(objectMapper, new CircuitBreaker("json-query", CircuitBreakerConfig.defaults(),
+                new AuditTrail(DEFAULT_AUDIT_CAPACITY), Clock.systemUTC()));
+    }
+
+    @Autowired
+    public JsonService(ObjectMapper objectMapper, CircuitBreaker circuitBreaker) {
         this.objectMapper = objectMapper;
+        this.circuitBreaker = circuitBreaker;
     }
 
     public JsonFormatResponse format(JsonFormatRequest request) {
@@ -55,6 +70,10 @@ public class JsonService {
     }
 
     public JsonQueryResponse query(JsonQueryRequest request) {
+        return circuitBreaker.execute(() -> queryInternal(request));
+    }
+
+    private JsonQueryResponse queryInternal(JsonQueryRequest request) {
         try {
             Object result = JsonPath.read(request.json(), request.jsonPath());
             return new JsonQueryResponse(request.jsonPath(), result);

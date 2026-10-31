@@ -3,6 +3,7 @@ package com.example.utiltools.json;
 import com.example.utiltools.common.GlobalExceptionHandler;
 import com.example.utiltools.json.controller.JsonController;
 import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.resilience.ResilienceConfig;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -17,7 +18,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(JsonController.class)
-@Import({JsonService.class, GlobalExceptionHandler.class})
+@Import({JsonService.class, GlobalExceptionHandler.class, ResilienceConfig.class})
 class JsonControllerTest {
 
     @Autowired

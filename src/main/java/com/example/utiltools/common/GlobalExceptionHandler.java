@@ -1,5 +1,6 @@
 package com.example.utiltools.common;
 
+import com.example.utiltools.resilience.CircuitBreakerOpenException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -8,7 +9,9 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
@@ -32,6 +35,16 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleHttpMessageNotReadable(HttpMessageNotReadableException ex) {
         ApiResponse<Void> response = ApiResponse.error("Malformed JSON request body: " + ex.getMessage(), "BAD_REQUEST", null);
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+    }
+
+    @ExceptionHandler(CircuitBreakerOpenException.class)
+    public ResponseEntity<ApiResponse<Void>> handleCircuitBreakerOpen(CircuitBreakerOpenException ex) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("state", ex.state() != null ? ex.state().name() : null);
+        details.put("resetAt", ex.resetAt());
+        details.put("reason", ex.reason());
+        ApiResponse<Void> response = ApiResponse.error("Service unavailable: circuit breaker is open", "CIRCUIT_OPEN", details);
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(response);
     }
 
     @ExceptionHandler(Exception.class)
