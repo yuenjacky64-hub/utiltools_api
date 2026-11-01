@@ -22,6 +22,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
   - [1. DateTime & Timezone Utility](#1-datetime--timezone-utility)
   - [2. Cryptography & Encoding Utility](#2-cryptography--encoding-utility)
   - [3. JSON & Data Processor Utility](#3-json--data-processor-utility)
+- [Rate Limiting](#-rate-limiting)
 - [Unified Response & Error Handling](#-unified-response--error-handling)
 - [Interactive API Documentation (Swagger UI)](#-interactive-api-documentation-swagger-ui)
 - [Quick Start Guide](#-quick-start-guide)
@@ -92,10 +93,15 @@ utiltools_api/
     │   │   │   ├── controller/CryptoController.java
     │   │   │   ├── service/CryptoService.java
     │   │   │   └── dto/
-    │   │   └── json/                          # Tool 3: JSON Data Processor
-    │   │       ├── controller/JsonController.java
-    │   │       ├── service/JsonService.java
-    │   │       └── dto/
+    │   │   ├── json/                          # Tool 3: JSON Data Processor
+    │   │   │   ├── controller/JsonController.java
+    │   │   │   ├── service/JsonService.java
+    │   │   │   └── dto/
+    │   │   └── ratelimit/                     # Cross-cutting request budget
+    │   │       ├── RateLimitProperties.java   # utiltools.ratelimit.* bindings
+    │   │       ├── SlidingWindowRateLimiter.java# Clock-driven, thread-safe limiter
+    │   │       ├── RateLimitFilter.java       # Servlet filter -> 429 RATE_LIMITED
+    │   │       └── RateLimitConfig.java       # FilterRegistrationBean + scheduler
     │   └── resources/
     │       └── application.properties         # Server & Swagger configuration
     └── test/java/com/example/utiltools/
@@ -107,9 +113,13 @@ utiltools_api/
         ├── crypto/
         │   ├── CryptoControllerTest.java
         │   └── CryptoServiceTest.java
-        └── json/
-            ├── JsonControllerTest.java
-            └── JsonServiceTest.java
+        ├── json/
+        │   ├── JsonControllerTest.java
+        │   └── JsonServiceTest.java
+        └── ratelimit/
+            ├── SlidingWindowRateLimiterTest.java
+            ├── RateLimitFilterTest.java
+            └── RateLimitConfigTest.java
 ```
 
 ---
@@ -428,6 +438,58 @@ curl -X POST http://localhost:8080/api/v1/utils/json/query \
 
 ---
 
+## 🚦 Rate Limiting
+
+Every `/api/v1/utils/**` request passes through `RateLimitFilter` before Spring MVC. A
+`SlidingWindowRateLimiter` keeps a fixed-size per-client ring buffer (`long[requests-per-window]`) of
+admitted timestamps and admits a call only while fewer than `requests-per-window` of them fall inside
+the trailing `window-ms` window. Admission is atomic per client, so concurrent requests can never
+exceed the budget.
+
+Rejected requests receive HTTP `429` with the unified envelope and never reach a controller:
+
+```json
+{
+  "success": false,
+  "message": "Rate limit exceeded",
+  "error": "RATE_LIMITED",
+  "details": { "retryAfterSeconds": 42 },
+  "timestamp": "2026-10-31T00:50:00Z"
+}
+```
+
+Response headers on every `/api/v1/utils/*` call (allowed or rejected):
+
+| Header | Meaning |
+| :--- | :--- |
+| `Retry-After` | Seconds until a slot frees (rejections only) |
+| `X-RateLimit-Limit` | Configured `requests-per-window` |
+| `X-RateLimit-Remaining` | Slots left to this client in the current window |
+| `X-RateLimit-Reset` | Seconds until the oldest admitted event leaves the window |
+
+A rejected request consumes no capacity, so a retry when `Retry-After` elapses succeeds. Idle
+client buckets are evicted by a `@Scheduled` cleanup pass, and `max-tracked-clients` bounds the map:
+the oldest idle bucket is dropped first, and once every tracked bucket is active an unseen client is
+rejected with the same `429 RATE_LIMITED` response instead of being inserted.
+
+### Configuration (`application.properties`)
+
+| Property | Default | Purpose |
+| :--- | :--- | :--- |
+| `utiltools.ratelimit.enabled` | `true` | Master switch; `false` passes everything through with no headers |
+| `utiltools.ratelimit.requests-per-window` | `60` | Admitted requests per client per window |
+| `utiltools.ratelimit.window-ms` | `60000` | Sliding window length in milliseconds |
+| `utiltools.ratelimit.cleanup-interval-ms` | `30000` | Fixed delay between idle-bucket cleanup passes |
+| `utiltools.ratelimit.max-tracked-clients` | `10000` | Hard cap on tracked client keys (bounds memory) |
+| `utiltools.ratelimit.trust-forwarded-header` | `false` | Use the first well-formed `X-Forwarded-For` entry as the client key |
+
+> **Scope note:** state is in-process only. `N` replicas of this service provide `N ×
+> requests-per-window` aggregate capacity, and limits are not shared across instances. Distributed
+> limiting (Redis/Bucket4j/gateway) is out of scope. Excluded from limiting: `/actuator`,
+> `/v3/api-docs`, `/swagger-ui`.
+
+---
+
 ## 🛡 Unified Response & Error Handling
 
 When client input fails validation or business rules, `@RestControllerAdvice` formats a clean, standardized error response:
@@ -450,6 +512,7 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Missing required fields (`@NotBlank`, `@NotNull`, etc.) |
 | `400 BAD_REQUEST` | `BAD_REQUEST` | Invalid timezone ID, unsupported hash algorithm, corrupt Base64 |
 | `400 BAD_REQUEST` | `BAD_REQUEST` | Malformed HTTP request body |
+| `429 TOO_MANY_REQUESTS` | `RATE_LIMITED` | Request budget for `/api/v1/utils/*` exhausted (see [Rate Limiting](#-rate-limiting)) |
 | `500 INTERNAL_SERVER_ERROR` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |
 
 ---
@@ -518,4 +581,7 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries.
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite.
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.
+- **`SlidingWindowRateLimiterTest`**: Exact-cap concurrent admission, deterministic window rollover on a mutable `Clock`, denials consuming no capacity, per-client isolation, idle eviction, and cap enforcement under many spoofed keys.
+- **`RateLimitFilterTest`**: MockMvc proof of the `429 RATE_LIMITED` envelope, `Retry-After`/`X-RateLimit-*` headers, and that a rejected call never invokes the controller.
+- **`RateLimitConfigTest`**: Property binding and overrides, filter registration for `/api/v1/utils/*` ahead of Spring MVC, and the `@Scheduled` cleanup wiring.
 - **`UtiltoolsApiApplicationTests`**: Spring ApplicationContext loading verification.
