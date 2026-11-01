@@ -131,6 +131,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/datetime/convert` | Convert epoch timestamp or ISO string to target timezone & pattern |
 | `POST` | `/api/v1/utils/datetime/diff` | Calculate duration & difference between two datetime points |
 | `GET` | `/api/v1/utils/datetime/current` | Fetch current time in UTC and target timezone |
+| `GET` | `/api/v1/utils/datetime/timezones` | List IANA timezones with current UTC offsets, optionally filtered by `prefix` |
 | `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-256, SHA-512, MD5) or HMAC |
 | `POST` | `/api/v1/utils/crypto/base64` | Encode or decode standard / URL-safe Base64 strings |
 | `GET` | `/api/v1/utils/crypto/uuid` | Generate random UUID v4 list (standard or compact 32-hex) |
@@ -237,6 +238,64 @@ curl "http://localhost:8080/api/v1/utils/datetime/current?timeZone=Asia/Taipei"
     "local": "2026-10-31T00:50:38.802177453+08:00",
     "timeZone": "Asia/Taipei"
   },
+  "timestamp": "2026-10-30T16:50:38.802324893Z"
+}
+```
+
+#### D. List Timezones (IANA Catalog)
+Discovers valid `timeZone` ids — and their current UTC offsets — before calling `/convert` or `/current`.
+
+| Query param | Required | Default | Notes |
+| :---------- | :------- | :------ | :---- |
+| `prefix` | no | *(none)* | Case-insensitive, trimmed prefix filter (e.g. `Asia`, `America/New`) |
+| `limit` | no | `50` | Whole number `1`–`200`; out-of-range or non-numeric values return HTTP 400 |
+
+Results are sorted lexicographically and all offsets are computed from a single captured instant.
+
+```bash
+curl "http://localhost:8080/api/v1/utils/datetime/timezones?prefix=Asia&limit=3"
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Timezones retrieved successfully",
+  "data": {
+    "prefix": "Asia",
+    "limit": 3,
+    "total": 99,
+    "timeZones": [
+      {
+        "timeZone": "Asia/Aden",
+        "offset": "+03:00",
+        "offsetSeconds": 10800,
+        "localDateTime": "2026-10-30T19:50:38+03:00"
+      },
+      {
+        "timeZone": "Asia/Almaty",
+        "offset": "+05:00",
+        "offsetSeconds": 18000,
+        "localDateTime": "2026-10-30T21:50:38+05:00"
+      },
+      {
+        "timeZone": "Asia/Amman",
+        "offset": "+03:00",
+        "offsetSeconds": 10800,
+        "localDateTime": "2026-10-30T19:50:38+03:00"
+      }
+    ]
+  },
+  "timestamp": "2026-10-30T16:50:38.802324893Z"
+}
+```
+
+**Error example** (`limit=201`):
+```json
+{
+  "success": false,
+  "message": "Limit must be between 1 and 200, got: 201",
+  "error": "BAD_REQUEST",
   "timestamp": "2026-10-30T16:50:38.802324893Z"
 }
 ```

@@ -5,10 +5,16 @@ import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
+import com.example.utiltools.datetime.dto.TimeZoneInfo;
+import com.example.utiltools.datetime.dto.TimeZoneListResponse;
 import com.example.utiltools.datetime.service.DateTimeService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -79,5 +85,110 @@ class DateTimeServiceTest {
         assertThat(response.epochMillis()).isGreaterThan(0);
         assertThat(response.utc()).isNotBlank();
         assertThat(response.local()).isNotBlank();
+    }
+
+    @Test
+    @DisplayName("Should return timezones in lexicographic order")
+    void shouldReturnLexicographicallySortedZones() {
+        TimeZoneListResponse response = dateTimeService.listTimeZones(null, 200);
+
+        List<String> ids = response.timeZones().stream().map(TimeZoneInfo::timeZone).toList();
+        assertThat(ids).isNotEmpty();
+        assertThat(ids).isEqualTo(ids.stream().sorted().toList());
+        assertThat(response.total()).isGreaterThanOrEqualTo(response.timeZones().size());
+        assertThat(response.timeZones()).hasSize(Math.min(200, response.total()));
+    }
+
+    @Test
+    @DisplayName("Should filter timezones case-insensitively by prefix")
+    void shouldFilterCaseInsensitivelyByPrefix() {
+        TimeZoneListResponse lower = dateTimeService.listTimeZones("asia", 50);
+        TimeZoneListResponse upper = dateTimeService.listTimeZones(" Asia ", 50);
+
+        List<String> lowerIds = lower.timeZones().stream().map(TimeZoneInfo::timeZone).toList();
+        List<String> upperIds = upper.timeZones().stream().map(TimeZoneInfo::timeZone).toList();
+        assertThat(lowerIds).isNotEmpty().isEqualTo(upperIds);
+        assertThat(lowerIds).allMatch(id -> id.startsWith("Asia/"));
+        assertThat(lower.prefix()).isEqualTo("asia");
+        assertThat(upper.prefix()).isEqualTo("Asia");
+
+        TimeZoneListResponse substring = dateTimeService.listTimeZones("Tokyo", 50);
+        assertThat(substring.timeZones()).isEmpty();
+        assertThat(substring.total()).isZero();
+
+        TimeZoneListResponse nested = dateTimeService.listTimeZones("America/New", 50);
+        assertThat(nested.timeZones()).isNotEmpty()
+                .allMatch(info -> info.timeZone().startsWith("America/New"));
+    }
+
+    @Test
+    @DisplayName("Should truncate to limit and report the total pre-truncation count")
+    void shouldTruncateToLimitAndReportTotal() {
+        long expectedTotal = ZoneId.getAvailableZoneIds().stream()
+                .filter(id -> id.startsWith("Asia"))
+                .count();
+
+        TimeZoneListResponse response = dateTimeService.listTimeZones("Asia", 3);
+
+        assertThat(response.timeZones()).hasSize(3);
+        assertThat(response.limit()).isEqualTo(3);
+        assertThat(response.total()).isEqualTo((int) expectedTotal);
+        assertThat(response.total()).isGreaterThan(3);
+    }
+
+    @Test
+    @DisplayName("Should report Asia/Tokyo offset as +09:00 / 32400 seconds")
+    void shouldReportTokyoOffset() {
+        TimeZoneListResponse response = dateTimeService.listTimeZones("Asia/Tokyo", 10);
+
+        assertThat(response.timeZones()).hasSize(1);
+        TimeZoneInfo tokyo = response.timeZones().get(0);
+        assertThat(tokyo.timeZone()).isEqualTo("Asia/Tokyo");
+        assertThat(tokyo.offset()).isEqualTo("+09:00");
+        assertThat(tokyo.offsetSeconds()).isEqualTo(32400);
+        assertThat(tokyo.offset()).matches("[+-]\\d{2}:\\d{2}");
+        assertThat(tokyo.localDateTime()).matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[+-]\\d{2}:\\d{2}");
+    }
+
+    @Test
+    @DisplayName("Should reject limits outside 1-200 and accept the boundaries")
+    void shouldRejectLimitOutsideRange() {
+        assertThatThrownBy(() -> dateTimeService.listTimeZones(null, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Limit must be between 1 and 200, got: 0");
+
+        assertThatThrownBy(() -> dateTimeService.listTimeZones(null, 201))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Limit must be between 1 and 200, got: 201");
+
+        assertThatThrownBy(() -> dateTimeService.listTimeZones(null, -5))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Limit must be between 1 and 200, got: -5");
+
+        assertThat(dateTimeService.listTimeZones(null, 1).timeZones()).hasSize(1);
+        assertThat(dateTimeService.listTimeZones(null, 200).timeZones()).hasSize(200);
+    }
+
+    @Test
+    @DisplayName("Should compute every offset from a single captured instant")
+    void shouldComputeOffsetsFromSingleInstant() {
+        TimeZoneListResponse response = dateTimeService.listTimeZones(null, 200);
+
+        List<Long> instants = response.timeZones().stream()
+                .map(info -> OffsetDateTime.parse(info.localDateTime()).toEpochSecond())
+                .distinct()
+                .toList();
+        assertThat(instants).hasSize(1);
+
+        assertThat(response.timeZones()).allSatisfy(info -> assertThat(info.offsetSeconds())
+                .isEqualTo(OffsetDateTime.parse(info.localDateTime()).getOffset().getTotalSeconds()));
+
+        TimeZoneListResponse utcResponse = dateTimeService.listTimeZones("UTC", 10);
+        TimeZoneInfo utc = utcResponse.timeZones().stream()
+                .filter(info -> info.timeZone().equals("UTC"))
+                .findFirst()
+                .orElseThrow();
+        assertThat(utc.offset()).isEqualTo("+00:00");
+        assertThat(utc.offsetSeconds()).isZero();
     }
 }

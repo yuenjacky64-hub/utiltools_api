@@ -11,6 +11,8 @@ import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 
+import static org.hamcrest.Matchers.everyItem;
+import static org.hamcrest.Matchers.startsWith;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -93,5 +95,65 @@ class DateTimeControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/datetime/timezones - should list filtered timezones")
+    void shouldListFilteredTimeZones() throws Exception {
+        mockMvc.perform(get("/api/v1/utils/datetime/timezones")
+                        .param("prefix", "Asia")
+                        .param("limit", "3"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Timezones retrieved successfully"))
+                .andExpect(jsonPath("$.data.prefix").value("Asia"))
+                .andExpect(jsonPath("$.data.limit").value(3))
+                .andExpect(jsonPath("$.data.total").isNumber())
+                .andExpect(jsonPath("$.data.timeZones.length()").value(3))
+                .andExpect(jsonPath("$.data.timeZones[*].timeZone", everyItem(startsWith("Asia/"))))
+                .andExpect(jsonPath("$.data.timeZones[0].timeZone").value("Asia/Aden"))
+                .andExpect(jsonPath("$.data.timeZones[0].offset").isString())
+                .andExpect(jsonPath("$.data.timeZones[0].offsetSeconds").isNumber())
+                .andExpect(jsonPath("$.data.timeZones[0].localDateTime").isString());
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/datetime/timezones - should apply the default limit of 50")
+    void shouldListDefaultTimeZones() throws Exception {
+        mockMvc.perform(get("/api/v1/utils/datetime/timezones"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.prefix").value(""))
+                .andExpect(jsonPath("$.data.limit").value(50))
+                .andExpect(jsonPath("$.data.timeZones.length()").value(50));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/datetime/timezones - should reject out-of-range limit with 400")
+    void shouldRejectOutOfRangeLimit() throws Exception {
+        mockMvc.perform(get("/api/v1/utils/datetime/timezones")
+                        .param("limit", "201"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("Limit must be between 1 and 200")));
+
+        mockMvc.perform(get("/api/v1/utils/datetime/timezones")
+                        .param("limit", "0"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("Limit must be between 1 and 200")));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/datetime/timezones - should reject non-numeric limit with 400 not 500")
+    void shouldRejectNonNumericLimit() throws Exception {
+        mockMvc.perform(get("/api/v1/utils/datetime/timezones")
+                        .param("limit", "abc"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("Invalid value for parameter 'limit'")));
     }
 }
