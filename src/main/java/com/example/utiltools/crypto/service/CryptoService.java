@@ -12,17 +12,42 @@ import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 public class CryptoService {
 
     private static final HexFormat HEX_FORMAT = HexFormat.of();
+
+    private static final String UUID_VERSION_V4 = "V4";
+    private static final String UUID_VERSION_V7 = "V7";
+
+    private static final long SEQ_BITS = 16;
+    private static final long SEQ_MASK = (1L << SEQ_BITS) - 1;
+    private static final long MILLIS_MASK = (1L << 48) - 1;
+    private static final long LOW_58_MASK = (1L << 58) - 1;
+    private static final long UUID_V7_VERSION_BITS = 0x7000L;
+    private static final long UUID_V7_VARIANT_BITS = 0x8000000000000000L;
+    private static final long NEVER_MINTED = -1L;
+
+    private final Clock clock;
+    private final AtomicLong counter = new AtomicLong(NEVER_MINTED);
+
+    public CryptoService() {
+        this(Clock.systemUTC());
+    }
+
+    public CryptoService(Clock clock) {
+        this.clock = clock;
+    }
 
     public HashResponse hash(HashRequest request) {
         String rawAlgorithm = request.algorithm().trim().toUpperCase(Locale.ROOT);
@@ -75,15 +100,52 @@ public class CryptoService {
     }
 
     public UuidResponse generateUuids(int count, boolean compact) {
+        return generateUuids(count, compact, UUID_VERSION_V4);
+    }
+
+    public UuidResponse generateUuids(int count, boolean compact, String version) {
         if (count < 1 || count > 100) {
             throw new IllegalArgumentException("UUID count must be between 1 and 100");
         }
+        String resolvedVersion = version == null ? UUID_VERSION_V4 : version.trim().toUpperCase(Locale.ROOT);
+        if (!UUID_VERSION_V4.equals(resolvedVersion) && !UUID_VERSION_V7.equals(resolvedVersion)) {
+            throw new IllegalArgumentException("Invalid version: " + version + ". Expected V4 or V7.");
+        }
         List<String> result = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
-            UUID uuid = UUID.randomUUID();
+            UUID uuid = UUID_VERSION_V7.equals(resolvedVersion) ? generateUuidV7() : UUID.randomUUID();
             result.add(compact ? uuid.toString().replace("-", "") : uuid.toString());
         }
-        return new UuidResponse(count, result);
+        return new UuidResponse(count, result, resolvedVersion);
+    }
+
+    public UUID generateUuidV7() {
+        long millis = clock.millis() & MILLIS_MASK;
+        long current;
+        long next;
+        do {
+            current = counter.get();
+            long currentMillis = current < 0 ? -1 : (current >>> SEQ_BITS);
+            long currentSeq = current < 0 ? SEQ_MASK : (current & SEQ_MASK);
+            if (currentMillis < millis) {
+                next = millis << SEQ_BITS;
+            } else if (currentSeq < SEQ_MASK) {
+                next = current + 1;
+            } else {
+                next = (currentMillis + 1) << SEQ_BITS;
+            }
+        } while (!counter.compareAndSet(current, next));
+
+        long sequenceMillis = next >>> SEQ_BITS;
+        long sequence = next & SEQ_MASK;
+
+        long mostSignificantBits = (sequenceMillis << 16)
+                | UUID_V7_VERSION_BITS
+                | ((sequence >>> 4) & 0x0FFFL);
+        long leastSignificantBits = UUID_V7_VARIANT_BITS
+                | ((sequence & 0x0FL) << 58)
+                | (ThreadLocalRandom.current().nextLong() & LOW_58_MASK);
+        return new UUID(mostSignificantBits, leastSignificantBits);
     }
 
     private String normalizeAlgorithm(String raw) {

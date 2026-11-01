@@ -10,10 +10,25 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CryptoServiceTest {
+
+    private static final long FIXED_CLOCK_MILLIS = 0x017F22E279B0L;
 
     private CryptoService cryptoService;
 
@@ -77,5 +92,175 @@ class CryptoServiceTest {
         UuidResponse compact = cryptoService.generateUuids(2, true);
         assertThat(compact.count()).isEqualTo(2);
         assertThat(compact.uuids().getFirst()).matches("^[0-9a-f]{32}$");
+    }
+
+    @Test
+    @DisplayName("Should generate UUIDv7 with the 48-bit millisecond prefix and version nibble 7 under a fixed clock")
+    void shouldGenerateUuidV7WithFixedClock() {
+        CryptoService fixedClockService = new CryptoService(
+                Clock.fixed(Instant.ofEpochMilli(FIXED_CLOCK_MILLIS), ZoneOffset.UTC));
+
+        List<String> uuids = fixedClockService.generateUuids(5, false, "V7").uuids();
+        assertThat(uuids).hasSize(5);
+
+        for (String uuid : uuids) {
+            assertThat(uuid).matches("^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$");
+            assertThat(uuid.substring(0, 8) + uuid.substring(9, 13)).isEqualTo("017f22e279b0");
+            assertThat(uuid.charAt(14)).isEqualTo('7');
+            assertThat("89ab").contains(String.valueOf(uuid.charAt(19)));
+        }
+        assertThat(uuids).isSorted();
+        assertThat(uuids.getFirst()).isLessThan(uuids.get(1));
+    }
+
+    @Test
+    @DisplayName("Should generate duplicate-free UUIDv7 values across threads without clock flake")
+    void shouldGenerateDuplicateFreeUuidV7UnderConcurrency() throws Exception {
+        CryptoService fixedClockService = new CryptoService(
+                Clock.fixed(Instant.ofEpochMilli(FIXED_CLOCK_MILLIS), ZoneOffset.UTC));
+
+        int threads = 8;
+        int mintsPerThread = 10000;
+        Set<String> collected = ConcurrentHashMap.newKeySet();
+        List<List<String>> perThread = new ArrayList<>(threads);
+        for (int i = 0; i < threads; i++) {
+            perThread.add(new ArrayList<>(mintsPerThread));
+        }
+
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threads);
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try {
+            for (int t = 0; t < threads; t++) {
+                List<String> sink = perThread.get(t);
+                pool.execute(() -> {
+                    try {
+                        start.await();
+                        for (int i = 0; i < mintsPerThread; i++) {
+                            String id = fixedClockService.generateUuidV7().toString();
+                            collected.add(id);
+                            sink.add(id);
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+            start.countDown();
+            assertThat(done.await(60, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            pool.shutdownNow();
+        }
+
+        int total = threads * mintsPerThread;
+        assertThat(collected).hasSize(total);
+        assertThat(perThread).allSatisfy(list -> assertThat(list).hasSize(mintsPerThread));
+
+        for (List<String> list : perThread) {
+            for (int i = 1; i < list.size(); i++) {
+                String previous = list.get(i - 1);
+                String current = list.get(i);
+                long currentMillis = timestampMillis(current);
+                long previousMillis = timestampMillis(previous);
+                assertThat(currentMillis)
+                        .as("millis must not regress for %s -> %s", previous, current)
+                        .isGreaterThanOrEqualTo(previousMillis);
+                if (currentMillis == previousMillis) {
+                    assertThat(sequence(current))
+                            .as("seq must not regress inside one millisecond for %s -> %s", previous, current)
+                            .isGreaterThanOrEqualTo(sequence(previous));
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Should never regress the counter when the clock steps backwards")
+    void shouldNeverRegressCounterWhenClockGoesBackwards() {
+        MutableClock mutableClock = new MutableClock(Instant.ofEpochMilli(FIXED_CLOCK_MILLIS));
+        CryptoService service = new CryptoService(mutableClock);
+
+        String first = service.generateUuidV7().toString();
+        mutableClock.set(Instant.ofEpochMilli(FIXED_CLOCK_MILLIS - 60_000L));
+        String second = service.generateUuidV7().toString();
+
+        assertThat(timestampMillis(second)).isGreaterThanOrEqualTo(timestampMillis(first));
+        assertThat(second).isGreaterThan(first);
+        assertThat(second.charAt(14)).isEqualTo('7');
+    }
+
+    @Test
+    @DisplayName("Should parse the UUID version case-insensitively and reject unknown versions")
+    void shouldParseUuidVersionCaseInsensitively() {
+        for (String version : List.of("V7", "v7", " V7 ", "v7\t")) {
+            UuidResponse response = cryptoService.generateUuids(1, false, version);
+            assertThat(response.version()).isEqualTo("V7");
+            assertThat(response.uuids().getFirst()).matches(
+                    "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$");
+        }
+        for (String version : List.of("V4", "v4", " V4")) {
+            UuidResponse response = cryptoService.generateUuids(1, false, version);
+            assertThat(response.version()).isEqualTo("V4");
+            assertThat(response.uuids().getFirst()).matches(
+                    "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+        }
+        for (String version : List.of("V9", "")) {
+            assertThatThrownBy(() -> cryptoService.generateUuids(1, false, version))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("Invalid version:")
+                    .hasMessageContaining("Expected V4 or V7.");
+        }
+    }
+
+    @Test
+    @DisplayName("Should generate UUIDv7 in compact 32-hex format")
+    void shouldGenerateUuidV7InCompactFormat() {
+        List<String> uuids = cryptoService.generateUuids(3, true, "V7").uuids();
+        assertThat(uuids).hasSize(3);
+        for (String uuid : uuids) {
+            assertThat(uuid).matches("^[0-9a-f]{32}$");
+            assertThat(uuid.charAt(12)).isEqualTo('7');
+        }
+    }
+
+    private static long timestampMillis(String uuid) {
+        return Long.parseLong(uuid.substring(0, 8) + uuid.substring(9, 13), 16);
+    }
+
+    private static long sequence(String uuid) {
+        long randA = Long.parseLong(uuid.substring(15, 18), 16);
+        long counterHighNibbleBits = (Character.digit(uuid.charAt(19), 16) & 0x03) << 2;
+        long counterLowNibbleBits = (Character.digit(uuid.charAt(20), 16) >> 2) & 0x03;
+        return (randA << 4) | counterHighNibbleBits | counterLowNibbleBits;
+    }
+
+    private static final class MutableClock extends Clock {
+
+        private volatile Instant instant;
+
+        private MutableClock(Instant instant) {
+            this.instant = instant;
+        }
+
+        private void set(Instant newInstant) {
+            this.instant = newInstant;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return instant;
+        }
     }
 }
