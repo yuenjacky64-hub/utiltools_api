@@ -1,23 +1,31 @@
 package com.example.utiltools.datetime;
 
+import com.example.utiltools.audit.service.AuditJournalService;
+import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.GlobalExceptionHandler;
-import com.example.utiltools.datetime.controller.DateTimeController;
+import com.example.utiltools.crypto.service.CryptoService;
 import com.example.utiltools.datetime.service.DateTimeService;
+import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.datetime.controller.DateTimeController;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(DateTimeController.class)
-@Import({DateTimeService.class, GlobalExceptionHandler.class})
+@Import({AuditJournalService.class, AuditedOperations.class, CryptoService.class, DateTimeService.class,
+        JsonService.class, GlobalExceptionHandler.class})
+@TestPropertySource(properties = {"utiltools.audit.max-entries=200", "utiltools.audit.max-replay-bytes=65536"})
 class DateTimeControllerTest {
 
     @Autowired
@@ -93,5 +101,14 @@ class DateTimeControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+    @Test
+    @DisplayName("GET /api/v1/utils/datetime/current - echoes X-Request-Id in the response envelope")
+    void shouldCarryRequestIdInEnvelope() throws Exception {
+        mockMvc.perform(get("/api/v1/utils/datetime/current")
+                        .header("X-Request-Id", "corr-datetime01"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-Request-Id", "corr-datetime01"))
+                .andExpect(jsonPath("$.requestId").value("corr-datetime01"));
     }
 }

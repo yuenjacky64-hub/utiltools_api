@@ -22,6 +22,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
   - [1. DateTime & Timezone Utility](#1-datetime--timezone-utility)
   - [2. Cryptography & Encoding Utility](#2-cryptography--encoding-utility)
   - [3. JSON & Data Processor Utility](#3-json--data-processor-utility)
+- [Operation Journal & Replay Verification](#-operation-journal--replay-verification)
 - [Unified Response & Error Handling](#-unified-response--error-handling)
 - [Interactive API Documentation (Swagger UI)](#-interactive-api-documentation-swagger-ui)
 - [Quick Start Guide](#-quick-start-guide)
@@ -127,6 +128,9 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/format` | Pretty-print or minify JSON strings |
 | `POST` | `/api/v1/utils/json/validate` | Check JSON syntax validity and report exact syntax error line/col |
 | `POST` | `/api/v1/utils/json/query` | Evaluate JSONPath queries and extract matching nodes |
+| `GET` | `/api/v1/utils/audit/entries` | List journal entries (newest first) with optional `limit` & `state` filters |
+| `GET` | `/api/v1/utils/audit/entries/{id}` | Fetch a single journal entry (redacted request/result) |
+| `POST` | `/api/v1/utils/audit/entries/{id}/replay` | Replay a deterministic SUCCEEDED entry and verify the outcome |
 
 ---
 
@@ -139,9 +143,15 @@ Every endpoint returns a unified JSON envelope:
   "success": true,
   "message": "Operation successful",
   "data": { ... },
+  "requestId": "9f3c1a7e-5b2d-4c8a-9e10-2f6d4b8a1c33",
   "timestamp": "2026-10-31T00:50:38.707903775Z"
 }
 ```
+
+Every response — success **and** error — carries the correlation id of the request in both
+the `X-Request-Id` response header and the `requestId` envelope field. Send your own
+`X-Request-Id` (8–64 chars of `A-Z a-z 0-9 _ -`) to keep your own trace id, otherwise the
+server generates a UUID.
 
 ---
 
@@ -431,6 +441,106 @@ curl -X POST http://localhost:8080/api/v1/utils/json/query \
 
 ---
 
+## 🧾 Operation Journal & Replay Verification
+
+Every `/api/v1/utils/**` call is recorded in a **bounded in-memory journal** so a failed hash,
+JSON query, or datetime conversion leaves a trace of what actually executed, and a retry can be
+verified against the original outcome without ever mutating the original entry.
+
+**Lifecycle:** `PENDING` on entry → `SUCCEEDED` with the response DTO, or `FAILED` with an
+`errorCode` (`BAD_REQUEST` / `INTERNAL_SERVER_ERROR`). Only `PENDING → SUCCEEDED` and
+`PENDING → FAILED` are legal; late or duplicate transitions throw `IllegalStateException`.
+
+**Bounds:** the journal keeps at most `utiltools.audit.max-entries` entries (default `200`,
+oldest evicted first).
+
+**Redaction:** in every response the request view replaces the *values* of the secret fields
+`secretKey`, `secret`, `password`, `token` and `authorization` (matched case-insensitively, at any
+depth) with `"***"`. Field names are preserved and every other field — including `content`,
+`json`, `input` and `timeZone` — is echoed verbatim, so avoid putting secrets in non-secret fields.
+The raw request is stored privately for replay and is never serialized by `list`, `find` or
+`replay`.
+
+**Oversized payloads:** a request whose JSON exceeds `utiltools.audit.max-replay-bytes` (default
+`65536`) is **not retained** — the entry keeps only an `omitted` marker instead of the payload and
+is flagged `"replayable": false`, so replaying it answers `409 REPLAY_CONFLICT`.
+
+### A. List journal entries
+
+```bash
+curl "http://localhost:8080/api/v1/utils/audit/entries?limit=5&state=FAILED"
+```
+```json
+{
+  "success": true,
+  "message": "Audit entries retrieved successfully",
+  "data": [
+    {
+      "id": "0f4f1f0e9c8b4d7e",
+      "requestId": "corr-crypto5678",
+      "operation": "CRYPTO_HASH",
+      "state": "FAILED",
+      "createdAt": "2026-10-31T00:51:02.114Z",
+      "completedAt": "2026-10-31T00:51:02.119Z",
+      "request": { "algorithm": "NOPE-1", "content": "Hello World", "secretKey": "***" },
+      "result": null,
+      "errorCode": "BAD_REQUEST",
+      "replayable": true,
+      "replay": null
+    }
+  ],
+  "requestId": "corr-crypto5678",
+  "timestamp": "2026-10-31T00:51:02.121Z"
+}
+```
+
+`state` accepts `PENDING`, `SUCCEEDED`, `FAILED` (omit for all); `limit` is clamped to the
+configured bound. Any other `state` value or a non-numeric `limit` answers `400 BAD_REQUEST` in the
+standard envelope rather than `500`.
+
+### B. Fetch a single entry
+
+```bash
+curl "http://localhost:8080/api/v1/utils/audit/entries/0f4f1f0e9c8b4d7e"
+```
+
+Unknown ids return `404 NOT_FOUND`.
+
+### C. Replay & verify an entry
+
+```bash
+curl -X POST "http://localhost:8080/api/v1/utils/audit/entries/3b7d9f2a1c5e4a60/replay"
+```
+```json
+{
+  "success": true,
+  "message": "Replay verification completed",
+  "data": {
+    "id": "3b7d9f2a1c5e4a60",
+    "operation": "CRYPTO_HASH",
+    "state": "SUCCEEDED",
+    "completedAt": "2026-10-31T00:51:02.119Z",
+    "result": { "algorithm": "SHA-256", "digest": "a591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e", "isHmac": false },
+    "replay": {
+      "state": "VERIFIED",
+      "replayedAt": "2026-10-31T00:52:10.004Z",
+      "detail": "results match"
+    }
+  },
+  "requestId": "corr-audit12345",
+  "timestamp": "2026-10-31T00:52:10.007Z"
+}
+```
+
+Replay re-invokes the original service with the privately stored request, compares the JSON of
+the new result against the stored result, and records `VERIFIED` or `MISMATCH`. Only
+`SUCCEEDED` **deterministic** entries (all operations except `DATETIME_CURRENT` and
+`CRYPTO_UUID`) of replayable size can be replayed. The original `state`, `result`, and
+`completedAt` are never rewritten — only the attached `replay` record is added. Any other case
+returns `409 REPLAY_CONFLICT`.
+
+---
+
 ## 🛡 Unified Response & Error Handling
 
 When client input fails validation or business rules, `@RestControllerAdvice` formats a clean, standardized error response:
@@ -453,6 +563,8 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Missing required fields (`@NotBlank`, `@NotNull`, etc.) |
 | `400 BAD_REQUEST` | `BAD_REQUEST` | Invalid timezone ID, unsupported hash algorithm, corrupt Base64 |
 | `400 BAD_REQUEST` | `BAD_REQUEST` | Malformed HTTP request body |
+| `404 NOT_FOUND` | `NOT_FOUND` | Unknown audit journal entry id |
+| `409 CONFLICT` | `REPLAY_CONFLICT` | Replay of a FAILED, non-deterministic, oversized, or still-PENDING entry |
 | `500 INTERNAL_SERVER_ERROR` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |
 
 ---
