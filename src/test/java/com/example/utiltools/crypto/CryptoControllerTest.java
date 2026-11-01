@@ -1,6 +1,11 @@
 package com.example.utiltools.crypto;
 
+import com.example.utiltools.audit.service.AuditJournalService;
+import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.GlobalExceptionHandler;
+import com.example.utiltools.datetime.service.DateTimeService;
+import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.resilience.ResilienceConfig;
 import com.example.utiltools.crypto.controller.CryptoController;
 import com.example.utiltools.crypto.service.CryptoService;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -11,6 +16,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.util.ArrayList;
@@ -19,11 +25,14 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(CryptoController.class)
-@Import({CryptoService.class, GlobalExceptionHandler.class})
+@Import({AuditJournalService.class, AuditedOperations.class, CryptoService.class, DateTimeService.class,
+        JsonService.class, ResilienceConfig.class, GlobalExceptionHandler.class})
+@TestPropertySource(properties = {"utiltools.audit.max-entries=200", "utiltools.audit.max-replay-bytes=65536"})
 class CryptoControllerTest {
 
     private static final String UUID_V7_PATTERN =
@@ -154,5 +163,29 @@ class CryptoControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/hash - echoes X-Request-Id on success and error envelopes")
+    void shouldCarryRequestIdInEnvelope() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/hash")
+                        .header("X-Request-Id", "corr-crypto1234")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"algorithm": "SHA-256", "content": "Hello World"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-Request-Id", "corr-crypto1234"))
+                .andExpect(jsonPath("$.requestId").value("corr-crypto1234"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/hash")
+                        .header("X-Request-Id", "corr-crypto5678")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"algorithm": "NOPE-1", "content": "Hello World"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(header().string("X-Request-Id", "corr-crypto5678"))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.requestId").value("corr-crypto5678"));
     }
 }

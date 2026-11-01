@@ -10,17 +10,21 @@ public record ApiResponse<T>(
         T data,
         String error,
         Object details,
-        Instant timestamp
+        Instant timestamp,
+        String requestId
 ) {
     public static <T> ApiResponse<T> success(T data) {
-        return new ApiResponse<>(true, "Operation successful", data, null, null, Instant.now());
+        return new ApiResponse<>(true, "Operation successful", data, null, null, Instant.now(),
+                RequestContext.get());
     }
 
     public static <T> ApiResponse<T> success(T data, String message) {
-        return new ApiResponse<>(true, message, data, null, null, Instant.now());
+        return new ApiResponse<>(true, message, data, null, null, Instant.now(),
+                RequestContext.get());
     }
 
     public static <T> ApiResponse<T> error(String message, String error, Object details) {
-        return new ApiResponse<>(false, message, null, error, details, Instant.now());
+        return new ApiResponse<>(false, message, null, error, details, Instant.now(),
+                RequestContext.get());
     }
 }
