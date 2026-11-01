@@ -40,7 +40,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | Tool | Base Path | Core Capabilities |
 | :--- | :--- | :--- |
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, duration diff calculation, current global time |
-| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, UUID v4 batch generation |
+| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 generation (`version=V4|V7`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation |
 
 ---
@@ -411,12 +411,20 @@ curl -X POST http://localhost:8080/api/v1/utils/crypto/base64 \
 Query parameters:
 - `count` (optional, default `1`, max `100`)
 - `compact` (optional, default `false`; when `true`, removes hyphens into 32-hex chars)
+- `version` (optional, default `V4`; values `V4|V7`, case-insensitive). `V4` is random; `V7` is
+  time-ordered RFC 9562 UUIDv7 — 48-bit unix-millisecond prefix plus a per-process monotonic counter,
+  so ids sort lexicographically and stay unique under concurrent generation. Any other value returns
+  `400 BAD_REQUEST` with `Invalid version:`.
 
 ```bash
+# random v4 (default), compact
 curl "http://localhost:8080/api/v1/utils/crypto/uuid?count=2&compact=true"
+
+# time-ordered v7
+curl "http://localhost:8080/api/v1/utils/crypto/uuid?version=V7&count=2"
 ```
 
-**Response:**
+**Response (v4 default, `compact=true`):**
 ```json
 {
   "success": true,
@@ -426,7 +434,27 @@ curl "http://localhost:8080/api/v1/utils/crypto/uuid?count=2&compact=true"
     "uuids": [
       "3776d0fbdbf94a999a7b029b588ecb47",
       "cb0151c680c24c63a26d1f5a013ad079"
-    ]
+    ],
+    "version": "V4"
+  },
+  "timestamp": "2026-10-30T16:50:38.954060989Z"
+}
+```
+
+**Response (`version=V7`):** values are ascending in string order and the 12 leading hex chars are the
+unix-millisecond timestamp, the 13th hex char is the version nibble `7`:
+
+```json
+{
+  "success": true,
+  "message": "UUIDs generated successfully",
+  "data": {
+    "count": 2,
+    "uuids": [
+      "017f22e2-79b0-7c4a-9a1d-2f5b6c7d8e9f",
+      "017f22e2-79b0-7c4b-8b2e-4d6f7a8b9c0d"
+    ],
+    "version": "V7"
   },
   "timestamp": "2026-10-30T16:50:38.954060989Z"
 }
@@ -783,8 +811,8 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 ### Test Suite Summary:
 - **`DateTimeServiceTest`**: Epoch parsing, timezone shifts, duration math, boundary checks.
 - **`DateTimeControllerTest`**: Full HTTP endpoint testing with MockMvc.
-- **`CryptoServiceTest`**: Standard hashing vectors, HMAC calculations, Base64 encode/decode, UUID generation.
-- **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing.
+- **`CryptoServiceTest`**: Standard hashing vectors, HMAC calculations, Base64 encode/decode, UUID v4 generation, UUIDv7 fixed-clock vector, `version=V4|V7` parsing, clock-regression monotonicity, and an 8-thread x 10000 duplicate-free concurrency invariant.
+- **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `version=V4|V7` selection, compact UUIDv7, and the 400 unified envelope for an unknown `version`.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries.
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite.
 - **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety.
