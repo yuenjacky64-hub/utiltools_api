@@ -11,6 +11,9 @@ import com.example.utiltools.resilience.CircuitBreaker;
 import com.example.utiltools.resilience.CircuitBreakerConfig;
 import com.fasterxml.jackson.core.JsonLocation;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.PrettyPrinter;
+import com.fasterxml.jackson.core.util.DefaultIndenter;
+import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jayway.jsonpath.InvalidPathException;
@@ -24,6 +27,7 @@ import java.time.Clock;
 @Service
 public class JsonService {
 
+    private static final int DEFAULT_INDENT_WIDTH = 2;
     private static final int DEFAULT_AUDIT_CAPACITY = 1024;
 
     private final ObjectMapper objectMapper;
@@ -47,13 +51,22 @@ public class JsonService {
             if (Boolean.TRUE.equals(request.minify())) {
                 formatted = objectMapper.writeValueAsString(node);
             } else {
-                formatted = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+                formatted = objectMapper.writer(prettyPrinter(request.indent())).writeValueAsString(node);
             }
             int sizeBytes = formatted.getBytes(StandardCharsets.UTF_8).length;
             return new JsonFormatResponse(formatted, sizeBytes);
         } catch (JsonProcessingException e) {
             throw new IllegalArgumentException("Invalid JSON content: " + e.getOriginalMessage(), e);
         }
+    }
+
+    private PrettyPrinter prettyPrinter(Integer indent) {
+        int width = indent == null ? DEFAULT_INDENT_WIDTH : indent;
+        if (width < 1 || width > 8) {
+            throw new IllegalArgumentException("indent must be between 1 and 8");
+        }
+        return new DefaultPrettyPrinter()
+                .withObjectIndenter(new DefaultIndenter(" ".repeat(width), "\n"));
     }
 
     public JsonValidateResponse validate(JsonValidateRequest request) {
