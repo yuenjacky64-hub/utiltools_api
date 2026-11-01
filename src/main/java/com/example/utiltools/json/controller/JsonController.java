@@ -3,6 +3,8 @@ package com.example.utiltools.json.controller;
 import com.example.utiltools.common.ApiResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
+import com.example.utiltools.json.dto.JsonPatchRequest;
+import com.example.utiltools.json.dto.JsonPatchResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
@@ -18,7 +20,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/v1/utils/json")
-@Tag(name = "JSON & Data Processor Utility", description = "Endpoints for formatting, minifying, validating, and querying JSON structures")
+@Tag(name = "JSON & Data Processor Utility", description = "Endpoints for formatting, minifying, validating, querying, and atomically patching JSON structures")
 public class JsonController {
 
     private final JsonService jsonService;
@@ -46,5 +48,17 @@ public class JsonController {
     public ApiResponse<JsonQueryResponse> query(@Valid @RequestBody JsonQueryRequest request) {
         JsonQueryResponse result = jsonService.query(request);
         return ApiResponse.success(result, "JSONPath executed successfully");
+    }
+
+    @PostMapping("/patch")
+    @Operation(summary = "Apply an atomic JSON Patch", description = "Applies an ordered RFC 6902-style operation list (add, remove, replace, test, move, copy) to a deep copy of the document. "
+            + "On the first failure every previously applied operation is rolled back in reverse order and the request fails with 422 PATCH_ROLLBACK carrying the full audit trail. "
+            + "dryRun=true validates the whole operation list and returns resultJson=null.")
+    public ApiResponse<JsonPatchResponse> patch(@Valid @RequestBody JsonPatchRequest request) {
+        JsonPatchResponse result = jsonService.patch(request);
+        String message = result.dryRun()
+                ? "JSON patch validated (dry run)"
+                : "JSON patch applied successfully";
+        return ApiResponse.success(result, message);
     }
 }

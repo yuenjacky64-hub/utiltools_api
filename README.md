@@ -40,7 +40,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | :--- | :--- | :--- |
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, duration diff calculation, current global time |
 | **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, UUID v4 batch generation |
-| **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation |
+| **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit |
 
 ---
 
@@ -96,7 +96,8 @@ utiltools_api/
     │   │   ├── json/                          # Tool 3: JSON Data Processor
     │   │   │   ├── controller/JsonController.java
     │   │   │   ├── service/JsonService.java
-    │   │   │   └── dto/
+    │   │   │   ├── exception/JsonPatchRollbackException.java
+    │   │   │   └── dto/                          # incl. JsonPatch*Request/Response/Operation
     │   │   └── ratelimit/                     # Cross-cutting request budget
     │   │       ├── RateLimitProperties.java   # utiltools.ratelimit.* bindings
     │   │       ├── SlidingWindowRateLimiter.java# Clock-driven, thread-safe limiter
@@ -137,6 +138,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/format` | Pretty-print or minify JSON strings |
 | `POST` | `/api/v1/utils/json/validate` | Check JSON syntax validity and report exact syntax error line/col |
 | `POST` | `/api/v1/utils/json/query` | Evaluate JSONPath queries and extract matching nodes |
+| `POST` | `/api/v1/utils/json/patch` | Apply an ordered RFC 6902-style patch atomically, with reverse-order rollback and audit |
 
 ---
 
@@ -512,6 +514,96 @@ curl -X POST http://localhost:8080/api/v1/utils/json/query \
 }
 ```
 
+#### D. Atomic Patch with Rollback Audit
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/json/patch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "json": "{\"name\":\"Alice\",\"age\":30,\"tags\":[\"a\",\"b\"],\"temp\":{\"x\":1}}",
+    "operations": [
+      { "op": "replace", "path": "/name", "value": "Bob" },
+      { "op": "add", "path": "/email", "value": "bob@example.com" },
+      { "op": "test", "path": "/age", "value": 30 },
+      { "op": "move", "from": "/temp/x", "path": "/temp/y" },
+      { "op": "copy", "from": "/tags/0", "path": "/tags/-" },
+      { "op": "remove", "path": "/tags/1" }
+    ]
+  }'
+```
+
+**Response (200):**
+
+```json
+{
+  "success": true,
+  "message": "JSON Patch applied successfully",
+  "data": {
+    "resultJson": { "name": "Bob", "age": 30, "email": "bob@example.com", "tags": ["a", "a"], "temp": { "y": 1 } },
+    "operationsApplied": 6,
+    "operationsRolledBack": 0,
+    "dryRun": false,
+    "audit": [
+      { "index": 0, "op": "replace", "path": "/name", "status": "APPLIED", "beforeValue": "Alice", "afterValue": "Bob" }
+    ]
+  },
+  "timestamp": "2026-10-30T16:50:39.127057574Z"
+}
+```
+
+`resultJson` and `audit[].beforeValue` / `audit[].afterValue` are abbreviated above; the real audit contains one
+entry per operation, with `index` 0..N-1 in the submitted order. The `audit` also echoes `from`, `value`, and `error`.
+
+**Supported operations:** `add`, `remove`, `replace`, `test`, `move`, `copy` over RFC 6901 JSON Pointers
+(`~0` -> `~`, `~1` -> `/`, `-` appends to an array). Unknown operations, malformed pointers, missing paths, and
+array index bounds violations are rejected.
+
+**Rollback semantics (all-or-nothing):** every operation starts `PENDING` and moves to `APPLIED` on success or
+`FAILED` on the first error. When an operation fails, all previously `APPLIED` operations are reverted in reverse
+order and marked `ROLLED_BACK`, then the request fails with **HTTP 422** — the caller-supplied JSON is never
+mutated and no partially patched document is returned.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/json/patch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "json": "{\"name\":\"Alice\"}",
+    "operations": [
+      { "op": "replace", "path": "/name", "value": "Bob" },
+      { "op": "remove", "path": "/missing" }
+    ]
+  }'
+```
+
+**Response (422):**
+
+```json
+{
+  "success": false,
+  "message": "JSON Patch failed at operation 1 (remove /missing): Missing path: /missing; 1 previously applied operation(s) were rolled back",
+  "error": "PATCH_ROLLBACK",
+  "details": {
+    "failedOperationIndex": 1,
+    "failedOperation": "remove",
+    "failedPath": "/missing",
+    "operationsRolledBack": 1,
+    "reason": "Missing path: /missing",
+    "audit": [
+      { "index": 0, "op": "replace", "path": "/name", "status": "ROLLED_BACK", "beforeValue": "Alice", "afterValue": "Alice" },
+      { "index": 1, "op": "remove", "path": "/missing", "status": "FAILED", "error": "Missing path: /missing" }
+    ]
+  },
+  "timestamp": "2026-10-30T16:50:39.127057574Z"
+}
+```
+
+**Dry run:** send `"dryRun": true` to validate the whole list without returning a document. Successful entries are
+marked `VALIDATED`, `resultJson` is `null`, and failures still produce `FAILED` + `ROLLED_BACK` audit entries and a
+422 — useful as a pre-flight check over the exact same code path.
+
+```json
+{ "json": "{\"name\":\"Alice\"}", "operations": [{ "op": "test", "path": "/name", "value": "Alice" }], "dryRun": true }
+```
+
 ---
 
 ## 🚦 Rate Limiting
@@ -654,8 +746,8 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`DateTimeControllerTest`**: Full HTTP endpoint testing with MockMvc.
 - **`CryptoServiceTest`**: Standard hashing vectors, HMAC calculations, Base64 encode/decode, UUID generation.
 - **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing.
-- **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries.
-- **`JsonControllerTest`**: JSON endpoints MockMvc test suite.
+- **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries, six-op patch success, rollback to byte-identical original, missing paths, malformed pointers, `-` append, dry runs, input-not-mutated.
+- **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, and empty-`operations` validation rejection.
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.
 - **`SlidingWindowRateLimiterTest`**: Exact-cap concurrent admission, deterministic window rollover on a mutable `Clock`, denials consuming no capacity, per-client isolation, idle eviction, and cap enforcement under many spoofed keys.
 - **`RateLimitFilterTest`**: MockMvc proof of the `429 RATE_LIMITED` envelope, `Retry-After`/`X-RateLimit-*` headers, and that a rejected call never invokes the controller.
