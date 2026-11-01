@@ -1,5 +1,7 @@
 package com.example.utiltools.common;
 
+import com.example.utiltools.resilience.CircuitBreakerOpenException;
+import com.example.utiltools.resilience.CircuitState;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import org.junit.jupiter.api.DisplayName;
@@ -17,6 +19,8 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.config.annotation.EnableWebMvc;
+
+import java.time.Instant;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -49,6 +53,11 @@ class GlobalExceptionHandlerTest {
         @GetMapping("/test/illegal-argument")
         public ApiResponse<Void> illegalArgument() {
             throw new IllegalArgumentException("Invalid input argument");
+        }
+
+        @GetMapping("/test/circuit-open")
+        public ApiResponse<Void> circuitOpen() {
+            throw new CircuitBreakerOpenException(CircuitState.OPEN, Instant.parse("2030-01-01T00:00:00Z"), "probe failed");
         }
 
         @PostMapping("/test/validation")
@@ -90,5 +99,18 @@ class GlobalExceptionHandlerTest {
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
                 .andExpect(jsonPath("$.details").isArray());
+    }
+
+    @Test
+    @DisplayName("Should return 503 when the circuit breaker is open")
+    void shouldReturn503WhenCircuitBreakerIsOpen() throws Exception {
+        mockMvc.perform(get("/test/circuit-open"))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("CIRCUIT_OPEN"))
+                .andExpect(jsonPath("$.message").value("Service unavailable: circuit breaker is open"))
+                .andExpect(jsonPath("$.details.state").value("OPEN"))
+                .andExpect(jsonPath("$.details.resetAt").exists())
+                .andExpect(jsonPath("$.details.reason").value("probe failed"));
     }
 }
