@@ -1,5 +1,9 @@
 package com.example.utiltools.common;
 
+import com.example.utiltools.json.exception.JsonPatchRollbackException;
+import com.example.utiltools.jobs.JobNotFoundException;
+import com.example.utiltools.jobs.JobQueueFullException;
+import com.example.utiltools.resilience.CircuitBreakerOpenException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -7,8 +11,11 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
@@ -28,10 +35,64 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
     }
 
+    @ExceptionHandler(JsonPatchRollbackException.class)
+    public ResponseEntity<ApiResponse<Void>> handleJsonPatchRollback(JsonPatchRollbackException ex) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("failedOperationIndex", ex.failedIndex());
+        details.put("failedOperation", ex.failedOperation());
+        details.put("failedPath", ex.failedPath());
+        details.put("operationsRolledBack", ex.operationsRolledBack());
+        details.put("reason", ex.reason());
+        details.put("audit", ex.audit());
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "PATCH_ROLLBACK", details);
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY).body(response);
+    }
+
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<ApiResponse<Void>> handleHttpMessageNotReadable(HttpMessageNotReadableException ex) {
         ApiResponse<Void> response = ApiResponse.error("Malformed JSON request body: " + ex.getMessage(), "BAD_REQUEST", null);
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+    }
+
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMethodArgumentTypeMismatch(MethodArgumentTypeMismatchException ex) {
+        ApiResponse<Void> response = ApiResponse.error(
+                "Invalid value '" + ex.getValue() + "' for parameter '" + ex.getName() + "'", "BAD_REQUEST", null);
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+    }
+
+    @ExceptionHandler(AuditEntryNotFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleAuditEntryNotFoundException(AuditEntryNotFoundException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "NOT_FOUND", null);
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
+    }
+
+    @ExceptionHandler(ReplayConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleReplayConflictException(ReplayConflictException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "REPLAY_CONFLICT", null);
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
+    }
+
+    @ExceptionHandler(JobQueueFullException.class)
+    public ResponseEntity<ApiResponse<Void>> handleJobQueueFull(JobQueueFullException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "QUEUE_FULL", null);
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(response);
+    }
+
+    @ExceptionHandler(JobNotFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleJobNotFound(JobNotFoundException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "JOB_NOT_FOUND", null);
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
+    }
+
+    @ExceptionHandler(CircuitBreakerOpenException.class)
+    public ResponseEntity<ApiResponse<Void>> handleCircuitBreakerOpen(CircuitBreakerOpenException ex) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("state", ex.state() != null ? ex.state().name() : null);
+        details.put("resetAt", ex.resetAt());
+        details.put("reason", ex.reason());
+        ApiResponse<Void> response = ApiResponse.error("Service unavailable: circuit breaker is open", "CIRCUIT_OPEN", details);
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(response);
     }
 
     @ExceptionHandler(Exception.class)

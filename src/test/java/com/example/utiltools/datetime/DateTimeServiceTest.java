@@ -7,10 +7,16 @@ import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
+import com.example.utiltools.datetime.dto.TimeZoneInfo;
+import com.example.utiltools.datetime.dto.TimeZoneListResponse;
 import com.example.utiltools.datetime.service.DateTimeService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -28,7 +34,7 @@ class DateTimeServiceTest {
     @DisplayName("Should convert epoch milliseconds to target timezone (Asia/Tokyo)")
     void shouldConvertEpochMillisToTargetTimeZone() {
         // 1730335200000 = 2024-10-31T00:40:00Z -> Tokyo (+09:00): 2024-10-31 09:40:00
-        DateTimeConvertRequest request = new DateTimeConvertRequest("1730335200000", "Asia/Tokyo", "yyyy-MM-dd HH:mm:ss");
+        DateTimeConvertRequest request = new DateTimeConvertRequest("1730335200000", "Asia/Tokyo", "yyyy-MM-dd HH:mm:ss", null);
         DateTimeConvertResponse response = dateTimeService.convert(request);
 
         assertThat(response.epochMillis()).isEqualTo(1730335200000L);
@@ -41,7 +47,7 @@ class DateTimeServiceTest {
     @Test
     @DisplayName("Should convert ISO-8601 string to target timezone (America/New_York)")
     void shouldConvertIsoStringToTargetTimeZone() {
-        DateTimeConvertRequest request = new DateTimeConvertRequest("2026-01-01T15:00:00Z", "America/New_York", null);
+        DateTimeConvertRequest request = new DateTimeConvertRequest("2026-01-01T15:00:00Z", "America/New_York", null, null);
         DateTimeConvertResponse response = dateTimeService.convert(request);
 
         assertThat(response.epochSeconds()).isEqualTo(1767279600L);
@@ -53,7 +59,7 @@ class DateTimeServiceTest {
     @Test
     @DisplayName("Should throw IllegalArgumentException when invalid timezone provided")
     void shouldThrowOnInvalidTimeZone() {
-        DateTimeConvertRequest request = new DateTimeConvertRequest("1730335200000", "Invalid/Zone", null);
+        DateTimeConvertRequest request = new DateTimeConvertRequest("1730335200000", "Invalid/Zone", null, null);
         assertThatThrownBy(() -> dateTimeService.convert(request))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Unknown or invalid timezone");
@@ -202,5 +208,212 @@ class DateTimeServiceTest {
         assertThatThrownBy(() -> dateTimeService.shift(badUnit))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Unsupported unit");
+    }
+
+    @Test
+    @DisplayName("Should return timezones in lexicographic order")
+    void shouldReturnLexicographicallySortedZones() {
+        TimeZoneListResponse response = dateTimeService.listTimeZones(null, 200);
+
+        List<String> ids = response.timeZones().stream().map(TimeZoneInfo::timeZone).toList();
+        assertThat(ids).isNotEmpty();
+        assertThat(ids).isEqualTo(ids.stream().sorted().toList());
+        assertThat(response.total()).isGreaterThanOrEqualTo(response.timeZones().size());
+        assertThat(response.timeZones()).hasSize(Math.min(200, response.total()));
+    }
+
+    @Test
+    @DisplayName("Should filter timezones case-insensitively by prefix")
+    void shouldFilterCaseInsensitivelyByPrefix() {
+        TimeZoneListResponse lower = dateTimeService.listTimeZones("asia", 50);
+        TimeZoneListResponse upper = dateTimeService.listTimeZones(" Asia ", 50);
+
+        List<String> lowerIds = lower.timeZones().stream().map(TimeZoneInfo::timeZone).toList();
+        List<String> upperIds = upper.timeZones().stream().map(TimeZoneInfo::timeZone).toList();
+        assertThat(lowerIds).isNotEmpty().isEqualTo(upperIds);
+        assertThat(lowerIds).allMatch(id -> id.startsWith("Asia/"));
+        assertThat(lower.prefix()).isEqualTo("asia");
+        assertThat(upper.prefix()).isEqualTo("Asia");
+
+        TimeZoneListResponse substring = dateTimeService.listTimeZones("Tokyo", 50);
+        assertThat(substring.timeZones()).isEmpty();
+        assertThat(substring.total()).isZero();
+
+        TimeZoneListResponse nested = dateTimeService.listTimeZones("America/New", 50);
+        assertThat(nested.timeZones()).isNotEmpty()
+                .allMatch(info -> info.timeZone().startsWith("America/New"));
+    }
+
+    @Test
+    @DisplayName("Should truncate to limit and report the total pre-truncation count")
+    void shouldTruncateToLimitAndReportTotal() {
+        long expectedTotal = ZoneId.getAvailableZoneIds().stream()
+                .filter(id -> id.startsWith("Asia"))
+                .count();
+
+        TimeZoneListResponse response = dateTimeService.listTimeZones("Asia", 3);
+
+        assertThat(response.timeZones()).hasSize(3);
+        assertThat(response.limit()).isEqualTo(3);
+        assertThat(response.total()).isEqualTo((int) expectedTotal);
+        assertThat(response.total()).isGreaterThan(3);
+    }
+
+    @Test
+    @DisplayName("Should report Asia/Tokyo offset as +09:00 / 32400 seconds")
+    void shouldReportTokyoOffset() {
+        TimeZoneListResponse response = dateTimeService.listTimeZones("Asia/Tokyo", 10);
+
+        assertThat(response.timeZones()).hasSize(1);
+        TimeZoneInfo tokyo = response.timeZones().get(0);
+        assertThat(tokyo.timeZone()).isEqualTo("Asia/Tokyo");
+        assertThat(tokyo.offset()).isEqualTo("+09:00");
+        assertThat(tokyo.offsetSeconds()).isEqualTo(32400);
+        assertThat(tokyo.offset()).matches("[+-]\\d{2}:\\d{2}");
+        assertThat(tokyo.localDateTime()).matches("\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[+-]\\d{2}:\\d{2}");
+    }
+
+    @Test
+    @DisplayName("Should reject limits outside 1-200 and accept the boundaries")
+    void shouldRejectLimitOutsideRange() {
+        assertThatThrownBy(() -> dateTimeService.listTimeZones(null, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Limit must be between 1 and 200, got: 0");
+
+        assertThatThrownBy(() -> dateTimeService.listTimeZones(null, 201))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Limit must be between 1 and 200, got: 201");
+
+        assertThatThrownBy(() -> dateTimeService.listTimeZones(null, -5))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Limit must be between 1 and 200, got: -5");
+
+        assertThat(dateTimeService.listTimeZones(null, 1).timeZones()).hasSize(1);
+        assertThat(dateTimeService.listTimeZones(null, 200).timeZones()).hasSize(200);
+    }
+
+    @Test
+    @DisplayName("Should compute every offset from a single captured instant")
+    void shouldComputeOffsetsFromSingleInstant() {
+        TimeZoneListResponse response = dateTimeService.listTimeZones(null, 200);
+
+        List<Long> instants = response.timeZones().stream()
+                .map(info -> OffsetDateTime.parse(info.localDateTime()).toEpochSecond())
+                .distinct()
+                .toList();
+        assertThat(instants).hasSize(1);
+
+        assertThat(response.timeZones()).allSatisfy(info -> assertThat(info.offsetSeconds())
+                .isEqualTo(OffsetDateTime.parse(info.localDateTime()).getOffset().getTotalSeconds()));
+
+        TimeZoneListResponse utcResponse = dateTimeService.listTimeZones("UTC", 10);
+        TimeZoneInfo utc = utcResponse.timeZones().stream()
+                .filter(info -> info.timeZone().equals("UTC"))
+                .findFirst()
+                .orElseThrow();
+        assertThat(utc.offset()).isEqualTo("+00:00");
+        assertThat(utc.offsetSeconds()).isZero();
+    }
+
+    @Test
+    @DisplayName("Should honor explicit EPOCH_SECONDS for a 10-digit value")
+    void shouldConvertExplicitEpochSeconds() {
+        DateTimeConvertRequest request = new DateTimeConvertRequest("1730335200", "UTC", null, "EPOCH_SECONDS");
+        DateTimeConvertResponse response = dateTimeService.convert(request);
+
+        assertThat(response.epochMillis()).isEqualTo(1730335200000L);
+        assertThat(response.epochSeconds()).isEqualTo(1730335200L);
+        assertThat(response.isoUtc()).isEqualTo("2024-10-31T00:40:00Z");
+    }
+
+    @Test
+    @DisplayName("Should honor explicit EPOCH_MILLIS for a 13-digit value")
+    void shouldConvertExplicitEpochMillis() {
+        DateTimeConvertRequest request = new DateTimeConvertRequest("1730335200000", "UTC", null, "EPOCH_MILLIS");
+        DateTimeConvertResponse response = dateTimeService.convert(request);
+
+        assertThat(response.epochMillis()).isEqualTo(1730335200000L);
+        assertThat(response.epochSeconds()).isEqualTo(1730335200L);
+        assertThat(response.isoUtc()).isEqualTo("2024-10-31T00:40:00Z");
+    }
+
+    @Test
+    @DisplayName("Should force ISO-8601 parsing and reject numeric input under ISO_8601")
+    void shouldForceIso8601AndRejectNumericInput() {
+        DateTimeConvertRequest isoRequest =
+                new DateTimeConvertRequest("2024-10-31T09:40:00+09:00", "UTC", null, "ISO_8601");
+        DateTimeConvertResponse response = dateTimeService.convert(isoRequest);
+        assertThat(response.epochMillis()).isEqualTo(1730335200000L);
+
+        DateTimeConvertRequest numericRequest = new DateTimeConvertRequest("1730335200", "UTC", null, "ISO_8601");
+        assertThatThrownBy(() -> dateTimeService.convert(numericRequest))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not match inputFormat ISO_8601");
+    }
+
+    @Test
+    @DisplayName("Should accept lower-case format and treat blank inputFormat as auto-detect")
+    void shouldAcceptLowerCaseFormatAndTreatBlankAsAutoDetect() {
+        DateTimeConvertResponse lowerCase = dateTimeService.convert(
+                new DateTimeConvertRequest("1000000000", "UTC", null, "epoch_millis"));
+        assertThat(lowerCase.epochMillis()).isEqualTo(1000000000L);
+        assertThat(lowerCase.epochSeconds()).isEqualTo(1000000L);
+
+        DateTimeConvertResponse omitted = dateTimeService.convert(
+                new DateTimeConvertRequest("1000000000", "UTC", null, null));
+        DateTimeConvertResponse empty = dateTimeService.convert(
+                new DateTimeConvertRequest("1000000000", "UTC", null, ""));
+        DateTimeConvertResponse whitespace = dateTimeService.convert(
+                new DateTimeConvertRequest("1000000000", "UTC", null, "   "));
+
+        assertThat(omitted.epochMillis()).isEqualTo(1000000000000L);
+        assertThat(empty.epochMillis()).isEqualTo(1000000000000L);
+        assertThat(whitespace.epochMillis()).isEqualTo(1000000000000L);
+    }
+
+    @Test
+    @DisplayName("Should raise IllegalArgumentException for out-of-range forced epoch seconds")
+    void shouldReturnIllegalArgumentForOutOfRangeForcedEpoch() {
+        DateTimeConvertRequest request =
+                new DateTimeConvertRequest("9223372036854775807", "UTC", null, "EPOCH_SECONDS");
+
+        assertThatThrownBy(() -> dateTimeService.convert(request))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not match inputFormat EPOCH_SECONDS");
+    }
+
+    @Test
+    @DisplayName("Should raise IllegalArgumentException for forced epoch seconds that overflow epoch millis")
+    void shouldReturnIllegalArgumentForForcedSecondsOutsideMillisRange() {
+        // 9223372036854776 s is a valid Instant (year 292278994) but toEpochMilli() would overflow
+        DateTimeConvertRequest request =
+                new DateTimeConvertRequest("9223372036854776", "UTC", null, "EPOCH_SECONDS");
+
+        assertThatThrownBy(() -> dateTimeService.convert(request))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not match inputFormat EPOCH_SECONDS")
+                .hasMessageContaining("epoch milliseconds");
+    }
+
+    @Test
+    @DisplayName("Should convert forced epoch seconds at the epoch-millis boundary")
+    void shouldConvertForcedEpochSecondsAtMillisBoundary() {
+        DateTimeConvertRequest upper =
+                new DateTimeConvertRequest("9223372036854775", "UTC", null, "EPOCH_SECONDS");
+        DateTimeConvertRequest lower =
+                new DateTimeConvertRequest("-9223372036854775", "UTC", null, "EPOCH_SECONDS");
+
+        assertThat(dateTimeService.convert(upper).epochMillis()).isEqualTo(9223372036854775000L);
+        assertThat(dateTimeService.convert(lower).epochMillis()).isEqualTo(-9223372036854775000L);
+    }
+
+    @Test
+    @DisplayName("Should reject non-numeric input for forced EPOCH_MILLIS")
+    void shouldRejectNonNumericMillis() {
+        DateTimeConvertRequest request = new DateTimeConvertRequest("12.5", "UTC", null, "EPOCH_MILLIS");
+
+        assertThatThrownBy(() -> dateTimeService.convert(request))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not match inputFormat EPOCH_MILLIS");
     }
 }

@@ -1,0 +1,10 @@
+# Per-target verification contract for the harness compliance gate.
+#
+# This repo is a Maven/Spring Boot project; the gate's language auto-detect
+# instead matched the top-level `tests/` directory (which holds `*.should`
+# DoD evidence shims, not pytest modules) and ran `pytest`, exiting 5 with
+# "no tests ran". Pin the real contract used by Plan §8 DOD-01.
+[[command]]
+name = "test"
+run = "bash ./mvnw -q clean test"
+timeout_sec = 900
