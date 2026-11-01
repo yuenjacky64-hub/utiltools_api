@@ -10,27 +10,46 @@ import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.exception.JsonPatchRollbackException;
+import com.example.utiltools.resilience.AuditTrail;
+import com.example.utiltools.resilience.CircuitBreaker;
+import com.example.utiltools.resilience.CircuitBreakerConfig;
 import com.fasterxml.jackson.core.JsonLocation;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.PrettyPrinter;
+import com.fasterxml.jackson.core.util.DefaultIndenter;
+import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.jayway.jsonpath.InvalidPathException;
 import com.jayway.jsonpath.JsonPath;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 
 @Service
 public class JsonService {
 
+    private static final int DEFAULT_INDENT_WIDTH = 2;
+    private static final int DEFAULT_AUDIT_CAPACITY = 1024;
+
     private final ObjectMapper objectMapper;
+    private final CircuitBreaker circuitBreaker;
 
     public JsonService(ObjectMapper objectMapper) {
+        this(objectMapper, new CircuitBreaker("json-query", CircuitBreakerConfig.defaults(),
+                new AuditTrail(DEFAULT_AUDIT_CAPACITY), Clock.systemUTC()));
+    }
+
+    @Autowired
+    public JsonService(ObjectMapper objectMapper, CircuitBreaker circuitBreaker) {
         this.objectMapper = objectMapper;
+        this.circuitBreaker = circuitBreaker;
     }
 
     public JsonFormatResponse format(JsonFormatRequest request) {
@@ -40,13 +59,22 @@ public class JsonService {
             if (Boolean.TRUE.equals(request.minify())) {
                 formatted = objectMapper.writeValueAsString(node);
             } else {
-                formatted = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+                formatted = objectMapper.writer(prettyPrinter(request.indent())).writeValueAsString(node);
             }
             int sizeBytes = formatted.getBytes(StandardCharsets.UTF_8).length;
             return new JsonFormatResponse(formatted, sizeBytes);
         } catch (JsonProcessingException e) {
             throw new IllegalArgumentException("Invalid JSON content: " + e.getOriginalMessage(), e);
         }
+    }
+
+    private PrettyPrinter prettyPrinter(Integer indent) {
+        int width = indent == null ? DEFAULT_INDENT_WIDTH : indent;
+        if (width < 1 || width > 8) {
+            throw new IllegalArgumentException("indent must be between 1 and 8");
+        }
+        return new DefaultPrettyPrinter()
+                .withObjectIndenter(new DefaultIndenter(" ".repeat(width), "\n"));
     }
 
     public JsonValidateResponse validate(JsonValidateRequest request) {
@@ -63,6 +91,10 @@ public class JsonService {
     }
 
     public JsonQueryResponse query(JsonQueryRequest request) {
+        return circuitBreaker.execute(() -> queryInternal(request));
+    }
+
+    private JsonQueryResponse queryInternal(JsonQueryRequest request) {
         try {
             Object result = JsonPath.read(request.json(), request.jsonPath());
             return new JsonQueryResponse(request.jsonPath(), result);
