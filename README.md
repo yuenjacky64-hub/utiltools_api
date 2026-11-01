@@ -578,8 +578,8 @@ curl http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c
     "itemCount": 3,
     "results": [
       { "algorithm": "SHA-256", "digest": "a591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e", "isHmac": false },
-      { "algorithm": "SHA-256", "digest": "0f3c1bb2f0e0f7f9a9b5bd0bb4d5f1a2f9a0c3d7e0b1a2c3d4e5f60718293a4b", "isHmac": false },
-      { "algorithm": "SHA-256", "digest": "7d1a5c9e2b8f43061c7d9e0a3b5c8d1e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c", "isHmac": false }
+      { "algorithm": "SHA-256", "digest": "75dd82daf219f04c6ea282151162b52f9ddd41437aac1b8e6d09133232504797", "isHmac": false },
+      { "algorithm": "SHA-256", "digest": "a5e019350fd755cb21a23f61f05f85b4e55aa6acc987436084fed97db11da5ad", "isHmac": false }
     ],
     "createdAt": "2026-10-31T19:12:04.418273Z",
     "startedAt": "2026-10-31T19:12:04.420118Z",
@@ -598,7 +598,7 @@ The state machine is strictly `QUEUED → RUNNING → COMPLETED | FAILED`. A `FA
 | :--- | :--- | :--- | :--- |
 | Bounded executor queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry with the **same** `idempotencyKey` once capacity frees. The rejected submission is rolled back atomically — its job row **and** its idempotency mapping are both removed, so it leaves no residue and the retry with that key starts a brand-new job |
 | Unknown or already-evicted `jobId` | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Resubmit the batch |
-| Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit |
+| Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit with a **new** `idempotencyKey` (or none). Reusing the failed job's key replays its cached `FAILED` snapshot instead of re-executing |
 | Blank/empty `items` | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Send a non-empty list of non-blank strings (max 1000) |
 
 #### D. Batch job configuration
@@ -631,8 +631,15 @@ job is a normal API call. Being jobs, they are **not** additionally exempted —
   response, not a job failure: the job keeps running and is still retrievable once `Retry-After` elapses.
 - The two `429` classes are distinguishable by the `error` field: `RATE_LIMITED` (too many calls —
   honour `Retry-After`) vs `QUEUE_FULL` (executor saturated — retry the **same** `idempotencyKey`).
-- Recommended polling: sleep for `utiltools.jobs.cleanup-interval-ms`-scale intervals (e.g. every
-  `250 ms`, backing off), and treat `429 RATE_LIMITED` as "slow down", never as "job gone".
+- Recommended polling: a batch completes in milliseconds to a few seconds on the default
+  `worker-count=2`, so a small number of polls is enough — **poll no faster than the default rate-limit
+  budget** of `utiltools.ratelimit.requests-per-window=60` per `utiltools.ratelimit.window-ms=60000`
+  (≈ 1 request/second). Polling every `250 ms` would exhaust that budget after ~15 s and then return
+  exactly the `429 RATE_LIMITED` above, so start at ~1 poll/second and back off from there.
+- `Retry-After` is sent **only** on a rejection, never on a successful poll, so honour it after a `429`
+  rather than using it as a cadence. Treat `429 RATE_LIMITED` as "slow down", never as "job gone".
+- The job itself is unaffected by rate limiting and stays retrievable for `utiltools.jobs.retention-seconds`
+  after it becomes terminal (the scheduled eviction pass runs every `utiltools.jobs.cleanup-interval-ms`).
 
 ---
 
