@@ -1,5 +1,6 @@
 package com.example.utiltools.common;
 
+import com.example.utiltools.json.exception.JsonPatchRollbackException;
 import com.example.utiltools.jobs.JobNotFoundException;
 import com.example.utiltools.jobs.JobQueueFullException;
 import com.example.utiltools.resilience.CircuitBreakerOpenException;
@@ -32,6 +33,19 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleIllegalArgumentException(IllegalArgumentException ex) {
         ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "BAD_REQUEST", null);
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+    }
+
+    @ExceptionHandler(JsonPatchRollbackException.class)
+    public ResponseEntity<ApiResponse<Void>> handleJsonPatchRollback(JsonPatchRollbackException ex) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("failedOperationIndex", ex.failedIndex());
+        details.put("failedOperation", ex.failedOperation());
+        details.put("failedPath", ex.failedPath());
+        details.put("operationsRolledBack", ex.operationsRolledBack());
+        details.put("reason", ex.reason());
+        details.put("audit", ex.audit());
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "PATCH_ROLLBACK", details);
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY).body(response);
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)
