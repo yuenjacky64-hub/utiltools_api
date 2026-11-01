@@ -7,6 +7,8 @@ import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
+import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
+import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.dto.TimeZoneListResponse;
 import com.example.utiltools.datetime.service.DateTimeService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -44,6 +46,13 @@ public class DateTimeController {
     public ApiResponse<DateTimeDiffResponse> diff(@Valid @RequestBody DateTimeDiffRequest request) {
         DateTimeDiffResponse result = auditedOperations.diff(request);
         return ApiResponse.success(result, "DateTime difference calculated successfully");
+    }
+
+    @PostMapping("/shift")
+    @Operation(summary = "Shift datetime by a signed amount and unit in a target timezone", description = "Applies years/months/weeks/days/hours/minutes/seconds arithmetic with java.time ZonedDateTime semantics, including month-end clamping and DST transitions")
+    public ApiResponse<DateTimeShiftResponse> shift(@Valid @RequestBody DateTimeShiftRequest request) {
+        DateTimeShiftResponse result = dateTimeService.shift(request);
+        return ApiResponse.success(result, "DateTime shifted successfully");
     }
 
     @GetMapping("/current")
