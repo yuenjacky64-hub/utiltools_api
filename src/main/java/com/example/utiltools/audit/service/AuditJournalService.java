@@ -9,9 +9,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -19,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -40,19 +43,25 @@ public class AuditJournalService {
 
     private static final String REDACTED = "***";
 
+    private static final String STALE_PENDING_REAPED = "STALE_PENDING_REAPED";
+
     private final ObjectMapper objectMapper;
     private final int maxEntries;
     private final int maxReplayBytes;
+    private final long stalePendingSeconds;
+    private final Clock clock = Clock.systemUTC();
 
     private final Object lock = new Object();
     private final LinkedHashMap<String, JournalRecord> entries = new LinkedHashMap<>();
 
     public AuditJournalService(ObjectMapper objectMapper,
                                @Value("${utiltools.audit.max-entries:200}") int maxEntries,
-                               @Value("${utiltools.audit.max-replay-bytes:65536}") int maxReplayBytes) {
+                               @Value("${utiltools.audit.max-replay-bytes:65536}") int maxReplayBytes,
+                               @Value("${utiltools.audit.stale-pending-seconds:300}") long stalePendingSeconds) {
         this.objectMapper = objectMapper;
         this.maxEntries = Math.max(1, maxEntries);
         this.maxReplayBytes = Math.max(1, maxReplayBytes);
+        this.stalePendingSeconds = Math.max(1L, stalePendingSeconds);
     }
 
     /**
@@ -114,6 +123,41 @@ public class AuditJournalService {
             record.base = updated;
             return updated;
         }
+    }
+
+    /**
+     * Scheduled stale-PENDING sweep; delegates to the clock-free variant with a cutoff derived
+     * from {@code utiltools.audit.stale-pending-seconds}.
+     */
+    @Scheduled(fixedDelayString = "${utiltools.audit.cleanup-interval-ms:60000}")
+    public void reapStalePending() {
+        reapStalePending(Instant.now(clock).minusSeconds(stalePendingSeconds));
+    }
+
+    /**
+     * Marks PENDING entries created before {@code cutoff} as FAILED with STALE_PENDING_REAPED.
+     * Public and clock-free so tests advance the cutoff instead of waiting.
+     *
+     * @return the number of reaped entries
+     */
+    public int reapStalePending(Instant cutoff) {
+        Objects.requireNonNull(cutoff, "cutoff");
+        Instant reapedAt = Instant.now(clock);
+        int reaped = 0;
+        synchronized (lock) {
+            for (JournalRecord record : entries.values()) {
+                AuditEntry base = record.base;
+                if (base.state() == JournalState.PENDING
+                        && base.createdAt() != null
+                        && base.createdAt().isBefore(cutoff)) {
+                    record.base = new AuditEntry(base.id(), base.requestId(), base.operation(),
+                            JournalState.FAILED, base.createdAt(), reapedAt, base.request(), null,
+                            STALE_PENDING_REAPED, base.replayable(), record.replay);
+                    reaped++;
+                }
+            }
+        }
+        return reaped;
     }
 
     public Optional<AuditEntry> find(String id) {
