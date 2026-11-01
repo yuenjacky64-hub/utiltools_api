@@ -1,5 +1,7 @@
 package com.example.utiltools.common;
 
+import com.example.utiltools.jobs.JobNotFoundException;
+import com.example.utiltools.jobs.JobQueueFullException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -32,6 +34,18 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleHttpMessageNotReadable(HttpMessageNotReadableException ex) {
         ApiResponse<Void> response = ApiResponse.error("Malformed JSON request body: " + ex.getMessage(), "BAD_REQUEST", null);
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+    }
+
+    @ExceptionHandler(JobQueueFullException.class)
+    public ResponseEntity<ApiResponse<Void>> handleJobQueueFull(JobQueueFullException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "QUEUE_FULL", null);
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(response);
+    }
+
+    @ExceptionHandler(JobNotFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleJobNotFound(JobNotFoundException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "JOB_NOT_FOUND", null);
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
     }
 
     @ExceptionHandler(Exception.class)
