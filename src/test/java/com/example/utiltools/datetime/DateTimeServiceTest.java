@@ -12,6 +12,8 @@ import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
+import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 
 class DateTimeServiceTest {
 
@@ -181,5 +183,126 @@ class DateTimeServiceTest {
         assertThatThrownBy(() -> dateTimeService.convert(request))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("does not match inputFormat EPOCH_MILLIS");
+    }
+
+    @Test
+    @DisplayName("Should clamp month-end when adding one month (2026-01-31 + 1 MONTHS -> 2026-02-28)")
+    void shouldClampMonthEndWhenAddingOneMonth() {
+        DateTimeShiftRequest request = new DateTimeShiftRequest(
+                "2026-01-31T12:00:00Z", "UTC", 1L, "MONTHS", null);
+        DateTimeShiftResponse response = dateTimeService.shift(request);
+
+        assertThat(response.formattedTarget()).isEqualTo("2026-02-28T12:00:00Z");
+        assertThat(response.isoUtc()).isEqualTo("2026-02-28T12:00:00Z");
+        assertThat(response.epochSeconds()).isEqualTo(1772280000L);
+        assertThat(response.epochMillis()).isEqualTo(1772280000000L);
+        assertThat(response.targetTimeZone()).isEqualTo("UTC");
+        assertThat(response.appliedAmount()).isEqualTo(1L);
+        assertThat(response.appliedUnit()).isEqualTo("MONTHS");
+    }
+
+    @Test
+    @DisplayName("Should shift by weeks with a positive amount (2026-01-31 + 2 WEEKS -> 2026-02-14)")
+    void shouldShiftByWeeksWithPositiveAmount() {
+        DateTimeShiftRequest request = new DateTimeShiftRequest(
+                "2026-01-31T12:00:00Z", "UTC", 2L, "weeks", null);
+        DateTimeShiftResponse response = dateTimeService.shift(request);
+
+        assertThat(response.formattedTarget()).isEqualTo("2026-02-14T12:00:00Z");
+        assertThat(response.appliedUnit()).isEqualTo("WEEKS");
+    }
+
+    @Test
+    @DisplayName("Should subtract when the amount is negative (2026-03-31 - 1 MONTHS -> 2026-02-28)")
+    void shouldShiftNegativeAmount() {
+        DateTimeShiftRequest request = new DateTimeShiftRequest(
+                "2026-03-31T12:00:00Z", "UTC", -1L, "MONTHS", null);
+        DateTimeShiftResponse response = dateTimeService.shift(request);
+
+        assertThat(response.formattedTarget()).isEqualTo("2026-02-28T12:00:00Z");
+        assertThat(response.appliedAmount()).isEqualTo(-1L);
+    }
+
+    @Test
+    @DisplayName("Should shift across the DST spring-forward gap in the target zone")
+    void shouldShiftAcrossDstSpringForward() {
+        // 2026-03-08T01:30:00-05:00 + 1 hour of elapsed time = 2026-03-08T03:30:00-04:00
+        DateTimeShiftRequest request = new DateTimeShiftRequest(
+                "2026-03-08T01:30:00-05:00", "America/New_York", 1L, "HOURS", null);
+        DateTimeShiftResponse response = dateTimeService.shift(request);
+
+        assertThat(response.formattedTarget()).isEqualTo("2026-03-08T03:30:00-04:00");
+        assertThat(response.epochSeconds()).isEqualTo(1772955000L);
+        assertThat(response.targetTimeZone()).isEqualTo("America/New_York");
+    }
+
+    @Test
+    @DisplayName("Should shift across the DST fall-back repeated hour in the target zone")
+    void shouldShiftAcrossDstFallBack() {
+        // 01:30 EDT (-04:00) + 1 hour of elapsed time lands on the repeated 01:30 EST (-05:00)
+        DateTimeShiftRequest request = new DateTimeShiftRequest(
+                "2026-11-01T01:30:00-04:00", "America/New_York", 1L, "HOURS", null);
+        DateTimeShiftResponse response = dateTimeService.shift(request);
+
+        long inputEpochMillis = 1793511000000L; // 2026-11-01T05:30:00Z
+        assertThat(response.formattedTarget()).isEqualTo("2026-11-01T01:30:00-05:00");
+        assertThat(response.epochMillis()).isEqualTo(inputEpochMillis + 3_600_000L);
+        assertThat(response.epochSeconds()).isEqualTo(1793514600L);
+    }
+
+    @Test
+    @DisplayName("Should format the shift result with the supplied custom pattern")
+    void shouldFormatShiftResultWithCustomPattern() {
+        DateTimeShiftRequest request = new DateTimeShiftRequest(
+                "2026-01-31T12:00:00Z", "UTC", 1L, "MONTHS", "yyyy-MM-dd HH:mm");
+        DateTimeShiftResponse response = dateTimeService.shift(request);
+
+        assertThat(response.formattedTarget()).isEqualTo("2026-02-28 12:00");
+    }
+
+    @Test
+    @DisplayName("Should throw IllegalArgumentException for an unknown timezone on shift")
+    void shouldThrowOnUnknownTimeZoneForShift() {
+        DateTimeShiftRequest request = new DateTimeShiftRequest(
+                "2026-01-31T12:00:00Z", "Invalid/Zone", 1L, "MONTHS", null);
+        assertThatThrownBy(() -> dateTimeService.shift(request))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unknown or invalid timezone");
+    }
+
+    @Test
+    @DisplayName("Should throw IllegalArgumentException for an invalid custom pattern on shift")
+    void shouldThrowOnInvalidCustomPatternForShift() {
+        DateTimeShiftRequest request = new DateTimeShiftRequest(
+                "2026-01-31T12:00:00Z", "UTC", 1L, "MONTHS", "yyyy-MM-dd 'unterminated");
+        assertThatThrownBy(() -> dateTimeService.shift(request))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid date-time pattern");
+    }
+
+    @Test
+    @DisplayName("Should throw IllegalArgumentException instead of a DateTimeException for an out-of-range amount")
+    void shouldThrowOnOutOfRangeAmount() {
+        DateTimeShiftRequest request = new DateTimeShiftRequest(
+                "2026-01-31T12:00:00Z", "UTC", Long.MAX_VALUE, "YEARS", null);
+        assertThatThrownBy(() -> dateTimeService.shift(request))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Shift amount out of range");
+    }
+
+    @Test
+    @DisplayName("Should throw IllegalArgumentException for zero amount and unsupported unit on shift")
+    void shouldThrowOnZeroAmountAndUnsupportedUnit() {
+        DateTimeShiftRequest zeroAmount = new DateTimeShiftRequest(
+                "2026-01-31T12:00:00Z", "UTC", 0L, "MONTHS", null);
+        assertThatThrownBy(() -> dateTimeService.shift(zeroAmount))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("amount must not be zero");
+
+        DateTimeShiftRequest badUnit = new DateTimeShiftRequest(
+                "2026-01-31T12:00:00Z", "UTC", 1L, "FORTNIGHTS", null);
+        assertThatThrownBy(() -> dateTimeService.shift(badUnit))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unsupported unit");
     }
 }

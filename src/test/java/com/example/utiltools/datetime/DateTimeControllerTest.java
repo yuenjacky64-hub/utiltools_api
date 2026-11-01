@@ -241,4 +241,160 @@ class DateTimeControllerTest {
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/shift - should clamp month-end and return the shift envelope")
+    void shouldShiftDateTime() throws Exception {
+        String body = """
+                {
+                    "input": "2026-01-31T12:00:00Z",
+                    "amount": 1,
+                    "unit": "MONTHS",
+                    "targetTimeZone": "UTC"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/shift")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("DateTime shifted successfully"))
+                .andExpect(jsonPath("$.data.formattedTarget").value("2026-02-28T12:00:00Z"))
+                .andExpect(jsonPath("$.data.isoUtc").value("2026-02-28T12:00:00Z"))
+                .andExpect(jsonPath("$.data.epochMillis").value(1772280000000L))
+                .andExpect(jsonPath("$.data.epochSeconds").value(1772280000L))
+                .andExpect(jsonPath("$.data.targetTimeZone").value("UTC"))
+                .andExpect(jsonPath("$.data.appliedAmount").value(1))
+                .andExpect(jsonPath("$.data.appliedUnit").value("MONTHS"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/shift - should reject amount 0 with 400 VALIDATION_ERROR")
+    void shouldRejectZeroAmountWithValidationError() throws Exception {
+        String body = """
+                {
+                    "input": "2026-01-31T12:00:00Z",
+                    "amount": 0,
+                    "unit": "MONTHS",
+                    "targetTimeZone": "UTC"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/shift")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/shift - should reject an unsupported unit and accept lower-case units")
+    void shouldRejectUnsupportedUnit() throws Exception {
+        String unknownUnit = """
+                {
+                    "input": "2026-01-31T12:00:00Z",
+                    "amount": 1,
+                    "unit": "FORTNIGHTS",
+                    "targetTimeZone": "UTC"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/shift")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(unknownUnit))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+
+        String missingAmount = """
+                {
+                    "input": "2026-01-31T12:00:00Z",
+                    "unit": "MONTHS",
+                    "targetTimeZone": "UTC"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/shift")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(missingAmount))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+
+        String lowerCaseUnit = """
+                {
+                    "input": "2026-01-31T12:00:00Z",
+                    "amount": 1,
+                    "unit": "months",
+                    "targetTimeZone": "UTC"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/shift")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(lowerCaseUnit))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.appliedUnit").value("MONTHS"))
+                .andExpect(jsonPath("$.data.formattedTarget").value("2026-02-28T12:00:00Z"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/shift - should return 400 BAD_REQUEST for an unknown timezone")
+    void shouldReturnBadRequestForUnknownTimeZoneOnShift() throws Exception {
+        String body = """
+                {
+                    "input": "2026-01-31T12:00:00Z",
+                    "amount": 1,
+                    "unit": "MONTHS",
+                    "targetTimeZone": "Invalid/Zone"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/shift")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("Unknown or invalid timezone")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/shift - should return 400 BAD_REQUEST for an invalid custom pattern")
+    void shouldReturnBadRequestForInvalidPatternOnShift() throws Exception {
+        String body = """
+                {
+                    "input": "2026-01-31T12:00:00Z",
+                    "amount": 1,
+                    "unit": "MONTHS",
+                    "targetTimeZone": "UTC",
+                    "customPattern": "yyyy-MM-dd 'unterminated"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/shift")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("Invalid date-time pattern")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/shift - should return 400 BAD_REQUEST for malformed JSON")
+    void shouldRejectMalformedJsonOnShift() throws Exception {
+        String body = """
+                {
+                    "input": "2026-01-31T12:00:00Z",
+                    "amount": 1,
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/shift")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+    }
 }
