@@ -10,6 +10,7 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -37,6 +38,25 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleHttpMessageNotReadable(HttpMessageNotReadableException ex) {
         ApiResponse<Void> response = ApiResponse.error("Malformed JSON request body: " + ex.getMessage(), "BAD_REQUEST", null);
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+    }
+
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMethodArgumentTypeMismatch(MethodArgumentTypeMismatchException ex) {
+        ApiResponse<Void> response = ApiResponse.error(
+                "Invalid value '" + ex.getValue() + "' for parameter '" + ex.getName() + "'", "BAD_REQUEST", null);
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+    }
+
+    @ExceptionHandler(AuditEntryNotFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleAuditEntryNotFoundException(AuditEntryNotFoundException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "NOT_FOUND", null);
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
+    }
+
+    @ExceptionHandler(ReplayConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleReplayConflictException(ReplayConflictException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "REPLAY_CONFLICT", null);
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
     }
 
     @ExceptionHandler(JobQueueFullException.class)
