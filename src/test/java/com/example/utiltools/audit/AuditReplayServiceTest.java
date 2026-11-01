@@ -36,7 +36,7 @@ class AuditReplayServiceTest {
     @BeforeEach
     void setUp() {
         objectMapper = new ObjectMapper();
-        journal = new AuditJournalService(objectMapper, 200, 65536);
+        journal = new AuditJournalService(objectMapper, 200, 65536, 300L);
         auditedOperations = new AuditedOperations(new DateTimeService(), new CryptoService(),
                 new JsonService(objectMapper), journal);
         replayService = new AuditReplayService(journal, auditedOperations, objectMapper);
