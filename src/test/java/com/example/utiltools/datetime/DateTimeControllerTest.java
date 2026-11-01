@@ -463,6 +463,28 @@ class DateTimeControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/utils/datetime/shift - should return 400 BAD_REQUEST when the shift overflows epoch millis")
+    void shouldReturnBadRequestForEpochMillisOverflowOnShift() throws Exception {
+        // 292278000 YEARS stays inside the ZonedDateTime year range but overflows long millis.
+        String body = """
+                {
+                    "input": "2026-01-31T12:00:00Z",
+                    "amount": 292278000,
+                    "unit": "YEARS",
+                    "targetTimeZone": "UTC"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/shift")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("epoch-millis range")));
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/datetime/shift - should return 400 BAD_REQUEST for malformed JSON")
     void shouldRejectMalformedJsonOnShift() throws Exception {
         String body = """

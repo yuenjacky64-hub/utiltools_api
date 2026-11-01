@@ -192,6 +192,14 @@ class DateTimeServiceTest {
         assertThatThrownBy(() -> dateTimeService.shift(request))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Shift amount out of range");
+
+        // Inside the ZonedDateTime year range (year 292 280 026) but outside the long millisecond
+        // range, so the escape happens at the epoch-millis conversion, not inside the unit switch.
+        DateTimeShiftRequest yearRangeRequest = new DateTimeShiftRequest(
+                "2026-01-31T12:00:00Z", "UTC", 292_278_000L, "YEARS", null);
+        assertThatThrownBy(() -> dateTimeService.shift(yearRangeRequest))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("outside the epoch-millis range");
     }
 
     @Test

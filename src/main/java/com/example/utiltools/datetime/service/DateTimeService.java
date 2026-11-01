@@ -100,7 +100,7 @@ public class DateTimeService {
         Instant shiftedInstant = shifted.toInstant();
 
         return new DateTimeShiftResponse(
-                shiftedInstant.toEpochMilli(),
+                toEpochMillis(shiftedInstant, request.input()),
                 shiftedInstant.getEpochSecond(),
                 DateTimeFormatter.ISO_INSTANT.format(shiftedInstant),
                 zoneId.getId(),
@@ -275,6 +275,16 @@ public class DateTimeService {
             throw new IllegalArgumentException("Datetime " + originalInput + " is outside the epoch-millis range: expected "
                     + expected, e);
         }
+    }
+
+    /**
+     * Same guard as {@link #toEpochMillis(Instant, String, String)} for call sites that take no
+     * {@code inputFormat} (the {@code shift} path), so a shift landing inside the {@code ZonedDateTime}
+     * year range but outside the {@code long} millisecond range is a 400 {@code BAD_REQUEST} rather
+     * than an {@link ArithmeticException} escaping to a 500.
+     */
+    private long toEpochMillis(Instant instant, String originalInput) {
+        return toEpochMillis(instant, originalInput, null);
     }
 
     private Instant parseIso8601Strict(String trimmed, String originalInput, String format) {
