@@ -43,11 +43,12 @@ public class CryptoController {
     }
 
     @GetMapping("/uuid")
-    @Operation(summary = "Generate random UUIDs", description = "Generates single or batch UUIDs with optional compact 32-character format")
+    @Operation(summary = "Generate random UUIDs", description = "Generates single or batch UUIDs with optional compact 32-character format; version selects random UUIDv4 (default) or time-ordered RFC 9562 UUIDv7")
     public ApiResponse<UuidResponse> uuid(
             @RequestParam(value = "count", required = false, defaultValue = "1") int count,
-            @RequestParam(value = "compact", required = false, defaultValue = "false") boolean compact) {
-        UuidResponse result = auditedOperations.uuid(count, compact);
+            @RequestParam(value = "compact", required = false, defaultValue = "false") boolean compact,
+            @RequestParam(value = "version", required = false, defaultValue = "V4") String version) {
+        UuidResponse result = auditedOperations.uuid(count, compact, version);
         return ApiResponse.success(result, "UUIDs generated successfully");
     }
 }

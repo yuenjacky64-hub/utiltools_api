@@ -11,6 +11,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -59,7 +60,7 @@ public class AuditJournalService {
      */
     public AuditEntry begin(OperationType operation, Object request, String requestId) {
         JsonNode tree = objectMapper.valueToTree(request);
-        boolean replayable = tree != null && tree.toString().length() <= maxReplayBytes;
+        boolean replayable = tree != null && serializedBytes(tree) <= maxReplayBytes;
         JsonNode storedRequest = tree == null ? null : (replayable ? redact(tree) : withheldPayload());
 
         synchronized (lock) {
@@ -91,9 +92,12 @@ public class AuditJournalService {
         synchronized (lock) {
             JournalRecord record = requirePending(id, JournalState.SUCCEEDED);
             AuditEntry base = record.base;
+            JsonNode resultTree = objectMapper.valueToTree(result);
+            boolean oversizeResult = resultTree != null && serializedBytes(resultTree) > maxReplayBytes;
             AuditEntry updated = new AuditEntry(base.id(), base.requestId(), base.operation(),
                     JournalState.SUCCEEDED, base.createdAt(), Instant.now(), base.request(),
-                    objectMapper.valueToTree(result), null, base.replayable(), record.replay);
+                    oversizeResult ? withheldPayload() : resultTree, null,
+                    base.replayable() && !oversizeResult, record.replay);
             record.base = updated;
             return updated;
         }
@@ -183,6 +187,11 @@ public class AuditJournalService {
                     + record.base.state() + ", cannot transition to " + target);
         }
         return record;
+    }
+
+    /** UTF-8 encoded size of a stored tree, so the byte bound is measured in bytes, not UTF-16 units. */
+    private int serializedBytes(JsonNode tree) {
+        return tree.toString().getBytes(StandardCharsets.UTF_8).length;
     }
 
     /** Recursively replaces secret values with {@code "***"}; field presence is preserved. */

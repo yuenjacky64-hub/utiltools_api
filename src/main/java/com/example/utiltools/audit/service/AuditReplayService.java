@@ -46,9 +46,10 @@ public class AuditReplayService {
         }
         Object original = journal.originalRequest(id)
                 .orElseThrow(() -> new ReplayConflictException(id,
-                        "entry is not replayable (oversized request payload)"));
+                        "entry is not replayable (payload exceeds utiltools.audit.max-replay-bytes)"));
         if (!entry.replayable()) {
-            throw new ReplayConflictException(id, "entry is not replayable (oversized request payload)");
+            throw new ReplayConflictException(id,
+                    "entry is not replayable (payload exceeds utiltools.audit.max-replay-bytes)");
         }
 
         Object actual;

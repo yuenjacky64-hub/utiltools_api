@@ -4,5 +4,6 @@ import java.util.List;
 
 public record UuidResponse(
         int count,
-        List<String> uuids
+        List<String> uuids,
+        String version
 ) {}

@@ -79,11 +79,13 @@ public class AuditedOperations {
         return record(OperationType.CRYPTO_BASE64, request, () -> cryptoService.base64(request));
     }
 
-    public UuidResponse uuid(int count, boolean compact) {
+    public UuidResponse uuid(int count, boolean compact, String version) {
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("count", count);
         request.put("compact", compact);
-        return record(OperationType.CRYPTO_UUID, request, () -> cryptoService.generateUuids(count, compact));
+        request.put("version", version);
+        return record(OperationType.CRYPTO_UUID, request,
+                () -> cryptoService.generateUuids(count, compact, version));
     }
 
     public JsonFormatResponse format(JsonFormatRequest request) {
@@ -108,7 +110,8 @@ public class AuditedOperations {
             case DATETIME_CURRENT -> dateTimeService.getCurrentTime(timeZoneOf(request));
             case CRYPTO_HASH -> cryptoService.hash((HashRequest) request);
             case CRYPTO_BASE64 -> cryptoService.base64((Base64Request) request);
-            case CRYPTO_UUID -> cryptoService.generateUuids(intOf(request, "count"), booleanOf(request, "compact"));
+            case CRYPTO_UUID -> cryptoService.generateUuids(intOf(request, "count"), booleanOf(request, "compact"),
+                    stringOf(request, "version"));
             case JSON_FORMAT -> jsonService.format((JsonFormatRequest) request);
             case JSON_VALIDATE -> jsonService.validate((JsonValidateRequest) request);
             case JSON_QUERY -> jsonService.query((JsonQueryRequest) request);
@@ -116,27 +119,43 @@ public class AuditedOperations {
     }
 
     private <T> T record(OperationType operation, Object request, Supplier<T> call) {
-        AuditEntry entry = journal.begin(operation, request, RequestContext.get());
+        AuditEntry entry = beginQuietly(operation, request);
+        String id = entry == null ? null : entry.id();
         T result;
         try {
             result = call.get();
         } catch (IllegalArgumentException e) {
-            recordFailure(entry.id(), BAD_REQUEST);
+            recordFailure(id, BAD_REQUEST);
             throw e;
         } catch (RuntimeException e) {
-            recordFailure(entry.id(), INTERNAL_SERVER_ERROR);
+            recordFailure(id, INTERNAL_SERVER_ERROR);
             throw e;
         }
-        recordSuccess(entry.id(), result);
+        recordSuccess(id, result);
         return result;
     }
 
     /**
-     * A journal transition fault (entry evicted by a concurrent burst, or already advanced) is
+     * Journalling is best effort end-to-end: a failure while beginning the entry (unserialisable
+     * request payload, for instance) yields a {@code null} entry and the operation still runs.
+     */
+    private AuditEntry beginQuietly(OperationType operation, Object request) {
+        try {
+            return journal.begin(operation, request, RequestContext.get());
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * A journal fault (no entry, entry evicted by a concurrent burst, or already advanced) is
      * swallowed: the operation outcome is what the caller asked for and must never be masked by
      * the journal writing 500s over a success or over a legitimate {@code BAD_REQUEST}.
      */
     private void recordSuccess(String id, Object result) {
+        if (id == null) {
+            return;
+        }
         try {
             journal.succeed(id, result);
         } catch (RuntimeException e) {
@@ -145,6 +164,9 @@ public class AuditedOperations {
     }
 
     private void recordFailure(String id, String errorCode) {
+        if (id == null) {
+            return;
+        }
         try {
             journal.fail(id, errorCode);
         } catch (RuntimeException e) {
@@ -165,6 +187,13 @@ public class AuditedOperations {
             return number.intValue();
         }
         return 0;
+    }
+
+    private static String stringOf(Object request, String key) {
+        if (request instanceof Map<?, ?> map && map.get(key) != null) {
+            return map.get(key).toString();
+        }
+        return null;
     }
 
     private static boolean booleanOf(Object request, String key) {

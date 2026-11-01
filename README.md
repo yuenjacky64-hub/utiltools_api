@@ -2,7 +2,7 @@
 
 [![Java](https://img.shields.io/badge/Java-21%20LTS-orange.svg?logo=openjdk)](https://openjdk.org/projects/jdk/21/)
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4%20(3.4.2)-brightgreen.svg?logo=springboot)](https://spring.io/projects/spring-boot)
-[![Build & Tests](https://img.shields.io/badge/Tests-32%20Passed%20(100%25)-success.svg)](https://junit.org/junit5/)
+[![Build & Tests](https://img.shields.io/badge/Tests-41%20Passed%20(100%25)-success.svg)](https://junit.org/junit5/)
 [![OpenAPI](https://img.shields.io/badge/OpenAPI-3.0%20%2F%20Swagger%20UI-blue.svg?logo=swagger)](http://localhost:8080/swagger-ui/index.html)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
@@ -22,6 +22,8 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
   - [1. DateTime & Timezone Utility](#1-datetime--timezone-utility)
   - [2. Cryptography & Encoding Utility](#2-cryptography--encoding-utility)
   - [3. JSON & Data Processor Utility](#3-json--data-processor-utility)
+  - [4. Batch Hash Jobs (async)](#4-batch-hash-jobs-async)
+- [Rate Limiting](#-rate-limiting)
 - [Operation Journal & Replay Verification](#-operation-journal--replay-verification)
 - [Unified Response & Error Handling](#-unified-response--error-handling)
 - [Interactive API Documentation (Swagger UI)](#-interactive-api-documentation-swagger-ui)
@@ -39,7 +41,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | Tool | Base Path | Core Capabilities |
 | :--- | :--- | :--- |
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, duration diff calculation, current global time |
-| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, UUID v4 batch generation |
+| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 generation (`version=V4|V7`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation |
 
 ---
@@ -93,10 +95,15 @@ utiltools_api/
     │   │   │   ├── controller/CryptoController.java
     │   │   │   ├── service/CryptoService.java
     │   │   │   └── dto/
-    │   │   └── json/                          # Tool 3: JSON Data Processor
-    │   │       ├── controller/JsonController.java
-    │   │       ├── service/JsonService.java
-    │   │       └── dto/
+    │   │   ├── json/                          # Tool 3: JSON Data Processor
+    │   │   │   ├── controller/JsonController.java
+    │   │   │   ├── service/JsonService.java
+    │   │   │   └── dto/
+    │   │   └── ratelimit/                     # Cross-cutting request budget
+    │   │       ├── RateLimitProperties.java   # utiltools.ratelimit.* bindings
+    │   │       ├── SlidingWindowRateLimiter.java# Clock-driven, thread-safe limiter
+    │   │       ├── RateLimitFilter.java       # Servlet filter -> 429 RATE_LIMITED
+    │   │       └── RateLimitConfig.java       # FilterRegistrationBean + scheduler
     │   └── resources/
     │       └── application.properties         # Server & Swagger configuration
     └── test/java/com/example/utiltools/
@@ -108,9 +115,13 @@ utiltools_api/
         ├── crypto/
         │   ├── CryptoControllerTest.java
         │   └── CryptoServiceTest.java
-        └── json/
-            ├── JsonControllerTest.java
-            └── JsonServiceTest.java
+        ├── json/
+        │   ├── JsonControllerTest.java
+        │   └── JsonServiceTest.java
+        └── ratelimit/
+            ├── SlidingWindowRateLimiterTest.java
+            ├── RateLimitFilterTest.java
+            └── RateLimitConfigTest.java
 ```
 
 ---
@@ -128,6 +139,8 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/format` | Pretty-print or minify JSON strings |
 | `POST` | `/api/v1/utils/json/validate` | Check JSON syntax validity and report exact syntax error line/col |
 | `POST` | `/api/v1/utils/json/query` | Evaluate JSONPath queries and extract matching nodes |
+| `POST` | `/api/v1/utils/jobs/hash` | Submit a bounded async batch-hash job; `202` with a job id, idempotent via `idempotencyKey` |
+| `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `COMPLETED` / `FAILED` |
 | `GET` | `/api/v1/utils/audit/entries` | List journal entries (newest first) with optional `limit` & `state` filters |
 | `GET` | `/api/v1/utils/audit/entries/{id}` | Fetch a single journal entry (redacted request/result) |
 | `POST` | `/api/v1/utils/audit/entries/{id}/replay` | Replay a deterministic SUCCEEDED entry and verify the outcome |
@@ -162,6 +175,7 @@ Supports:
 - Epoch milliseconds (e.g., `1730335200000`)
 - Epoch seconds (e.g., `1730335200`)
 - ISO-8601 strings (e.g., `2026-01-01T15:00:00Z`)
+- Optional `inputFormat` request field to force the interpretation of `input` — one of `EPOCH_SECONDS`, `EPOCH_MILLIS`, `ISO_8601` (case-insensitive). Omit it, send `null`, or send a blank string to keep auto-detection (numeric values are treated as epoch millis when the digit count exceeds 11, otherwise as epoch seconds).
 - Target IANA timezones (e.g., `Asia/Tokyo`, `America/New_York`, `Europe/London`, `UTC`)
 - Optional custom formatting pattern (e.g., `yyyy-MM-dd HH:mm:ss`)
 
@@ -187,6 +201,78 @@ curl -X POST http://localhost:8080/api/v1/utils/datetime/convert \
     "targetTimeZone": "Asia/Tokyo",
     "formattedTarget": "2024-10-31 09:40:00"
   },
+  "timestamp": "2026-10-30T16:50:38.707903775Z"
+}
+```
+
+**Force the input format (optional `inputFormat`):**
+
+`inputFormat` pins the interpretation of `input` instead of relying on digit-count auto-detection. It is useful when the units are ambiguous — for example `1000000000` is auto-detected as epoch **seconds** (2001-09-09T01:46:40Z), while `"inputFormat": "EPOCH_MILLIS"` reads it as epoch millis (1970-01-12T13:46:40Z). Allowed values (case-insensitive) are `EPOCH_SECONDS`, `EPOCH_MILLIS` and `ISO_8601`.
+
+```bash
+# EPOCH_SECONDS: a 10-digit value is read as seconds
+curl -X POST http://localhost:8080/api/v1/utils/datetime/convert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "1730335200",
+    "inputFormat": "EPOCH_SECONDS",
+    "targetTimeZone": "Asia/Tokyo"
+  }'
+
+# EPOCH_MILLIS: a 13-digit value (or a pre-1973 value) is read as milliseconds
+curl -X POST http://localhost:8080/api/v1/utils/datetime/convert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "1730335200000",
+    "inputFormat": "EPOCH_MILLIS",
+    "targetTimeZone": "Asia/Tokyo"
+  }'
+
+# ISO_8601: numeric heuristics are bypassed entirely
+curl -X POST http://localhost:8080/api/v1/utils/datetime/convert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "2024-10-31T09:40:00+09:00",
+    "inputFormat": "ISO_8601",
+    "targetTimeZone": "Asia/Tokyo"
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "DateTime converted successfully",
+  "data": {
+    "epochMillis": 1730335200000,
+    "epochSeconds": 1730335200,
+    "isoUtc": "2024-10-31T00:40:00Z",
+    "targetTimeZone": "Asia/Tokyo",
+    "formattedTarget": "2024-10-31T09:40:00+09:00"
+  },
+  "timestamp": "2026-10-30T16:50:38.707903775Z"
+}
+```
+
+If `input` does not match the forced `inputFormat` (an ISO-8601 string sent with `EPOCH_MILLIS`, a numeric value sent with `ISO_8601`, or a value outside the representable range, since the response also reports `epochMillis` and `EPOCH_SECONDS` therefore accepts at most `±9223372036854775`) the endpoint answers HTTP 400 with `error` = `BAD_REQUEST`. An unrecognised `inputFormat` answers HTTP 400 with `error` = `VALIDATION_ERROR` and the allowed values in `details`:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/datetime/convert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "1730335200000",
+    "inputFormat": "BOGUS"
+  }'
+```
+
+```json
+{
+  "success": false,
+  "message": "Validation failed",
+  "error": "VALIDATION_ERROR",
+  "details": [
+    "inputFormat must be one of EPOCH_SECONDS, EPOCH_MILLIS, ISO_8601"
+  ],
   "timestamp": "2026-10-30T16:50:38.707903775Z"
 }
 ```
@@ -335,12 +421,20 @@ curl -X POST http://localhost:8080/api/v1/utils/crypto/base64 \
 Query parameters:
 - `count` (optional, default `1`, max `100`)
 - `compact` (optional, default `false`; when `true`, removes hyphens into 32-hex chars)
+- `version` (optional, default `V4`; values `V4|V7`, case-insensitive). `V4` is random; `V7` is
+  time-ordered RFC 9562 UUIDv7 — 48-bit unix-millisecond prefix plus a per-process monotonic counter,
+  so ids sort lexicographically and stay unique under concurrent generation. Any other value returns
+  `400 BAD_REQUEST` with `Invalid version:`.
 
 ```bash
+# random v4 (default), compact
 curl "http://localhost:8080/api/v1/utils/crypto/uuid?count=2&compact=true"
+
+# time-ordered v7
+curl "http://localhost:8080/api/v1/utils/crypto/uuid?version=V7&count=2"
 ```
 
-**Response:**
+**Response (v4 default, `compact=true`):**
 ```json
 {
   "success": true,
@@ -350,7 +444,27 @@ curl "http://localhost:8080/api/v1/utils/crypto/uuid?count=2&compact=true"
     "uuids": [
       "3776d0fbdbf94a999a7b029b588ecb47",
       "cb0151c680c24c63a26d1f5a013ad079"
-    ]
+    ],
+    "version": "V4"
+  },
+  "timestamp": "2026-10-30T16:50:38.954060989Z"
+}
+```
+
+**Response (`version=V7`):** values are ascending in string order and the 12 leading hex chars are the
+unix-millisecond timestamp, the 13th hex char is the version nibble `7`:
+
+```json
+{
+  "success": true,
+  "message": "UUIDs generated successfully",
+  "data": {
+    "count": 2,
+    "uuids": [
+      "017f22e2-79b0-7c4a-9a1d-2f5b6c7d8e9f",
+      "017f22e2-79b0-7c4b-8b2e-4d6f7a8b9c0d"
+    ],
+    "version": "V7"
   },
   "timestamp": "2026-10-30T16:50:38.954060989Z"
 }
@@ -361,12 +475,15 @@ curl "http://localhost:8080/api/v1/utils/crypto/uuid?count=2&compact=true"
 ### 3. JSON & Data Processor Utility
 
 #### A. Format / Pretty-Print or Minify JSON
+`indent` is optional: it must be an integer in **1-8**, defaults to **2** spaces per nesting level when omitted, and is ignored when `minify` is `true`. Values outside 1-8 are rejected with HTTP 400 and `error` `VALIDATION_ERROR`.
+
 ```bash
 curl -X POST http://localhost:8080/api/v1/utils/json/format \
   -H "Content-Type: application/json" \
   -d '{
     "json": "{\"user\":{\"id\":101,\"name\":\"Alice\"}}",
-    "minify": false
+    "minify": false,
+    "indent": 4
   }'
 ```
 
@@ -376,8 +493,8 @@ curl -X POST http://localhost:8080/api/v1/utils/json/format \
   "success": true,
   "message": "JSON formatted successfully",
   "data": {
-    "formattedJson": "{\n  \"user\" : {\n    \"id\" : 101,\n    \"name\" : \"Alice\"\n  }\n}",
-    "sizeBytes": 57
+    "formattedJson": "{\n    \"user\" : {\n        \"id\" : 101,\n        \"name\" : \"Alice\"\n    }\n}",
+    "sizeBytes": 69
   },
   "timestamp": "2026-10-30T16:50:38.987061888Z"
 }
@@ -538,6 +655,184 @@ returns `409 REPLAY_CONFLICT`.
 
 ---
 
+### 4. Batch Hash Jobs (async)
+
+Hash up to **1000 items** in the background instead of blocking one HTTP request per item. Submission is
+accepted immediately with **202** and a `jobId`; you then poll `GET /api/v1/utils/jobs/{jobId}` until the job
+reaches `COMPLETED` or `FAILED`. Every item is hashed with the same `CryptoService.hash` used by
+`POST /api/v1/utils/crypto/hash`, and results are returned in **input order**.
+
+Jobs live in the JVM heap only: this API is **single-instance and in-memory**, so a restart (or a revert)
+discards all jobs and idempotency keys — clients then get `404 JOB_NOT_FOUND` and must resubmit.
+
+#### A. Submit a batch (202 Accepted)
+
+`idempotencyKey` is optional. When present, duplicate **or concurrent** submissions with the same key return the
+same `jobId` and cause exactly one execution. A *first* submission always reports `"status": "QUEUED"` (the state
+it was accepted in, captured before enqueue); a *duplicate* submission returns the current live snapshot of the
+existing job instead, so its `status` may already be `RUNNING`, `COMPLETED` or `FAILED`.
+
+```bash
+curl -i -X POST http://localhost:8080/api/v1/utils/jobs/hash \
+  -H "Content-Type: application/json" \
+  -d '{
+    "algorithm": "SHA-256",
+    "items": ["Hello World", "Second payload", "Third payload"],
+    "idempotencyKey": "batch-2026-10-31-001"
+  }'
+```
+
+**Response — `202 Accepted`:**
+```json
+{
+  "success": true,
+  "message": "Batch hash job accepted",
+  "data": {
+    "jobId": "3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3",
+    "idempotencyKey": "batch-2026-10-31-001",
+    "status": "QUEUED",
+    "itemCount": 3,
+    "createdAt": "2026-10-31T19:12:04.418273Z"
+  },
+  "timestamp": "2026-10-31T19:12:04.418503Z"
+}
+```
+
+#### B. Poll the job snapshot
+
+```bash
+curl http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3
+```
+
+**Response — `200 OK`, `COMPLETED` (results in input order):**
+```json
+{
+  "success": true,
+  "message": "Job status retrieved",
+  "data": {
+    "jobId": "3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3",
+    "idempotencyKey": "batch-2026-10-31-001",
+    "status": "COMPLETED",
+    "itemCount": 3,
+    "results": [
+      { "algorithm": "SHA-256", "digest": "a591a6d40bf420404a011733cfb7b190d62c65bf0bcda32b57b277d9ad9f146e", "isHmac": false },
+      { "algorithm": "SHA-256", "digest": "75dd82daf219f04c6ea282151162b52f9ddd41437aac1b8e6d09133232504797", "isHmac": false },
+      { "algorithm": "SHA-256", "digest": "a5e019350fd755cb21a23f61f05f85b4e55aa6acc987436084fed97db11da5ad", "isHmac": false }
+    ],
+    "createdAt": "2026-10-31T19:12:04.418273Z",
+    "startedAt": "2026-10-31T19:12:04.420118Z",
+    "completedAt": "2026-10-31T19:12:04.421907Z"
+  },
+  "timestamp": "2026-10-31T19:12:05.012775Z"
+}
+```
+
+The state machine is strictly `QUEUED → RUNNING → COMPLETED | FAILED`. A `FAILED` job carries a non-null
+`error` and a `completedAt`, and never blocks later jobs.
+
+#### C. Failure modes
+
+| Situation | HTTP | `error` | What to do |
+| :--- | :--- | :--- | :--- |
+| Bounded executor queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry with the **same** `idempotencyKey` once capacity frees. The rejected submission is rolled back atomically — its job row **and** its idempotency mapping are both removed, so it leaves no residue and the retry with that key starts a brand-new job |
+| Unknown or already-evicted `jobId` | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Resubmit the batch |
+| Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit with a **new** `idempotencyKey` (or none). Reusing the failed job's key replays its cached `FAILED` snapshot instead of re-executing |
+| Blank/empty `items` | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Send a non-empty list of non-blank strings (max 1000) |
+
+#### D. Batch job configuration
+
+```properties
+# Batch hash jobs (bounded async execution)
+utiltools.jobs.worker-count=2
+utiltools.jobs.queue-capacity=100
+utiltools.jobs.retention-seconds=300
+utiltools.jobs.cleanup-interval-ms=60000
+```
+
+| Property | Default | Meaning |
+| :--- | :--- | :--- |
+| `utiltools.jobs.worker-count` | `2` | Worker threads hashing batches; bounds CPU-wide concurrency |
+| `utiltools.jobs.queue-capacity` | `100` | `ArrayBlockingQueue` slots for accepted-but-not-started jobs; full queue ⇒ `429 QUEUE_FULL` (`AbortPolicy`) |
+| `utiltools.jobs.retention-seconds` | `300` | How long a `COMPLETED`/`FAILED` job (plus its idempotency key) is kept before eviction |
+| `utiltools.jobs.cleanup-interval-ms` | `60000` | Interval of the scheduled eviction pass (`@EnableScheduling`); `QUEUED`/`RUNNING` jobs are never evicted |
+
+#### E. Rate limiting interaction (explicit decision)
+
+Both jobs endpoints live under `/api/v1/utils/**`, so they are **not exempt** from `RateLimitFilter`
+(see [Rate Limiting](#-rate-limiting)): every `POST /api/v1/utils/jobs/hash` **and** every
+`GET /api/v1/utils/jobs/{jobId}` poll consumes one slot of the caller's window budget, because polling a
+job is a normal API call. Being jobs, they are **not** additionally exempted — no entry was added to
+`RateLimitFilter.shouldNotFilter`. Consequences:
+
+- A caller that submits a batch and then polls aggressively can exhaust its own budget and receive
+  `429 RATE_LIMITED` (error `RATE_LIMITED`) *before* the job finishes. This is a client-throttling
+  response, not a job failure: the job keeps running and is still retrievable once `Retry-After` elapses.
+- The two `429` classes are distinguishable by the `error` field: `RATE_LIMITED` (too many calls —
+  honour `Retry-After`) vs `QUEUE_FULL` (executor saturated — retry the **same** `idempotencyKey`).
+- Recommended polling: a batch completes in milliseconds to a few seconds on the default
+  `worker-count=2`, so a small number of polls is enough — **poll no faster than the default rate-limit
+  budget** of `utiltools.ratelimit.requests-per-window=60` per `utiltools.ratelimit.window-ms=60000`
+  (≈ 1 request/second). Polling every `250 ms` would exhaust that budget after ~15 s and then return
+  exactly the `429 RATE_LIMITED` above, so start at ~1 poll/second and back off from there.
+- `Retry-After` is sent **only** on a rejection, never on a successful poll, so honour it after a `429`
+  rather than using it as a cadence. Treat `429 RATE_LIMITED` as "slow down", never as "job gone".
+- The job itself is unaffected by rate limiting and stays retrievable for `utiltools.jobs.retention-seconds`
+  after it becomes terminal (the scheduled eviction pass runs every `utiltools.jobs.cleanup-interval-ms`).
+
+---
+
+## 🚦 Rate Limiting
+
+Every `/api/v1/utils/**` request passes through `RateLimitFilter` before Spring MVC. A
+`SlidingWindowRateLimiter` keeps a fixed-size per-client ring buffer (`long[requests-per-window]`) of
+admitted timestamps and admits a call only while fewer than `requests-per-window` of them fall inside
+the trailing `window-ms` window. Admission is atomic per client, so concurrent requests can never
+exceed the budget.
+
+Rejected requests receive HTTP `429` with the unified envelope and never reach a controller:
+
+```json
+{
+  "success": false,
+  "message": "Rate limit exceeded",
+  "error": "RATE_LIMITED",
+  "details": { "retryAfterSeconds": 42 },
+  "timestamp": "2026-10-31T00:50:00Z"
+}
+```
+
+Response headers on every `/api/v1/utils/*` call (allowed or rejected):
+
+| Header | Meaning |
+| :--- | :--- |
+| `Retry-After` | Seconds until a slot frees (rejections only) |
+| `X-RateLimit-Limit` | Configured `requests-per-window` |
+| `X-RateLimit-Remaining` | Slots left to this client in the current window |
+| `X-RateLimit-Reset` | Seconds until the oldest admitted event leaves the window |
+
+A rejected request consumes no capacity, so a retry when `Retry-After` elapses succeeds. Idle
+client buckets are evicted by a `@Scheduled` cleanup pass, and `max-tracked-clients` bounds the map:
+the oldest idle bucket is dropped first, and once every tracked bucket is active an unseen client is
+rejected with the same `429 RATE_LIMITED` response instead of being inserted.
+
+### Configuration (`application.properties`)
+
+| Property | Default | Purpose |
+| :--- | :--- | :--- |
+| `utiltools.ratelimit.enabled` | `true` | Master switch; `false` passes everything through with no headers |
+| `utiltools.ratelimit.requests-per-window` | `60` | Admitted requests per client per window |
+| `utiltools.ratelimit.window-ms` | `60000` | Sliding window length in milliseconds |
+| `utiltools.ratelimit.cleanup-interval-ms` | `30000` | Fixed delay between idle-bucket cleanup passes |
+| `utiltools.ratelimit.max-tracked-clients` | `10000` | Hard cap on tracked client keys (bounds memory) |
+| `utiltools.ratelimit.trust-forwarded-header` | `false` | Use the first well-formed `X-Forwarded-For` entry as the client key |
+
+> **Scope note:** state is in-process only. `N` replicas of this service provide `N ×
+> requests-per-window` aggregate capacity, and limits are not shared across instances. Distributed
+> limiting (Redis/Bucket4j/gateway) is out of scope. Excluded from limiting: `/actuator`,
+> `/v3/api-docs`, `/swagger-ui`.
+
+---
+
 ## 🛡 Unified Response & Error Handling
 
 When client input fails validation or business rules, `@RestControllerAdvice` formats a clean, standardized error response:
@@ -560,8 +855,11 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Missing required fields (`@NotBlank`, `@NotNull`, etc.) |
 | `400 BAD_REQUEST` | `BAD_REQUEST` | Invalid timezone ID, unsupported hash algorithm, corrupt Base64 |
 | `400 BAD_REQUEST` | `BAD_REQUEST` | Malformed HTTP request body |
+| `404 NOT_FOUND` | `JOB_NOT_FOUND` | Unknown or evicted batch job id |
 | `404 NOT_FOUND` | `NOT_FOUND` | Unknown audit journal entry id |
 | `409 CONFLICT` | `REPLAY_CONFLICT` | Replay of a FAILED, non-deterministic, oversized, or still-PENDING entry |
+| `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Batch job queue is saturated; retry after capacity frees |
+| `429 TOO_MANY_REQUESTS` | `RATE_LIMITED` | Request budget for `/api/v1/utils/*` exhausted (see [Rate Limiting](#-rate-limiting)) |
 | `500 INTERNAL_SERVER_ERROR` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |
 
 ---
@@ -625,9 +923,14 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 ### Test Suite Summary:
 - **`DateTimeServiceTest`**: Epoch parsing, timezone shifts, duration math, boundary checks.
 - **`DateTimeControllerTest`**: Full HTTP endpoint testing with MockMvc.
-- **`CryptoServiceTest`**: Standard hashing vectors, HMAC calculations, Base64 encode/decode, UUID generation.
-- **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing.
+- **`CryptoServiceTest`**: Standard hashing vectors, HMAC calculations, Base64 encode/decode, UUID v4 generation, UUIDv7 fixed-clock vector, `version=V4|V7` parsing, clock-regression monotonicity, and an 8-thread x 10000 duplicate-free concurrency invariant.
+- **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `version=V4|V7` selection, compact UUIDv7, and the 400 unified envelope for an unknown `version`.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries.
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite.
+- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety.
+- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202, 400, 404 `JOB_NOT_FOUND`, 429 `QUEUE_FULL`).
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.
+- **`SlidingWindowRateLimiterTest`**: Exact-cap concurrent admission, deterministic window rollover on a mutable `Clock`, denials consuming no capacity, per-client isolation, idle eviction, and cap enforcement under many spoofed keys.
+- **`RateLimitFilterTest`**: MockMvc proof of the `429 RATE_LIMITED` envelope, `Retry-After`/`X-RateLimit-*` headers, and that a rejected call never invokes the controller.
+- **`RateLimitConfigTest`**: Property binding and overrides, filter registration for `/api/v1/utils/*` ahead of Spring MVC, and the `@Scheduled` cleanup wiring.
 - **`UtiltoolsApiApplicationTests`**: Spring ApplicationContext loading verification.
