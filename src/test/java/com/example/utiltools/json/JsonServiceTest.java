@@ -7,11 +7,14 @@ import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.service.JsonService;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -51,6 +54,56 @@ class JsonServiceTest {
         JsonFormatResponse response = jsonService.format(request);
 
         assertThat(response.formattedJson()).isEqualTo("{\"name\":\"Alice\",\"age\":30}");
+    }
+
+    @Test
+    @DisplayName("Should indent nested JSON with the supplied width of four spaces")
+    void shouldIndentNestedOutputWithWidthFour() {
+        JsonFormatRequest request = new JsonFormatRequest("{\"a\":{\"b\":1}}", false, 4);
+        JsonFormatResponse response = jsonService.format(request);
+
+        String[] lines = response.formattedJson().split("\\R");
+        assertThat(lines).hasSize(5);
+        assertThat(lines[0]).isEqualTo("{");
+        assertThat(lines[1]).isEqualTo("    \"a\" : {");
+        assertThat(lines[2]).isEqualTo("        \"b\" : 1");
+        assertThat(lines[3]).isEqualTo("    }");
+        assertThat(lines[4]).isEqualTo("}");
+    }
+
+    @Test
+    @DisplayName("Should default to two spaces when indent is omitted")
+    void shouldDefaultToTwoSpacesWhenIndentOmitted() throws JsonProcessingException {
+        String json = "{\"a\":{\"b\":1}}";
+        JsonFormatRequest request = new JsonFormatRequest(json, false, null);
+        JsonFormatResponse response = jsonService.format(request);
+
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode node = mapper.readTree(json);
+        assertThat(response.formattedJson())
+                .isEqualTo(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(node));
+    }
+
+    @Test
+    @DisplayName("Should ignore indent when minify is true")
+    void shouldIgnoreIndentWhenMinifyTrue() {
+        JsonFormatRequest request = new JsonFormatRequest("{\"a\":{\"b\":1}}", true, 8);
+        JsonFormatResponse response = jsonService.format(request);
+
+        assertThat(response.formattedJson()).isEqualTo("{\"a\":{\"b\":1}}");
+        assertThat(response.formattedJson()).doesNotContain("\n");
+    }
+
+    @Test
+    @DisplayName("Should compute sizeBytes from the final formatted output")
+    void shouldComputeSizeBytesFromFormattedOutput() {
+        String json = "{\"a\":{\"b\":1}}";
+        JsonFormatResponse indented = jsonService.format(new JsonFormatRequest(json, false, 4));
+        JsonFormatResponse minified = jsonService.format(new JsonFormatRequest(json, true, null));
+
+        assertThat(indented.sizeBytes())
+                .isEqualTo(indented.formattedJson().getBytes(StandardCharsets.UTF_8).length);
+        assertThat(indented.sizeBytes()).isNotEqualTo(minified.sizeBytes());
     }
 
     @Test

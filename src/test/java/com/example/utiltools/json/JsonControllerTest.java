@@ -12,6 +12,7 @@ import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 
+import static org.hamcrest.Matchers.containsString;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -94,5 +95,62 @@ class JsonControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/format - should format nested JSON with four spaces when indent=4")
+    void shouldFormatWithIndentFour() throws Exception {
+        String body = """
+                {
+                    "json": "{\\"a\\":{\\"b\\":1}}",
+                    "indent": 4
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/format")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.formattedJson").value(containsString("\n    \"a\" : {")))
+                .andExpect(jsonPath("$.data.formattedJson").value(containsString("\n        \"b\" : 1")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/format - should reject indent below one")
+    void shouldRejectIndentZero() throws Exception {
+        String body = """
+                {
+                    "json": "{\\"a\\":1}",
+                    "indent": 0
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/format")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]").value("indent must be between 1 and 8"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/format - should reject indent above eight")
+    void shouldRejectIndentNine() throws Exception {
+        String body = """
+                {
+                    "json": "{\\"a\\":1}",
+                    "indent": 9
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/format")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]").value("indent must be between 1 and 8"));
     }
 }
