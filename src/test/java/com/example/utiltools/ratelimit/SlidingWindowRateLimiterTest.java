@@ -356,4 +356,67 @@ class SlidingWindowRateLimiterTest {
         // The active client keeps its true in-window count (one pre-admission + limit - 1).
         assertThat(victimAdmitted.get()).isEqualTo(limit - 1);
     }
+
+    @Test
+    @DisplayName("peek on a disabled limiter reports the full budget with a live reset instant")
+    void peekReportsFallbackStateWhenDisabled() {
+        SlidingWindowRateLimiter limiter = new SlidingWindowRateLimiter(
+                new RateLimitProperties(false, 7, 1000L, 30_000L, 10, false), clock);
+
+        SlidingWindowRateLimiter.Admission peeked = limiter.peek("client");
+
+        assertThat(peeked.allowed()).isTrue();
+        assertThat(peeked.limit()).isEqualTo(7L);
+        assertThat(peeked.remaining()).isEqualTo(7L);
+        assertThat(peeked.retryAfterSeconds()).isZero();
+        // tryAcquire's disabled short-circuit returns resetEpochSeconds == 0; peek must not.
+        long expectedReset = ceilSeconds(clock.millis() + 1000L);
+        assertThat(peeked.resetEpochSeconds()).isGreaterThanOrEqualTo(expectedReset);
+        assertThat(peeked.resetEpochSeconds()).isLessThan(expectedReset + 1000L);
+        assertThat(limiter.trackedClients()).isZero();
+    }
+
+    @Test
+    @DisplayName("peek neither consumes budget nor creates buckets")
+    void peekNeverConsumesBudgetOrCreatesBuckets() {
+        SlidingWindowRateLimiter limiter = limiter(3, 60_000L, 100);
+
+        for (int i = 0; i < 50; i++) {
+            SlidingWindowRateLimiter.Admission peeked = limiter.peek("ghost");
+            assertThat(peeked.remaining()).isEqualTo(3L);
+            assertThat(peeked.allowed()).isTrue();
+        }
+        assertThat(limiter.trackedClients()).isZero();
+
+        int admitted = 0;
+        for (int i = 0; i < 3; i++) {
+            assertThat(limiter.tryAcquire("client").allowed()).isTrue();
+            admitted++;
+            for (int p = 0; p < 5; p++) {
+                SlidingWindowRateLimiter.Admission peeked = limiter.peek("client");
+                assertThat(peeked.limit()).isEqualTo(3L);
+                assertThat(peeked.remaining()).isEqualTo(3L - admitted);
+                assertThat(peeked.remaining()).isBetween(0L, 3L);
+                assertThat(peeked.allowed()).isEqualTo(peeked.remaining() > 0L);
+                assertThat(peeked.resetEpochSeconds())
+                        .isGreaterThanOrEqualTo(clock.instant().getEpochSecond());
+            }
+        }
+        assertThat(limiter.trackedClients()).isEqualTo(1);
+
+        SlidingWindowRateLimiter.Admission exhausted = limiter.peek("client");
+        assertThat(exhausted.allowed()).isFalse();
+        assertThat(exhausted.remaining()).isZero();
+
+        // A read must not shorten the budget either: the filter would still reject this client.
+        assertThat(limiter.tryAcquire("client").allowed()).isFalse();
+
+        clock.advance(Duration.ofMillis(60_000L));
+        assertThat(limiter.peek("client").remaining()).isEqualTo(3L);
+        assertThat(limiter.trackedClients()).isEqualTo(1);
+    }
+
+    private static long ceilSeconds(long millis) {
+        return -Math.floorDiv(-millis, 1000L);
+    }
 }

@@ -4,12 +4,16 @@ import java.time.Instant;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.example.utiltools.common.ApiResponse;
+import com.example.utiltools.common.RequestIdFilter;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -37,6 +41,195 @@ class RateLimitFilterTest {
         return MockMvcBuilders.standaloneSetup(probe)
                 .addFilters(new RateLimitFilter(limiter, properties, objectMapper))
                 .build();
+    }
+
+    /**
+     * Standalone slice wiring the real filter, the real request-id filter (so the envelope carries a
+     * {@code requestId}) and the status controller over one shared limiter.
+     */
+    private MockMvc statusMockMvc(RateLimitProperties properties, SlidingWindowRateLimiter limiter) {
+        return MockMvcBuilders.standaloneSetup(new RateLimitStatusController(limiter, properties, clock))
+                .addFilters(new RequestIdFilter(), new RateLimitFilter(limiter, properties, objectMapper))
+                .build();
+    }
+
+    private static final String STATUS_PATH = "/api/v1/utils/rate-limit/status";
+
+    @Test
+    @DisplayName("status endpoint answers 200 with a success envelope on a fresh client")
+    void statusEndpointReturnsOkEnvelopeAndHeaders() throws Exception {
+        RateLimitProperties properties = properties(true, 5, false);
+        SlidingWindowRateLimiter limiter = new SlidingWindowRateLimiter(properties, clock);
+
+        statusMockMvc(properties, limiter).perform(get(STATUS_PATH))
+                .andExpect(status().isOk())
+                .andExpect(header().exists("X-RateLimit-Limit"))
+                .andExpect(header().exists("X-RateLimit-Remaining"))
+                .andExpect(header().exists("X-RateLimit-Reset"))
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data").isNotEmpty())
+                .andExpect(jsonPath("$.requestId").isNotEmpty())
+                .andExpect(jsonPath("$.error").doesNotExist())
+                .andExpect(jsonPath("$.data.allowed").value(true))
+                .andExpect(jsonPath("$.data.limit").value(5))
+                .andExpect(jsonPath("$.data.remaining").value(4));
+    }
+
+    @Test
+    @DisplayName("status body limits, header values and resetAt agree numerically")
+    void statusEndpointBodyMatchesRateLimitHeaders() throws Exception {
+        RateLimitProperties properties = properties(true, 4, false);
+        SlidingWindowRateLimiter limiter = new SlidingWindowRateLimiter(properties, clock);
+
+        MvcResult result = statusMockMvc(properties, limiter).perform(get(STATUS_PATH))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        JsonNode data = objectMapper.readTree(result.getResponse().getContentAsString()).get("data");
+        assertThat(data.get("limit").isInt()).isTrue();
+        assertThat(data.get("remaining").isInt()).isTrue();
+        assertThat(data.get("resetAt").isIntegralNumber()).isTrue();
+        assertThat(data.get("allowed").isBoolean()).isTrue();
+
+        MockHttpServletResponse response = result.getResponse();
+        assertThat(response.getHeader("X-RateLimit-Limit"))
+                .isEqualTo(Integer.toString(data.get("limit").asInt()));
+        assertThat(response.getHeader("X-RateLimit-Remaining"))
+                .isEqualTo(Integer.toString(data.get("remaining").asInt()));
+        assertThat(response.getHeader("X-RateLimit-Reset"))
+                .isEqualTo(Long.toString(data.get("resetAt").asLong()));
+
+        long resetAt = data.get("resetAt").asLong();
+        assertThat(resetAt).isGreaterThanOrEqualTo(clock.millis() / 1000L);
+        assertThat(resetAt).isLessThanOrEqualTo((clock.millis() + properties.windowMs()) / 1000L + 1L);
+        assertThat(data.get("remaining").asInt()).isGreaterThanOrEqualTo(0);
+    }
+
+    @Test
+    @DisplayName("remaining decrements by one per status call and the next call is the 429")
+    void statusEndpointRemainingTracksSuccessiveRequests() throws Exception {
+        RateLimitProperties properties = properties(true, 3, false);
+        SlidingWindowRateLimiter limiter = new SlidingWindowRateLimiter(properties, clock);
+        MockMvc mvc = statusMockMvc(properties, limiter);
+
+        for (int expectedRemaining = 2; expectedRemaining >= 0; expectedRemaining--) {
+            mvc.perform(get(STATUS_PATH))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.data.limit").value(3))
+                    .andExpect(jsonPath("$.data.remaining").value(expectedRemaining))
+                    .andExpect(jsonPath("$.data.allowed").value(expectedRemaining > 0));
+        }
+
+        // Same bucket, same budget: the read endpoint proves which bucket the filter counts.
+        mvc.perform(get(STATUS_PATH))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(header().string("Retry-After", "60"));
+    }
+
+    @Test
+    @DisplayName("exhausted budget is reported with allowed=false but still HTTP 200")
+    void statusEndpointReportsExhaustedWindowWithoutFailing() throws Exception {
+        RateLimitProperties properties = properties(true, 2, false);
+        SlidingWindowRateLimiter limiter = new SlidingWindowRateLimiter(properties, clock);
+        MockMvc mvc = statusMockMvc(properties, limiter);
+
+        mvc.perform(get(STATUS_PATH)).andExpect(status().isOk());
+
+        MvcResult result = mvc.perform(get(STATUS_PATH))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(header().string("X-RateLimit-Remaining", "0"))
+                .andExpect(jsonPath("$.data.remaining").value(0))
+                .andExpect(jsonPath("$.data.allowed").value(false))
+                .andReturn();
+
+        long resetAt = objectMapper.readTree(result.getResponse().getContentAsString())
+                .get("data").get("resetAt").asLong();
+        assertThat(resetAt).isGreaterThanOrEqualTo(clock.millis() / 1000L);
+        assertThat(resetAt).isEqualTo((clock.millis() + properties.windowMs()) / 1000L);
+
+        mvc.perform(get(STATUS_PATH)).andExpect(status().isTooManyRequests());
+    }
+
+    @Test
+    @DisplayName("disabled limiter reports the full default budget instead of rejecting")
+    void statusEndpointFallsBackToDefaultsWhenDisabled() throws Exception {
+        RateLimitProperties properties = properties(false, 60, false);
+        SlidingWindowRateLimiter limiter = new SlidingWindowRateLimiter(properties, clock);
+
+        MvcResult result = statusMockMvc(properties, limiter).perform(get(STATUS_PATH))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.allowed").value(true))
+                .andExpect(jsonPath("$.data.limit").value(60))
+                .andExpect(jsonPath("$.data.remaining").value(60))
+                .andReturn();
+
+        MockHttpServletResponse response = result.getResponse();
+        assertThat(response.getHeader("X-RateLimit-Limit")).isEqualTo("60");
+        assertThat(response.getHeader("X-RateLimit-Remaining")).isEqualTo("60");
+
+        long windowMs = 60_000L;
+        long expectedReset = (clock.millis() + windowMs) / 1000L;
+        assertThat(objectMapper.readTree(response.getContentAsString()).get("data").get("resetAt").asLong())
+                .isBetween(expectedReset, expectedReset + 1L);
+        assertThat(Long.parseLong(response.getHeader("X-RateLimit-Reset")))
+                .isBetween(expectedReset, expectedReset + 1L);
+    }
+
+    @Test
+    @DisplayName("a failing limiter read fails open with HTTP 200 and the full budget")
+    void statusEndpointFailsOpenWhenLimiterThrows() throws Exception {
+        RateLimitProperties properties = properties(true, 4, false);
+        SlidingWindowRateLimiter throwingLimiter = new SlidingWindowRateLimiter(properties, clock) {
+            @Override
+            public Admission peek(String clientKey) {
+                throw new IllegalStateException("bucket store unavailable");
+            }
+        };
+
+        MvcResult result = statusMockMvc(properties, throwingLimiter).perform(get(STATUS_PATH))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.allowed").value(true))
+                .andExpect(jsonPath("$.data.limit").value(4))
+                .andExpect(jsonPath("$.data.remaining").value(4))
+                .andReturn();
+
+        assertThat(result.getResponse().getStatus()).isEqualTo(200);
+        assertThat(result.getResponse().getHeader("X-RateLimit-Remaining")).isEqualTo("4");
+    }
+
+    @Test
+    @DisplayName("status endpoint and filter resolve the same client key in both trust modes")
+    void statusEndpointUsesSameClientKeyAsFilter() throws Exception {
+        // trust-forwarded-header off: a spoofed header must be ignored by both paths.
+        RateLimitProperties untrusted = properties(true, 3, false);
+        SlidingWindowRateLimiter untrustedLimiter = new SlidingWindowRateLimiter(untrusted, clock);
+        MockMvc untrustedMvc = statusMockMvc(untrusted, untrustedLimiter);
+
+        untrustedMvc.perform(get(STATUS_PATH).header("X-Forwarded-For", "203.0.113.9"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.remaining").value(2));
+        untrustedMvc.perform(get(STATUS_PATH).header("X-Forwarded-For", "198.51.100.7"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.remaining").value(1));
+
+        // trust-forwarded-header on: the first well-formed entry names the bucket for both paths.
+        RateLimitProperties trusted = properties(true, 3, true);
+        SlidingWindowRateLimiter trustedLimiter = new SlidingWindowRateLimiter(trusted, clock);
+        MockMvc trustedMvc = statusMockMvc(trusted, trustedLimiter);
+
+        trustedMvc.perform(get(STATUS_PATH).header("X-Forwarded-For", "203.0.113.9, 10.0.0.1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.remaining").value(2));
+        trustedMvc.perform(get(STATUS_PATH).header("X-Forwarded-For", "198.51.100.7"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.remaining").value(2))
+                .andExpect(jsonPath("$.data.allowed").value(true));
+        trustedMvc.perform(get(STATUS_PATH).header("X-Forwarded-For", "203.0.113.9"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.remaining").value(1));
     }
 
     @Test
