@@ -14,6 +14,8 @@ import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
+import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
+import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.service.DateTimeService;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
@@ -34,7 +36,7 @@ import java.util.Map;
 import java.util.function.Supplier;
 
 /**
- * Journalling facade over the nine existing utility operations.
+ * Journalling facade over the ten existing utility operations.
  *
  * <p>Every journalled call begins a PENDING entry, invokes the underlying service once,
  * and records SUCCEEDED or FAILED before returning/rethrowing. The original exception is
@@ -71,6 +73,10 @@ public class AuditedOperations {
 
     public DateTimeDiffResponse diff(DateTimeDiffRequest request) {
         return record(OperationType.DATETIME_DIFF, request, () -> dateTimeService.diff(request));
+    }
+
+    public DateTimeShiftResponse shift(DateTimeShiftRequest request) {
+        return record(OperationType.DATETIME_SHIFT, request, () -> dateTimeService.shift(request));
     }
 
     public CurrentTimeResponse current(String timeZone) {
@@ -123,6 +129,7 @@ public class AuditedOperations {
         return switch (operation) {
             case DATETIME_CONVERT -> dateTimeService.convert((DateTimeConvertRequest) request);
             case DATETIME_DIFF -> dateTimeService.diff((DateTimeDiffRequest) request);
+            case DATETIME_SHIFT -> dateTimeService.shift((DateTimeShiftRequest) request);
             case DATETIME_CURRENT -> dateTimeService.getCurrentTime(timeZoneOf(request));
             case CRYPTO_HASH -> cryptoService.hash((HashRequest) request);
             case CRYPTO_BASE64 -> cryptoService.base64((Base64Request) request);
