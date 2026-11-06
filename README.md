@@ -774,6 +774,48 @@ marked `VALIDATED`, `resultJson` is `null`, and failures still produce `FAILED` 
 { "json": "{\"name\":\"Alice\"}", "operations": [{ "op": "test", "path": "/name", "value": "Alice" }], "dryRun": true }
 ```
 
+#### E. Circuit breaker & probe lease recovery
+
+The JSONPath query path runs behind a single `CLOSED` / `OPEN` / `HALF_OPEN` circuit breaker, exposed
+read-only by `GET /api/v1/utils/resilience` and driven by hand with `POST /api/v1/utils/resilience/probe`.
+
+```json
+{
+  "success": true,
+  "data": {
+    "name": "json-query",
+    "state": "HALF_OPEN",
+    "consecutiveFailures": 0,
+    "consecutiveSuccesses": 0,
+    "resetAt": "2026-01-01T00:00:30Z",
+    "probeInFlight": true,
+    "probeLeaseExpiresAt": "2026-01-01T00:00:40Z",
+    "auditCapacity": 1024,
+    "audit": []
+  },
+  "message": "Resilience state retrieved",
+  "timestamp": "2026-01-01T00:00:31Z"
+}
+```
+
+| Field | Meaning |
+| :--- | :--- |
+| `probeInFlight` | `true` while a `HALF_OPEN` probe claim is held and its lease has not expired |
+| `probeLeaseExpiresAt` | Deadline of that claim (`null` when the breaker holds no claim) |
+
+Recovery: while a probe lease is live a concurrent caller is refused with `503` `CIRCUIT_OPEN` and reason
+`probe already in flight`. Once the lease expires the claim is superseded — the superseded generation can no
+longer change counters, state or the audit trail, so a probe that hung inside the delegate and returns late is
+ignored — and the next admitted caller claims a fresh generation. The scheduled reaper records exactly one
+`PROBE_LEASE_EXPIRED` audit row per expired generation, so the breaker recovers even with no further traffic.
+
+| Property | Default | Purpose |
+| :--- | :--- | :--- |
+| `utiltools.resilience.probe-lease-seconds` | `10` | Lifetime of a `HALF_OPEN` probe claim before it may be superseded |
+| `utiltools.resilience.probe-reaper-interval-ms` | `5000` | Fixed delay between scheduled sweeps that release expired leases |
+
+> **Scope note:** breaker state, the probe claim and the audit trail are in-process and reset on restart.
+
 ---
 
 ## 🧾 Operation Journal & Replay Verification
@@ -1242,4 +1284,8 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`SlidingWindowRateLimiterTest`**: Exact-cap concurrent admission, deterministic window rollover on a mutable `Clock`, denials consuming no capacity, per-client isolation, idle eviction, and cap enforcement under many spoofed keys.
 - **`RateLimitFilterTest`**: MockMvc proof of the `429 RATE_LIMITED` envelope, `Retry-After`/`X-RateLimit-*` headers, and that a rejected call never invokes the controller.
 - **`RateLimitConfigTest`**: Property binding and overrides, filter registration for `/api/v1/utils/*` ahead of Spring MVC, and the `@Scheduled` cleanup wiring.
+- **`CircuitBreakerTest`**: CLOSED→OPEN thresholds, forced `probe()` semantics, and the `HALF_OPEN` probe lease — a concurrent caller inside the lease gets `CIRCUIT_OPEN` "probe already in flight" with no audit row, a clock advance past the lease admits a new probe with exactly one `PROBE_LEASE_EXPIRED` row, late success and late failure from the superseded generation change no counter/state and append no row, and `reapExpiredProbe()` is idempotent.
+- **`ResilienceControllerTest`**: MockMvc coverage of `GET /api/v1/utils/resilience` (`probeInFlight` / `probeLeaseExpiresAt` in the payload) and of `POST /api/v1/utils/resilience/probe` with the unified envelope.
+- **`AuditTrailTest`**: Bounded audit ring buffer ordering and capacity-eviction behaviour.
+- **`JsonQueryCircuitOpenTest`**: End-to-end proof that an `OPEN` breaker maps to a `503` `CIRCUIT_OPEN` envelope on `/api/v1/utils/json/query`.
 - **`UtiltoolsApiApplicationTests`**: Spring ApplicationContext loading verification.
