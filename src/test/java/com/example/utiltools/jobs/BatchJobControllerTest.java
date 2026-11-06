@@ -207,6 +207,31 @@ class BatchJobControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/retry - the three retry failure modes answer 409, 429 and 404 in one run")
+    void shouldReturn409Then429Then404ForRetryFailuresInOneRun() throws Exception {
+        doThrow(new JobRetryConflictException("job-completed-1", JobStatus.COMPLETED, 3, 3))
+                .when(jobService).retry("job-completed-1");
+        doThrow(new JobQueueFullException("Hash job queue is full (worker-count=2, queue-capacity=100); retry after capacity frees"))
+                .when(jobService).retry("job-failed-3");
+        doThrow(new JobNotFoundException("evicted-1"))
+                .when(jobService).retry("evicted-1");
+
+        // Every retry on one snapshot of the route: conflict first, then saturation, then an id the
+        // eviction pass has already unregistered. Each call must leave the others' routes intact.
+        mockMvc.perform(post("/api/v1/utils/jobs/job-completed-1/retry"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("JOB_RETRY_CONFLICT"))
+                .andExpect(jsonPath("$.details.attempt").value(3))
+                .andExpect(jsonPath("$.details.maxAttempts").value(3));
+        mockMvc.perform(post("/api/v1/utils/jobs/job-failed-3/retry"))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.error").value("QUEUE_FULL"));
+        mockMvc.perform(post("/api/v1/utils/jobs/evicted-1/retry"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error").value("JOB_NOT_FOUND"));
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/jobs/{jobId}/retry - should map a rejected requeue to 429 QUEUE_FULL")
     void shouldReturn429WhenRetryQueueFull() throws Exception {
         doThrow(new JobQueueFullException("Hash job queue is full (worker-count=2, queue-capacity=100); retry after capacity frees"))

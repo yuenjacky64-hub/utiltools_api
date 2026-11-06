@@ -142,6 +142,12 @@ public class BatchHashJobService {
     public BatchHashJobResponse retry(String jobId) {
         MutableJob job = requireJob(jobId); // unknown/evicted -> JobNotFoundException (404 JOB_NOT_FOUND)
         synchronized (job) {
+            // Registry membership is re-checked under the monitor: an eviction pass that acquired
+            // the monitor first has already unregistered this instance, and a 202 for a job the
+            // caller can no longer poll (or that a same-key submit would duplicate) must not happen.
+            if (jobs.get(job.jobId) != job) {
+                throw new JobNotFoundException(job.jobId);
+            }
             if (job.status != JobStatus.FAILED || job.attempt >= job.maxAttempts) {
                 // Thrown before a single field is touched: the 409 leaves the snapshot identical.
                 throw new JobRetryConflictException(job.jobId, job.status, job.attempt, job.maxAttempts);
@@ -206,21 +212,22 @@ public class BatchHashJobService {
     public int evictExpiredJobs(Instant cutoff) {
         int evicted = 0;
         for (MutableJob job : jobs.values()) {
-            boolean evictable;
             synchronized (job) {
-                evictable = (job.status == JobStatus.COMPLETED
+                // Terminality and removal share one monitor section with retry's FAILED -> QUEUED
+                // transition, so a retry can neither slip between the check and the remove nor
+                // target a job this pass has unregistered: either the retry wins (the job is
+                // QUEUED here and is not evicted) or this pass wins (retry re-checks the registry
+                // under the same monitor and answers 404).
+                boolean evictable = (job.status == JobStatus.COMPLETED
                         || job.status == JobStatus.FAILED
                         || job.status == JobStatus.CANCELLED)
                         && job.completedAt != null
                         && job.completedAt.isBefore(cutoff);
-            }
-            if (!evictable) {
-                continue;
-            }
-            if (jobs.remove(job.jobId, job)) {
-                evicted++;
-                if (job.idempotencyKey != null) {
-                    idempotencyIndex.remove(job.idempotencyKey, job.jobId);
+                if (evictable && jobs.remove(job.jobId, job)) {
+                    evicted++;
+                    if (job.idempotencyKey != null) {
+                        idempotencyIndex.remove(job.idempotencyKey, job.jobId);
+                    }
                 }
             }
         }
@@ -276,6 +283,8 @@ public class BatchHashJobService {
             }
             synchronized (job) {
                 if (job.attempt != generation || job.status != JobStatus.RUNNING) {
+                    // Defence-in-depth only: the load-bearing fence is the admission check above,
+                    // because RUNNING jobs are neither retryable nor evictable today.
                     return; // fenced: the attempt was requeued or reaped while hashing
                 }
                 job.results = List.copyOf(results);
@@ -288,6 +297,7 @@ public class BatchHashJobService {
             // Intentional: an Error must not wedge the pool, later jobs still run.
             synchronized (job) {
                 if (job.attempt != generation || job.status != JobStatus.RUNNING) {
+                    // Defence-in-depth only, same reasoning as the COMPLETED fence above.
                     return; // fenced: a superseded failure must not overwrite the retried attempt
                 }
                 job.error = describe(t);

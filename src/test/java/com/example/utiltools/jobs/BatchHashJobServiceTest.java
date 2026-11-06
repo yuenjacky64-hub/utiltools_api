@@ -17,6 +17,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -517,6 +518,94 @@ class BatchHashJobServiceTest {
         assertThat(service.getJob(failed.jobId()).results()).isEqualTo(completed.results());
         assertThat(service.getJob(failed.jobId()).error()).isNull();
         assertThat(service.getJob(failed.jobId()).attempts()).isEqualTo(completed.attempts());
+    }
+
+    @Test
+    @DisplayName("retry - a pass that saw the job FAILED does not evict it once it is requeued")
+    void shouldNotEvictRequeuedJob() throws Exception {
+        CountDownLatch enteredHash = new CountDownLatch(1);
+        CountDownLatch releaseHash = new CountDownLatch(1);
+        RetryCryptoService crypto = new RetryCryptoService("transient", 1, enteredHash, releaseHash, "blocked");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
+
+        BatchHashJobResponse failed = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", List.of("transient"), null, "requeue-key")).jobId(),
+                JobStatus.FAILED);
+
+        // Occupy the single worker so the retried attempt provably stays QUEUED, i.e. the job is
+        // observable in the non-terminal state that eviction must respect.
+        service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
+        assertThat(enteredHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+
+        BatchHashJobResponse requeued = service.retry(failed.jobId());
+        assertThat(requeued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(requeued.attempt()).isEqualTo(2);
+
+        // The cutoff is past every completion instant, so a stale FAILED verdict would evict; the
+        // pass must instead observe the requeued attempt and keep the job pollable.
+        assertThat(service.evictExpiredJobs(Instant.now().plusSeconds(300 + 3600))).isZero();
+        assertThat(service.getJob(failed.jobId())).isEqualTo(requeued);
+
+        releaseHash.countDown();
+        BatchHashJobResponse completed = awaitStatus(failed.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.attempt()).isEqualTo(2);
+        assertThat(completed.attempts()).hasSize(2);
+        assertThat(completed.attempts().get(0).status()).isEqualTo(JobStatus.FAILED);
+        assertThat(completed.attempts().get(1).status()).isEqualTo(JobStatus.COMPLETED);
+    }
+
+    @Test
+    @DisplayName("retry - an accepted retry is never lost to a concurrently running eviction pass")
+    void shouldNeverAcceptRetryForAJobTheEvictionPassRemoves() throws Exception {
+        ExecutorService racers = Executors.newFixedThreadPool(2);
+        try {
+            for (int round = 0; round < 30; round++) {
+                CountDownLatch decided = new CountDownLatch(1);
+                CountDownLatch releaseHash = new CountDownLatch(1);
+                RetryCryptoService crypto = new RetryCryptoService("transient", 1, null, releaseHash, "blocked");
+                BatchHashJobService roundService = new BatchHashJobService(crypto, 1, 10, 300, 3);
+                service = roundService;
+                try {
+                    // Attempt 1 fails on "transient" before "blocked" is reached; the retried
+                    // attempt passes "transient" and blocks in "blocked", so it stays non-terminal.
+                    BatchHashJobResponse failed = awaitStatus(roundService.submit(new BatchHashRequest(
+                            "SHA-256", List.of("transient", "blocked"), null, "race-key")).jobId(),
+                            JobStatus.FAILED);
+                    Instant cutoff = Instant.now().plusSeconds(300 + 3600);
+
+                    Future<BatchHashJobResponse> retryFuture = racers.submit(() -> {
+                        decided.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                        return roundService.retry(failed.jobId());
+                    });
+                    Future<Integer> evictFuture = racers.submit(() -> {
+                        decided.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                        return roundService.evictExpiredJobs(cutoff);
+                    });
+                    decided.countDown();
+
+                    BatchHashJobResponse requeued = null;
+                    try {
+                        requeued = retryFuture.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    } catch (ExecutionException e) {
+                        // The other legal outcome: the pass unregistered the job first, so the
+                        // caller gets 404 instead of a 202 for an unpollable job.
+                        assertThat(e.getCause()).isInstanceOf(JobNotFoundException.class);
+                    }
+                    evictFuture.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+                    if (requeued != null) {
+                        BatchHashJobResponse observed = roundService.getJob(failed.jobId());
+                        assertThat(observed.attempt()).isEqualTo(2);
+                        assertThat(observed.status()).isIn(JobStatus.QUEUED, JobStatus.RUNNING);
+                    }
+                } finally {
+                    releaseHash.countDown();
+                    roundService.shutdown();
+                }
+            }
+        } finally {
+            racers.shutdownNow();
+        }
     }
 
     @Test
