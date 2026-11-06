@@ -4,6 +4,8 @@ import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
+import com.example.utiltools.crypto.dto.UrlRequest;
+import com.example.utiltools.crypto.dto.UrlResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
 import com.example.utiltools.crypto.service.CryptoService;
 import org.junit.jupiter.api.BeforeEach;
@@ -58,6 +60,91 @@ class CryptoServiceTest {
         assertThat(response.digest()).isNotBlank();
         assertThat(response.isHmac()).isTrue();
         assertThat(response.algorithm()).isEqualTo("HmacSHA256");
+    }
+
+    @Test
+    @DisplayName("Should percent-encode in COMPONENT, PATH and FORM modes")
+    void shouldPercentEncodeInEachMode() {
+        String content = "a b/c?d=\u00e9";
+
+        assertThat(cryptoService.url(new UrlRequest("ENCODE", content, "COMPONENT")).result())
+                .isEqualTo("a%20b%2Fc%3Fd%3D%C3%A9");
+        assertThat(cryptoService.url(new UrlRequest("ENCODE", content, "PATH")).result())
+                .isEqualTo("a%20b/c%3Fd%3D%C3%A9");
+        assertThat(cryptoService.url(new UrlRequest("ENCODE", content, "FORM")).result())
+                .isEqualTo("a+b%2Fc%3Fd%3D%C3%A9");
+
+        for (String mode : List.of("COMPONENT", "PATH", "FORM")) {
+            UrlResponse response = cryptoService.url(new UrlRequest("encode", "AZaz09-._~", mode));
+            assertThat(response.result()).isEqualTo("AZaz09-._~");
+            assertThat(response.action()).isEqualTo("ENCODE");
+            assertThat(response.mode()).isEqualTo(mode);
+        }
+    }
+
+    @Test
+    @DisplayName("Should default a missing mode to COMPONENT and normalise case")
+    void shouldDefaultUrlModeToComponent() {
+        UrlResponse response = cryptoService.url(new UrlRequest("encode", "a b", null));
+
+        assertThat(response.mode()).isEqualTo("COMPONENT");
+        assertThat(response.result()).isEqualTo("a%20b");
+
+        assertThat(cryptoService.url(new UrlRequest("encode", "a b", "  ")).mode()).isEqualTo("COMPONENT");
+        assertThat(cryptoService.url(new UrlRequest("ENCODE", "a b", "path")).result()).isEqualTo("a%20b");
+        assertThat(cryptoService.url(new UrlRequest("ENCODE", "a b", "form")).result()).isEqualTo("a+b");
+    }
+
+    @Test
+    @DisplayName("Should decode each mode back to the original content with mode-specific plus handling")
+    void shouldDecodeRoundTripWithModeSpecificPlus() {
+        String content = "a b/c?d=\u00e9";
+
+        assertThat(cryptoService.url(new UrlRequest("DECODE", "a%20b%2Fc%3Fd%3D%C3%A9", "COMPONENT")).result())
+                .isEqualTo(content);
+        assertThat(cryptoService.url(new UrlRequest("DECODE", "a%20b/c%3Fd%3D%C3%A9", "PATH")).result())
+                .isEqualTo(content);
+        assertThat(cryptoService.url(new UrlRequest("DECODE", "a+b%2Fc%3Fd%3D%C3%A9", "FORM")).result())
+                .isEqualTo(content);
+
+        assertThat(cryptoService.url(new UrlRequest("DECODE", "a+b", "FORM")).result()).isEqualTo("a b");
+        assertThat(cryptoService.url(new UrlRequest("DECODE", "a+b", "COMPONENT")).result()).isEqualTo("a+b");
+        assertThat(cryptoService.url(new UrlRequest("DECODE", "a+b", "PATH")).result()).isEqualTo("a+b");
+        for (String mode : List.of("COMPONENT", "PATH", "FORM")) {
+            assertThat(cryptoService.url(new UrlRequest("DECODE", "%2B", mode)).result()).isEqualTo("+");
+        }
+        assertThat(cryptoService.url(new UrlRequest("DECODE", "%2f", "COMPONENT")).result()).isEqualTo("/");
+    }
+
+    @Test
+    @DisplayName("Should reject truncated or non-hex percent escapes with IllegalArgumentException")
+    void shouldRejectMalformedPercentEscape() {
+        for (String malformed : List.of("%2", "%ZZ", "abc%4", "abc%g0", "%")) {
+            assertThatThrownBy(() -> cryptoService.url(new UrlRequest("DECODE", malformed, "COMPONENT")))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("Invalid percent-encoding");
+        }
+    }
+
+    @Test
+    @DisplayName("Should reject undecodable UTF-8 byte sequences with IllegalArgumentException")
+    void shouldRejectUndecodableUtf8() {
+        for (String malformed : List.of("%E9", "%C3", "%FF", "%C0%AF")) {
+            assertThatThrownBy(() -> cryptoService.url(new UrlRequest("DECODE", malformed, "COMPONENT")))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("Invalid UTF-8 sequence");
+        }
+    }
+
+    @Test
+    @DisplayName("Should reject an unknown action or mode with IllegalArgumentException")
+    void shouldRejectUnknownUrlActionAndMode() {
+        assertThatThrownBy(() -> cryptoService.url(new UrlRequest("SCRAMBLE", "abc", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid action");
+        assertThatThrownBy(() -> cryptoService.url(new UrlRequest("ENCODE", "abc", "SEGMENT")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid mode");
     }
 
     @Test
