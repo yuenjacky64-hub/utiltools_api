@@ -330,4 +330,88 @@ class AuditJournalReaperTest {
         assertThat(log.get(0).reason()).isEqualTo(ReapReason.STALE_PENDING);
         assertThat(log.get(0).detail()).contains("stale-pending-seconds");
     }
+
+    @Test
+    @DisplayName("MANUALLY_REAPED is declared between REPLAY_LEASE_EXPIRED and STALE_PENDING")
+    void manuallyReapedValueSitsBetweenLeaseAndStale() {
+        assertThat(ReapReason.values()).contains(ReapReason.MANUALLY_REAPED);
+        assertThat(ReapReason.MANUALLY_REAPED.ordinal())
+                .isGreaterThan(ReapReason.REPLAY_LEASE_EXPIRED.ordinal())
+                .isLessThan(ReapReason.STALE_PENDING.ordinal());
+    }
+
+    @Test
+    @DisplayName("a PENDING entry requested for manual reap becomes FAILED with one REAPED tombstone")
+    void reapsManuallyRequestedPendingEntry() {
+        AuditEntry pending = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000001");
+        assertThat(pending.state()).isEqualTo(JournalState.PENDING);
+
+        assertThat(journal.requestManualReap(pending.id())).isTrue();
+        assertThat(journal.reap()).isEqualTo(1);
+
+        AuditEntry after = journal.find(pending.id()).orElseThrow();
+        assertThat(after.state()).isEqualTo(JournalState.FAILED);
+        assertThat(after.errorCode()).isEqualTo("MANUALLY_REAPED");
+        assertThat(after.completedAt()).isEqualTo(START);
+        assertThat(after.result()).isNull();
+        assertThat(after.createdAt()).isEqualTo(pending.createdAt());
+        assertThat(after.request()).isEqualTo(pending.request());
+
+        List<ReapRecord> log = journal.reapLog(10);
+        assertThat(log).hasSize(1);
+        ReapRecord tombstone = log.get(0);
+        assertThat(tombstone.status()).isEqualTo("REAPED");
+        assertThat(tombstone.entryId()).isEqualTo(pending.id());
+        assertThat(tombstone.operation()).isEqualTo(OperationType.CRYPTO_HASH);
+        assertThat(tombstone.reason()).isEqualTo(ReapReason.MANUALLY_REAPED);
+        assertThat(tombstone.reapedAt()).isEqualTo(START);
+        assertThat(tombstone.detail()).isNotBlank().hasSizeLessThanOrEqualTo(ReapRecord.MAX_DETAIL_LENGTH);
+        assertThat(tombstone.detail()).contains("manually reaped");
+        assertThat(tombstone.toString()).doesNotContain("Hello World").doesNotContain("super-secret-key");
+
+        assertThat(journal.reap()).isZero();
+        assertThat(journal.reapLog(10)).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("a manual reap request wins over the stale-pending sweep")
+    void manualReapWinsOverStalePending() {
+        AuditEntry pending = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000001");
+        assertThat(journal.requestManualReap(pending.id())).isTrue();
+        clock.advanceSeconds(STALE_SECONDS + 1);
+
+        assertThat(journal.reap()).isEqualTo(1);
+
+        AuditEntry after = journal.find(pending.id()).orElseThrow();
+        assertThat(after.state()).isEqualTo(JournalState.FAILED);
+        assertThat(after.errorCode()).isEqualTo("MANUALLY_REAPED");
+        assertThat(after.completedAt()).isEqualTo(START.plusSeconds(STALE_SECONDS + 1));
+
+        List<ReapRecord> log = journal.reapLog(10);
+        assertThat(log).hasSize(1);
+        assertThat(log.get(0).reason()).isEqualTo(ReapReason.MANUALLY_REAPED);
+        assertThat(log.get(0).reason()).isNotEqualTo(ReapReason.STALE_PENDING);
+        assertThat(log.get(0).entryId()).isEqualTo(pending.id());
+    }
+
+    @Test
+    @DisplayName("a manual reap request is ignored for a terminal or unknown entry")
+    void manualReapRequestIsIgnoredForTerminalOrUnknownEntry() {
+        assertThat(journal.requestManualReap("missing-id")).isFalse();
+        assertThat(journal.requestManualReap(null)).isFalse();
+        assertThat(journal.requestManualReap("  ")).isFalse();
+
+        AuditEntry succeeded = succeeded("req-00000001");
+        assertThat(journal.requestManualReap(succeeded.id())).isFalse();
+
+        AuditEntry failed = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000002");
+        journal.fail(failed.id(), "boom");
+        AuditEntry failedBefore = journal.find(failed.id()).orElseThrow();
+        assertThat(journal.requestManualReap(failed.id())).isFalse();
+
+        assertThat(journal.reap()).isZero();
+        assertThat(journal.reapLog(10)).isEmpty();
+        assertThat(journal.find(succeeded.id()).orElseThrow()).isEqualTo(succeeded);
+        assertThat(journal.find(failed.id()).orElseThrow()).isEqualTo(failedBefore);
+    }
 }
