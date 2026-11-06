@@ -8,5 +8,6 @@ import java.time.Instant;
 public record ReplayRecord(
         ReplayState state,
         Instant replayedAt,
-        String detail
+        String detail,
+        Instant leaseExpiresAt
 ) {}
