@@ -778,9 +778,12 @@ marked `VALIDATED`, `resultJson` is `null`, and failures still produce `FAILED` 
 
 ## 🧾 Operation Journal & Replay Verification
 
-Every `/api/v1/utils/**` call is recorded in a **bounded in-memory journal** so a failed hash,
-JSON query, or datetime conversion leaves a trace of what actually executed, and a retry can be
-verified against the original outcome without ever mutating the original entry.
+All ten journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+`datetime/shift`, `crypto/hash`, `crypto/base64`, `crypto/uuid`, `json/format`, `json/validate`,
+`json/query` — are recorded in a **bounded in-memory journal** so a failed hash, JSON query, or
+datetime conversion leaves a trace of what actually executed, and a retry can be verified against
+the original outcome without ever mutating the original entry. `GET /api/v1/utils/datetime/timezones`
+is read-only catalogue metadata and is not journalled.
 
 **Lifecycle:** `PENDING` on entry → `SUCCEEDED` with the response DTO, or `FAILED` with an
 `errorCode` (`BAD_REQUEST` / `INTERNAL_SERVER_ERROR`). Only `PENDING → SUCCEEDED` and
