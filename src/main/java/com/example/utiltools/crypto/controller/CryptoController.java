@@ -6,6 +6,8 @@ import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
+import com.example.utiltools.crypto.dto.UrlRequest;
+import com.example.utiltools.crypto.dto.UrlResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -19,7 +21,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/v1/utils/crypto")
-@Tag(name = "Crypto & Encoding Utility", description = "Endpoints for cryptographic hashing, HMAC signatures, Base64 encoding/decoding, and UUID generation")
+@Tag(name = "Crypto & Encoding Utility", description = "Endpoints for cryptographic hashing, HMAC signatures, Base64 encoding/decoding, URL percent-encoding/decoding, and UUID generation")
 public class CryptoController {
 
     private final AuditedOperations auditedOperations;
@@ -40,6 +42,13 @@ public class CryptoController {
     public ApiResponse<Base64Response> base64(@Valid @RequestBody Base64Request request) {
         Base64Response result = auditedOperations.base64(request);
         return ApiResponse.success(result, "Base64 operation completed successfully");
+    }
+
+    @PostMapping("/url")
+    @Operation(summary = "Percent-encode or decode URL components", description = "Deterministic UTF-8 percent-encoding for COMPONENT (RFC 3986 unreserved bytes, space as %20), PATH (additionally preserves /) and FORM (application/x-www-form-urlencoded, space as +) modes")
+    public ApiResponse<UrlResponse> url(@Valid @RequestBody UrlRequest request) {
+        UrlResponse result = auditedOperations.url(request);
+        return ApiResponse.success(result, "URL operation completed successfully");
     }
 
     @GetMapping("/uuid")

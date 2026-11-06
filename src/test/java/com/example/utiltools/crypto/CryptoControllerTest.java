@@ -1,7 +1,13 @@
 package com.example.utiltools.crypto;
 
 import com.example.utiltools.audit.AuditTestSupport;
+import com.example.utiltools.audit.controller.AuditController;
+import com.example.utiltools.audit.model.AuditEntry;
+import com.example.utiltools.audit.model.JournalState;
+import com.example.utiltools.audit.model.OperationType;
+import com.example.utiltools.audit.model.ReplayState;
 import com.example.utiltools.audit.service.AuditJournalService;
+import com.example.utiltools.audit.service.AuditReplayService;
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.GlobalExceptionHandler;
 import com.example.utiltools.datetime.service.DateTimeService;
@@ -31,9 +37,10 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-@WebMvcTest(CryptoController.class)
-@Import({AuditTestSupport.class, AuditJournalService.class, AuditedOperations.class, CryptoService.class, DateTimeService.class,
-        JsonService.class, TextService.class, ResilienceConfig.class, GlobalExceptionHandler.class})
+@WebMvcTest({CryptoController.class, AuditController.class})
+@Import({AuditTestSupport.class, AuditJournalService.class, AuditedOperations.class, AuditReplayService.class, CryptoService.class,
+        DateTimeService.class, JsonService.class, TextService.class, ResilienceConfig.class,
+        GlobalExceptionHandler.class})
 @TestPropertySource(properties = {"utiltools.audit.max-entries=200", "utiltools.audit.max-replay-bytes=65536"})
 class CryptoControllerTest {
 
@@ -42,6 +49,9 @@ class CryptoControllerTest {
 
     @Autowired
     private MockMvc mockMvc;
+
+    @Autowired
+    private AuditJournalService journal;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -189,5 +199,193 @@ class CryptoControllerTest {
                 .andExpect(header().string("X-Request-Id", "corr-crypto5678"))
                 .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
                 .andExpect(jsonPath("$.requestId").value("corr-crypto5678"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/url - should encode for each mode")
+    void shouldPercentEncodeViaController() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "content": "a b/c?d=\\u00e9", "mode": "COMPONENT"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("URL operation completed successfully"))
+                .andExpect(jsonPath("$.data.action").value("ENCODE"))
+                .andExpect(jsonPath("$.data.mode").value("COMPONENT"))
+                .andExpect(jsonPath("$.data.result").value("a%20b%2Fc%3Fd%3D%C3%A9"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "encode", "content": "a b/c?d=\\u00e9", "mode": "path"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.mode").value("PATH"))
+                .andExpect(jsonPath("$.data.result").value("a%20b/c%3Fd%3D%C3%A9"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "content": "a b/c?d=\\u00e9", "mode": "FORM"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.result").value("a+b%2Fc%3Fd%3D%C3%A9"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/url - should default mode to COMPONENT and decode round trips")
+    void shouldDecodeUrlWithModeSemantics() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "DECODE", "content": "a%20b%2Fc"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.mode").value("COMPONENT"))
+                .andExpect(jsonPath("$.data.result").value("a b/c"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "DECODE", "content": "a+b", "mode": "FORM"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.result").value("a b"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "DECODE", "content": "a+b", "mode": "COMPONENT"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.result").value("a+b"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "DECODE", "content": "%2B", "mode": "FORM"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.result").value("+"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/url - should answer 400 for malformed escapes and invalid input")
+    void shouldReturnValidationAndBadRequestErrors() throws Exception {
+        for (String malformed : List.of("%2", "%ZZ", "%E9")) {
+            mockMvc.perform(post("/api/v1/utils/crypto/url")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("""
+                                    {"action": "DECODE", "content": "%s", "mode": "COMPONENT"}
+                                    """.formatted(malformed)))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.success").value(false))
+                    .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+        }
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "SCRAMBLE", "content": "abc"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "content": "abc", "mode": "SEGMENT"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "content": "   "}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/url - should journal a SUCCEEDED CRYPTO_URL entry")
+    void shouldJournalUrlOperation() throws Exception {
+        int before = (int) journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_URL)
+                .count();
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "content": "a b", "mode": "PATH"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.result").value("a%20b"));
+
+        List<AuditEntry> urls = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_URL)
+                .toList();
+        assertThat(urls).hasSize(before + 1);
+        AuditEntry entry = urls.get(0);
+        assertThat(entry.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entry.replayable()).isTrue();
+        assertThat(entry.result().path("result").asText()).isEqualTo("a%20b");
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "DECODE", "content": "%2", "mode": "COMPONENT"}
+                                """))
+                .andExpect(status().isBadRequest());
+
+        urls = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_URL)
+                .toList();
+        assertThat(urls).hasSize(before + 2);
+        assertThat(urls.get(0).state()).isEqualTo(JournalState.FAILED);
+        assertThat(urls.get(0).errorCode()).isEqualTo("BAD_REQUEST");
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/url - replay of a CRYPTO_URL entry is VERIFIED and leaves it untouched")
+    void shouldReplayUrlOperationAsVerified() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/url")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "content": "a b", "mode": "PATH"}
+                                """))
+                .andExpect(status().isOk());
+
+        int before = (int) journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_URL)
+                .count();
+        AuditEntry entry = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_URL)
+                .findFirst()
+                .orElseThrow();
+
+        String replayBody = mockMvc.perform(post("/api/v1/utils/audit/entries/" + entry.id() + "/replay"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value(ReplayState.VERIFIED.name()))
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+
+        JsonNode replayed = objectMapper.readTree(replayBody).path("data");
+        assertThat(replayed.path("state").asText()).isEqualTo(JournalState.SUCCEEDED.name());
+        assertThat(replayed.path("result").path("result").asText()).isEqualTo("a%20b");
+        assertThat(replayed.path("completedAt").asText()).isEqualTo(entry.completedAt().toString());
+
+        List<AuditEntry> after = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_URL)
+                .toList();
+        assertThat(after).hasSize(before);
+        AuditEntry stored = after.stream().filter(e -> e.id().equals(entry.id())).findFirst().orElseThrow();
+        assertThat(stored.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(stored.result()).isEqualTo(entry.result());
+        assertThat(stored.completedAt()).isEqualTo(entry.completedAt());
     }
 }

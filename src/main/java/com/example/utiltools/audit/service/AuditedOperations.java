@@ -7,6 +7,8 @@ import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
+import com.example.utiltools.crypto.dto.UrlRequest;
+import com.example.utiltools.crypto.dto.UrlResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
 import com.example.utiltools.crypto.service.CryptoService;
 import com.example.utiltools.datetime.dto.CurrentTimeResponse;
@@ -93,6 +95,10 @@ public class AuditedOperations {
         return record(OperationType.CRYPTO_BASE64, request, () -> cryptoService.base64(request));
     }
 
+    public UrlResponse url(UrlRequest request) {
+        return record(OperationType.CRYPTO_URL, request, () -> cryptoService.url(request));
+    }
+
     public UuidResponse uuid(int count, boolean compact, String version) {
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("count", count);
@@ -133,6 +139,7 @@ public class AuditedOperations {
             case DATETIME_CURRENT -> dateTimeService.getCurrentTime(timeZoneOf(request));
             case CRYPTO_HASH -> cryptoService.hash((HashRequest) request);
             case CRYPTO_BASE64 -> cryptoService.base64((Base64Request) request);
+            case CRYPTO_URL -> cryptoService.url((UrlRequest) request);
             case CRYPTO_UUID -> cryptoService.generateUuids(intOf(request, "count"), booleanOf(request, "compact"),
                     stringOf(request, "version"));
             case JSON_FORMAT -> jsonService.format((JsonFormatRequest) request);
