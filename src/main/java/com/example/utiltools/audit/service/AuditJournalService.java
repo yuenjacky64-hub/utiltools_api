@@ -3,6 +3,8 @@ package com.example.utiltools.audit.service;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
 import com.example.utiltools.audit.model.OperationType;
+import com.example.utiltools.audit.model.ReapReason;
+import com.example.utiltools.audit.model.ReapRecord;
 import com.example.utiltools.audit.model.ReplayRecord;
 import com.example.utiltools.audit.model.ReplayState;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -18,6 +20,7 @@ import org.springframework.stereotype.Service;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -53,6 +56,14 @@ public class AuditJournalService {
 
     private static final String STALE_PENDING_REAPED = "STALE_PENDING_REAPED";
 
+    private static final String REPLAY_LEASE_EXPIRED_DETAIL = "replay claim lease expired";
+
+    private static final String OVERSIZE_PAYLOAD_DETAIL =
+            "request payload exceeds utiltools.audit.max-replay-bytes";
+
+    private static final String STALE_PENDING_DETAIL =
+            "PENDING entry older than utiltools.audit.stale-pending-seconds";
+
     static final int MAX_DETAIL_LENGTH = 200;
 
     private final ObjectMapper objectMapper;
@@ -64,6 +75,8 @@ public class AuditJournalService {
 
     private final Object lock = new Object();
     private final LinkedHashMap<String, JournalRecord> entries = new LinkedHashMap<>();
+    /** Bounded, newest-last audit trail of reaped entries; trimmed to {@code maxEntries}. */
+    private final ArrayDeque<ReapRecord> reaped = new ArrayDeque<>();
 
     /**
      * Production constructor: lease deadlines are measured with the application-wide
@@ -152,12 +165,123 @@ public class AuditJournalService {
     }
 
     /**
-     * Scheduled stale-PENDING sweep; delegates to the clock-free variant with a cutoff derived
-     * from {@code utiltools.audit.stale-pending-seconds}.
+     * Scheduled cleanup sweep, the single scheduled entry point of the journal. Runs every
+     * {@code utiltools.audit.cleanup-interval-ms} (fixed delay, so passes never overlap) and
+     * delegates to the clock-free {@link #reap()} body.
      */
     @Scheduled(fixedDelayString = "${utiltools.audit.cleanup-interval-ms:60000}")
+    public void reapJournal() {
+        reap();
+    }
+
+    /**
+     * Stale-PENDING sweep; delegates to the clock-free variant with a cutoff derived from
+     * {@code utiltools.audit.stale-pending-seconds}. No longer scheduled on its own — the
+     * {@link #reapJournal()} reaper covers this scenario.
+     */
     public void reapStalePending() {
         reapStalePending(Instant.now(clock).minusSeconds(stalePendingSeconds));
+    }
+
+    /**
+     * One reaping pass over the journal, executed entirely under the journal lock so a pass can
+     * never observe or produce a half-applied transition.
+     *
+     * <p>Each entry is classified with a fixed precedence and receives at most one reason per
+     * pass: an expired {@code IN_PROGRESS} replay claim is rolled back to {@code FAILED} without
+     * touching the entry, an orphaned PENDING entry older than
+     * {@code utiltools.audit.stale-pending-seconds} is moved to {@code FAILED} with
+     * {@code STALE_PENDING_REAPED}, and an entry that was already terminal when the pass started
+     * and is not replayable is reclaimed (removed) because its payload exceeded
+     * {@code utiltools.audit.max-replay-bytes}. Every reap leaves one bounded {@link ReapRecord}
+     * tombstone.</p>
+     *
+     * @return the number of reaped entries/tombstones produced by this pass
+     */
+    public int reap() {
+        Instant now = Instant.now(clock);
+        Instant staleCutoff = now.minusSeconds(stalePendingSeconds);
+        int reapedCount = 0;
+        synchronized (lock) {
+            List<Map.Entry<String, JournalRecord>> snapshot = new ArrayList<>(entries.entrySet());
+            List<String> reclaimed = new ArrayList<>();
+            for (Map.Entry<String, JournalRecord> candidate : snapshot) {
+                String id = candidate.getKey();
+                JournalRecord record = candidate.getValue();
+                AuditEntry base = record.base;
+                JournalState stateAtScan = base.state();
+
+                ReplayRecord claim = record.replay;
+                if (claim != null && claim.state() == ReplayState.IN_PROGRESS
+                        && claim.leaseExpiresAt() != null
+                        && !claim.leaseExpiresAt().isAfter(now)) {
+                    ReplayRecord rolledBack = new ReplayRecord(ReplayState.FAILED, now,
+                            boundedDetail(ReplayState.FAILED, REPLAY_LEASE_EXPIRED_DETAIL
+                                    + " at " + claim.leaseExpiresAt()), null);
+                    record.replayOwnerToken = null;
+                    record.replay = rolledBack;
+                    record.base = withReplay(base, rolledBack);
+                    recordReap(id, base.operation(), ReapReason.REPLAY_LEASE_EXPIRED,
+                            REPLAY_LEASE_EXPIRED_DETAIL, now);
+                    reapedCount++;
+                    continue;
+                }
+
+                if (stateAtScan == JournalState.PENDING && base.createdAt() != null
+                        && base.createdAt().isBefore(staleCutoff)) {
+                    record.base = new AuditEntry(base.id(), base.requestId(), base.operation(),
+                            JournalState.FAILED, base.createdAt(), now, base.request(), null,
+                            STALE_PENDING_REAPED, base.replayable(), record.replay);
+                    recordReap(id, base.operation(), ReapReason.STALE_PENDING,
+                            STALE_PENDING_DETAIL, now);
+                    reapedCount++;
+                    continue;
+                }
+
+                if (stateAtScan != JournalState.PENDING && !base.replayable()) {
+                    reclaimed.add(id);
+                    recordReap(id, base.operation(), ReapReason.OVERSIZE_PAYLOAD,
+                            OVERSIZE_PAYLOAD_DETAIL, now);
+                    reapedCount++;
+                }
+            }
+            for (String id : reclaimed) {
+                entries.remove(id);
+            }
+            enforceBound();
+        }
+        return reapedCount;
+    }
+
+    /**
+     * Newest-first snapshot of reaped-entry tombstones, clamped to {@code [1, maxEntries]}.
+     */
+    public List<ReapRecord> reapLog(int limit) {
+        int effectiveLimit = Math.min(Math.max(1, limit), maxEntries);
+        synchronized (lock) {
+            List<ReapRecord> snapshot = new ArrayList<>();
+            Iterator<ReapRecord> it = reaped.descendingIterator();
+            while (it.hasNext() && snapshot.size() < effectiveLimit) {
+                snapshot.add(it.next());
+            }
+            return snapshot;
+        }
+    }
+
+    /** Assumes the lock is held. Appends a tombstone and keeps the log bounded. */
+    private void recordReap(String entryId, OperationType operation, ReapReason reason,
+                            String detail, Instant reapedAt) {
+        reaped.addLast(ReapRecord.reaped(entryId, operation, reason, detail, reapedAt));
+        while (reaped.size() > maxEntries) {
+            reaped.removeFirst();
+        }
+    }
+
+    /** Assumes the lock is held. Oldest-first eviction so {@code size() <= maxEntries} holds. */
+    private void enforceBound() {
+        while (entries.size() > maxEntries) {
+            entries.remove(entries.keySet().iterator().next());
+        }
     }
 
     /**
