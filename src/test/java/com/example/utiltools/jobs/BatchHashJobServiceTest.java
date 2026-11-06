@@ -273,14 +273,16 @@ class BatchHashJobServiceTest {
             assertThat(conflict.existingJobId()).isEqualTo(winnerJobId);
         });
 
+        // Wait for the winner's single execution to reach a terminal state BEFORE counting, so the
+        // hash-count assertions observe a finished job instead of racing the worker thread.
+        assertThat(awaitStatus(winnerJobId, JobStatus.COMPLETED).itemCount()).isEqualTo(1);
+
         // Only the winning payload ran, exactly once.
         int hashedA = crypto.count("a");
         int hashedB = crypto.count("b");
         assertThat(hashedA + hashedB).isEqualTo(1);
         assertThat(Math.max(hashedA, hashedB)).isEqualTo(1);
         assertThat(Math.min(hashedA, hashedB)).isZero();
-
-        assertThat(awaitStatus(winnerJobId, JobStatus.COMPLETED).itemCount()).isEqualTo(1);
         assertThat(registryKeys("jobs")).containsExactly(winnerJobId);
         assertThat(registryKeys("idempotencyIndex")).containsExactly(key);
     }
