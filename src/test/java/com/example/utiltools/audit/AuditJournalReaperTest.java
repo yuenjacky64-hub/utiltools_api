@@ -20,6 +20,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -138,6 +139,35 @@ class AuditJournalReaperTest {
         assertThat(tombstone.toString()).doesNotContain("Hello World").doesNotContain("super-secret-key");
 
         assertThat(bounded.reap()).isZero();
+    }
+
+    @Test
+    @DisplayName("an oversize RESULT with an in-bounds request keeps its audit record")
+    void keepsOversizeResultEntryWithInBoundsRequest() {
+        AuditJournalService bounded = new AuditJournalService(new ObjectMapper(), MAX_ENTRIES, 64,
+                STALE_SECONDS, LEASE_SECONDS, clock);
+        AuditEntry pending = bounded.begin(OperationType.CRYPTO_HASH,
+                Map.of("input", "Hello World"), "req-00000001");
+        assertThat(pending.replayable()).isTrue();
+
+        AuditEntry terminal = bounded.succeed(pending.id(), "x".repeat(200));
+        assertThat(terminal.replayable()).isFalse();
+        assertThat(terminal.state()).isEqualTo(JournalState.SUCCEEDED);
+
+        assertThat(bounded.reap()).isZero();
+        assertThat(bounded.reapLog(10)).isEmpty();
+
+        AuditEntry after = bounded.find(pending.id()).orElseThrow();
+        assertThat(after.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(after.completedAt()).isEqualTo(terminal.completedAt());
+        assertThat(after.result()).isEqualTo(terminal.result());
+        assertThat(after.result().toString()).doesNotContain("x".repeat(10));
+        assertThat(after.request()).isEqualTo(pending.request());
+        assertThat(after.replayable()).isFalse();
+        assertThat(bounded.size()).isEqualTo(1);
+
+        assertThat(bounded.reap()).isZero();
+        assertThat(bounded.find(pending.id())).isPresent();
     }
 
     @Test
@@ -292,6 +322,12 @@ class AuditJournalReaperTest {
         AuditEntry reaped = journal.find(stale.id()).orElseThrow();
         assertThat(reaped.state()).isEqualTo(JournalState.FAILED);
         assertThat(reaped.errorCode()).isEqualTo("STALE_PENDING_REAPED");
-        assertThat(journal.reapLog(10)).isEmpty();
+
+        List<ReapRecord> log = journal.reapLog(10);
+        assertThat(log).hasSize(1);
+        assertThat(log.get(0).status()).isEqualTo("REAPED");
+        assertThat(log.get(0).entryId()).isEqualTo(stale.id());
+        assertThat(log.get(0).reason()).isEqualTo(ReapReason.STALE_PENDING);
+        assertThat(log.get(0).detail()).contains("stale-pending-seconds");
     }
 }

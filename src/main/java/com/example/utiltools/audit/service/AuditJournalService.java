@@ -64,7 +64,8 @@ public class AuditJournalService {
     private static final String STALE_PENDING_DETAIL =
             "PENDING entry older than utiltools.audit.stale-pending-seconds";
 
-    static final int MAX_DETAIL_LENGTH = 200;
+    /** Single source of truth for bounded detail length, shared with {@link ReapRecord}. */
+    static final int MAX_DETAIL_LENGTH = ReapRecord.MAX_DETAIL_LENGTH;
 
     private final ObjectMapper objectMapper;
     private final int maxEntries;
@@ -109,6 +110,7 @@ public class AuditJournalService {
     public AuditEntry begin(OperationType operation, Object request, String requestId) {
         JsonNode tree = objectMapper.valueToTree(request);
         boolean replayable = tree != null && serializedBytes(tree) <= maxReplayBytes;
+        boolean requestOversize = tree != null && !replayable;
         JsonNode storedRequest = tree == null ? null : (replayable ? redact(tree) : withheldPayload());
 
         synchronized (lock) {
@@ -118,7 +120,7 @@ public class AuditJournalService {
             String id = UUID.randomUUID().toString();
             AuditEntry base = new AuditEntry(id, requestId, operation, JournalState.PENDING,
                     Instant.now(clock), null, storedRequest, null, null, replayable, null);
-            entries.put(id, new JournalRecord(base, replayable ? request : null, null));
+            entries.put(id, new JournalRecord(base, replayable ? request : null, null, requestOversize));
             return base;
         }
     }
@@ -192,8 +194,10 @@ public class AuditJournalService {
      * touching the entry, an orphaned PENDING entry older than
      * {@code utiltools.audit.stale-pending-seconds} is moved to {@code FAILED} with
      * {@code STALE_PENDING_REAPED}, and an entry that was already terminal when the pass started
-     * and is not replayable is reclaimed (removed) because its payload exceeded
-     * {@code utiltools.audit.max-replay-bytes}. Every reap leaves one bounded {@link ReapRecord}
+     * and whose <em>request</em> exceeded {@code utiltools.audit.max-replay-bytes} at {@code begin()}
+     * (so the payload was withheld) is reclaimed (removed). An entry whose replayable flag was
+     * cleared only because its <em>result</em> was oversize keeps a truthful {@code SUCCEEDED}
+     * record and is never reclaimed. Every reap leaves one bounded {@link ReapRecord}
      * tombstone.</p>
      *
      * @return the number of reaped entries/tombstones produced by this pass
@@ -238,7 +242,7 @@ public class AuditJournalService {
                     continue;
                 }
 
-                if (stateAtScan != JournalState.PENDING && !base.replayable()) {
+                if (stateAtScan != JournalState.PENDING && record.requestOversize) {
                     reclaimed.add(id);
                     recordReap(id, base.operation(), ReapReason.OVERSIZE_PAYLOAD,
                             OVERSIZE_PAYLOAD_DETAIL, now);
@@ -288,6 +292,9 @@ public class AuditJournalService {
      * Marks PENDING entries created before {@code cutoff} as FAILED with STALE_PENDING_REAPED.
      * Public and clock-free so tests advance the cutoff instead of waiting.
      *
+     * <p>Leaves the same bounded {@code STALE_PENDING} {@link ReapRecord} tombstone as the
+     * {@link #reap()} pass, so this legacy sweep cannot bypass REQ-03's audit trail.</p>
+     *
      * @return the number of reaped entries
      */
     public int reapStalePending(Instant cutoff) {
@@ -303,6 +310,8 @@ public class AuditJournalService {
                     record.base = new AuditEntry(base.id(), base.requestId(), base.operation(),
                             JournalState.FAILED, base.createdAt(), reapedAt, base.request(), null,
                             STALE_PENDING_REAPED, base.replayable(), record.replay);
+                    recordReap(base.id(), base.operation(), ReapReason.STALE_PENDING,
+                            STALE_PENDING_DETAIL, reapedAt);
                     reaped++;
                 }
             }
@@ -513,13 +522,17 @@ public class AuditJournalService {
     private static final class JournalRecord {
         private AuditEntry base;
         private final Object originalRequest;
+        /** Set when {@code begin()} withheld the request because it exceeded max-replay-bytes. */
+        private final boolean requestOversize;
         private ReplayRecord replay;
         private String replayOwnerToken;
 
-        private JournalRecord(AuditEntry base, Object originalRequest, ReplayRecord replay) {
+        private JournalRecord(AuditEntry base, Object originalRequest, ReplayRecord replay,
+                              boolean requestOversize) {
             this.base = base;
             this.originalRequest = originalRequest;
             this.replay = replay;
+            this.requestOversize = requestOversize;
         }
     }
 }
