@@ -29,7 +29,7 @@ public class ResilienceController {
     }
 
     @GetMapping
-    @Operation(summary = "Inspect circuit breaker state", description = "Returns the live breaker state, consecutive failure/success counters, the cooldown reset time, and the most recent transition audit entries")
+    @Operation(summary = "Inspect circuit breaker state", description = "Returns the live breaker state, consecutive failure/success counters, the cooldown reset time, the live HALF_OPEN probe claim and lease deadline, and the most recent transition audit entries")
     public ApiResponse<ResilienceResponse> state(@RequestParam(defaultValue = "20") int limit) {
         int bounded = Math.max(0, Math.min(limit, circuitBreaker.auditTrail().capacity()));
         ResilienceResponse response = new ResilienceResponse(
@@ -38,6 +38,8 @@ public class ResilienceController {
                 circuitBreaker.consecutiveFailures(),
                 circuitBreaker.consecutiveSuccesses(),
                 circuitBreaker.resetAt(),
+                circuitBreaker.probeInFlight(),
+                circuitBreaker.probeLeaseExpiresAt(),
                 circuitBreaker.auditTrail().capacity(),
                 circuitBreaker.auditTrail().recent(bounded));
         return ApiResponse.success(response, "Resilience state retrieved");

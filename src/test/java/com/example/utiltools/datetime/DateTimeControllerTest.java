@@ -1,11 +1,13 @@
 package com.example.utiltools.datetime;
 
+import com.example.utiltools.audit.AuditTestSupport;
 import com.example.utiltools.audit.service.AuditJournalService;
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.GlobalExceptionHandler;
 import com.example.utiltools.crypto.service.CryptoService;
 import com.example.utiltools.datetime.service.DateTimeService;
 import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.text.service.TextService;
 import com.example.utiltools.resilience.ResilienceConfig;
 import com.example.utiltools.datetime.controller.DateTimeController;
 import org.junit.jupiter.api.DisplayName;
@@ -26,8 +28,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(DateTimeController.class)
-@Import({AuditJournalService.class, AuditedOperations.class, CryptoService.class, DateTimeService.class,
-        JsonService.class, ResilienceConfig.class, GlobalExceptionHandler.class})
+@Import({AuditTestSupport.class, AuditJournalService.class, AuditedOperations.class, CryptoService.class, DateTimeService.class,
+        JsonService.class, TextService.class, ResilienceConfig.class, GlobalExceptionHandler.class})
 @TestPropertySource(properties = {"utiltools.audit.max-entries=200", "utiltools.audit.max-replay-bytes=65536"})
 class DateTimeControllerTest {
 

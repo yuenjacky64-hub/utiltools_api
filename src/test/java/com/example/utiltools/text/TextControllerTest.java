@@ -1,0 +1,171 @@
+package com.example.utiltools.text;
+
+import com.example.utiltools.audit.AuditTestSupport;
+import com.example.utiltools.audit.controller.AuditController;
+import com.example.utiltools.audit.model.AuditEntry;
+import com.example.utiltools.audit.model.OperationType;
+import com.example.utiltools.audit.service.AuditJournalService;
+import com.example.utiltools.audit.service.AuditReplayService;
+import com.example.utiltools.audit.service.AuditedOperations;
+import com.example.utiltools.common.GlobalExceptionHandler;
+import com.example.utiltools.crypto.service.CryptoService;
+import com.example.utiltools.datetime.service.DateTimeService;
+import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.resilience.ResilienceConfig;
+import com.example.utiltools.text.controller.TextController;
+import com.example.utiltools.text.service.TextService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.context.annotation.Import;
+import org.springframework.http.MediaType;
+import org.springframework.test.context.TestPropertySource;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
+
+import java.time.Instant;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.hasItem;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+@WebMvcTest({TextController.class, AuditController.class})
+@Import({AuditTestSupport.class, AuditJournalService.class, AuditedOperations.class, AuditReplayService.class,
+        CryptoService.class, DateTimeService.class, JsonService.class, TextService.class,
+        GlobalExceptionHandler.class, ResilienceConfig.class})
+@TestPropertySource(properties = {"utiltools.audit.max-entries=200", "utiltools.audit.max-replay-bytes=65536"})
+class TextControllerTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @Autowired
+    private AuditJournalService journal;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/transform - should transform to snake case")
+    void shouldTransformToSnakeCase() throws Exception {
+        String body = """
+                {
+                    "text": "Hello, World!",
+                    "operation": "SNAKE"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/text/transform")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Text transformed successfully"))
+                .andExpect(jsonPath("$.data.operation").value("SNAKE"))
+                .andExpect(jsonPath("$.data.result").value("hello_world"))
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.length").value(11));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/transform - slugs diacritics and rejects unknown operations with 400")
+    void shouldSlugDiacriticsAndRejectUnknownOperation() throws Exception {
+        String body = """
+                {
+                    "text": "Café déjà vu!",
+                    "operation": "SLUG"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/text/transform")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("SLUG"))
+                .andExpect(jsonPath("$.data.result").value("cafe-deja-vu"))
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.length").value(12));
+
+        String unknown = """
+                {
+                    "text": "Hello, World!",
+                    "operation": "shout"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/text/transform")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(unknown))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("Unsupported operation 'shout'")))
+                .andExpect(jsonPath("$.message").value(containsString(
+                        "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG")));
+    }
+
+    @Test
+    @DisplayName("blank text returns 400 VALIDATION_ERROR on both endpoints")
+    void shouldRejectBlankText() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/transform")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "   ", "operation": "SNAKE"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("text is required")));
+
+        mockMvc.perform(post("/api/v1/utils/text/stats")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": ""}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("text is required")));
+    }
+
+    @Test
+    @DisplayName("a transform call is journalled as TEXT_TRANSFORM and replays as VERIFIED")
+    void shouldJournalAndReplayTextTransform() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/transform")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "Hello, World!", "operation": "SNAKE"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.result").value("hello_world"));
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_TRANSFORM"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.result").value("hello_world"))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        AuditEntry before = journal.find(id).orElseThrow();
+        Instant completedAt = before.completedAt();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("TEXT_TRANSFORM"))
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.result.result").value("hello_world"))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"));
+
+        AuditEntry after = journal.find(id).orElseThrow();
+        assertThat(after.operation()).isEqualTo(OperationType.TEXT_TRANSFORM);
+        assertThat(after.completedAt()).isEqualTo(completedAt);
+        assertThat(after.result()).isEqualTo(before.result());
+    }
+}

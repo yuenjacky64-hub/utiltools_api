@@ -2,6 +2,7 @@ package com.example.utiltools.common;
 
 import com.example.utiltools.json.exception.JsonPatchRollbackException;
 import com.example.utiltools.jobs.IdempotencyConflictException;
+import com.example.utiltools.jobs.JobCancellationConflictException;
 import com.example.utiltools.jobs.JobNotFoundException;
 import com.example.utiltools.jobs.JobQueueFullException;
 import com.example.utiltools.resilience.CircuitBreakerOpenException;
@@ -92,6 +93,15 @@ public class GlobalExceptionHandler {
         details.put("idempotencyKey", ex.idempotencyKey());
         details.put("existingJobId", ex.existingJobId());
         ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "IDEMPOTENCY_CONFLICT", details);
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
+    }
+
+    @ExceptionHandler(JobCancellationConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleJobCancellationConflict(JobCancellationConflictException ex) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("jobId", ex.jobId());
+        details.put("status", ex.status() != null ? ex.status().name() : null);
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "JOB_CANCELLATION_CONFLICT", details);
         return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
     }
 

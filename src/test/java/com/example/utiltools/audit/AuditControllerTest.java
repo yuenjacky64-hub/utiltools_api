@@ -4,9 +4,11 @@ import com.example.utiltools.audit.controller.AuditController;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
 import com.example.utiltools.audit.model.OperationType;
+import com.example.utiltools.audit.model.ReplayState;
 import com.example.utiltools.audit.service.AuditJournalService;
 import com.example.utiltools.audit.service.AuditReplayService;
 import com.example.utiltools.audit.service.AuditedOperations;
+import com.example.utiltools.audit.service.ReplayClaim;
 import com.example.utiltools.common.GlobalExceptionHandler;
 import com.example.utiltools.crypto.controller.CryptoController;
 import com.example.utiltools.common.RequestContext;
@@ -15,6 +17,7 @@ import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
 import com.example.utiltools.datetime.service.DateTimeService;
 import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.text.service.TextService;
 import com.example.utiltools.resilience.ResilienceConfig;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -40,7 +43,8 @@ import java.util.Map;
 
 @WebMvcTest({AuditController.class, CryptoController.class})
 @Import({AuditJournalService.class, AuditedOperations.class, AuditReplayService.class,
-        CryptoService.class, DateTimeService.class, JsonService.class, ResilienceConfig.class, GlobalExceptionHandler.class})
+        CryptoService.class, DateTimeService.class, JsonService.class, TextService.class, ResilienceConfig.class,
+        GlobalExceptionHandler.class, AuditTestSupport.class})
 @TestPropertySource(properties = {"utiltools.audit.max-entries=200", "utiltools.audit.max-replay-bytes=65536"})
 class AuditControllerTest {
 
@@ -138,10 +142,16 @@ class AuditControllerTest {
                 new HashRequest("SHA-256", "Hello World", null), "audit-replay001");
         journal.succeed(entry.id(), new CryptoService().hash(new HashRequest("SHA-256", "Hello World", null)));
 
-        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", entry.id()))
+        MvcResult result = mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", entry.id()))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
-                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"));
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"))
+                .andExpect(jsonPath("$.data.replay.leaseExpiresAt").doesNotExist())
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andReturn();
+
+        assertThat(result.getResponse().getContentAsString()).doesNotContain("leaseExpiresAt");
+        assertThat(journal.find(entry.id()).orElseThrow().replay().leaseExpiresAt()).isNull();
     }
 
     @Test
@@ -241,5 +251,43 @@ class AuditControllerTest {
                 + replayed.getResponse().getContentAsString();
         assertThat(everything).doesNotContain("super-secret-value");
         assertThat(everything).contains("\"secretKey\":\"***\"");
+    }
+
+    @Test
+    @DisplayName("POST replay - an entry with a live claim returns 409 REPLAY_CONFLICT")
+    void shouldConflictOnActiveClaim() throws Exception {
+        AuditEntry entry = journal.begin(OperationType.CRYPTO_HASH,
+                new HashRequest("SHA-256", "Hello World", null), "audit-claim0001");
+        journal.succeed(entry.id(), new CryptoService().hash(new HashRequest("SHA-256", "Hello World", null)));
+        ReplayClaim claim = journal.claimReplay(entry.id());
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", entry.id()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("REPLAY_CONFLICT"))
+                .andExpect(jsonPath("$.success").value(false));
+
+        AuditEntry after = journal.find(entry.id()).orElseThrow();
+        assertThat(after.replay().state()).isEqualTo(ReplayState.IN_PROGRESS);
+        assertThat(journal.completeReplay(entry.id(), claim.ownerToken(), ReplayState.VERIFIED, "owner"))
+                .isTrue();
+        assertThat(journal.find(entry.id()).orElseThrow().replay().state())
+                .isEqualTo(ReplayState.VERIFIED);
+    }
+
+    @Test
+    @DisplayName("GET entries/{id} - an IN_PROGRESS claim is visible with its lease expiry and no owner token")
+    void shouldExposeInProgressClaimWithoutOwnerToken() throws Exception {
+        AuditEntry entry = journal.begin(OperationType.CRYPTO_HASH,
+                new HashRequest("SHA-256", "Hello World", null), "audit-claim0002");
+        journal.succeed(entry.id(), new CryptoService().hash(new HashRequest("SHA-256", "Hello World", null)));
+        ReplayClaim claim = journal.claimReplay(entry.id());
+
+        MvcResult result = mockMvc.perform(get("/api/v1/utils/audit/entries/{id}", entry.id()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value("IN_PROGRESS"))
+                .andExpect(jsonPath("$.data.replay.leaseExpiresAt").isNotEmpty())
+                .andReturn();
+
+        assertThat(result.getResponse().getContentAsString()).doesNotContain(claim.ownerToken());
     }
 }

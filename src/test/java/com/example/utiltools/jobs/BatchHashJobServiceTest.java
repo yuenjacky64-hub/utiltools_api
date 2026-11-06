@@ -343,6 +343,181 @@ class BatchHashJobServiceTest {
         assertThat(registryKeys("idempotencyIndex")).containsExactly("boundary-key");
     }
 
+    @Test
+    @DisplayName("cancel - QUEUED job moves to CANCELLED exactly once with completedAt and no results")
+    void shouldCancelQueuedJobExactlyOnce() throws Exception {
+        CountDownLatch enteredHash = new CountDownLatch(1);
+        CountDownLatch releaseHash = new CountDownLatch(1);
+        CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
+        service = new BatchHashJobService(crypto, 1, 10, 300);
+
+        // The single worker is busy, so the second job is guaranteed to still be QUEUED.
+        BatchHashJobResponse running =
+                service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
+        assertThat(enteredHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+
+        BatchHashJobResponse queued =
+                service.submit(new BatchHashRequest("SHA-256", List.of("alpha", "beta"), null, "cancel-key"));
+        assertThat(service.getJob(queued.jobId()).status()).isEqualTo(JobStatus.QUEUED);
+
+        BatchHashJobResponse cancelled = service.cancel(queued.jobId());
+
+        assertThat(cancelled.jobId()).isEqualTo(queued.jobId());
+        assertThat(cancelled.status()).isEqualTo(JobStatus.CANCELLED);
+        assertThat(cancelled.completedAt()).isNotNull();
+        assertThat(cancelled.startedAt()).isNull();
+        assertThat(cancelled.results()).isNull();
+        assertThat(cancelled.error()).isNull();
+        assertThat(cancelled.itemCount()).isEqualTo(2);
+        assertThat(cancelled.idempotencyKey()).isEqualTo("cancel-key");
+
+        // Polling returns the very same cancelled snapshot.
+        assertThat(service.getJob(queued.jobId())).isEqualTo(cancelled);
+
+        releaseHash.countDown();
+        assertThat(awaitStatus(running.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("cancel - a second cancel on a CANCELLED job returns the identical snapshot")
+    void shouldBeIdempotentWhenCancellingTwice() throws Exception {
+        CountDownLatch enteredHash = new CountDownLatch(1);
+        CountDownLatch releaseHash = new CountDownLatch(1);
+        CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
+        service = new BatchHashJobService(crypto, 1, 10, 300);
+
+        BatchHashJobResponse running =
+                service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
+        assertThat(enteredHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+        BatchHashJobResponse queued =
+                service.submit(new BatchHashRequest("SHA-256", List.of("alpha"), null, null));
+
+        BatchHashJobResponse first = service.cancel(queued.jobId());
+        BatchHashJobResponse second = service.cancel(queued.jobId());
+        BatchHashJobResponse third = service.cancel(queued.jobId());
+
+        assertThat(second).isEqualTo(first);
+        assertThat(third).isEqualTo(first);
+        assertThat(second.completedAt()).isEqualTo(first.completedAt());
+        assertThat(third.status()).isEqualTo(JobStatus.CANCELLED);
+
+        releaseHash.countDown();
+        assertThat(awaitStatus(running.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("cancel - a cancelled queued job never invokes CryptoService.hash and never publishes results")
+    void shouldNotHashAfterCancellation() throws Exception {
+        CountDownLatch enteredHash = new CountDownLatch(1);
+        CountDownLatch releaseHash = new CountDownLatch(1);
+        CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
+        service = new BatchHashJobService(crypto, 1, 10, 300);
+
+        BatchHashJobResponse running =
+                service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
+        assertThat(enteredHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+
+        BatchHashJobResponse cancelledJob =
+                service.submit(new BatchHashRequest("SHA-256", List.of("alpha", "beta"), null, null));
+        assertThat(service.cancel(cancelledJob.jobId()).status()).isEqualTo(JobStatus.CANCELLED);
+
+        releaseHash.countDown();
+        assertThat(awaitStatus(running.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+
+        // FIFO queue: this marker only runs after the cancelled task has been dequeued and returned,
+        // so by the time it completes the cancelled runnable has provably been executed as a no-op.
+        BatchHashJobResponse marker =
+                service.submit(new BatchHashRequest("SHA-256", List.of("marker"), null, null));
+        assertThat(awaitStatus(marker.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+
+        assertThat(crypto.count("alpha")).isZero();
+        assertThat(crypto.count("beta")).isZero();
+        BatchHashJobResponse polled = service.getJob(cancelledJob.jobId());
+        assertThat(polled.status()).isEqualTo(JobStatus.CANCELLED);
+        assertThat(polled.results()).isNull();
+        assertThat(polled.startedAt()).isNull();
+    }
+
+    @Test
+    @DisplayName("evictExpiredJobs - CANCELLED job stays observable until the retention cutoff, then is evicted")
+    void shouldEvictCancelledJobOnlyAfterRetentionCutoff() throws Exception {
+        CountDownLatch enteredHash = new CountDownLatch(1);
+        CountDownLatch releaseHash = new CountDownLatch(1);
+        CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
+        service = new BatchHashJobService(crypto, 1, 10, 300);
+
+        BatchHashJobResponse running =
+                service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
+        assertThat(enteredHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+        BatchHashJobResponse queued =
+                service.submit(new BatchHashRequest("SHA-256", List.of("alpha"), null, "cancelled-key"));
+        assertThat(service.cancel(queued.jobId()).status()).isEqualTo(JobStatus.CANCELLED);
+
+        // The cutoff is the "completed before" bound: a cutoff one second in the past is younger
+        // than the job's completedAt, so nothing is evicted and the snapshot is still pollable.
+        assertThat(service.evictExpiredJobs(Instant.now().minusSeconds(1))).isZero();
+        assertThat(service.getJob(queued.jobId()).status()).isEqualTo(JobStatus.CANCELLED);
+
+        // A duplicate submission with the same key still resolves to the cancelled snapshot.
+        BatchHashJobResponse duplicate =
+                service.submit(new BatchHashRequest("SHA-256", List.of("alpha"), null, "cancelled-key"));
+        assertThat(duplicate.jobId()).isEqualTo(queued.jobId());
+        assertThat(duplicate.status()).isEqualTo(JobStatus.CANCELLED);
+
+        // Past the cutoff: the job and its idempotency mapping are retired together.
+        assertThat(service.evictExpiredJobs(Instant.now().plusSeconds(300 + 3600))).isEqualTo(1);
+        assertThatThrownBy(() -> service.getJob(queued.jobId())).isInstanceOf(JobNotFoundException.class);
+        assertThat(registryKeys("idempotencyIndex")).doesNotContain("cancelled-key");
+
+        releaseHash.countDown();
+        assertThat(awaitStatus(running.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("cancel - a RUNNING job is rejected with a conflict carrying the job id and status")
+    void shouldRejectCancellationOfRunningJob() throws Exception {
+        CountDownLatch enteredHash = new CountDownLatch(1);
+        CountDownLatch releaseHash = new CountDownLatch(1);
+        CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
+        service = new BatchHashJobService(crypto, 1, 10, 300);
+
+        BatchHashJobResponse running =
+                service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
+        assertThat(enteredHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+
+        JobCancellationConflictException conflict = conflictFrom(running.jobId());
+        assertThat(conflict.jobId()).isEqualTo(running.jobId());
+        assertThat(conflict.status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(conflict.getMessage()).contains(running.jobId()).contains("RUNNING");
+        assertThat(service.getJob(running.jobId()).status()).isEqualTo(JobStatus.RUNNING);
+
+        releaseHash.countDown();
+        assertThat(awaitStatus(running.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("cancel - COMPLETED and FAILED jobs are rejected with a conflict carrying that status")
+    void shouldRejectCancellationOfTerminalJob() {
+        service = new BatchHashJobService(new CryptoService(), 2, 10, 300);
+
+        BatchHashJobResponse completed = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", List.of("done"), null, null)).jobId(),
+                JobStatus.COMPLETED);
+        JobCancellationConflictException completedConflict = conflictFrom(completed.jobId());
+        assertThat(completedConflict.jobId()).isEqualTo(completed.jobId());
+        assertThat(completedConflict.status()).isEqualTo(JobStatus.COMPLETED);
+
+        BatchHashJobResponse failed = awaitStatus(
+                service.submit(new BatchHashRequest("NOPE-256", List.of("payload"), null, null)).jobId(),
+                JobStatus.FAILED);
+        JobCancellationConflictException failedConflict = conflictFrom(failed.jobId());
+        assertThat(failedConflict.jobId()).isEqualTo(failed.jobId());
+        assertThat(failedConflict.status()).isEqualTo(JobStatus.FAILED);
+
+        // Unknown ids keep the pre-existing 404 path untouched.
+        assertThatThrownBy(() -> service.cancel("does-not-exist")).isInstanceOf(JobNotFoundException.class);
+    }
+
     /**
      * Snapshot of the keys of a private registry map ({@code jobs} / {@code idempotencyIndex}).
      * Reflection keeps the production class free of test-only accessors while still letting the
@@ -358,6 +533,16 @@ class BatchHashJobServiceTest {
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Cannot read BatchHashJobService." + fieldName, e);
         }
+    }
+
+    /** Runs {@code cancel} expecting a conflict and returns the exception for field-level assertions. */
+    private JobCancellationConflictException conflictFrom(String jobId) {
+        try {
+            service.cancel(jobId);
+        } catch (JobCancellationConflictException e) {
+            return e;
+        }
+        throw new AssertionError("Expected JobCancellationConflictException for job " + jobId);
     }
 
     private BatchHashJobResponse awaitStatus(String jobId, JobStatus expected) {
