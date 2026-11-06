@@ -22,9 +22,18 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class AuditReplayServiceTest {
 
@@ -154,5 +163,76 @@ class AuditReplayServiceTest {
         assertThat(replayed.request().get("secretKey").asText()).isEqualTo("***");
         assertThat(replayed.toString()).doesNotContain("top-secret");
         assertThat(replayed.replay().state()).isEqualTo(ReplayState.VERIFIED);
+    }
+
+    @Test
+    @DisplayName("concurrent replays: exactly one invocation records VERIFIED, the loser gets REPLAY_CONFLICT")
+    void concurrentReplaysHaveASingleWinner() throws Exception {
+        HashResponse expected = new CryptoService().hash(hashRequest());
+        AuditEntry pending = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-replay01");
+        journal.succeed(pending.id(), expected);
+
+        AtomicInteger invocations = new AtomicInteger();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AuditedOperations slow = mock(AuditedOperations.class);
+        when(slow.replayInvoke(any(), any())).thenAnswer(call -> {
+            invocations.incrementAndGet();
+            entered.countDown();
+            release.await(5, TimeUnit.SECONDS);
+            return expected;
+        });
+        AuditReplayService service = new AuditReplayService(journal, slow, objectMapper);
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<AuditEntry> first = pool.submit(() -> service.replay(pending.id()));
+            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+
+            Future<AuditEntry> second = pool.submit(() -> service.replay(pending.id()));
+            assertThatThrownBy(() -> second.get(5, TimeUnit.SECONDS))
+                    .hasCauseInstanceOf(ReplayConflictException.class);
+
+            release.countDown();
+            AuditEntry replayed = first.get(5, TimeUnit.SECONDS);
+            assertThat(invocations.get()).isEqualTo(1);
+            assertThat(replayed.replay().state()).isEqualTo(ReplayState.VERIFIED);
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+
+        AuditEntry after = journal.find(pending.id()).orElseThrow();
+        assertThat(after.replay().state()).isEqualTo(ReplayState.VERIFIED);
+        assertThat(after.replay().detail()).isEqualTo("results match");
+        assertThat(journal.size()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("a throwing replayInvoke records FAILED and a later replay still succeeds")
+    void failedReplayIsRecordedAndCanBeRetried() {
+        HashResponse expected = new CryptoService().hash(hashRequest());
+        AuditEntry pending = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-replay01");
+        AuditEntry succeeded = journal.succeed(pending.id(), expected);
+
+        AuditedOperations broken = mock(AuditedOperations.class);
+        when(broken.replayInvoke(any(), any())).thenThrow(new IllegalStateException("boom"));
+        AuditReplayService brokenService = new AuditReplayService(journal, broken, objectMapper);
+
+        assertThatThrownBy(() -> brokenService.replay(pending.id()))
+                .isInstanceOf(ReplayConflictException.class)
+                .hasMessageContaining("boom");
+
+        AuditEntry afterFailure = journal.find(pending.id()).orElseThrow();
+        assertThat(afterFailure.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(afterFailure.result()).isEqualTo(succeeded.result());
+        assertThat(afterFailure.completedAt()).isEqualTo(succeeded.completedAt());
+        assertThat(afterFailure.replay().state()).isEqualTo(ReplayState.FAILED);
+        assertThat(afterFailure.replay().detail()).isNotNull().contains("boom");
+
+        AuditEntry replayed = replayService.replay(pending.id());
+        assertThat(replayed.replay().state()).isEqualTo(ReplayState.VERIFIED);
+        assertThat(replayed.replay().detail()).isEqualTo("results match");
+        assertThat(replayed.state()).isEqualTo(JournalState.SUCCEEDED);
     }
 }

@@ -874,6 +874,54 @@ the new result against the stored result, and records `VERIFIED` or `MISMATCH`. 
 `completedAt` are never rewritten — only the attached `replay` record is added. Any other case
 returns `409 REPLAY_CONFLICT`.
 
+**Replay is a single-winner operation.** Before the operation runs, the journal *claims* the entry
+under the same lock that owns every journal transition, so only one replay per entry can execute:
+
+```
+claim:  (no replay | expired IN_PROGRESS) -> IN_PROGRESS   (writes replay.state, replayedAt, leaseExpiresAt)
+result: IN_PROGRESS -> VERIFIED | MISMATCH | FAILED         (by the owning claim only)
+```
+
+`IN_PROGRESS -> VERIFIED|MISMATCH|FAILED` is the *only* legal replay transition; a replay record is
+never rewritten by anyone except the owner of a live claim. A replay record is `IN_PROGRESS` only
+while a claim is live, so a `GET` showing `IN_PROGRESS` means another replay of the same entry is
+in flight:
+
+```json
+"replay": {
+  "state": "IN_PROGRESS",
+  "replayedAt": "2026-10-31T00:52:09.988Z",
+  "detail": "replay claimed by a single worker",
+  "leaseExpiresAt": "2026-10-31T00:52:39.988Z"
+}
+```
+
+**Claim conflicts:** a second replay while a claim is live answers `409 REPLAY_CONFLICT` and leaves
+the in-flight record untouched. The claim lease is `utiltools.audit.replay-lease-seconds` (default
+`30`).
+
+**Failed replays are audited.** If `replayInvoke` throws (for example the stored payload is no
+longer accepted by the service), the replay is recorded as `FAILED` with a bounded
+`detail` before the claim is released, then `500 INTERNAL_SERVER_ERROR` is returned. The entry's
+original `state`, `result` and `completedAt` are unchanged, so the entry stays replayable and a
+later replay can still produce `VERIFIED`:
+
+```json
+"replay": {
+  "state": "FAILED",
+  "replayedAt": "2026-10-31T00:52:10.004Z",
+  "detail": "replayInvoke failed: IllegalArgumentException: unknown algorithm"
+}
+```
+
+**Crash recovery via lease expiry:** claims live in the JVM heap only. If the JVM dies (or a replay
+never completes) the entry is left `IN_PROGRESS`; once `leaseExpiresAt` has passed a later replay
+*claims it over* — the stale owner's write is rejected, a new owner token is issued, and the new
+owner's `VERIFIED`/`MISMATCH`/`FAILED` is the outcome that is retained. Expiry is evaluated lazily
+at claim time; there is no background sweeper. The owner token itself is stored privately and never
+serialized by `list`, `find` or `replay`, so a client can never forge or complete another caller's
+claim.
+
 ---
 
 ### 4. Batch Hash Jobs (async)
@@ -1117,7 +1165,7 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | `400 BAD_REQUEST` | `BAD_REQUEST` | Malformed HTTP request body |
 | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Unknown or evicted batch job id |
 | `404 NOT_FOUND` | `NOT_FOUND` | Unknown audit journal entry id |
-| `409 CONFLICT` | `REPLAY_CONFLICT` | Replay of a FAILED, non-deterministic, oversized, or still-PENDING entry |
+| `409 CONFLICT` | `REPLAY_CONFLICT` | Replay of a FAILED, non-deterministic, oversized, or still-PENDING entry, or a replay of an entry whose claim is already `IN_PROGRESS` (live lease) or was lost to a lease takeover |
 | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Batch job queue is saturated; retry after capacity frees |
 | `429 TOO_MANY_REQUESTS` | `RATE_LIMITED` | Request budget for `/api/v1/utils/*` exhausted (see [Rate Limiting](#-rate-limiting)) |
 | `500 INTERNAL_SERVER_ERROR` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |

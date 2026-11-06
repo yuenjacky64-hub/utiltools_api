@@ -1,5 +1,6 @@
 package com.example.utiltools.crypto;
 
+import com.example.utiltools.audit.AuditTestSupport;
 import com.example.utiltools.audit.service.AuditJournalService;
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.GlobalExceptionHandler;
@@ -30,7 +31,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(CryptoController.class)
-@Import({AuditJournalService.class, AuditedOperations.class, CryptoService.class, DateTimeService.class,
+@Import({AuditTestSupport.class, AuditJournalService.class, AuditedOperations.class, CryptoService.class, DateTimeService.class,
         JsonService.class, ResilienceConfig.class, GlobalExceptionHandler.class})
 @TestPropertySource(properties = {"utiltools.audit.max-entries=200", "utiltools.audit.max-replay-bytes=65536"})
 class CryptoControllerTest {
