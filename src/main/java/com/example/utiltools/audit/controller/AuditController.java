@@ -19,7 +19,9 @@ import java.util.List;
 
 @RestController
 @RequestMapping("/api/v1/utils/audit")
-@Tag(name = "Audit Journal", description = "Bounded in-memory operation journal with request correlation and replay verification")
+@Tag(name = "Audit Journal", description = "Bounded in-memory operation journal with request correlation and single-winner replay verification: "
+        + "a replay claims the entry (IN_PROGRESS), records VERIFIED, MISMATCH or FAILED, and answers "
+        + "409 REPLAY_CONFLICT while another claim is live or when the caller's lease expired")
 public class AuditController {
 
     private final AuditJournalService journal;
@@ -46,7 +48,14 @@ public class AuditController {
     }
 
     @PostMapping("/entries/{id}/replay")
-    @Operation(summary = "Replay a journal entry", description = "Re-runs a deterministic SUCCEEDED entry and returns VERIFIED or MISMATCH without altering the original entry")
+    @Operation(summary = "Replay a journal entry", description = """
+            Claims the entry atomically (replay.state IN_PROGRESS with leaseExpiresAt), re-runs the
+            deterministic SUCCEEDED operation, then records VERIFIED or MISMATCH — or FAILED with a
+            bounded detail when the invocation throws. The original state, result and completedAt are
+            never altered. Answers 409 REPLAY_CONFLICT when another replay holds a live claim, when the
+            caller's claim was lost to lease expiry, or when the entry is not replayable; a crashed
+            replayer's IN_PROGRESS claim is taken over once utiltools.audit.replay-lease-seconds
+            elapses.""")
     public ApiResponse<AuditEntry> replay(@PathVariable String id) {
         return ApiResponse.success(replayService.replay(id), "Replay verification completed");
     }
