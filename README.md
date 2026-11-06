@@ -778,6 +778,42 @@ marked `VALIDATED`, `resultJson` is `null`, and failures still produce `FAILED` 
 { "json": "{\"name\":\"Alice\"}", "operations": [{ "op": "test", "path": "/name", "value": "Alice" }], "dryRun": true }
 ```
 
+**Operation-count limit:** a single request may carry at most **100** operations. The cap is checked by bean
+validation on the request body *before* any patching runs, so an oversized list is rejected with **HTTP 400**,
+`error` `VALIDATION_ERROR`, and `details` containing `operations must contain at most 100 entries` — no
+`resultJson` and no patch audit are produced. The same limit applies to `"dryRun": true`; an empty list still fails
+with `operations list is required`.
+
+Oversized request (101 operations, list abbreviated):
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/json/patch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "json": "{\"name\":\"Alice\"}",
+    "operations": [
+      { "op": "add", "path": "/k0", "value": 0 },
+      { "op": "add", "path": "/k1", "value": 1 },
+      "... 98 more ...",
+      { "op": "add", "path": "/k100", "value": 100 }
+    ]
+  }'
+```
+
+**Response (400):**
+
+```json
+{
+  "success": false,
+  "message": "Validation failed",
+  "error": "VALIDATION_ERROR",
+  "details": [
+    "operations must contain at most 100 entries"
+  ],
+  "timestamp": "2026-10-30T16:50:39.127057574Z"
+}
+```
+
 #### E. Circuit breaker & probe lease recovery
 
 The JSONPath query path runs behind a single `CLOSED` / `OPEN` / `HALF_OPEN` circuit breaker, exposed

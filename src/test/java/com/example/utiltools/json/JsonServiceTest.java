@@ -14,12 +14,18 @@ import com.example.utiltools.json.service.JsonService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validation;
+import jakarta.validation.Validator;
+import jakarta.validation.ValidatorFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.IntStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -412,5 +418,62 @@ class JsonServiceTest {
                 List.of(op("replace", "/a/5", null, "9")), false)))
                 .isInstanceOf(JsonPatchRollbackException.class)
                 .hasMessageContaining("Array index out of bounds");
+    }
+
+    @Test
+    @DisplayName("Should keep the @NotEmpty rule alongside the 100-operation cap")
+    void shouldPreserveNotEmptyConstraintAlongsideOperationCap() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+
+            assertThat(validator.validate(new JsonPatchRequest("{\"a\":1}", List.of(), false)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("operations list is required");
+            assertThat(validator.validate(new JsonPatchRequest("{\"a\":1}", null, false)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("operations list is required");
+            assertThat(validator.validate(new JsonPatchRequest("{\"a\":1}", patchOperations(100), false)))
+                    .isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("Should enforce the 100-operation cap through bean validation")
+    void shouldEnforceOperationCapThroughBeanValidation() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+
+            assertThat(validator.validate(new JsonPatchRequest("{\"a\":1}", patchOperations(100), false)))
+                    .isEmpty();
+
+            Set<ConstraintViolation<JsonPatchRequest>> violations =
+                    validator.validate(new JsonPatchRequest("{\"a\":1}", patchOperations(101), false));
+            assertThat(violations).hasSize(1);
+            assertThat(violations).extracting(ConstraintViolation::getMessage)
+                    .containsExactly("operations must contain at most 100 entries");
+            assertThat(violations.iterator().next().getPropertyPath().toString()).isEqualTo("operations");
+
+            // The DTO-level cap changes nothing for an in-range payload: same document, same audit.
+            JsonPatchResponse response = jsonService.patch(new JsonPatchRequest(
+                    "{\"name\":\"Alice\",\"age\":30}", List.of(
+                    op("replace", "/name", null, "\"Bob\""),
+                    op("add", "/city", null, "\"Paris\""),
+                    op("copy", "/years", "/age", null)), false));
+            assertThat(response.resultJson().get("name").asText()).isEqualTo("Bob");
+            assertThat(response.resultJson().get("city").asText()).isEqualTo("Paris");
+            assertThat(response.resultJson().get("years").asInt()).isEqualTo(30);
+            assertThat(response.operationsApplied()).isEqualTo(3);
+            assertThat(response.operationsRolledBack()).isZero();
+            assertThat(response.audit()).extracting(JsonPatchOperation::index).containsExactly(0, 1, 2);
+            assertThat(response.audit()).extracting(JsonPatchOperation::status)
+                    .containsExactly(JsonPatchOperation.APPLIED, JsonPatchOperation.APPLIED,
+                            JsonPatchOperation.APPLIED);
+        }
+    }
+
+    private static List<JsonPatchOperation> patchOperations(int count) {
+        return IntStream.range(0, count)
+                .mapToObj(i -> op("add", "/k" + i, null, String.valueOf(i)))
+                .toList();
     }
 }

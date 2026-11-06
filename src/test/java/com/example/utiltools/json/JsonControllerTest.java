@@ -257,4 +257,60 @@ class JsonControllerTest {
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/patch - should reject 101 operations")
+    void shouldRejectPatchWith101Operations() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/patch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(patchBodyWithOperations(101, false)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.data").doesNotExist())
+                .andExpect(jsonPath("$.details[0]").value("operations must contain at most 100 entries"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/patch - should reject 101 operations on a dry run")
+    void shouldRejectDryRunPatchWith101Operations() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/patch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(patchBodyWithOperations(101, true)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.data").doesNotExist())
+                .andExpect(jsonPath("$.details[0]").value("operations must contain at most 100 entries"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/patch - should accept exactly 100 operations")
+    void shouldAcceptPatchWithExactly100Operations() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/patch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(patchBodyWithOperations(100, false)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.operationsApplied").value(100))
+                .andExpect(jsonPath("$.data.operationsRolledBack").value(0))
+                .andExpect(jsonPath("$.data.dryRun").value(false))
+                .andExpect(jsonPath("$.data.audit.length()").value(100))
+                .andExpect(jsonPath("$.data.audit[0].index").value(0))
+                .andExpect(jsonPath("$.data.audit[99].index").value(99))
+                .andExpect(jsonPath("$.data.audit[99].status").value("APPLIED"));
+    }
+
+    private static String patchBodyWithOperations(int count, boolean dryRun) {
+        StringBuilder operations = new StringBuilder();
+        for (int i = 0; i < count; i++) {
+            if (i > 0) {
+                operations.append(',');
+            }
+            operations.append("{\"op\": \"add\", \"path\": \"/k").append(i)
+                    .append("\", \"value\": ").append(i).append('}');
+        }
+        return "{\"json\": \"{\\\"a\\\":1}\", \"operations\": [" + operations + "]"
+                + (dryRun ? ", \"dryRun\": true" : "") + "}";
+    }
 }
