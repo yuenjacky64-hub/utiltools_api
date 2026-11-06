@@ -80,6 +80,13 @@ class CryptoServiceTest {
             assertThat(response.action()).isEqualTo("ENCODE");
             assertThat(response.mode()).isEqualTo(mode);
         }
+
+        // INV-2: a literal `+` is never emitted unescaped outside FORM's space spelling,
+        // so decode can never confuse it with a form space.
+        for (String mode : List.of("COMPONENT", "PATH", "FORM")) {
+            assertThat(cryptoService.url(new UrlRequest("ENCODE", "a+b", mode)).result())
+                    .isEqualTo("a%2Bb");
+        }
     }
 
     @Test
