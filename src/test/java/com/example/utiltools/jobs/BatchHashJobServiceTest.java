@@ -18,6 +18,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -48,7 +49,7 @@ class BatchHashJobServiceTest {
     @DisplayName("submit - concurrent same idempotency key yields one jobId and one execution per item")
     void shouldDeduplicateConcurrentSubmissionsWithSameIdempotencyKey() throws Exception {
         CountingCryptoService crypto = new CountingCryptoService(null, null, null);
-        service = new BatchHashJobService(crypto, 2, 10, 300);
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3);
 
         BatchHashRequest request = new BatchHashRequest("SHA-256", List.of("alpha", "beta"), null, "dedup-key");
         int threads = 8;
@@ -83,7 +84,7 @@ class BatchHashJobServiceTest {
     @DisplayName("getJob - results keep input order and equal CryptoService output per item")
     void shouldPreserveInputOrderInResults() {
         List<String> items = List.of("alpha", "beta", "gamma");
-        service = new BatchHashJobService(new CryptoService(), 2, 10, 300);
+        service = new BatchHashJobService(new CryptoService(), 2, 10, 300, 3);
 
         BatchHashJobResponse submitted = service.submit(new BatchHashRequest("SHA-256", items, null, null));
         BatchHashJobResponse completed = awaitStatus(submitted.jobId(), JobStatus.COMPLETED);
@@ -108,7 +109,7 @@ class BatchHashJobServiceTest {
         CountDownLatch enteredHash = new CountDownLatch(1);
         CountDownLatch releaseHash = new CountDownLatch(1);
         CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "a");
-        service = new BatchHashJobService(crypto, 1, 1, 300);
+        service = new BatchHashJobService(crypto, 1, 1, 300, 3);
 
         // Job A occupies the single worker thread.
         BatchHashJobResponse jobA = service.submit(new BatchHashRequest("SHA-256", List.of("a"), null, null));
@@ -146,7 +147,7 @@ class BatchHashJobServiceTest {
     @Test
     @DisplayName("worker - a Throwable marks the job FAILED and leaves the pool usable")
     void shouldMarkJobFailedWhenWorkerThrowsAndKeepPoolUsable() {
-        service = new BatchHashJobService(new CryptoService(), 1, 10, 300);
+        service = new BatchHashJobService(new CryptoService(), 1, 10, 300, 3);
 
         BatchHashJobResponse submitted =
                 service.submit(new BatchHashRequest("NOPE-256", List.of("payload"), null, null));
@@ -172,7 +173,7 @@ class BatchHashJobServiceTest {
         CountDownLatch enteredHash = new CountDownLatch(1);
         CountDownLatch releaseHash = new CountDownLatch(1);
         CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
-        service = new BatchHashJobService(crypto, 2, 10, 300);
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3);
 
         // A job that stays RUNNING while blocked inside hash().
         BatchHashJobResponse running =
@@ -204,7 +205,7 @@ class BatchHashJobServiceTest {
     @DisplayName("submit - same key with a different item list conflicts and leaves no residue")
     void shouldRejectConflictWhenItemListChangesUnderSameKey() {
         CountingCryptoService crypto = new CountingCryptoService(null, null, null);
-        service = new BatchHashJobService(crypto, 2, 10, 300);
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3);
 
         BatchHashJobResponse first = awaitStatus(
                 service.submit(new BatchHashRequest("SHA-256", List.of("a"), null, "seq-key")).jobId(),
@@ -233,7 +234,7 @@ class BatchHashJobServiceTest {
     @DisplayName("submit - concurrent same key with different payloads yields one accepted job and one conflict per loser")
     void shouldRejectConcurrentConflictingPayloadsWithOneWinner() throws Exception {
         CountingCryptoService crypto = new CountingCryptoService(null, null, null);
-        service = new BatchHashJobService(crypto, 2, 10, 300);
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3);
 
         String key = "race-key";
         int threads = 8;
@@ -291,7 +292,7 @@ class BatchHashJobServiceTest {
     @DisplayName("submit - identical key and payload returns the same jobId without a second execution")
     void shouldReturnSameJobIdForIdenticalRetryWithoutSecondExecution() {
         CountingCryptoService crypto = new CountingCryptoService(null, null, null);
-        service = new BatchHashJobService(crypto, 2, 10, 300);
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3);
 
         BatchHashRequest request = new BatchHashRequest("SHA-256", List.of("alpha"), "s3cret", "identical-key");
         BatchHashJobResponse first = service.submit(request);
@@ -310,7 +311,7 @@ class BatchHashJobServiceTest {
     @Test
     @DisplayName("submit - algorithm and secretKey spellings normalise like CryptoService")
     void shouldTreatAlgorithmAndSecretKeySpellingsAsEquivalent() {
-        service = new BatchHashJobService(new CryptoService(), 2, 10, 300);
+        service = new BatchHashJobService(new CryptoService(), 2, 10, 300, 3);
 
         BatchHashJobResponse first =
                 service.submit(new BatchHashRequest("sha-256", List.of("alpha"), null, "norm-key"));
@@ -327,7 +328,7 @@ class BatchHashJobServiceTest {
     @Test
     @DisplayName("submit - reordered or boundary-shifted items conflict under the same key")
     void shouldRejectConflictWhenItemsAreReordered() {
-        service = new BatchHashJobService(new CryptoService(), 2, 10, 300);
+        service = new BatchHashJobService(new CryptoService(), 2, 10, 300, 3);
 
         BatchHashJobResponse first =
                 service.submit(new BatchHashRequest("SHA-256", List.of("ab", "c"), null, "boundary-key"));
@@ -349,7 +350,7 @@ class BatchHashJobServiceTest {
         CountDownLatch enteredHash = new CountDownLatch(1);
         CountDownLatch releaseHash = new CountDownLatch(1);
         CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
-        service = new BatchHashJobService(crypto, 1, 10, 300);
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
 
         // The single worker is busy, so the second job is guaranteed to still be QUEUED.
         BatchHashJobResponse running =
@@ -384,7 +385,7 @@ class BatchHashJobServiceTest {
         CountDownLatch enteredHash = new CountDownLatch(1);
         CountDownLatch releaseHash = new CountDownLatch(1);
         CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
-        service = new BatchHashJobService(crypto, 1, 10, 300);
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
 
         BatchHashJobResponse running =
                 service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
@@ -411,7 +412,7 @@ class BatchHashJobServiceTest {
         CountDownLatch enteredHash = new CountDownLatch(1);
         CountDownLatch releaseHash = new CountDownLatch(1);
         CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
-        service = new BatchHashJobService(crypto, 1, 10, 300);
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
 
         BatchHashJobResponse running =
                 service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
@@ -444,7 +445,7 @@ class BatchHashJobServiceTest {
         CountDownLatch enteredHash = new CountDownLatch(1);
         CountDownLatch releaseHash = new CountDownLatch(1);
         CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
-        service = new BatchHashJobService(crypto, 1, 10, 300);
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
 
         BatchHashJobResponse running =
                 service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
@@ -479,7 +480,7 @@ class BatchHashJobServiceTest {
         CountDownLatch enteredHash = new CountDownLatch(1);
         CountDownLatch releaseHash = new CountDownLatch(1);
         CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
-        service = new BatchHashJobService(crypto, 1, 10, 300);
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
 
         BatchHashJobResponse running =
                 service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
@@ -498,7 +499,7 @@ class BatchHashJobServiceTest {
     @Test
     @DisplayName("cancel - COMPLETED and FAILED jobs are rejected with a conflict carrying that status")
     void shouldRejectCancellationOfTerminalJob() {
-        service = new BatchHashJobService(new CryptoService(), 2, 10, 300);
+        service = new BatchHashJobService(new CryptoService(), 2, 10, 300, 3);
 
         BatchHashJobResponse completed = awaitStatus(
                 service.submit(new BatchHashRequest("SHA-256", List.of("done"), null, null)).jobId(),
@@ -516,6 +517,289 @@ class BatchHashJobServiceTest {
 
         // Unknown ids keep the pre-existing 404 path untouched.
         assertThatThrownBy(() -> service.cancel("does-not-exist")).isInstanceOf(JobNotFoundException.class);
+    }
+
+    @Test
+    @DisplayName("retry - a FAILED job is requeued as QUEUED, keeps attempt-1 history and reaches COMPLETED")
+    void shouldRetryFailedJobAndRetainAttemptHistory() {
+        // Transient failure: the designated item fails its first hash only, so attempt 2 succeeds.
+        service = new BatchHashJobService(new RetryCryptoService("transient", 1, null, null, null), 1, 10, 300, 3);
+
+        BatchHashJobResponse failed = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", List.of("transient"), null, "retry-key")).jobId(),
+                JobStatus.FAILED);
+        assertThat(failed.attempt()).isEqualTo(1);
+        assertThat(failed.maxAttempts()).isEqualTo(3);
+        assertThat(failed.attempts()).hasSize(1);
+        assertThat(failed.attempts().get(0).attempt()).isEqualTo(1);
+        assertThat(failed.attempts().get(0).status()).isEqualTo(JobStatus.FAILED);
+        assertThat(failed.attempts().get(0).error()).isEqualTo(failed.error());
+        assertThat(failed.attempts().get(0).completedAt()).isEqualTo(failed.completedAt());
+
+        BatchHashJobResponse requeued = service.retry(failed.jobId());
+
+        // The retried snapshot: same job, QUEUED, attempt 2, previous attempt still observable.
+        assertThat(requeued.jobId()).isEqualTo(failed.jobId());
+        assertThat(requeued.idempotencyKey()).isEqualTo("retry-key");
+        assertThat(requeued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(requeued.attempt()).isEqualTo(2);
+        assertThat(requeued.maxAttempts()).isEqualTo(3);
+        assertThat(requeued.startedAt()).isNull();
+        assertThat(requeued.completedAt()).isNull();
+        assertThat(requeued.error()).isNull();
+        assertThat(requeued.results()).isNull();
+        assertThat(requeued.attempts()).hasSize(1);
+        assertThat(requeued.attempts().get(0).attempt()).isEqualTo(1);
+        assertThat(requeued.attempts().get(0).status()).isEqualTo(JobStatus.FAILED);
+
+        BatchHashJobResponse completed = awaitStatus(failed.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.attempt()).isEqualTo(2);
+        assertThat(completed.results()).hasSize(1);
+        assertThat(completed.attempts()).hasSize(2);
+        assertThat(completed.attempts().get(0).attempt()).isEqualTo(1);
+        assertThat(completed.attempts().get(0).status()).isEqualTo(JobStatus.FAILED);
+        assertThat(completed.attempts().get(1).attempt()).isEqualTo(2);
+        assertThat(completed.attempts().get(1).status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(completed.attempts().get(1).completedAt()).isEqualTo(completed.completedAt());
+
+        // The retry rides on the same id and leaves the idempotency mapping untouched.
+        assertThat(service.submit(new BatchHashRequest("SHA-256", List.of("transient"), null, "retry-key")).jobId())
+                .isEqualTo(failed.jobId());
+    }
+
+    @Test
+    @DisplayName("retry - QUEUED, RUNNING, COMPLETED and CANCELLED jobs are rejected without mutation")
+    void shouldRejectRetryOfNonFailedJob() throws Exception {
+        CountDownLatch enteredHash = new CountDownLatch(1);
+        CountDownLatch releaseHash = new CountDownLatch(1);
+        RetryCryptoService crypto = new RetryCryptoService("flaky", 1, enteredHash, releaseHash, "blocked");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
+
+        BatchHashJobResponse completed = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", List.of("done"), null, null)).jobId(),
+                JobStatus.COMPLETED);
+        BatchHashJobResponse failed = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", List.of("flaky"), null, null)).jobId(),
+                JobStatus.FAILED);
+
+        // The single worker is busy inside hash(), so one job stays QUEUED and one can be cancelled.
+        BatchHashJobResponse running =
+                service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
+        assertThat(enteredHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+        BatchHashJobResponse queued =
+                service.submit(new BatchHashRequest("SHA-256", List.of("alpha"), null, null));
+        BatchHashJobResponse cancelled = service.cancel(
+                service.submit(new BatchHashRequest("SHA-256", List.of("beta"), null, null)).jobId());
+
+        assertRetryConflict(queued, JobStatus.QUEUED);
+        assertRetryConflict(running, JobStatus.RUNNING);
+        assertRetryConflict(completed, JobStatus.COMPLETED);
+        assertRetryConflict(cancelled, JobStatus.CANCELLED);
+
+        // An unknown id keeps the pre-existing 404 path and registers nothing.
+        Set<String> keysBefore = registryKeys("jobs");
+        assertThatThrownBy(() -> service.retry("does-not-exist")).isInstanceOf(JobNotFoundException.class);
+        assertThat(registryKeys("jobs")).isEqualTo(keysBefore);
+
+        // An evicted id is indistinguishable from an unknown one.
+        assertThat(service.evictExpiredJobs(Instant.now().plusSeconds(300 + 3600))).isGreaterThan(0);
+        assertThatThrownBy(() -> service.retry(completed.jobId())).isInstanceOf(JobNotFoundException.class);
+        assertThatThrownBy(() -> service.retry(failed.jobId())).isInstanceOf(JobNotFoundException.class);
+
+        releaseHash.countDown();
+        assertThat(awaitStatus(running.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("retry - a job at maxAttempts cannot be retried and its snapshot stays identical")
+    void shouldRejectRetryAtAttemptExhaustion() {
+        service = new BatchHashJobService(
+                new RetryCryptoService("forever", Integer.MAX_VALUE, null, null, null), 1, 10, 300, 2);
+
+        BatchHashJobResponse firstFailure = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", List.of("forever"), null, null)).jobId(),
+                JobStatus.FAILED);
+        assertThat(firstFailure.attempt()).isEqualTo(1);
+        assertThat(firstFailure.maxAttempts()).isEqualTo(2);
+
+        BatchHashJobResponse requeued = service.retry(firstFailure.jobId());
+        assertThat(requeued.attempt()).isEqualTo(2);
+
+        BatchHashJobResponse exhausted = awaitStatus(firstFailure.jobId(), JobStatus.FAILED);
+        assertThat(exhausted.attempt()).isEqualTo(2);
+        assertThat(exhausted.attempts()).hasSize(2);
+        assertThat(exhausted.attempts()).allSatisfy(entry -> assertThat(entry.status()).isEqualTo(JobStatus.FAILED));
+
+        JobRetryConflictException conflict = retryConflictFrom(firstFailure.jobId());
+        assertThat(conflict.jobId()).isEqualTo(firstFailure.jobId());
+        assertThat(conflict.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(conflict.attempt()).isEqualTo(2);
+        assertThat(conflict.maxAttempts()).isEqualTo(2);
+        assertThat(conflict.getMessage()).contains("attempt 2 of 2");
+
+        // Rejected before a single field was written.
+        assertThat(service.getJob(firstFailure.jobId())).isEqualTo(exhausted);
+    }
+
+    @Test
+    @DisplayName("retry - a superseded worker generation cannot touch the retried attempt")
+    void shouldFenceStaleAttemptGeneration() {
+        service = new BatchHashJobService(new RetryCryptoService("transient", 1, null, null, null), 1, 10, 300, 3);
+
+        BatchHashJobResponse failed = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", List.of("transient"), null, null)).jobId(),
+                JobStatus.FAILED);
+        assertThat(service.retry(failed.jobId()).attempt()).isEqualTo(2);
+        BatchHashJobResponse completed = awaitStatus(failed.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.attempt()).isEqualTo(2);
+
+        // Replaying the superseded generation 1 must change nothing at all.
+        service.executeAttempt(failed.jobId(), 1);
+
+        assertThat(service.getJob(failed.jobId())).isEqualTo(completed);
+        assertThat(service.getJob(failed.jobId()).status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(service.getJob(failed.jobId()).attempt()).isEqualTo(2);
+        assertThat(service.getJob(failed.jobId()).results()).isEqualTo(completed.results());
+        assertThat(service.getJob(failed.jobId()).error()).isNull();
+        assertThat(service.getJob(failed.jobId()).attempts()).isEqualTo(completed.attempts());
+    }
+
+    @Test
+    @DisplayName("retry - a pass that saw the job FAILED does not evict it once it is requeued")
+    void shouldNotEvictRequeuedJob() throws Exception {
+        CountDownLatch enteredHash = new CountDownLatch(1);
+        CountDownLatch releaseHash = new CountDownLatch(1);
+        RetryCryptoService crypto = new RetryCryptoService("transient", 1, enteredHash, releaseHash, "blocked");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
+
+        BatchHashJobResponse failed = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", List.of("transient"), null, "requeue-key")).jobId(),
+                JobStatus.FAILED);
+
+        // Occupy the single worker so the retried attempt provably stays QUEUED, i.e. the job is
+        // observable in the non-terminal state that eviction must respect.
+        service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
+        assertThat(enteredHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+
+        BatchHashJobResponse requeued = service.retry(failed.jobId());
+        assertThat(requeued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(requeued.attempt()).isEqualTo(2);
+
+        // The cutoff is past every completion instant, so a stale FAILED verdict would evict; the
+        // pass must instead observe the requeued attempt and keep the job pollable.
+        assertThat(service.evictExpiredJobs(Instant.now().plusSeconds(300 + 3600))).isZero();
+        assertThat(service.getJob(failed.jobId())).isEqualTo(requeued);
+
+        releaseHash.countDown();
+        BatchHashJobResponse completed = awaitStatus(failed.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.attempt()).isEqualTo(2);
+        assertThat(completed.attempts()).hasSize(2);
+        assertThat(completed.attempts().get(0).status()).isEqualTo(JobStatus.FAILED);
+        assertThat(completed.attempts().get(1).status()).isEqualTo(JobStatus.COMPLETED);
+    }
+
+    @Test
+    @DisplayName("retry - an accepted retry is never lost to a concurrently running eviction pass")
+    void shouldNeverAcceptRetryForAJobTheEvictionPassRemoves() throws Exception {
+        ExecutorService racers = Executors.newFixedThreadPool(2);
+        try {
+            for (int round = 0; round < 30; round++) {
+                CountDownLatch decided = new CountDownLatch(1);
+                CountDownLatch releaseHash = new CountDownLatch(1);
+                RetryCryptoService crypto = new RetryCryptoService("transient", 1, null, releaseHash, "blocked");
+                BatchHashJobService roundService = new BatchHashJobService(crypto, 1, 10, 300, 3);
+                service = roundService;
+                try {
+                    // Attempt 1 fails on "transient" before "blocked" is reached; the retried
+                    // attempt passes "transient" and blocks in "blocked", so it stays non-terminal.
+                    BatchHashJobResponse failed = awaitStatus(roundService.submit(new BatchHashRequest(
+                            "SHA-256", List.of("transient", "blocked"), null, "race-key")).jobId(),
+                            JobStatus.FAILED);
+                    Instant cutoff = Instant.now().plusSeconds(300 + 3600);
+
+                    Future<BatchHashJobResponse> retryFuture = racers.submit(() -> {
+                        decided.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                        return roundService.retry(failed.jobId());
+                    });
+                    Future<Integer> evictFuture = racers.submit(() -> {
+                        decided.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                        return roundService.evictExpiredJobs(cutoff);
+                    });
+                    decided.countDown();
+
+                    BatchHashJobResponse requeued = null;
+                    try {
+                        requeued = retryFuture.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    } catch (ExecutionException e) {
+                        // The other legal outcome: the pass unregistered the job first, so the
+                        // caller gets 404 instead of a 202 for an unpollable job.
+                        assertThat(e.getCause()).isInstanceOf(JobNotFoundException.class);
+                    }
+                    evictFuture.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+                    if (requeued != null) {
+                        BatchHashJobResponse observed = roundService.getJob(failed.jobId());
+                        assertThat(observed.attempt()).isEqualTo(2);
+                        assertThat(observed.status()).isIn(JobStatus.QUEUED, JobStatus.RUNNING);
+                    }
+                } finally {
+                    releaseHash.countDown();
+                    roundService.shutdown();
+                }
+            }
+        } finally {
+            racers.shutdownNow();
+        }
+    }
+
+    @Test
+    @DisplayName("retry - queue rejection rolls back to FAILED, keeps the attempt count and is retryable later")
+    void shouldRollbackRetryWhenQueueRejects() throws Exception {
+        CountDownLatch enteredHash = new CountDownLatch(1);
+        CountDownLatch releaseHash = new CountDownLatch(1);
+        RetryCryptoService crypto = new RetryCryptoService("transient", 1, enteredHash, releaseHash, "blocked");
+        // One worker and a one-slot queue: while the worker is blocked and the slot is taken, a
+        // retry is provably rejected by the AbortPolicy.
+        service = new BatchHashJobService(crypto, 1, 1, 300, 3);
+
+        BatchHashJobResponse failed = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", List.of("transient"), null, "rollback-key")).jobId(),
+                JobStatus.FAILED);
+
+        BatchHashJobResponse running =
+                service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
+        assertThat(enteredHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+        BatchHashJobResponse filler = service.submit(new BatchHashRequest("SHA-256", List.of("filler"), null, null));
+        assertThat(service.getJob(filler.jobId()).status()).isEqualTo(JobStatus.QUEUED);
+
+        Set<String> keysBefore = registryKeys("jobs");
+        assertThatThrownBy(() -> service.retry(failed.jobId()))
+                .isInstanceOf(JobQueueFullException.class)
+                .hasMessageContaining("queue-capacity=1");
+
+        // The rejected retry consumed nothing: same FAILED snapshot, same attempt, no new history.
+        BatchHashJobResponse restored = service.getJob(failed.jobId());
+        assertThat(restored.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(restored.attempt()).isEqualTo(1);
+        assertThat(restored.error()).isEqualTo(failed.error());
+        assertThat(restored.completedAt()).isEqualTo(failed.completedAt());
+        assertThat(restored.attempts()).isEqualTo(failed.attempts());
+        assertThat(restored.idempotencyKey()).isEqualTo("rollback-key");
+        assertThat(registryKeys("jobs")).isEqualTo(keysBefore);
+
+        // Once capacity frees, the very same job can be retried and completes on attempt 2.
+        releaseHash.countDown();
+        assertThat(awaitStatus(running.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+        assertThat(awaitStatus(filler.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+
+        BatchHashJobResponse requeued = service.retry(failed.jobId());
+        assertThat(requeued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(requeued.attempt()).isEqualTo(2);
+
+        BatchHashJobResponse completed = awaitStatus(failed.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.attempt()).isEqualTo(2);
+        assertThat(completed.attempts()).hasSize(2);
+        assertThat(completed.results()).hasSize(1);
     }
 
     /**
@@ -545,6 +829,28 @@ class BatchHashJobServiceTest {
         throw new AssertionError("Expected JobCancellationConflictException for job " + jobId);
     }
 
+    /** Runs {@code retry} expecting a conflict and returns the exception for field-level assertions. */
+    private JobRetryConflictException retryConflictFrom(String jobId) {
+        try {
+            service.retry(jobId);
+        } catch (JobRetryConflictException e) {
+            return e;
+        }
+        throw new AssertionError("Expected JobRetryConflictException for job " + jobId);
+    }
+
+    /** Asserts that retrying a non-FAILED job conflicts and leaves the polled snapshot identical. */
+    private void assertRetryConflict(BatchHashJobResponse expected, JobStatus expectedStatus) {
+        BatchHashJobResponse before = service.getJob(expected.jobId());
+        JobRetryConflictException conflict = retryConflictFrom(expected.jobId());
+        assertThat(conflict.jobId()).isEqualTo(expected.jobId());
+        assertThat(conflict.status()).isEqualTo(expectedStatus);
+        assertThat(conflict.attempt()).isEqualTo(before.attempt());
+        assertThat(conflict.maxAttempts()).isEqualTo(before.maxAttempts());
+        assertThat(conflict.getMessage()).contains(expected.jobId()).contains(expectedStatus.name());
+        assertThat(service.getJob(expected.jobId())).isEqualTo(before);
+    }
+
     private BatchHashJobResponse awaitStatus(String jobId, JobStatus expected) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
         while (System.nanoTime() < deadline) {
@@ -561,6 +867,50 @@ class BatchHashJobServiceTest {
         }
         throw new AssertionError("Job " + jobId + " did not reach " + expected
                 + "; last observed status=" + service.getJob(jobId).status());
+    }
+
+    /**
+     * Hashing stub for the retry tests: one designated item fails its first {@code failures} hashes
+     * (a transient fault) and, optionally, another designated item blocks the worker on latches so a
+     * job can be observed in QUEUED / RUNNING. Every other item delegates to real hashing.
+     */
+    private static final class RetryCryptoService extends CryptoService {
+
+        private final Map<String, AtomicInteger> remainingFailures = new ConcurrentHashMap<>();
+        private final CountDownLatch enteredHash;
+        private final CountDownLatch releaseHash;
+        private final String blockItem;
+
+        private RetryCryptoService(String failingItem, int failures,
+                CountDownLatch enteredHash, CountDownLatch releaseHash, String blockItem) {
+            if (failingItem != null) {
+                remainingFailures.put(failingItem, new AtomicInteger(failures));
+            }
+            this.enteredHash = enteredHash;
+            this.releaseHash = releaseHash;
+            this.blockItem = blockItem;
+        }
+
+        @Override
+        public HashResponse hash(HashRequest request) {
+            AtomicInteger remaining = remainingFailures.get(request.content());
+            if (remaining != null && remaining.getAndUpdate(n -> n > 0 ? n - 1 : 0) > 0) {
+                throw new IllegalStateException("transient hashing failure for " + request.content());
+            }
+            if (blockItem != null && blockItem.equals(request.content())) {
+                if (enteredHash != null) {
+                    enteredHash.countDown();
+                }
+                if (releaseHash != null) {
+                    try {
+                        releaseHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+            return super.hash(request);
+        }
     }
 
     /**
