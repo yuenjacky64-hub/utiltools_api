@@ -5,10 +5,17 @@ import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
+import com.example.utiltools.crypto.dto.UrlRequest;
+import com.example.utiltools.crypto.dto.UrlResponse;
 import org.springframework.stereotype.Service;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -26,6 +33,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class CryptoService {
 
     private static final HexFormat HEX_FORMAT = HexFormat.of();
+    private static final char[] HEX_DIGITS = "0123456789ABCDEF".toCharArray();
 
     private static final String UUID_VERSION_V4 = "V4";
     private static final String UUID_VERSION_V7 = "V7";
@@ -97,6 +105,108 @@ public class CryptoService {
         } else {
             throw new IllegalArgumentException("Invalid action: " + request.action() + ". Expected ENCODE or DECODE.");
         }
+    }
+
+    public UrlResponse url(UrlRequest request) {
+        String action = request.action().trim().toUpperCase(Locale.ROOT);
+        String mode = resolveUrlMode(request.mode());
+
+        if ("ENCODE".equals(action)) {
+            return new UrlResponse("ENCODE", mode, encodeUrl(request.content(), mode));
+        } else if ("DECODE".equals(action)) {
+            return new UrlResponse("DECODE", mode, decodeUrl(request.content(), mode));
+        } else {
+            throw new IllegalArgumentException("Invalid action: " + request.action() + ". Expected ENCODE or DECODE.");
+        }
+    }
+
+    private String resolveUrlMode(String rawMode) {
+        if (rawMode == null || rawMode.isBlank()) {
+            return "COMPONENT";
+        }
+        String mode = rawMode.trim().toUpperCase(Locale.ROOT);
+        return switch (mode) {
+            case "COMPONENT", "PATH", "FORM" -> mode;
+            default -> throw new IllegalArgumentException(
+                    "Invalid mode: " + rawMode + ". Expected COMPONENT, PATH or FORM.");
+        };
+    }
+
+    private String encodeUrl(String content, String mode) {
+        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+        StringBuilder encoded = new StringBuilder(bytes.length * 2);
+        for (byte raw : bytes) {
+            int value = raw & 0xFF;
+            if (isUnreservedUrlByte(value) || ("PATH".equals(mode) && value == '/')) {
+                encoded.append((char) value);
+            } else if (value == ' ' && "FORM".equals(mode)) {
+                encoded.append('+');
+            } else {
+                encoded.append('%')
+                        .append(HEX_DIGITS[value >>> 4])
+                        .append(HEX_DIGITS[value & 0x0F]);
+            }
+        }
+        return encoded.toString();
+    }
+
+    private String decodeUrl(String content, String mode) {
+        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+        ByteArrayOutputStream decoded = new ByteArrayOutputStream(bytes.length);
+        int index = 0;
+        while (index < bytes.length) {
+            int value = bytes[index] & 0xFF;
+            if (value == '%') {
+                if (index + 2 >= bytes.length) {
+                    throw new IllegalArgumentException(
+                            "Invalid percent-encoding at index " + index + ": truncated escape sequence");
+                }
+                int high = hexValue(bytes[index + 1]);
+                int low = hexValue(bytes[index + 2]);
+                if (high < 0 || low < 0) {
+                    throw new IllegalArgumentException(
+                            "Invalid percent-encoding at index " + index + ": expected two hexadecimal digits");
+                }
+                decoded.write((high << 4) | low);
+                index += 3;
+            } else if (value == '+' && "FORM".equals(mode)) {
+                decoded.write(' ');
+                index++;
+            } else {
+                decoded.write(value);
+                index++;
+            }
+        }
+
+        CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT);
+        try {
+            return decoder.decode(ByteBuffer.wrap(decoded.toByteArray())).toString();
+        } catch (CharacterCodingException e) {
+            throw new IllegalArgumentException("Invalid UTF-8 sequence in decoded content: " + e.getMessage(), e);
+        }
+    }
+
+    private static boolean isUnreservedUrlByte(int value) {
+        return (value >= 'A' && value <= 'Z')
+                || (value >= 'a' && value <= 'z')
+                || (value >= '0' && value <= '9')
+                || value == '-' || value == '.' || value == '_' || value == '~';
+    }
+
+    private static int hexValue(byte raw) {
+        int value = raw & 0xFF;
+        if (value >= '0' && value <= '9') {
+            return value - '0';
+        }
+        if (value >= 'A' && value <= 'F') {
+            return value - 'A' + 10;
+        }
+        if (value >= 'a' && value <= 'f') {
+            return value - 'a' + 10;
+        }
+        return -1;
     }
 
     public UuidResponse generateUuids(int count, boolean compact) {
