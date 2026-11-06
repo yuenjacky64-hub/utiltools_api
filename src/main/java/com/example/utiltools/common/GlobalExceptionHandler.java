@@ -1,6 +1,7 @@
 package com.example.utiltools.common;
 
 import com.example.utiltools.json.exception.JsonPatchRollbackException;
+import com.example.utiltools.jobs.JobCancellationConflictException;
 import com.example.utiltools.jobs.JobNotFoundException;
 import com.example.utiltools.jobs.JobQueueFullException;
 import com.example.utiltools.resilience.CircuitBreakerOpenException;
@@ -83,6 +84,15 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleJobNotFound(JobNotFoundException ex) {
         ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "JOB_NOT_FOUND", null);
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
+    }
+
+    @ExceptionHandler(JobCancellationConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleJobCancellationConflict(JobCancellationConflictException ex) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("jobId", ex.jobId());
+        details.put("status", ex.status() != null ? ex.status().name() : null);
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "JOB_CANCELLATION_CONFLICT", details);
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
     }
 
     @ExceptionHandler(CircuitBreakerOpenException.class)

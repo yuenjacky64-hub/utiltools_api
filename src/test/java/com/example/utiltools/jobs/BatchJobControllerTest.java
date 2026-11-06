@@ -11,8 +11,12 @@ import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 
+import java.time.Instant;
+
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -96,5 +100,58 @@ class BatchJobControllerTest {
                 .andExpect(status().isTooManyRequests())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("QUEUE_FULL"));
+    }
+
+    @Test
+    @DisplayName("DELETE /api/v1/utils/jobs/{jobId} - should return 200 with the CANCELLED snapshot")
+    void shouldReturn200WhenCancellingQueuedJob() throws Exception {
+        Instant createdAt = Instant.parse("2026-11-06T10:00:00Z");
+        Instant completedAt = Instant.parse("2026-11-06T10:00:01Z");
+        BatchHashJobResponse cancelled = new BatchHashJobResponse("job-cancelled-1", "controller-cancel-key",
+                JobStatus.CANCELLED, 2, null, null, createdAt, null, completedAt);
+        doReturn(cancelled).when(jobService).cancel("job-cancelled-1");
+        doReturn(cancelled).when(jobService).getJob("job-cancelled-1");
+
+        mockMvc.perform(delete("/api/v1/utils/jobs/job-cancelled-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Job cancelled"))
+                .andExpect(jsonPath("$.data.jobId").value("job-cancelled-1"))
+                .andExpect(jsonPath("$.data.status").value("CANCELLED"))
+                .andExpect(jsonPath("$.data.completedAt").isNotEmpty())
+                .andExpect(jsonPath("$.data.itemCount").value(2))
+                .andExpect(jsonPath("$.data.startedAt").doesNotExist())
+                .andExpect(jsonPath("$.data.results").doesNotExist());
+
+        // Polling afterwards returns the very same cancelled snapshot.
+        mockMvc.perform(get("/api/v1/utils/jobs/job-cancelled-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.jobId").value("job-cancelled-1"))
+                .andExpect(jsonPath("$.data.status").value("CANCELLED"))
+                .andExpect(jsonPath("$.data.completedAt").value("2026-11-06T10:00:01Z"))
+                .andExpect(jsonPath("$.data.results").doesNotExist());
+    }
+
+    @Test
+    @DisplayName("DELETE /api/v1/utils/jobs/{jobId} - should map a late cancellation to 409 JOB_CANCELLATION_CONFLICT")
+    void shouldReturn409WhenCancellationConflicts() throws Exception {
+        doThrow(new JobCancellationConflictException("job-running-1", JobStatus.RUNNING))
+                .when(jobService).cancel("job-running-1");
+
+        mockMvc.perform(delete("/api/v1/utils/jobs/job-running-1"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("JOB_CANCELLATION_CONFLICT"))
+                .andExpect(jsonPath("$.details.jobId").value("job-running-1"))
+                .andExpect(jsonPath("$.details.status").value("RUNNING"));
+    }
+
+    @Test
+    @DisplayName("DELETE /api/v1/utils/jobs/{jobId} - should return 404 JOB_NOT_FOUND for an unknown job id")
+    void shouldReturn404WhenCancellingUnknownJob() throws Exception {
+        mockMvc.perform(delete("/api/v1/utils/jobs/does-not-exist"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("JOB_NOT_FOUND"));
     }
 }
