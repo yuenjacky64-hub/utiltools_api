@@ -144,7 +144,8 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/query` | Evaluate JSONPath queries and extract matching nodes |
 | `POST` | `/api/v1/utils/json/patch` | Apply an ordered RFC 6902-style patch atomically, with reverse-order rollback and audit |
 | `POST` | `/api/v1/utils/jobs/hash` | Submit a bounded async batch-hash job; `202` with a job id, idempotent via `idempotencyKey` |
-| `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `COMPLETED` / `FAILED` |
+| `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `COMPLETED` / `FAILED` / `CANCELLED` |
+| `DELETE` | `/api/v1/utils/jobs/{jobId}` | Cancel a `QUEUED` job (`200`, idempotent); `409` `JOB_CANCELLATION_CONFLICT` once it is `RUNNING`/`COMPLETED`/`FAILED` |
 | `GET` | `/api/v1/utils/audit/entries` | List journal entries (newest first) with optional `limit` & `state` filters |
 | `GET` | `/api/v1/utils/audit/entries/{id}` | Fetch a single journal entry (redacted request/result) |
 | `POST` | `/api/v1/utils/audit/entries/{id}/replay` | Replay a deterministic SUCCEEDED entry and verify the outcome |
@@ -879,7 +880,8 @@ returns `409 REPLAY_CONFLICT`.
 
 Hash up to **1000 items** in the background instead of blocking one HTTP request per item. Submission is
 accepted immediately with **202** and a `jobId`; you then poll `GET /api/v1/utils/jobs/{jobId}` until the job
-reaches `COMPLETED` or `FAILED`. Every item is hashed with the same `CryptoService.hash` used by
+reaches `COMPLETED` or `FAILED`, or withdraw it with `DELETE /api/v1/utils/jobs/{jobId}` while it is still
+`QUEUED`. Every item is hashed with the same `CryptoService.hash` used by
 `POST /api/v1/utils/crypto/hash`, and results are returned in **input order**.
 
 Jobs live in the JVM heap only: this API is **single-instance and in-memory**, so a restart (or a revert)
@@ -947,19 +949,56 @@ curl http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c
 }
 ```
 
-The state machine is strictly `QUEUED → RUNNING → COMPLETED | FAILED`. A `FAILED` job carries a non-null
-`error` and a `completedAt`, and never blocks later jobs.
+The state machine is `QUEUED → RUNNING → COMPLETED | FAILED` plus `QUEUED → CANCELLED`; `COMPLETED`,
+`FAILED` and `CANCELLED` are terminal. A `FAILED` job carries a non-null `error` and a `completedAt`, and never
+blocks later jobs.
 
-#### C. Failure modes
+#### C. Cancel a queued job (200 OK, idempotent)
+
+`DELETE /api/v1/utils/jobs/{jobId}` withdraws a job that is still `QUEUED`. The job moves `QUEUED → CANCELLED`
+exactly once: it is either still waiting behind other work (cancellation wins and **nothing is hashed**) or a
+worker has already admitted it, in which case the call reports a conflict instead. `startedAt` and `results`
+stay absent, and `completedAt` is set to the instant the cancellation was accepted.
+
+```bash
+curl -i -X DELETE http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3
+```
+
+**Response — `200 OK`, `CANCELLED`:**
+```json
+{
+  "success": true,
+  "message": "Job cancelled",
+  "data": {
+    "jobId": "3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3",
+    "idempotencyKey": "batch-2026-10-31-001",
+    "status": "CANCELLED",
+    "itemCount": 3,
+    "createdAt": "2026-10-31T19:12:04.418273Z",
+    "completedAt": "2026-10-31T19:12:04.502114Z"
+  },
+  "timestamp": "2026-10-31T19:12:04.502381Z"
+}
+```
+
+Cancellation is idempotent: repeating the same `DELETE` on an already-`CANCELLED` job returns **`200`** with the
+identical snapshot (`jobId`, `status`, `completedAt` unchanged) rather than a conflict. A `RUNNING`, `COMPLETED`
+or `FAILED` job returns `409 JOB_CANCELLATION_CONFLICT` (see [D](#d-failure-modes)), and an unknown or
+already-evicted `jobId` returns `404 JOB_NOT_FOUND`. The cancelled snapshot — and its `idempotencyKey` mapping —
+stays pollable for `utiltools.jobs.retention-seconds` and is then evicted like any other terminal job, so a
+duplicate submission with the same key observes the `CANCELLED` snapshot until the retention cutoff elapses.
+
+#### D. Failure modes
 
 | Situation | HTTP | `error` | What to do |
 | :--- | :--- | :--- | :--- |
 | Bounded executor queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry with the **same** `idempotencyKey` once capacity frees. The rejected submission is rolled back atomically — its job row **and** its idempotency mapping are both removed, so it leaves no residue and the retry with that key starts a brand-new job |
 | Unknown or already-evicted `jobId` | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Resubmit the batch |
+| Cancelling a job that is `RUNNING`, `COMPLETED` or `FAILED` | `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Stop cancelling; poll `GET` for the terminal snapshot. A repeat `DELETE` on an already-`CANCELLED` job is `200`, not a conflict |
 | Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit with a **new** `idempotencyKey` (or none). Reusing the failed job's key replays its cached `FAILED` snapshot instead of re-executing |
 | Blank/empty `items` | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Send a non-empty list of non-blank strings (max 1000) |
 
-#### D. Batch job configuration
+#### E. Batch job configuration
 
 ```properties
 # Batch hash jobs (bounded async execution)
@@ -973,16 +1012,16 @@ utiltools.jobs.cleanup-interval-ms=60000
 | :--- | :--- | :--- |
 | `utiltools.jobs.worker-count` | `2` | Worker threads hashing batches; bounds CPU-wide concurrency |
 | `utiltools.jobs.queue-capacity` | `100` | `ArrayBlockingQueue` slots for accepted-but-not-started jobs; full queue ⇒ `429 QUEUE_FULL` (`AbortPolicy`) |
-| `utiltools.jobs.retention-seconds` | `300` | How long a `COMPLETED`/`FAILED` job (plus its idempotency key) is kept before eviction |
-| `utiltools.jobs.cleanup-interval-ms` | `60000` | Interval of the scheduled eviction pass (`@EnableScheduling`); `QUEUED`/`RUNNING` jobs are never evicted |
+| `utiltools.jobs.retention-seconds` | `300` | How long a `COMPLETED`/`FAILED`/`CANCELLED` job (plus its idempotency key) is kept before eviction |
+| `utiltools.jobs.cleanup-interval-ms` | `60000` | Interval of the scheduled eviction pass (`@EnableScheduling`); `QUEUED`/`RUNNING` jobs are never evicted, and `CANCELLED` jobs are evicted on the same retention cutoff as `COMPLETED`/`FAILED` |
 
-#### E. Rate limiting interaction (explicit decision)
+#### F. Rate limiting interaction (explicit decision)
 
-Both jobs endpoints live under `/api/v1/utils/**`, so they are **not exempt** from `RateLimitFilter`
-(see [Rate Limiting](#-rate-limiting)): every `POST /api/v1/utils/jobs/hash` **and** every
-`GET /api/v1/utils/jobs/{jobId}` poll consumes one slot of the caller's window budget, because polling a
-job is a normal API call. Being jobs, they are **not** additionally exempted — no entry was added to
-`RateLimitFilter.shouldNotFilter`. Consequences:
+All three jobs endpoints live under `/api/v1/utils/**`, so they are **not exempt** from `RateLimitFilter`
+(see [Rate Limiting](#-rate-limiting)): every `POST /api/v1/utils/jobs/hash`, every
+`GET /api/v1/utils/jobs/{jobId}` poll **and** every `DELETE /api/v1/utils/jobs/{jobId}` cancellation consumes
+one slot of the caller's window budget, because polling or cancelling a job is a normal API call. Being jobs,
+they are **not** additionally exempted — no entry was added to `RateLimitFilter.shouldNotFilter`. Consequences:
 
 - A caller that submits a batch and then polls aggressively can exhaust its own budget and receive
   `429 RATE_LIMITED` (error `RATE_LIMITED`) *before* the job finishes. This is a client-throttling
@@ -997,7 +1036,8 @@ job is a normal API call. Being jobs, they are **not** additionally exempted —
 - `Retry-After` is sent **only** on a rejection, never on a successful poll, so honour it after a `429`
   rather than using it as a cadence. Treat `429 RATE_LIMITED` as "slow down", never as "job gone".
 - The job itself is unaffected by rate limiting and stays retrievable for `utiltools.jobs.retention-seconds`
-  after it becomes terminal (the scheduled eviction pass runs every `utiltools.jobs.cleanup-interval-ms`).
+  after it becomes terminal — `COMPLETED`, `FAILED` **or** `CANCELLED` (the scheduled eviction pass runs every
+  `utiltools.jobs.cleanup-interval-ms`).
 
 ---
 
@@ -1148,8 +1188,8 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `version=V4|V7` selection, compact UUIDv7, and the 400 unified envelope for an unknown `version`.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries, six-op patch success, rollback to byte-identical original, missing paths, malformed pointers, `-` append, dry runs, input-not-mutated.
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, and empty-`operations` validation rejection.
-- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety.
-- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202, 400, 404 `JOB_NOT_FOUND`, 429 `QUEUE_FULL`).
+- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff.
+- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202, 400, 404 `JOB_NOT_FOUND`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND` and 409 `JOB_CANCELLATION_CONFLICT`).
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.
 - **`SlidingWindowRateLimiterTest`**: Exact-cap concurrent admission, deterministic window rollover on a mutable `Clock`, denials consuming no capacity, per-client isolation, idle eviction, and cap enforcement under many spoofed keys.
 - **`RateLimitFilterTest`**: MockMvc proof of the `429 RATE_LIMITED` envelope, `Retry-After`/`X-RateLimit-*` headers, and that a rejected call never invokes the controller.

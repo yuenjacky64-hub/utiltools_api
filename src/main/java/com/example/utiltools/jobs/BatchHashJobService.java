@@ -24,9 +24,9 @@ import java.util.concurrent.TimeUnit;
  * <p>Jobs are executed by a bounded {@link ThreadPoolExecutor} backed by an
  * {@link ArrayBlockingQueue} with an {@link ThreadPoolExecutor.AbortPolicy}, so saturation is
  * observable as a {@link JobQueueFullException} instead of blocking a request thread or growing
- * the heap. Every accepted job moves QUEUED -> RUNNING -> COMPLETED|FAILED exactly once, an
- * optional idempotency key maps to exactly one job and one execution, and stored results keep the
- * input item order.</p>
+ * the heap. Every accepted job moves QUEUED -> RUNNING -> COMPLETED|FAILED exactly once, or
+ * QUEUED -> CANCELLED when it is withdrawn before a worker admits it, an optional idempotency key
+ * maps to exactly one job and one execution, and stored results keep the input item order.</p>
  */
 @Service
 public class BatchHashJobService {
@@ -110,15 +110,42 @@ public class BatchHashJobService {
         return snapshot(requireJob(jobId));
     }
 
+    /**
+     * Withdraws a job that is still QUEUED. The QUEUED -> CANCELLED transition happens exactly once,
+     * under the job's own monitor, so it cannot interleave with the worker's admission check: either
+     * the worker has not started (and will see CANCELLED and return without hashing) or the job is
+     * already RUNNING and this call reports a conflict. A repeated call on a CANCELLED job returns the
+     * same snapshot, because CANCELLED is terminal and no field is written again.
+     *
+     * @throws JobNotFoundException              when the id is unknown or was already evicted
+     * @throws JobCancellationConflictException  when the job is RUNNING, COMPLETED or FAILED
+     */
+    public BatchHashJobResponse cancel(String jobId) {
+        MutableJob job = requireJob(jobId);
+        synchronized (job) {
+            if (job.status == JobStatus.CANCELLED) {
+                return snapshot(job); // idempotent: nothing is written
+            }
+            if (job.status != JobStatus.QUEUED) {
+                throw new JobCancellationConflictException(job.jobId, job.status);
+            }
+            job.status = JobStatus.CANCELLED;
+            job.completedAt = Instant.now();
+            job.results = null; // explicit: nothing was hashed
+            job.error = null;
+            return snapshot(job);
+        }
+    }
+
     @Scheduled(fixedDelayString = "${utiltools.jobs.cleanup-interval-ms:60000}")
     public void evictExpiredJobs() {
         evictExpiredJobs(Instant.now().minusSeconds(retentionSeconds));
     }
 
     /**
-     * Removes terminal jobs whose completion instant is older than {@code cutoff}, together with
-     * their idempotency entries. QUEUED and RUNNING jobs are never evicted. Public and clock-free
-     * so tests can advance the cutoff instead of waiting.
+     * Removes terminal jobs (COMPLETED, FAILED, CANCELLED) whose completion instant is older than
+     * {@code cutoff}, together with their idempotency entries. QUEUED and RUNNING jobs are never
+     * evicted. Public and clock-free so tests can advance the cutoff instead of waiting.
      *
      * @return the number of evicted jobs
      */
@@ -127,7 +154,9 @@ public class BatchHashJobService {
         for (MutableJob job : jobs.values()) {
             boolean evictable;
             synchronized (job) {
-                evictable = (job.status == JobStatus.COMPLETED || job.status == JobStatus.FAILED)
+                evictable = (job.status == JobStatus.COMPLETED
+                        || job.status == JobStatus.FAILED
+                        || job.status == JobStatus.CANCELLED)
                         && job.completedAt != null
                         && job.completedAt.isBefore(cutoff);
             }
