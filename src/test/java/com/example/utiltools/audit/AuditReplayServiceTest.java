@@ -15,6 +15,9 @@ import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
 import com.example.utiltools.datetime.service.DateTimeService;
 import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.text.dto.TextTransformRequest;
+import com.example.utiltools.text.dto.TextTransformResponse;
+import com.example.utiltools.text.service.TextService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -47,7 +50,7 @@ class AuditReplayServiceTest {
         objectMapper = new ObjectMapper();
         journal = new AuditJournalService(objectMapper, 200, 65536, 300L);
         auditedOperations = new AuditedOperations(new DateTimeService(), new CryptoService(),
-                new JsonService(objectMapper), journal);
+                new JsonService(objectMapper), new TextService(), journal);
         replayService = new AuditReplayService(journal, auditedOperations, objectMapper);
         RequestContext.set("req-replay01");
     }
@@ -76,6 +79,31 @@ class AuditReplayServiceTest {
         assertThat(replayed.completedAt()).isEqualTo(completedAt);
         assertThat(replayed.result()).isEqualTo(original.result());
         assertThat(replayed.result().get("digest").asText()).isEqualTo(result.digest());
+        assertThat(journal.size()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("replay of a TEXT_TRANSFORM entry is VERIFIED and leaves the original result untouched")
+    void textTransformReplayIsVerified() {
+        TextTransformResponse result = auditedOperations.transform(
+                new TextTransformRequest("Café déjà vu!", "SLUG"));
+        assertThat(result.result()).isEqualTo("cafe-deja-vu");
+
+        AuditEntry original = journal.list(1, null).get(0);
+        assertThat(original.operation()).isEqualTo(OperationType.TEXT_TRANSFORM);
+        assertThat(original.state()).isEqualTo(JournalState.SUCCEEDED);
+        Instant completedAt = original.completedAt();
+
+        AuditEntry replayed = replayService.replay(original.id());
+
+        assertThat(replayed.replay().state()).isEqualTo(ReplayState.VERIFIED);
+        assertThat(replayed.replay().detail()).isEqualTo("results match");
+        assertThat(replayed.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(replayed.completedAt()).isEqualTo(completedAt);
+        assertThat(replayed.result()).isEqualTo(original.result());
+        assertThat(replayed.result().get("result").asText()).isEqualTo("cafe-deja-vu");
+        assertThat(replayed.result().get("operation").asText()).isEqualTo("SLUG");
+        assertThat(replayed.result().get("changed").asBoolean()).isTrue();
         assertThat(journal.size()).isEqualTo(1);
     }
 
@@ -145,7 +173,7 @@ class AuditReplayServiceTest {
                         org.mockito.ArgumentMatchers.any()))
                 .thenThrow(new IllegalStateException("entry entry-1 was evicted"));
         AuditedOperations faultyOperations = new AuditedOperations(new DateTimeService(), new CryptoService(),
-                new JsonService(objectMapper), faulty);
+                new JsonService(objectMapper), new TextService(), faulty);
 
         HashResponse response = faultyOperations.hash(hashRequest());
 

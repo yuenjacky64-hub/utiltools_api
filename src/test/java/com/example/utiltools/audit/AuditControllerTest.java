@@ -17,6 +17,7 @@ import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
 import com.example.utiltools.datetime.service.DateTimeService;
 import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.text.service.TextService;
 import com.example.utiltools.resilience.ResilienceConfig;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -42,7 +43,7 @@ import java.util.Map;
 
 @WebMvcTest({AuditController.class, CryptoController.class})
 @Import({AuditJournalService.class, AuditedOperations.class, AuditReplayService.class,
-        CryptoService.class, DateTimeService.class, JsonService.class, ResilienceConfig.class,
+        CryptoService.class, DateTimeService.class, JsonService.class, TextService.class, ResilienceConfig.class,
         GlobalExceptionHandler.class, AuditTestSupport.class})
 @TestPropertySource(properties = {"utiltools.audit.max-entries=200", "utiltools.audit.max-replay-bytes=65536"})
 class AuditControllerTest {
