@@ -10,9 +10,11 @@ import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
 
 import java.time.Instant;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
@@ -100,6 +102,77 @@ class BatchJobControllerTest {
                 .andExpect(status().isTooManyRequests())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("QUEUE_FULL"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/hash - reused key with a different body is 409 IDEMPOTENCY_CONFLICT")
+    void shouldReturn409WhenIdempotencyKeyReusedWithDifferentBody() throws Exception {
+        String acceptedBody = """
+                {
+                    "algorithm": "SHA-256",
+                    "items": ["alpha"],
+                    "idempotencyKey": "controller-conflict-key"
+                }
+                """;
+        String conflictingBody = """
+                {
+                    "algorithm": "SHA-256",
+                    "items": ["gamma"],
+                    "idempotencyKey": "controller-conflict-key"
+                }
+                """;
+
+        MvcResult accepted = mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(acceptedBody))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.data.jobId").isNotEmpty())
+                .andReturn();
+        String jobId = com.jayway.jsonpath.JsonPath.read(accepted.getResponse().getContentAsString(),
+                "$.data.jobId");
+
+        mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(conflictingBody))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("IDEMPOTENCY_CONFLICT"))
+                .andExpect(jsonPath("$.message",
+                        org.hamcrest.Matchers.containsString("controller-conflict-key")))
+                .andExpect(jsonPath("$.details.idempotencyKey").value("controller-conflict-key"))
+                .andExpect(jsonPath("$.details.existingJobId").value(jobId));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/hash - identical retry still returns 202 with the same jobId")
+    void shouldReturn202WithSameJobIdForIdenticalRetry() throws Exception {
+        String body = """
+                {
+                    "algorithm": "SHA-256",
+                    "items": ["alpha", "beta"],
+                    "secretKey": "s3cret",
+                    "idempotencyKey": "controller-identical-key"
+                }
+                """;
+
+        MvcResult first = mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.data.itemCount").value(2))
+                .andReturn();
+        String jobId = com.jayway.jsonpath.JsonPath.read(first.getResponse().getContentAsString(),
+                "$.data.jobId");
+
+        MvcResult retry = mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isAccepted())
+                .andReturn();
+
+        String retryJobId = com.jayway.jsonpath.JsonPath.read(retry.getResponse().getContentAsString(),
+                "$.data.jobId");
+        assertThat(retryJobId).isEqualTo(jobId);
     }
 
     @Test
