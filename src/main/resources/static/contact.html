@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Contact Us</title>
+</head>
+<body>
+<main>
+    <h1>Contact Us</h1>
+
+    <form id="contact-form" novalidate>
+        <p>
+            <label for="name">Name</label>
+            <input id="name" name="name" type="text" autocomplete="name" maxlength="100">
+        </p>
+        <p>
+            <label for="email">Email</label>
+            <input id="email" name="email" type="email" autocomplete="email" maxlength="254">
+        </p>
+        <p>
+            <label for="message">Message</label>
+            <textarea id="message" name="message" rows="6" maxlength="2000"></textarea>
+        </p>
+        <p>
+            <button id="contact-submit" type="submit">Send message</button>
+        </p>
+    </form>
+
+    <div id="contact-errors" role="alert" aria-live="polite">
+        <p id="error-summary"></p>
+        <p id="error-name"></p>
+        <p id="error-email"></p>
+        <p id="error-message"></p>
+    </div>
+
+    <div id="contact-success" role="status" aria-live="polite" hidden>
+        Thanks — your message has been sent.
+    </div>
+</main>
+<script src="/script.js" defer></script>
+</body>
+</html>
