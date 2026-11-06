@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import java.lang.reflect.Field;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -198,6 +199,149 @@ class BatchHashJobServiceTest {
 
         releaseHash.countDown();
         assertThat(awaitStatus(running.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("submit - same key with a different item list conflicts and leaves no residue")
+    void shouldRejectConflictWhenItemListChangesUnderSameKey() {
+        CountingCryptoService crypto = new CountingCryptoService(null, null, null);
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3);
+
+        BatchHashJobResponse first = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", List.of("a"), null, "seq-key")).jobId(),
+                JobStatus.COMPLETED);
+
+        assertThatThrownBy(() -> service.submit(new BatchHashRequest("SHA-256", List.of("b"), null, "seq-key")))
+                .isInstanceOf(IdempotencyConflictException.class)
+                .hasMessageContaining("seq-key")
+                .hasMessageContaining(first.jobId());
+
+        // The conflicting payload never reached CryptoService; the first job is untouched.
+        assertThat(crypto.count("b")).isZero();
+        assertThat(crypto.count("a")).isEqualTo(1);
+        BatchHashJobResponse unchanged = service.getJob(first.jobId());
+        assertThat(unchanged.status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(unchanged.itemCount()).isEqualTo(1);
+        assertThat(unchanged.idempotencyKey()).isEqualTo("seq-key");
+        assertThat(unchanged.results()).hasSize(1);
+
+        // No residue: exactly one job and one idempotency mapping remain.
+        assertThat(registryKeys("jobs")).containsExactly(first.jobId());
+        assertThat(registryKeys("idempotencyIndex")).containsExactly("seq-key");
+    }
+
+    @Test
+    @DisplayName("submit - concurrent same key with different payloads yields one accepted job and one conflict per loser")
+    void shouldRejectConcurrentConflictingPayloadsWithOneWinner() throws Exception {
+        CountingCryptoService crypto = new CountingCryptoService(null, null, null);
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3);
+
+        String key = "race-key";
+        int threads = 8;
+        CyclicBarrier barrier = new CyclicBarrier(threads);
+        ExecutorService submitter = Executors.newFixedThreadPool(threads);
+        List<String> acceptedJobIds = Collections.synchronizedList(new ArrayList<>());
+        List<IdempotencyConflictException> conflicts = Collections.synchronizedList(new ArrayList<>());
+        try {
+            List<Future<?>> futures = new ArrayList<>();
+            for (int i = 0; i < threads; i++) {
+                String item = (i % 2 == 0) ? "a" : "b";
+                futures.add(submitter.submit(() -> {
+                    barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    try {
+                        acceptedJobIds.add(
+                                service.submit(new BatchHashRequest("SHA-256", List.of(item), null, key)).jobId());
+                    } catch (IdempotencyConflictException e) {
+                        conflicts.add(e);
+                    }
+                    return null;
+                }));
+            }
+            for (Future<?> future : futures) {
+                future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+        } finally {
+            submitter.shutdownNow();
+        }
+
+        // Which payload wins is not asserted: the split is deterministic only in size.
+        assertThat(acceptedJobIds).hasSize(threads / 2);
+        assertThat(new HashSet<>(acceptedJobIds)).hasSize(1);
+        assertThat(conflicts).hasSize(threads / 2);
+        String winnerJobId = acceptedJobIds.get(0);
+        assertThat(conflicts).allSatisfy(conflict -> {
+            assertThat(conflict.idempotencyKey()).isEqualTo(key);
+            assertThat(conflict.existingJobId()).isEqualTo(winnerJobId);
+        });
+
+        // Wait for the winner's single execution to reach a terminal state BEFORE counting, so the
+        // hash-count assertions observe a finished job instead of racing the worker thread.
+        assertThat(awaitStatus(winnerJobId, JobStatus.COMPLETED).itemCount()).isEqualTo(1);
+
+        // Only the winning payload ran, exactly once.
+        int hashedA = crypto.count("a");
+        int hashedB = crypto.count("b");
+        assertThat(hashedA + hashedB).isEqualTo(1);
+        assertThat(Math.max(hashedA, hashedB)).isEqualTo(1);
+        assertThat(Math.min(hashedA, hashedB)).isZero();
+        assertThat(registryKeys("jobs")).containsExactly(winnerJobId);
+        assertThat(registryKeys("idempotencyIndex")).containsExactly(key);
+    }
+
+    @Test
+    @DisplayName("submit - identical key and payload returns the same jobId without a second execution")
+    void shouldReturnSameJobIdForIdenticalRetryWithoutSecondExecution() {
+        CountingCryptoService crypto = new CountingCryptoService(null, null, null);
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3);
+
+        BatchHashRequest request = new BatchHashRequest("SHA-256", List.of("alpha"), "s3cret", "identical-key");
+        BatchHashJobResponse first = service.submit(request);
+        BatchHashJobResponse duplicate = service.submit(request);
+
+        assertThat(duplicate.jobId()).isEqualTo(first.jobId());
+        awaitStatus(first.jobId(), JobStatus.COMPLETED);
+
+        // A retry after completion still resolves to the same job, never a second execution.
+        assertThat(service.submit(request).jobId()).isEqualTo(first.jobId());
+        assertThat(crypto.count("alpha")).isEqualTo(1);
+        assertThat(registryKeys("jobs")).containsExactly(first.jobId());
+        assertThat(registryKeys("idempotencyIndex")).containsExactly("identical-key");
+    }
+
+    @Test
+    @DisplayName("submit - algorithm and secretKey spellings normalise like CryptoService")
+    void shouldTreatAlgorithmAndSecretKeySpellingsAsEquivalent() {
+        service = new BatchHashJobService(new CryptoService(), 2, 10, 300, 3);
+
+        BatchHashJobResponse first =
+                service.submit(new BatchHashRequest("sha-256", List.of("alpha"), null, "norm-key"));
+        BatchHashJobResponse aliased =
+                service.submit(new BatchHashRequest("SHA256", List.of("alpha"), "   ", "norm-key"));
+        BatchHashJobResponse padded =
+                service.submit(new BatchHashRequest("  SHA-256  ", List.of("alpha"), null, "norm-key"));
+
+        assertThat(aliased.jobId()).isEqualTo(first.jobId());
+        assertThat(padded.jobId()).isEqualTo(first.jobId());
+        assertThat(registryKeys("jobs")).containsExactly(first.jobId());
+    }
+
+    @Test
+    @DisplayName("submit - reordered or boundary-shifted items conflict under the same key")
+    void shouldRejectConflictWhenItemsAreReordered() {
+        service = new BatchHashJobService(new CryptoService(), 2, 10, 300, 3);
+
+        BatchHashJobResponse first =
+                service.submit(new BatchHashRequest("SHA-256", List.of("ab", "c"), null, "boundary-key"));
+
+        assertThatThrownBy(() -> service.submit(
+                new BatchHashRequest("SHA-256", List.of("a", "bc"), null, "boundary-key")))
+                .isInstanceOf(IdempotencyConflictException.class);
+        assertThatThrownBy(() -> service.submit(
+                new BatchHashRequest("SHA-256", List.of("c", "ab"), null, "boundary-key")))
+                .isInstanceOf(IdempotencyConflictException.class);
+
+        assertThat(registryKeys("jobs")).containsExactly(first.jobId());
+        assertThat(registryKeys("idempotencyIndex")).containsExactly("boundary-key");
     }
 
     @Test

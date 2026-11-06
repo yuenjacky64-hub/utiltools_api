@@ -1,6 +1,7 @@
 package com.example.utiltools.common;
 
 import com.example.utiltools.json.exception.JsonPatchRollbackException;
+import com.example.utiltools.jobs.IdempotencyConflictException;
 import com.example.utiltools.jobs.JobCancellationConflictException;
 import com.example.utiltools.jobs.JobNotFoundException;
 import com.example.utiltools.jobs.JobQueueFullException;
@@ -85,6 +86,15 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleJobNotFound(JobNotFoundException ex) {
         ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "JOB_NOT_FOUND", null);
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
+    }
+
+    @ExceptionHandler(IdempotencyConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleIdempotencyConflict(IdempotencyConflictException ex) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("idempotencyKey", ex.idempotencyKey());
+        details.put("existingJobId", ex.existingJobId());
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "IDEMPOTENCY_CONFLICT", details);
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
     }
 
     @ExceptionHandler(JobCancellationConflictException.class)

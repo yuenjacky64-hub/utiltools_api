@@ -779,13 +779,58 @@ marked `VALIDATED`, `resultJson` is `null`, and failures still produce `FAILED` 
 { "json": "{\"name\":\"Alice\"}", "operations": [{ "op": "test", "path": "/name", "value": "Alice" }], "dryRun": true }
 ```
 
+#### E. Circuit breaker & probe lease recovery
+
+The JSONPath query path runs behind a single `CLOSED` / `OPEN` / `HALF_OPEN` circuit breaker, exposed
+read-only by `GET /api/v1/utils/resilience` and driven by hand with `POST /api/v1/utils/resilience/probe`.
+
+```json
+{
+  "success": true,
+  "data": {
+    "name": "json-query",
+    "state": "HALF_OPEN",
+    "consecutiveFailures": 0,
+    "consecutiveSuccesses": 0,
+    "resetAt": "2026-01-01T00:00:30Z",
+    "probeInFlight": true,
+    "probeLeaseExpiresAt": "2026-01-01T00:00:40Z",
+    "auditCapacity": 1024,
+    "audit": []
+  },
+  "message": "Resilience state retrieved",
+  "timestamp": "2026-01-01T00:00:31Z"
+}
+```
+
+| Field | Meaning |
+| :--- | :--- |
+| `probeInFlight` | `true` while a `HALF_OPEN` probe claim is held and its lease has not expired |
+| `probeLeaseExpiresAt` | Deadline of that claim (`null` when the breaker holds no claim) |
+
+Recovery: while a probe lease is live a concurrent caller is refused with `503` `CIRCUIT_OPEN` and reason
+`probe already in flight`. Once the lease expires the claim is superseded — the superseded generation can no
+longer change counters, state or the audit trail, so a probe that hung inside the delegate and returns late is
+ignored — and the next admitted caller claims a fresh generation. The scheduled reaper records exactly one
+`PROBE_LEASE_EXPIRED` audit row per expired generation, so the breaker recovers even with no further traffic.
+
+| Property | Default | Purpose |
+| :--- | :--- | :--- |
+| `utiltools.resilience.probe-lease-seconds` | `10` | Lifetime of a `HALF_OPEN` probe claim before it may be superseded |
+| `utiltools.resilience.probe-reaper-interval-ms` | `5000` | Fixed delay between scheduled sweeps that release expired leases |
+
+> **Scope note:** breaker state, the probe claim and the audit trail are in-process and reset on restart.
+
 ---
 
 ## 🧾 Operation Journal & Replay Verification
 
-Every `/api/v1/utils/**` call is recorded in a **bounded in-memory journal** so a failed hash,
-JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry can be
-verified against the original outcome without ever mutating the original entry.
+All twelve journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+`datetime/shift`, `crypto/hash`, `crypto/base64`, `crypto/uuid`, `json/format`, `json/validate`,
+`json/query`, `text/transform`, `text/stats` — are recorded in a **bounded in-memory journal** so a failed
+hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
+can be verified against the original outcome without ever mutating the original entry.
+`GET /api/v1/utils/datetime/timezones` is read-only catalogue metadata and is not journalled.
 
 **Lifecycle:** `PENDING` on entry → `SUCCEEDED` with the response DTO, or `FAILED` with an
 `errorCode` (`BAD_REQUEST` / `INTERNAL_SERVER_ERROR`). Only `PENDING → SUCCEEDED` and
@@ -1041,6 +1086,13 @@ same `jobId` and cause exactly one execution. A *first* submission always report
 it was accepted in, captured before enqueue); a *duplicate* submission returns the current live snapshot of the
 existing job instead, so its `status` may already be `RUNNING`, `COMPLETED` or `FAILED`.
 
+An `idempotencyKey` identifies exactly **one canonical request payload** — the `algorithm` (after trim,
+upper-case and `SHA256`/`SHA-256` alias normalisation), the **ordered** `items` list, and the `secretKey` (where
+`null` and blank are equivalent). An identical retry therefore returns the same `jobId` with no second execution,
+while reusing the key with a **changed** payload is rejected with `409 IDEMPOTENCY_CONFLICT` **instead of**
+returning the cached job. The conflict is detected before registration, so the rejected submission creates no job
+row, hashes nothing and leaves no idempotency residue; the first job is untouched and keeps running.
+
 ```bash
 curl -i -X POST http://localhost:8080/api/v1/utils/jobs/hash \
   -H "Content-Type: application/json" \
@@ -1066,6 +1118,22 @@ curl -i -X POST http://localhost:8080/api/v1/utils/jobs/hash \
   "timestamp": "2026-10-31T19:12:04.418503Z"
 }
 ```
+
+**Response — `409 Conflict` (same key, different payload):**
+```json
+{
+  "success": false,
+  "message": "Idempotency key 'batch-2026-10-31-001' was already used with a different request payload",
+  "error": "IDEMPOTENCY_CONFLICT",
+  "details": {
+    "idempotencyKey": "batch-2026-10-31-001",
+    "existingJobId": "3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3"
+  },
+  "timestamp": "2026-10-31T19:13:11.204880Z"
+}
+```
+
+The payload never echoes `items` or `secretKey`; only the key and the existing job id are returned.
 
 #### B. Poll the job snapshot
 
@@ -1198,6 +1266,7 @@ duplicate submission with the same key observes the `CANCELLED` snapshot until t
 | Cancelling a job that is `RUNNING`, `COMPLETED` or `FAILED` | `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Stop cancelling; poll `GET` for the terminal snapshot. A repeat `DELETE` on an already-`CANCELLED` job is `200`, not a conflict |
 | Retrying a `QUEUED`, `RUNNING`, `COMPLETED` or `CANCELLED` job, or a `FAILED` job at `maxAttempts` | `409 CONFLICT` | `JOB_RETRY_CONFLICT` | Only a `FAILED` job below `maxAttempts` can be retried. The job snapshot is unchanged by the rejection; resubmit if the attempt budget is spent |
 | Retry rejected because the bounded queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry `POST …/retry` again once capacity frees: the previous `FAILED` snapshot and its `attempt` are restored, so nothing is consumed |
+| Same `idempotencyKey` reused with a different `algorithm`, `items` or `secretKey` | `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | The first job is untouched and keeps running; the conflicting submission is discarded before registration (no job, no execution, no key residue). Pick a new `idempotencyKey` for a genuinely new payload |
 | Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit with a **new** `idempotencyKey` (or none). `POST …/retry` would re-run the same rejected algorithm and fail again; reusing the failed job's key replays its cached `FAILED` snapshot instead of re-executing |
 | Blank/empty `items` | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Send a non-empty list of non-blank strings (max 1000) |
 
@@ -1326,6 +1395,8 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | `404 NOT_FOUND` | `NOT_FOUND` | Unknown audit journal entry id |
 | `409 CONFLICT` | `REPLAY_CONFLICT` | Replay of a FAILED, non-deterministic, oversized, or still-PENDING entry, or a replay of an entry whose claim is already `IN_PROGRESS` (live lease) or was lost to a lease takeover |
 | `409 CONFLICT` | `JOB_RETRY_CONFLICT` | Retry of a `QUEUED`/`RUNNING`/`COMPLETED`/`CANCELLED` batch job, or of a `FAILED` job whose `attempt` already equals `maxAttempts` |
+| `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | Batch job idempotency key reused with a different request payload |
+| `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Cancellation attempted on a batch job that is `RUNNING`, `COMPLETED` or `FAILED` |
 | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Batch job queue is saturated; retry after capacity frees |
 | `429 TOO_MANY_REQUESTS` | `RATE_LIMITED` | Request budget for `/api/v1/utils/*` exhausted (see [Rate Limiting](#-rate-limiting)) |
 | `500 INTERNAL_SERVER_ERROR` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |
@@ -1398,10 +1469,14 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, and empty-`operations` validation rejection.
 - **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`), diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points.
 - **`TextControllerTest`**: Text endpoints MockMvc suite, including the snake-case transform envelope, diacritic slugging, `400 BAD_REQUEST` for an unknown operation, `400 VALIDATION_ERROR` for blank text, and a `TEXT_TRANSFORM` entry listed by `/audit/entries` and replayed as `VERIFIED`.
-- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff. Retry coverage: transient failure then a successful retry (`attempt` 2, attempt-1 `FAILED` entry retained), `RUNNING`/`COMPLETED`/`CANCELLED` conflicts that leave the snapshot unchanged, attempt exhaustion at `maxAttempts`, stale-worker fencing (a superseded generation writes nothing after a retry), and queue-rejection rollback that leaves the job `FAILED` with an unconsumed attempt while a later retry succeeds.
-- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202 submit/retry, 400, 404 `JOB_NOT_FOUND`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND`, 409 `JOB_CANCELLATION_CONFLICT`, and `POST …/retry` 202 `QUEUED` vs 409 `JOB_RETRY_CONFLICT` with `jobId`/`status`/`attempt`/`maxAttempts` details).
+- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, key/payload fingerprint conflict detection (changed items, reordered items, changed algorithm or `secretKey`), 8-thread different-payload races, identical-key/identical-payload retries that mint no second execution, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff. Retry coverage: transient failure then a successful retry (`attempt` 2, attempt-1 `FAILED` entry retained), `RUNNING`/`COMPLETED`/`CANCELLED` conflicts that leave the snapshot unchanged, attempt exhaustion at `maxAttempts`, stale-worker fencing (a superseded generation writes nothing after a retry), and queue-rejection rollback that leaves the job `FAILED` with an unconsumed attempt while a later retry succeeds.
+- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202 submit/retry, 400, 404 `JOB_NOT_FOUND`, 409 `IDEMPOTENCY_CONFLICT`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND`, 409 `JOB_CANCELLATION_CONFLICT`, and `POST …/retry` 202 `QUEUED` vs 409 `JOB_RETRY_CONFLICT` with `jobId`/`status`/`attempt`/`maxAttempts` details).
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.
 - **`SlidingWindowRateLimiterTest`**: Exact-cap concurrent admission, deterministic window rollover on a mutable `Clock`, denials consuming no capacity, per-client isolation, idle eviction, and cap enforcement under many spoofed keys.
 - **`RateLimitFilterTest`**: MockMvc proof of the `429 RATE_LIMITED` envelope, `Retry-After`/`X-RateLimit-*` headers, and that a rejected call never invokes the controller.
 - **`RateLimitConfigTest`**: Property binding and overrides, filter registration for `/api/v1/utils/*` ahead of Spring MVC, and the `@Scheduled` cleanup wiring.
+- **`CircuitBreakerTest`**: CLOSED→OPEN thresholds, forced `probe()` semantics, and the `HALF_OPEN` probe lease — a concurrent caller inside the lease gets `CIRCUIT_OPEN` "probe already in flight" with no audit row, a clock advance past the lease admits a new probe with exactly one `PROBE_LEASE_EXPIRED` row, late success and late failure from the superseded generation change no counter/state and append no row, and `reapExpiredProbe()` is idempotent.
+- **`ResilienceControllerTest`**: MockMvc coverage of `GET /api/v1/utils/resilience` (`probeInFlight` / `probeLeaseExpiresAt` in the payload) and of `POST /api/v1/utils/resilience/probe` with the unified envelope.
+- **`AuditTrailTest`**: Bounded audit ring buffer ordering and capacity-eviction behaviour.
+- **`JsonQueryCircuitOpenTest`**: End-to-end proof that an `OPEN` breaker maps to a `503` `CIRCUIT_OPEN` envelope on `/api/v1/utils/json/query`.
 - **`UtiltoolsApiApplicationTests`**: Spring ApplicationContext loading verification.

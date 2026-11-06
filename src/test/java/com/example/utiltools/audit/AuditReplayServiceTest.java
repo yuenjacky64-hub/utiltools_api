@@ -13,6 +13,8 @@ import com.example.utiltools.common.RequestContext;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
+import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
+import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.service.DateTimeService;
 import com.example.utiltools.json.service.JsonService;
 import com.example.utiltools.text.dto.TextTransformRequest;
@@ -80,6 +82,58 @@ class AuditReplayServiceTest {
         assertThat(replayed.result()).isEqualTo(original.result());
         assertThat(replayed.result().get("digest").asText()).isEqualTo(result.digest());
         assertThat(journal.size()).isEqualTo(1);
+    }
+
+    private static DateTimeShiftRequest shiftRequest() {
+        return new DateTimeShiftRequest("2026-01-31T12:00:00Z", "UTC", 1L, "MONTHS", null);
+    }
+
+    @Test
+    @DisplayName("replay of a SUCCEEDED DATETIME_SHIFT entry is VERIFIED and leaves the entry untouched")
+    void successfulShiftReplayIsVerifiedAndLeavesOriginalEntryUnchanged() {
+        DateTimeShiftResponse result = auditedOperations.shift(shiftRequest());
+        AuditEntry original = journal.list(1, null).get(0);
+        assertThat(original.operation()).isEqualTo(OperationType.DATETIME_SHIFT);
+        assertThat(original.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(original.request().get("input").asText()).isEqualTo("2026-01-31T12:00:00Z");
+        assertThat(original.request().get("targetTimeZone").asText()).isEqualTo("UTC");
+        assertThat(original.request().get("amount").asLong()).isEqualTo(1L);
+        assertThat(original.request().get("unit").asText()).isEqualTo("MONTHS");
+        assertThat(original.request().has("amountNonZero")).isFalse();
+        Instant completedAt = original.completedAt();
+        int sizeBeforeReplay = journal.size();
+
+        AuditEntry replayed = replayService.replay(original.id());
+
+        assertThat(replayed.replay().state()).isEqualTo(ReplayState.VERIFIED);
+        assertThat(replayed.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(replayed.completedAt()).isEqualTo(completedAt);
+        assertThat(replayed.result()).isEqualTo(original.result());
+        assertThat(replayed.result().get("isoUtc").asText()).isEqualTo(result.isoUtc());
+        assertThat(replayed.result().get("isoUtc").asText()).isEqualTo("2026-02-28T12:00:00Z");
+        assertThat(journal.size()).isEqualTo(sizeBeforeReplay);
+    }
+
+    @Test
+    @DisplayName("a shift with an unknown timezone is journalled as a FAILED DATETIME_SHIFT entry")
+    void unknownTimeZoneShiftIsJournalledAsFailed() {
+        DateTimeShiftRequest unknownZone =
+                new DateTimeShiftRequest("2026-01-31T12:00:00Z", "Invalid/Zone", 1L, "MONTHS", null);
+
+        assertThatThrownBy(() -> auditedOperations.shift(unknownZone))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        AuditEntry failed = journal.list(1, null).get(0);
+        assertThat(failed.operation()).isEqualTo(OperationType.DATETIME_SHIFT);
+        assertThat(failed.state()).isEqualTo(JournalState.FAILED);
+        assertThat(failed.errorCode()).isEqualTo("BAD_REQUEST");
+        assertThat(failed.result()).isNull();
+        assertThat(failed.request().get("targetTimeZone").asText()).isEqualTo("Invalid/Zone");
+        assertThat(failed.request().get("amount").asLong()).isEqualTo(1L);
+
+        assertThatThrownBy(() -> replayService.replay(failed.id()))
+                .isInstanceOf(ReplayConflictException.class);
+        assertThat(journal.find(failed.id()).orElseThrow().replay()).isNull();
     }
 
     @Test

@@ -51,7 +51,7 @@ public class DateTimeController {
     @PostMapping("/shift")
     @Operation(summary = "Shift datetime by a signed amount and unit in a target timezone", description = "Applies years/months/weeks/days/hours/minutes/seconds arithmetic with java.time ZonedDateTime semantics, including month-end clamping and DST transitions")
     public ApiResponse<DateTimeShiftResponse> shift(@Valid @RequestBody DateTimeShiftRequest request) {
-        DateTimeShiftResponse result = dateTimeService.shift(request);
+        DateTimeShiftResponse result = auditedOperations.shift(request);
         return ApiResponse.success(result, "DateTime shifted successfully");
     }
 

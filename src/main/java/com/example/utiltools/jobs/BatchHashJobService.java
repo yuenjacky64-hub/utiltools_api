@@ -8,9 +8,14 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -74,6 +79,7 @@ public class BatchHashJobService {
         String key = (request.idempotencyKey() == null || request.idempotencyKey().isBlank())
                 ? null
                 : request.idempotencyKey();
+        String fingerprint = fingerprint(request.algorithm(), request.items(), request.secretKey());
 
         synchronized (registryLock) {
             if (key != null) {
@@ -81,13 +87,20 @@ public class BatchHashJobService {
                 if (existingJobId != null) {
                     MutableJob existing = jobs.get(existingJobId);
                     if (existing != null) {
+                        if (!existing.fingerprint.equals(fingerprint)) {
+                            // An idempotency key identifies exactly one canonical payload: the
+                            // conflicting submission is refused before any registration or enqueue,
+                            // so it leaves no job row and no idempotency mapping behind.
+                            throw new IdempotencyConflictException(key, existing.jobId);
+                        }
                         return snapshot(existing); // duplicate submission: same jobId, no second execution
                     }
                 }
             }
 
             MutableJob job = new MutableJob(UUID.randomUUID().toString(), key,
-                    request.algorithm(), request.items(), request.secretKey(), Instant.now(), maxAttempts);
+                    request.algorithm(), request.items(), request.secretKey(), fingerprint, Instant.now(),
+                    maxAttempts);
             if (key != null) {
                 idempotencyIndex.put(key, job.jobId);
             }
@@ -363,6 +376,57 @@ public class BatchHashJobService {
         }
     }
 
+    /**
+     * Canonical fingerprint of a request payload: the normalised algorithm, the ordered item list
+     * and the secret key. Only the SHA-256 digest leaves this method, so no pre-image (and no
+     * secret) is ever stored on a job, logged, or returned.
+     *
+     * <p>Fields are encoded unambiguously — explicit item count plus byte-length-prefixed UTF-8
+     * values — so {@code ["ab","c"]} and {@code ["a","bc"]} cannot collide, and input order is
+     * significant. The normalisation mirrors {@code CryptoService.hash}: trim, upper-case, then the
+     * {@code SHA256}/{@code SHA-256} style aliases, with {@code null} and blank secrets treated as
+     * equivalent. An unsupported algorithm is <em>not</em> rejected here — it keeps its trimmed
+     * upper-cased spelling so it still reaches the worker and becomes a {@code FAILED} job.</p>
+     */
+    private static String fingerprint(String algorithm, List<String> items, String secretKey) {
+        String canonicalAlgorithm = normalizeAlgorithmForFingerprint(algorithm);
+        boolean secretPresent = secretKey != null && !secretKey.isBlank();
+        StringBuilder canonical = new StringBuilder(96 + items.size() * 24);
+        appendField(canonical, canonicalAlgorithm);
+        canonical.append(items.size()).append('|');
+        for (String item : items) {
+            appendField(canonical, item);
+        }
+        canonical.append(secretPresent ? '1' : '0');
+        appendField(canonical, secretPresent ? secretKey : "");
+        byte[] canonicalBytes = canonical.toString().getBytes(StandardCharsets.UTF_8);
+        return HexFormat.of().formatHex(sha256(canonicalBytes));
+    }
+
+    private static void appendField(StringBuilder out, String value) {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        out.append(bytes.length).append(':').append(value).append(';');
+    }
+
+    private static byte[] sha256(byte[] input) {
+        try {
+            return MessageDigest.getInstance("SHA-256").digest(input);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is required by the JVM spec but unavailable", e);
+        }
+    }
+
+    private static String normalizeAlgorithmForFingerprint(String algorithm) {
+        String upper = algorithm.trim().toUpperCase(Locale.ROOT);
+        return switch (upper) {
+            case "SHA256", "SHA-256" -> "SHA-256";
+            case "SHA512", "SHA-512" -> "SHA-512";
+            case "SHA1", "SHA-1" -> "SHA-1";
+            case "MD5" -> "MD5";
+            default -> upper;
+        };
+    }
+
     private static final class MutableJob {
 
         private final String jobId;
@@ -370,6 +434,7 @@ public class BatchHashJobService {
         private final String algorithm;
         private final List<String> items;
         private final String secretKey;
+        private final String fingerprint;
         private final Instant createdAt;
         private final int maxAttempts;
         private final List<JobAttempt> attemptHistory = new ArrayList<>();
@@ -382,12 +447,13 @@ public class BatchHashJobService {
         private String error;
 
         private MutableJob(String jobId, String idempotencyKey, String algorithm, List<String> items,
-                String secretKey, Instant createdAt, int maxAttempts) {
+                String secretKey, String fingerprint, Instant createdAt, int maxAttempts) {
             this.jobId = jobId;
             this.idempotencyKey = idempotencyKey;
             this.algorithm = algorithm;
             this.items = List.copyOf(items);
             this.secretKey = secretKey;
+            this.fingerprint = fingerprint;
             this.createdAt = createdAt;
             this.maxAttempts = maxAttempts;
         }
