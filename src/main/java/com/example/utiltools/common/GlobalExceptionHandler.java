@@ -4,6 +4,7 @@ import com.example.utiltools.json.exception.JsonPatchRollbackException;
 import com.example.utiltools.jobs.JobCancellationConflictException;
 import com.example.utiltools.jobs.JobNotFoundException;
 import com.example.utiltools.jobs.JobQueueFullException;
+import com.example.utiltools.jobs.JobRetryConflictException;
 import com.example.utiltools.resilience.CircuitBreakerOpenException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -103,6 +104,17 @@ public class GlobalExceptionHandler {
         details.put("reason", ex.reason());
         ApiResponse<Void> response = ApiResponse.error("Service unavailable: circuit breaker is open", "CIRCUIT_OPEN", details);
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(response);
+    }
+
+    @ExceptionHandler(JobRetryConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleJobRetryConflict(JobRetryConflictException ex) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("jobId", ex.jobId());
+        details.put("status", ex.status() != null ? ex.status().name() : null);
+        details.put("attempt", ex.attempt());
+        details.put("maxAttempts", ex.maxAttempts());
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "JOB_RETRY_CONFLICT", details);
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
     }
 
     @ExceptionHandler(Exception.class)

@@ -25,8 +25,15 @@ import java.util.concurrent.TimeUnit;
  * {@link ArrayBlockingQueue} with an {@link ThreadPoolExecutor.AbortPolicy}, so saturation is
  * observable as a {@link JobQueueFullException} instead of blocking a request thread or growing
  * the heap. Every accepted job moves QUEUED -> RUNNING -> COMPLETED|FAILED exactly once, or
- * QUEUED -> CANCELLED when it is withdrawn before a worker admits it, an optional idempotency key
- * maps to exactly one job and one execution, and stored results keep the input item order.</p>
+ * QUEUED -> CANCELLED when it is withdrawn before a worker admits it; a FAILED job may be requeued
+ * as FAILED -> QUEUED while its attempt count is below the configured maximum. An optional
+ * idempotency key maps to exactly one job and one execution, and stored results keep the input item
+ * order.</p>
+ *
+ * <p>Each execution attempt carries a generation equal to its 1-based attempt number. A worker
+ * captures its generation at admission and writes RUNNING, COMPLETED or FAILED only while
+ * {@code job.attempt} still equals it, so a late worker from a superseded attempt cannot overwrite
+ * the retried attempt's status, results or error.</p>
  */
 @Service
 public class BatchHashJobService {
@@ -36,6 +43,7 @@ public class BatchHashJobService {
     private final int workerCount;
     private final int queueCapacity;
     private final long retentionSeconds;
+    private final int maxAttempts;
 
     private final ConcurrentHashMap<String, MutableJob> jobs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> idempotencyIndex = new ConcurrentHashMap<>();
@@ -44,11 +52,14 @@ public class BatchHashJobService {
     public BatchHashJobService(CryptoService cryptoService,
             @Value("${utiltools.jobs.worker-count:2}") int workerCount,
             @Value("${utiltools.jobs.queue-capacity:100}") int queueCapacity,
-            @Value("${utiltools.jobs.retention-seconds:300}") long retentionSeconds) {
+            @Value("${utiltools.jobs.retention-seconds:300}") long retentionSeconds,
+            @Value("${utiltools.jobs.max-attempts:3}") int maxAttempts) {
         this.cryptoService = cryptoService;
         this.workerCount = workerCount;
         this.queueCapacity = queueCapacity;
         this.retentionSeconds = retentionSeconds;
+        // A non-positive configuration must not authorise unlimited retries.
+        this.maxAttempts = Math.max(1, maxAttempts);
         this.executor = new ThreadPoolExecutor(workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(queueCapacity), new ThreadPoolExecutor.AbortPolicy());
     }
@@ -76,7 +87,7 @@ public class BatchHashJobService {
             }
 
             MutableJob job = new MutableJob(UUID.randomUUID().toString(), key,
-                    request.algorithm(), request.items(), request.secretKey(), Instant.now());
+                    request.algorithm(), request.items(), request.secretKey(), Instant.now(), maxAttempts);
             if (key != null) {
                 idempotencyIndex.put(key, job.jobId);
             }
@@ -89,7 +100,8 @@ public class BatchHashJobService {
             BatchHashJobResponse accepted = snapshot(job);
 
             try {
-                executor.execute(() -> executeJob(job));
+                // The first attempt's generation is explicit rather than implicit.
+                executor.execute(() -> executeAttempt(job.jobId, 1));
             } catch (RejectedExecutionException e) {
                 // Rollback must undo BOTH registrations: the idempotency index stores job ids
                 // (String), so the conditional remove must be given the id, not the job object.
@@ -108,6 +120,48 @@ public class BatchHashJobService {
     /** Current snapshot of a job; throws {@link JobNotFoundException} for unknown or evicted ids. */
     public BatchHashJobResponse getJob(String jobId) {
         return snapshot(requireJob(jobId));
+    }
+
+    /**
+     * Requeues a FAILED job for one more execution attempt.
+     *
+     * <p>Validation and the {@code FAILED -> QUEUED} transition happen in a single monitor section,
+     * so a worker can never complete the job between the status check and the requeue. The attempt
+     * counter is incremented in that same section and doubles as the new generation: a worker from
+     * the previous attempt fails its generation check and writes nothing. The jobId and the
+     * idempotency mapping are untouched by a retry.</p>
+     *
+     * <p>If the executor rejects the requeued attempt, the previous FAILED snapshot is restored -
+     * including the attempt counter - and the existing {@link JobQueueFullException} is thrown, so
+     * the attempt is not consumed and the retry can be repeated once capacity frees.</p>
+     *
+     * @throws JobNotFoundException        when the id is unknown or was already evicted
+     * @throws JobRetryConflictException   when the job is not FAILED, or its attempt budget is spent
+     * @throws JobQueueFullException       when the bounded executor rejects the requeued attempt
+     */
+    public BatchHashJobResponse retry(String jobId) {
+        MutableJob job = requireJob(jobId); // unknown/evicted -> JobNotFoundException (404 JOB_NOT_FOUND)
+        synchronized (job) {
+            if (job.status != JobStatus.FAILED || job.attempt >= job.maxAttempts) {
+                // Thrown before a single field is touched: the 409 leaves the snapshot identical.
+                throw new JobRetryConflictException(job.jobId, job.status, job.attempt, job.maxAttempts);
+            }
+            FailedState before = FailedState.of(job);
+            int admittedAttempt = ++job.attempt;
+            job.status = JobStatus.QUEUED;
+            job.startedAt = null;
+            job.completedAt = null;
+            job.error = null;
+            job.results = null; // a retried attempt starts from nothing
+            try {
+                executor.execute(() -> executeAttempt(job.jobId, admittedAttempt));
+            } catch (RejectedExecutionException e) {
+                before.restore(job); // attempt decremented, status FAILED, error/completedAt back
+                throw new JobQueueFullException("Hash job queue is full (worker-count=" + workerCount
+                        + ", queue-capacity=" + queueCapacity + "); retry after capacity frees");
+            }
+            return snapshot(job); // QUEUED, attempt = 2, attempt-1 entry retained
+        }
     }
 
     /**
@@ -189,17 +243,31 @@ public class BatchHashJobService {
     private BatchHashJobResponse snapshot(MutableJob job) {
         synchronized (job) {
             return new BatchHashJobResponse(job.jobId, job.idempotencyKey, job.status, job.items.size(),
-                    job.results, job.error, job.createdAt, job.startedAt, job.completedAt);
+                    job.results, job.error, job.createdAt, job.startedAt, job.completedAt,
+                    job.attempt, job.maxAttempts, List.copyOf(job.attemptHistory));
         }
     }
 
-    private void executeJob(MutableJob job) {
+    /**
+     * Worker entry point. Package-private like {@link #evictExpiredJobs(Instant)} so tests can replay
+     * a superseded generation. An evicted job resolves to {@code null} and is simply not executed,
+     * rather than throwing inside the pool.
+     */
+    void executeAttempt(String jobId, int generation) {
+        MutableJob job = jobs.get(jobId);
+        if (job != null) {
+            executeJob(job, generation);
+        }
+    }
+
+    private void executeJob(MutableJob job, int generation) {
         synchronized (job) {
-            if (job.status != JobStatus.QUEUED) {
-                return; // a second execution is a no-op
+            if (job.status != JobStatus.QUEUED || job.attempt != generation) {
+                return; // fenced: a superseded generation (or a cancelled/retried job) writes nothing
             }
             job.status = JobStatus.RUNNING;
             job.startedAt = Instant.now();
+            recordAttempt(job, generation, JobStatus.RUNNING, job.startedAt, null, null);
         }
         try {
             List<HashResponse> results = new ArrayList<>(job.items.size());
@@ -207,25 +275,82 @@ public class BatchHashJobService {
                 results.add(cryptoService.hash(new HashRequest(job.algorithm, item, job.secretKey)));
             }
             synchronized (job) {
+                if (job.attempt != generation || job.status != JobStatus.RUNNING) {
+                    return; // fenced: the attempt was requeued or reaped while hashing
+                }
                 job.results = List.copyOf(results);
                 job.error = null;
                 job.status = JobStatus.COMPLETED;
                 job.completedAt = Instant.now();
+                recordAttempt(job, generation, JobStatus.COMPLETED, job.startedAt, job.completedAt, null);
             }
         } catch (Throwable t) {
             // Intentional: an Error must not wedge the pool, later jobs still run.
             synchronized (job) {
+                if (job.attempt != generation || job.status != JobStatus.RUNNING) {
+                    return; // fenced: a superseded failure must not overwrite the retried attempt
+                }
                 job.error = describe(t);
                 job.status = JobStatus.FAILED;
                 job.completedAt = Instant.now();
+                recordAttempt(job, generation, JobStatus.FAILED, job.startedAt, job.completedAt, job.error);
             }
         }
+    }
+
+    /**
+     * Upserts the single history entry for {@code attempt}: it first appears as RUNNING and is then
+     * replaced in place by its terminal status, so the history stays bounded by {@code maxAttempts}
+     * and no entry is ever duplicated.
+     */
+    private void recordAttempt(MutableJob job, int attempt, JobStatus status, Instant startedAt,
+            Instant completedAt, String error) {
+        JobAttempt entry = new JobAttempt(attempt, status, startedAt, completedAt, error);
+        for (int i = 0; i < job.attemptHistory.size(); i++) {
+            if (job.attemptHistory.get(i).attempt() == attempt) {
+                job.attemptHistory.set(i, entry);
+                return;
+            }
+        }
+        job.attemptHistory.add(entry);
     }
 
     private String describe(Throwable t) {
         return t.getMessage() == null
                 ? t.getClass().getName()
                 : t.getClass().getSimpleName() + ": " + t.getMessage();
+    }
+
+    /** The observable fields of a FAILED job, captured so a rejected requeue can restore them exactly. */
+    private static final class FailedState {
+
+        private final int attempt;
+        private final Instant startedAt;
+        private final Instant completedAt;
+        private final String error;
+        private final List<HashResponse> results;
+
+        private FailedState(int attempt, Instant startedAt, Instant completedAt, String error,
+                List<HashResponse> results) {
+            this.attempt = attempt;
+            this.startedAt = startedAt;
+            this.completedAt = completedAt;
+            this.error = error;
+            this.results = results;
+        }
+
+        private static FailedState of(MutableJob job) {
+            return new FailedState(job.attempt, job.startedAt, job.completedAt, job.error, job.results);
+        }
+
+        private void restore(MutableJob job) {
+            job.attempt = attempt;
+            job.status = JobStatus.FAILED;
+            job.startedAt = startedAt;
+            job.completedAt = completedAt;
+            job.error = error;
+            job.results = results;
+        }
     }
 
     private static final class MutableJob {
@@ -236,7 +361,10 @@ public class BatchHashJobService {
         private final List<String> items;
         private final String secretKey;
         private final Instant createdAt;
+        private final int maxAttempts;
+        private final List<JobAttempt> attemptHistory = new ArrayList<>();
 
+        private int attempt = 1;
         private JobStatus status = JobStatus.QUEUED;
         private Instant startedAt;
         private Instant completedAt;
@@ -244,13 +372,14 @@ public class BatchHashJobService {
         private String error;
 
         private MutableJob(String jobId, String idempotencyKey, String algorithm, List<String> items,
-                String secretKey, Instant createdAt) {
+                String secretKey, Instant createdAt, int maxAttempts) {
             this.jobId = jobId;
             this.idempotencyKey = idempotencyKey;
             this.algorithm = algorithm;
             this.items = List.copyOf(items);
             this.secretKey = secretKey;
             this.createdAt = createdAt;
+            this.maxAttempts = maxAttempts;
         }
     }
 }

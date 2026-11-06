@@ -48,4 +48,15 @@ public class BatchJobController {
     public ApiResponse<BatchHashJobResponse> cancel(@PathVariable String jobId) {
         return ApiResponse.success(jobService.cancel(jobId), "Job cancelled");
     }
+
+    @PostMapping("/{jobId}/retry")
+    @Operation(summary = "Retry a failed batch hash job",
+            description = "Only FAILED -> QUEUED is allowed; returns 202 with the requeued snapshot, "
+                    + "409 JOB_RETRY_CONFLICT for a QUEUED/RUNNING/COMPLETED/CANCELLED job or an exhausted "
+                    + "attempt budget, 404 JOB_NOT_FOUND for an unknown or evicted id, and 429 QUEUE_FULL "
+                    + "when the retry is rejected by a saturated queue")
+    public ResponseEntity<ApiResponse<BatchHashJobResponse>> retry(@PathVariable String jobId) {
+        return ResponseEntity.status(HttpStatus.ACCEPTED)
+                .body(ApiResponse.success(jobService.retry(jobId), "Job retried"));
+    }
 }
