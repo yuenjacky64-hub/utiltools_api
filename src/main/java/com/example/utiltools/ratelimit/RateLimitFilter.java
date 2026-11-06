@@ -3,7 +3,6 @@ package com.example.utiltools.ratelimit;
 import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.regex.Pattern;
 
 import com.example.utiltools.common.ApiResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -28,13 +27,6 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
     private static final Logger log = LoggerFactory.getLogger(RateLimitFilter.class);
 
-    private static final String UNKNOWN_CLIENT = "unknown";
-    private static final String FORWARDED_HEADER = "X-Forwarded-For";
-    private static final Pattern WELL_FORMED_ADDRESS = Pattern.compile("^[0-9a-fA-F:.]{2,45}$");
-
-    private static final String HEADER_LIMIT = "X-RateLimit-Limit";
-    private static final String HEADER_REMAINING = "X-RateLimit-Remaining";
-    private static final String HEADER_RESET = "X-RateLimit-Reset";
     private static final String HEADER_RETRY_AFTER = "Retry-After";
     private static final int STATUS_TOO_MANY_REQUESTS = 429;
 
@@ -75,9 +67,9 @@ public class RateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        response.setHeader(HEADER_LIMIT, Long.toString(admission.limit()));
-        response.setHeader(HEADER_REMAINING, Long.toString(Math.max(0L, admission.remaining())));
-        response.setHeader(HEADER_RESET, Long.toString(admission.resetEpochSeconds()));
+        response.setHeader(RateLimitHeaders.LIMIT, Long.toString(admission.limit()));
+        response.setHeader(RateLimitHeaders.REMAINING, Long.toString(Math.max(0L, admission.remaining())));
+        response.setHeader(RateLimitHeaders.RESET, Long.toString(admission.resetEpochSeconds()));
 
         if (admission.allowed()) {
             chain.doFilter(request, response);
@@ -87,19 +79,9 @@ public class RateLimitFilter extends OncePerRequestFilter {
     }
 
     private String resolveClientKey(HttpServletRequest request) {
-        String remoteAddress = request.getRemoteAddr();
-        if (remoteAddress == null || remoteAddress.isBlank()) {
-            remoteAddress = UNKNOWN_CLIENT;
-        }
-        if (!properties.trustForwardedHeader()) {
-            return remoteAddress;
-        }
-        String forwarded = request.getHeader(FORWARDED_HEADER);
-        if (forwarded == null || forwarded.isBlank()) {
-            return remoteAddress;
-        }
-        String candidate = forwarded.split(",", 2)[0].trim();
-        return WELL_FORMED_ADDRESS.matcher(candidate).matches() ? candidate : remoteAddress;
+        // Single implementation: the status endpoint resolves keys through the same class, so the
+        // admission gate and the read path can never disagree about which bucket a caller owns.
+        return ClientKeyResolver.resolve(request, properties);
     }
 
     private void reject(HttpServletResponse response, SlidingWindowRateLimiter.Admission admission)

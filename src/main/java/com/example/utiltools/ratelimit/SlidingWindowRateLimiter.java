@@ -125,6 +125,82 @@ public class SlidingWindowRateLimiter {
         return new Admission(true, limit, Math.max(0L, limit - 1L), 0L, ceilDiv(now + windowMs, 1000L));
     }
 
+    /**
+     * Reads the current window state for {@code clientKey} without consuming budget. The only
+     * read path of the limiter.
+     *
+     * <p>The read is side-effect free: it never records an admission, never inserts a bucket,
+     * never touches {@code lastEventMillis}, and never purges the ring buffer, so it can neither
+     * shrink a client's budget, consume the {@code max-tracked-clients} allowance, nor keep an
+     * idle bucket alive against the eviction passes. It takes only the per-bucket lock, so the
+     * documented {@code mapLock} → bucket-lock order is untouched.</p>
+     *
+     * @param clientKey client identity; {@code null}/blank is normalised to {@code "unknown"}
+     * @return the current state, never {@code null}; {@code allowed} is {@code true} exactly when
+     *         {@code remaining > 0}
+     */
+    public Admission peek(String clientKey) {
+        long limit = properties.requestsPerWindow();
+        long windowMs = properties.windowMs();
+        long now = clock.millis();
+        if (!properties.enabled()) {
+            // Unlike tryAcquire's disabled short-circuit (resetEpochSeconds == 0), a status reader
+            // must report a live reset instant: REQ-03 asks for now + windowMs.
+            return new Admission(true, limit, limit, 0L, ceilDiv(now + windowMs, 1000L));
+        }
+
+        String key = normaliseKey(clientKey);
+
+        for (int attempt = 0; attempt < MAX_MAPPING_ATTEMPTS; attempt++) {
+            Bucket bucket = buckets.get(key);
+            if (bucket == null) {
+                // Deliberately no registerBucket(): a read may not insert, cap-evict, or fail.
+                return new Admission(true, limit, limit, 0L, ceilDiv(now + windowMs, 1000L));
+            }
+
+            bucket.lock.lock();
+            try {
+                // I8: never read an instance an eviction path already removed from the map.
+                if (buckets.get(key) != bucket) {
+                    continue;
+                }
+
+                // Clock-regression guard: the window never moves backwards.
+                long effectiveNow = Math.max(now, bucket.lastEventMillis);
+                long boundary = effectiveNow - windowMs;
+                int capacity = bucket.timestamps.length;
+                int inWindow = 0;
+                long oldestInWindow = 0L;
+                // Entries are recorded in non-decreasing time order, so the in-window set is a
+                // suffix: walk newest first and stop at the first expired entry.
+                for (int i = 0; i < bucket.size; i++) {
+                    long timestamp = bucket.timestamps[
+                            Math.floorMod(bucket.start + bucket.size - 1 - i, capacity)];
+                    if (timestamp <= boundary) {
+                        break;
+                    }
+                    inWindow++;
+                    oldestInWindow = timestamp;
+                }
+
+                if (inWindow >= limit) {
+                    long resetAtMillis = oldestInWindow + windowMs;
+                    return new Admission(false, limit, 0L,
+                            Math.max(1L, ceilDiv(resetAtMillis - effectiveNow, 1000L)),
+                            ceilDiv(resetAtMillis, 1000L));
+                }
+                long remaining = Math.max(0L, limit - inWindow);
+                long resetAtMillis = inWindow == 0 ? effectiveNow + windowMs : oldestInWindow + windowMs;
+                return new Admission(true, limit, remaining, 0L, ceilDiv(resetAtMillis, 1000L));
+            } finally {
+                bucket.lock.unlock();
+            }
+        }
+
+        // Unreachable for any real clock: fail open rather than report a state we could not read.
+        return new Admission(true, limit, limit, 0L, ceilDiv(now + windowMs, 1000L));
+    }
+
     /** Number of currently tracked client buckets (bounded by {@code max-tracked-clients}). */
     public int trackedClients() {
         return buckets.size();
