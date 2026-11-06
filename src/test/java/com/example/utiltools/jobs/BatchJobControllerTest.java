@@ -12,6 +12,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.time.Instant;
+import java.util.List;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
@@ -108,7 +109,8 @@ class BatchJobControllerTest {
         Instant createdAt = Instant.parse("2026-11-06T10:00:00Z");
         Instant completedAt = Instant.parse("2026-11-06T10:00:01Z");
         BatchHashJobResponse cancelled = new BatchHashJobResponse("job-cancelled-1", "controller-cancel-key",
-                JobStatus.CANCELLED, 2, null, null, createdAt, null, completedAt);
+                JobStatus.CANCELLED, 2, null, null, createdAt, null, completedAt, 1, 3,
+                List.of(new JobAttempt(1, JobStatus.CANCELLED, null, completedAt, null)));
         doReturn(cancelled).when(jobService).cancel("job-cancelled-1");
         doReturn(cancelled).when(jobService).getJob("job-cancelled-1");
 
@@ -153,5 +155,91 @@ class BatchJobControllerTest {
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("JOB_NOT_FOUND"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/retry - should return 202 with the requeued snapshot")
+    void shouldReturn202WhenRetryingFailedJob() throws Exception {
+        Instant createdAt = Instant.parse("2026-11-06T10:00:00Z");
+        Instant failedAt = Instant.parse("2026-11-06T10:00:02Z");
+        BatchHashJobResponse requeued = new BatchHashJobResponse("job-failed-1", "controller-retry-key",
+                JobStatus.QUEUED, 2, null, null, createdAt, null, null, 2, 3,
+                List.of(new JobAttempt(1, JobStatus.FAILED, createdAt, failedAt, "IllegalStateException: boom")));
+        doReturn(requeued).when(jobService).retry("job-failed-1");
+
+        mockMvc.perform(post("/api/v1/utils/jobs/job-failed-1/retry"))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Job retried"))
+                .andExpect(jsonPath("$.data.jobId").value("job-failed-1"))
+                .andExpect(jsonPath("$.data.idempotencyKey").value("controller-retry-key"))
+                .andExpect(jsonPath("$.data.status").value("QUEUED"))
+                .andExpect(jsonPath("$.data.attempt").value(2))
+                .andExpect(jsonPath("$.data.maxAttempts").value(3))
+                .andExpect(jsonPath("$.data.attempts[0].attempt").value(1))
+                .andExpect(jsonPath("$.data.attempts[0].status").value("FAILED"))
+                .andExpect(jsonPath("$.data.attempts[0].error").value("IllegalStateException: boom"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/retry - should map a conflict to 409 JOB_RETRY_CONFLICT")
+    void shouldReturn409WhenRetryConflicts() throws Exception {
+        doThrow(new JobRetryConflictException("job-running-1", JobStatus.RUNNING, 1, 3))
+                .when(jobService).retry("job-running-1");
+
+        mockMvc.perform(post("/api/v1/utils/jobs/job-running-1/retry"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("JOB_RETRY_CONFLICT"))
+                .andExpect(jsonPath("$.details.jobId").value("job-running-1"))
+                .andExpect(jsonPath("$.details.status").value("RUNNING"))
+                .andExpect(jsonPath("$.details.attempt").value(1))
+                .andExpect(jsonPath("$.details.maxAttempts").value(3));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/retry - should return 404 JOB_NOT_FOUND for an unknown job id")
+    void shouldReturn404WhenRetryingUnknownJob() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/jobs/does-not-exist/retry"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("JOB_NOT_FOUND"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/retry - the three retry failure modes answer 409, 429 and 404 in one run")
+    void shouldReturn409Then429Then404ForRetryFailuresInOneRun() throws Exception {
+        doThrow(new JobRetryConflictException("job-completed-1", JobStatus.COMPLETED, 3, 3))
+                .when(jobService).retry("job-completed-1");
+        doThrow(new JobQueueFullException("Hash job queue is full (worker-count=2, queue-capacity=100); retry after capacity frees"))
+                .when(jobService).retry("job-failed-3");
+        doThrow(new JobNotFoundException("evicted-1"))
+                .when(jobService).retry("evicted-1");
+
+        // Every retry on one snapshot of the route: conflict first, then saturation, then an id the
+        // eviction pass has already unregistered. Each call must leave the others' routes intact.
+        mockMvc.perform(post("/api/v1/utils/jobs/job-completed-1/retry"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("JOB_RETRY_CONFLICT"))
+                .andExpect(jsonPath("$.details.attempt").value(3))
+                .andExpect(jsonPath("$.details.maxAttempts").value(3));
+        mockMvc.perform(post("/api/v1/utils/jobs/job-failed-3/retry"))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.error").value("QUEUE_FULL"));
+        mockMvc.perform(post("/api/v1/utils/jobs/evicted-1/retry"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error").value("JOB_NOT_FOUND"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/retry - should map a rejected requeue to 429 QUEUE_FULL")
+    void shouldReturn429WhenRetryQueueFull() throws Exception {
+        doThrow(new JobQueueFullException("Hash job queue is full (worker-count=2, queue-capacity=100); retry after capacity frees"))
+                .when(jobService).retry("job-failed-2");
+
+        mockMvc.perform(post("/api/v1/utils/jobs/job-failed-2/retry"))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("QUEUE_FULL"));
     }
 }
