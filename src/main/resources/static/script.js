@@ -59,6 +59,10 @@
      * a transition nor rethrow. */
     function createAuditTrail(storage) {
         let memory = [];
+        /* Set once a write has failed: storage then lags behind the in-memory
+         * trail, so later reads must not overwrite the newest records with the
+         * stale stored array. */
+        let memoryOnly = false;
 
         function clearStored() {
             try {
@@ -70,22 +74,25 @@
             }
         }
 
-        function readAll() {
+        /* Returns the stored records, or null when storage is unavailable,
+         * empty or holding a value that is not a valid array of records. */
+        function readStored() {
             let raw = null;
             try {
                 raw = storage ? storage.getItem(CONTACT_AUDIT_KEY) : null;
             } catch (error) {
-                raw = null;
+                return null;
             }
             if (raw === null || raw === undefined) {
-                return memory.slice();
+                return null;
             }
             try {
                 const parsed = JSON.parse(raw);
                 if (!Array.isArray(parsed)) {
                     memory = [];
+                    memoryOnly = false;
                     clearStored();
-                    return [];
+                    return null;
                 }
                 return parsed
                     .filter(function (record) {
@@ -94,9 +101,20 @@
                     .slice(0, CONTACT_AUDIT_MAX);
             } catch (error) {
                 memory = [];
+                memoryOnly = false;
                 clearStored();
-                return [];
+                return null;
             }
+        }
+
+        function readAll() {
+            const stored = readStored();
+            if (memoryOnly || stored === null) {
+                /* degraded storage: the in-memory trail is the newest truth */
+                return memory.slice(0, CONTACT_AUDIT_MAX);
+            }
+            memory = stored;
+            return stored.slice();
         }
 
         function append(record) {
@@ -106,8 +124,11 @@
                 if (storage) {
                     storage.setItem(CONTACT_AUDIT_KEY, JSON.stringify(next));
                 }
+                memoryOnly = false;
             } catch (error) {
-                /* quota or private mode: the in-memory trail still carries the record */
+                /* quota or private mode: the in-memory trail still carries the
+                 * record and now outranks the stale stored value on read */
+                memoryOnly = true;
             }
             return next.length;
         }
@@ -317,6 +338,12 @@
             if (state === 'validating' || state === 'submitted') {
                 /* re-entrancy guard: one click must not fire two transitions */
                 return false;
+            }
+            if (state === 'success') {
+                /* the declared success -> idle edge, fired by the handler so a
+                 * second submission is a real transition (audited) instead of a
+                 * silent no-op */
+                go('reset');
             }
             if (!go('submit')) {
                 return false;
