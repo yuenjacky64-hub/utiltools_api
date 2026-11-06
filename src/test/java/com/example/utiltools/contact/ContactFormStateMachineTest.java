@@ -2,7 +2,6 @@ package com.example.utiltools.contact;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.core.io.ClassPathResource;
@@ -298,14 +297,17 @@ class ContactFormStateMachineTest {
 
     /**
      * Runs {@code static/script.js} in Node against the embedded DOM/storage driver and
-     * caches the JSON report. Skipped (not passed) when Node is unavailable.
+     * caches the JSON report. A missing Node runtime fails the suite rather than skipping it:
+     * the behaviour of the shipped file is the proof, so it must not be able to vanish silently.
      */
     private static JsonNode scenarios() throws IOException {
         JsonNode cached = scenarios;
         if (cached != null) {
             return cached;
         }
-        Assumptions.assumeTrue(nodeAvailable(), "node is required to execute static/script.js headlessly");
+        assertThat(nodeAvailable())
+                .describedAs("node is required to execute the shipped static/script.js headlessly")
+                .isTrue();
         synchronized (ContactFormStateMachineTest.class) {
             if (scenarios == null) {
                 scenarios = runDriver();
