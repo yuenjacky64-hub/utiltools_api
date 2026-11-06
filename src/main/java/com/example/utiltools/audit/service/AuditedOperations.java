@@ -24,6 +24,11 @@ import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.text.dto.TextStatsRequest;
+import com.example.utiltools.text.dto.TextStatsResponse;
+import com.example.utiltools.text.dto.TextTransformRequest;
+import com.example.utiltools.text.dto.TextTransformResponse;
+import com.example.utiltools.text.service.TextService;
 import org.springframework.stereotype.Service;
 
 import java.util.LinkedHashMap;
@@ -47,15 +52,18 @@ public class AuditedOperations {
     private final DateTimeService dateTimeService;
     private final CryptoService cryptoService;
     private final JsonService jsonService;
+    private final TextService textService;
     private final AuditJournalService journal;
 
     public AuditedOperations(DateTimeService dateTimeService,
                              CryptoService cryptoService,
                              JsonService jsonService,
+                             TextService textService,
                              AuditJournalService journal) {
         this.dateTimeService = dateTimeService;
         this.cryptoService = cryptoService;
         this.jsonService = jsonService;
+        this.textService = textService;
         this.journal = journal;
     }
 
@@ -106,6 +114,14 @@ public class AuditedOperations {
         return record(OperationType.JSON_QUERY, request, () -> jsonService.query(request));
     }
 
+    public TextTransformResponse transform(TextTransformRequest request) {
+        return record(OperationType.TEXT_TRANSFORM, request, () -> textService.transform(request));
+    }
+
+    public TextStatsResponse stats(TextStatsRequest request) {
+        return record(OperationType.TEXT_STATS, request, () -> textService.stats(request));
+    }
+
     /**
      * Re-runs a stored operation without journalling; the single entry point used by replay.
      */
@@ -122,6 +138,8 @@ public class AuditedOperations {
             case JSON_FORMAT -> jsonService.format((JsonFormatRequest) request);
             case JSON_VALIDATE -> jsonService.validate((JsonValidateRequest) request);
             case JSON_QUERY -> jsonService.query((JsonQueryRequest) request);
+            case TEXT_TRANSFORM -> textService.transform((TextTransformRequest) request);
+            case TEXT_STATS -> textService.stats((TextStatsRequest) request);
         };
     }
 

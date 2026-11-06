@@ -3,7 +3,10 @@ package com.example.utiltools.audit;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
 import com.example.utiltools.audit.model.OperationType;
+import com.example.utiltools.audit.model.ReplayState;
 import com.example.utiltools.audit.service.AuditJournalService;
+import com.example.utiltools.audit.service.ReplayClaim;
+import com.example.utiltools.common.ReplayConflictException;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -319,5 +322,126 @@ class AuditJournalServiceTest {
         assertThat(OperationType.DATETIME_CONVERT.isDeterministic()).isTrue();
         assertThat(OperationType.CRYPTO_HASH.isDeterministic()).isTrue();
         assertThat(OperationType.JSON_QUERY.isDeterministic()).isTrue();
+    }
+
+
+    private AuditEntry succeededEntry() {
+        AuditEntry pending = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-12345678");
+        return journal.succeed(pending.id(), hashResponse());
+    }
+
+    @Test
+    @DisplayName("an active replay claim rejects a second claim with REPLAY_CONFLICT")
+    void shouldRejectSecondClaimWhileLeaseIsLive() {
+        AuditEntry succeeded = succeededEntry();
+        ReplayClaim claim = journal.claimReplay(succeeded.id());
+
+        assertThat(claim.ownerToken()).isNotBlank();
+        assertThat(journal.find(succeeded.id()).orElseThrow().replay().state())
+                .isEqualTo(ReplayState.IN_PROGRESS);
+        assertThatThrownBy(() -> journal.claimReplay(succeeded.id()))
+                .isInstanceOf(ReplayConflictException.class)
+                .hasMessageContaining("active replay claim");
+    }
+
+    @Test
+    @DisplayName("only the live owner may record the terminal replay outcome")
+    void shouldRejectCompletionFromAStaleOrUnknownToken() {
+        AuditEntry succeeded = succeededEntry();
+        ReplayClaim claim = journal.claimReplay(succeeded.id());
+
+        assertThat(journal.completeReplay(succeeded.id(), "not-the-owner", ReplayState.VERIFIED, "x"))
+                .isFalse();
+        assertThat(journal.completeReplay(succeeded.id(), null, ReplayState.VERIFIED, "x")).isFalse();
+        assertThat(journal.find(succeeded.id()).orElseThrow().replay().state())
+                .isEqualTo(ReplayState.IN_PROGRESS);
+
+        assertThat(journal.completeReplay(succeeded.id(), claim.ownerToken(), ReplayState.MISMATCH,
+                "digest differs")).isTrue();
+        assertThat(journal.completeReplay(succeeded.id(), claim.ownerToken(), ReplayState.VERIFIED,
+                "late")).isFalse();
+
+        AuditEntry after = journal.find(succeeded.id()).orElseThrow();
+        assertThat(after.replay().state()).isEqualTo(ReplayState.MISMATCH);
+        assertThat(after.replay().detail()).isEqualTo("digest differs");
+    }
+
+    @Test
+    @DisplayName("completion never rewrites the original state, result or completedAt")
+    void failedCompletionLeavesOriginalEntryUntouched() {
+        AuditEntry succeeded = succeededEntry();
+        ReplayClaim claim = journal.claimReplay(succeeded.id());
+
+        assertThat(journal.completeReplay(succeeded.id(), claim.ownerToken(), ReplayState.FAILED,
+                "replay failed: boom")).isTrue();
+
+        AuditEntry after = journal.find(succeeded.id()).orElseThrow();
+        assertThat(after.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(after.result()).isEqualTo(succeeded.result());
+        assertThat(after.completedAt()).isEqualTo(succeeded.completedAt());
+        assertThat(after.replay().state()).isEqualTo(ReplayState.FAILED);
+        assertThat(after.replay().detail()).isEqualTo("replay failed: boom");
+    }
+
+    @Test
+    @DisplayName("completing an evicted or unknown entry returns false without throwing or writing")
+    void shouldReturnFalseWhenCompletingAnEvictedEntry() {
+        AuditEntry succeeded = succeededEntry();
+        ReplayClaim claim = journal.claimReplay(succeeded.id());
+
+        // fill the bounded journal past max-entries so the claimed entry is evicted
+        journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000002");
+        journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000003");
+        journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000004");
+        assertThat(journal.find(succeeded.id())).isEmpty();
+
+        assertThatCode(() -> assertThat(journal.completeReplay(succeeded.id(), claim.ownerToken(),
+                ReplayState.VERIFIED, "late owner")).isFalse()).doesNotThrowAnyException();
+        assertThat(journal.find(succeeded.id())).isEmpty();
+
+        assertThatCode(() -> assertThat(journal.completeReplay("missing-entry", claim.ownerToken(),
+                ReplayState.FAILED, "unknown")).isFalse()).doesNotThrowAnyException();
+        assertThat(journal.find("missing-entry")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("a failed replay detail is bounded to the journal detail limit")
+    void shouldBoundReplayDetail() {
+        AuditEntry succeeded = succeededEntry();
+        ReplayClaim claim = journal.claimReplay(succeeded.id());
+        String tooLong = "x".repeat(1000);
+
+        assertThat(journal.completeReplay(succeeded.id(), claim.ownerToken(), ReplayState.FAILED, tooLong))
+                .isTrue();
+        assertThat(journal.find(succeeded.id()).orElseThrow().replay().detail()).hasSizeLessThanOrEqualTo(200);
+    }
+
+    @Test
+    @DisplayName("an expired IN_PROGRESS claim can be taken over and the old owner is rejected")
+    void shouldAllowTakeoverAfterLeaseExpiry() {
+        MutableAuditClock clock = new MutableAuditClock(Instant.parse("2026-01-01T00:00:00Z"));
+        AuditJournalService leased = new AuditJournalService(new ObjectMapper(), 3, 65536, 300L, 30L, clock);
+        AuditEntry pending = leased.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-12345678");
+        AuditEntry succeeded = leased.succeed(pending.id(), hashResponse());
+
+        ReplayClaim oldOwner = leased.claimReplay(succeeded.id());
+        assertThat(oldOwner.leaseExpiresAt()).isEqualTo(Instant.parse("2026-01-01T00:00:30Z"));
+
+        clock.advanceSeconds(30);
+        assertThat(leased.completeReplay(succeeded.id(), oldOwner.ownerToken(), ReplayState.VERIFIED,
+                "stale owner")).isFalse();
+
+        ReplayClaim newOwner = leased.claimReplay(succeeded.id());
+        assertThat(newOwner.ownerToken()).isNotEqualTo(oldOwner.ownerToken());
+        assertThat(leased.completeReplay(succeeded.id(), oldOwner.ownerToken(), ReplayState.VERIFIED,
+                "still stale")).isFalse();
+        assertThat(leased.completeReplay(succeeded.id(), newOwner.ownerToken(), ReplayState.MISMATCH,
+                "fresh owner")).isTrue();
+
+        AuditEntry after = leased.find(succeeded.id()).orElseThrow();
+        assertThat(after.replay().state()).isEqualTo(ReplayState.MISMATCH);
+        assertThat(after.replay().detail()).isEqualTo("fresh owner");
+        assertThat(after.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(after.completedAt()).isEqualTo(succeeded.completedAt());
     }
 }

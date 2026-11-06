@@ -22,7 +22,8 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
   - [1. DateTime & Timezone Utility](#1-datetime--timezone-utility)
   - [2. Cryptography & Encoding Utility](#2-cryptography--encoding-utility)
   - [3. JSON & Data Processor Utility](#3-json--data-processor-utility)
-  - [4. Batch Hash Jobs (async)](#4-batch-hash-jobs-async)
+  - [4. Text Transformation & Statistics Utility](#4-text-transformation--statistics-utility)
+  - [5. Batch Hash Jobs (async)](#5-batch-hash-jobs-async)
 - [Rate Limiting](#-rate-limiting)
 - [Operation Journal & Replay Verification](#-operation-journal--replay-verification)
 - [Unified Response & Error Handling](#-unified-response--error-handling)
@@ -43,6 +44,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, current global time |
 | **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 generation (`version=V4|V7`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit |
+| **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`) and code-point accurate text statistics (characters, words, lines, sentences) |
 
 ---
 
@@ -143,6 +145,8 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/validate` | Check JSON syntax validity and report exact syntax error line/col |
 | `POST` | `/api/v1/utils/json/query` | Evaluate JSONPath queries and extract matching nodes |
 | `POST` | `/api/v1/utils/json/patch` | Apply an ordered RFC 6902-style patch atomically, with reverse-order rollback and audit |
+| `POST` | `/api/v1/utils/text/transform` | Apply a deterministic case/format operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`) to a string |
+| `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
 | `POST` | `/api/v1/utils/jobs/hash` | Submit a bounded async batch-hash job; `202` with a job id, idempotent via `idempotencyKey` |
 | `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `COMPLETED` / `FAILED` / `CANCELLED` |
 | `DELETE` | `/api/v1/utils/jobs/{jobId}` | Cancel a `QUEUED` job (`200`, idempotent); `409` `JOB_CANCELLATION_CONFLICT` once it is `RUNNING`/`COMPLETED`/`FAILED` |
@@ -774,16 +778,58 @@ marked `VALIDATED`, `resultJson` is `null`, and failures still produce `FAILED` 
 { "json": "{\"name\":\"Alice\"}", "operations": [{ "op": "test", "path": "/name", "value": "Alice" }], "dryRun": true }
 ```
 
+#### E. Circuit breaker & probe lease recovery
+
+The JSONPath query path runs behind a single `CLOSED` / `OPEN` / `HALF_OPEN` circuit breaker, exposed
+read-only by `GET /api/v1/utils/resilience` and driven by hand with `POST /api/v1/utils/resilience/probe`.
+
+```json
+{
+  "success": true,
+  "data": {
+    "name": "json-query",
+    "state": "HALF_OPEN",
+    "consecutiveFailures": 0,
+    "consecutiveSuccesses": 0,
+    "resetAt": "2026-01-01T00:00:30Z",
+    "probeInFlight": true,
+    "probeLeaseExpiresAt": "2026-01-01T00:00:40Z",
+    "auditCapacity": 1024,
+    "audit": []
+  },
+  "message": "Resilience state retrieved",
+  "timestamp": "2026-01-01T00:00:31Z"
+}
+```
+
+| Field | Meaning |
+| :--- | :--- |
+| `probeInFlight` | `true` while a `HALF_OPEN` probe claim is held and its lease has not expired |
+| `probeLeaseExpiresAt` | Deadline of that claim (`null` when the breaker holds no claim) |
+
+Recovery: while a probe lease is live a concurrent caller is refused with `503` `CIRCUIT_OPEN` and reason
+`probe already in flight`. Once the lease expires the claim is superseded — the superseded generation can no
+longer change counters, state or the audit trail, so a probe that hung inside the delegate and returns late is
+ignored — and the next admitted caller claims a fresh generation. The scheduled reaper records exactly one
+`PROBE_LEASE_EXPIRED` audit row per expired generation, so the breaker recovers even with no further traffic.
+
+| Property | Default | Purpose |
+| :--- | :--- | :--- |
+| `utiltools.resilience.probe-lease-seconds` | `10` | Lifetime of a `HALF_OPEN` probe claim before it may be superseded |
+| `utiltools.resilience.probe-reaper-interval-ms` | `5000` | Fixed delay between scheduled sweeps that release expired leases |
+
+> **Scope note:** breaker state, the probe claim and the audit trail are in-process and reset on restart.
+
 ---
 
 ## 🧾 Operation Journal & Replay Verification
 
-All ten journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+All twelve journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
 `datetime/shift`, `crypto/hash`, `crypto/base64`, `crypto/uuid`, `json/format`, `json/validate`,
-`json/query` — are recorded in a **bounded in-memory journal** so a failed hash, JSON query, or
-datetime conversion leaves a trace of what actually executed, and a retry can be verified against
-the original outcome without ever mutating the original entry. `GET /api/v1/utils/datetime/timezones`
-is read-only catalogue metadata and is not journalled.
+`json/query`, `text/transform`, `text/stats` — are recorded in a **bounded in-memory journal** so a failed
+hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
+can be verified against the original outcome without ever mutating the original entry.
+`GET /api/v1/utils/datetime/timezones` is read-only catalogue metadata and is not journalled.
 
 **Lifecycle:** `PENDING` on entry → `SUCCEEDED` with the response DTO, or `FAILED` with an
 `errorCode` (`BAD_REQUEST` / `INTERNAL_SERVER_ERROR`). Only `PENDING → SUCCEEDED` and
@@ -877,9 +923,150 @@ the new result against the stored result, and records `VERIFIED` or `MISMATCH`. 
 `completedAt` are never rewritten — only the attached `replay` record is added. Any other case
 returns `409 REPLAY_CONFLICT`.
 
+**Replay is a single-winner operation.** Before the operation runs, the journal *claims* the entry
+under the same lock that owns every journal transition, so only one replay per entry can execute:
+
+```
+claim:  (no replay | expired IN_PROGRESS) -> IN_PROGRESS   (writes replay.state, replayedAt, leaseExpiresAt)
+result: IN_PROGRESS -> VERIFIED | MISMATCH | FAILED         (by the owning claim only)
+```
+
+`IN_PROGRESS -> VERIFIED|MISMATCH|FAILED` is the *only* legal replay transition; a replay record is
+never rewritten by anyone except the owner of a live claim. A replay record is `IN_PROGRESS` only
+while a claim is live, so a `GET` showing `IN_PROGRESS` means another replay of the same entry is
+in flight:
+
+```json
+"replay": {
+  "state": "IN_PROGRESS",
+  "replayedAt": "2026-10-31T00:52:09.988Z",
+  "detail": "replay in progress",
+  "leaseExpiresAt": "2026-10-31T00:52:39.988Z"
+}
+```
+
+**Claim conflicts:** a second replay while a claim is live answers `409 REPLAY_CONFLICT` and leaves
+the in-flight record untouched. The claim lease is `utiltools.audit.replay-lease-seconds` (default
+`30`).
+
+**Failed replays are audited.** If `replayInvoke` throws (for example the stored payload is no
+longer accepted by the service), the replay is recorded as `FAILED` with a bounded
+`detail` before the claim is released, then `409 REPLAY_CONFLICT` is returned. The entry's
+original `state`, `result` and `completedAt` are unchanged, so the entry stays replayable and a
+later replay can still produce `VERIFIED`:
+
+```json
+"replay": {
+  "state": "FAILED",
+  "replayedAt": "2026-10-31T00:52:10.004Z",
+  "detail": "replay failed: unknown algorithm"
+}
+```
+
+**Crash recovery via lease expiry:** claims live in the JVM heap only. If the JVM dies (or a replay
+never completes) the entry is left `IN_PROGRESS`; once `leaseExpiresAt` has passed a later replay
+*claims it over* — the stale owner's write is rejected, a new owner token is issued, and the new
+owner's `VERIFIED`/`MISMATCH`/`FAILED` is the outcome that is retained. Expiry is evaluated lazily
+at claim time; there is no background sweeper. The owner token itself is stored privately and never
+serialized by `list`, `find` or `replay`, so a client can never forge or complete another caller's
+claim.
+
 ---
 
-### 4. Batch Hash Jobs (async)
+### 4. Text Transformation & Statistics Utility
+
+Deterministic, locale-independent (`Locale.ROOT`) text helpers. Both endpoints are pure functions of
+their request body, so every call is journalled and replayable.
+
+#### Allowed operations
+
+Word tokenization splits the input on every run of `Character.isLetterOrDigit` code points, so
+punctuation and whitespace are separators. With tokenizer output `w1..wn`:
+
+| Operation | Rule | `"Hello, World!"` |
+| :--- | :--- | :--- |
+| `UPPER` | whole input upper-cased | `HELLO, WORLD!` |
+| `LOWER` | whole input lower-cased | `hello, world!` |
+| `TITLE` | per token: first code point upper-cased, rest lower-cased; joined with a space | `Hello World` |
+| `CAMEL` | `w1` lower-cased; later tokens lower-cased then first code point upper-cased; joined with nothing | `helloWorld` |
+| `SNAKE` | tokens lower-cased; joined with `_` | `hello_world` |
+| `KEBAB` | tokens lower-cased; joined with `-` | `hello-world` |
+| `SLUG` | tokens lower-cased, NFD-normalised with combining marks stripped, emptied tokens dropped; joined with `-` | `hello-world` |
+
+`operation` is case-insensitive on input and echoed back upper-case. Unknown operations answer
+`400 BAD_REQUEST` and list the allowed values; blank `text` answers `400 VALIDATION_ERROR`.
+
+#### Transform
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/text/transform \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "Café déjà vu!", "operation": "slug"}'
+```
+
+```json
+{
+  "success": true,
+  "message": "Text transformed successfully",
+  "data": {
+    "operation": "SLUG",
+    "result": "cafe-deja-vu",
+    "changed": true,
+    "length": 12
+  },
+  "timestamp": "2026-01-01T00:00:00Z",
+  "requestId": "b1f0c4d2-6d4f-4a1f-8b2c-2f0f3a9d1e77"
+}
+```
+
+`length` is the **Unicode code-point count of `result`** (an emoji counts once), and `changed` is
+`true` when `result` differs from the supplied `text`.
+
+#### Statistics
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/text/stats \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "Line one.\nTwo 😀 lines! Bye?"}'
+```
+
+```json
+{
+  "success": true,
+  "message": "Text statistics computed successfully",
+  "data": {
+    "characters": 27,
+    "charactersNoWhitespace": 22,
+    "words": 5,
+    "lines": 2,
+    "sentences": 3
+  },
+  "timestamp": "2026-01-01T00:00:00Z",
+  "requestId": "0a5c8f31-2b7e-4c66-9d0b-7f1c3e5a9b44"
+}
+```
+
+| Field | Definition |
+| :--- | :--- |
+| `characters` | Unicode code points in `text`, whitespace included (a surrogate pair counts once) |
+| `charactersNoWhitespace` | code points where `Character.isWhitespace` is false |
+| `words` | number of letter/digit runs (the transform tokenizer) |
+| `lines` | newline-separated segments; `\r\n` and `\r` are normalised to `\n`, so a trailing newline yields a final empty segment |
+| `sentences` | non-blank segments produced by splitting on runs of `.`, `!` and `?` |
+
+#### Journal & replay
+
+Both endpoints call `AuditedOperations`, so every call is recorded as `TEXT_TRANSFORM` or
+`TEXT_STATS` in `GET /api/v1/utils/audit/entries`, with the request (redacted like every other
+operation) and the response. Both are deterministic, so
+`POST /api/v1/utils/audit/entries/{id}/replay` re-runs the stored request and answers
+`replay.state = VERIFIED` without mutating the entry's original `state`, `result` or `completedAt`.
+A body larger than `utiltools.audit.max-replay-bytes` is still transformed but stored as
+non-replayable, so its replay answers the existing `409 REPLAY_CONFLICT`.
+
+---
+
+### 5. Batch Hash Jobs (async)
 
 Hash up to **1000 items** in the background instead of blocking one HTTP request per item. Submission is
 accepted immediately with **202** and a `jobId`; you then poll `GET /api/v1/utils/jobs/{jobId}` until the job
@@ -896,6 +1083,13 @@ discards all jobs and idempotency keys — clients then get `404 JOB_NOT_FOUND` 
 same `jobId` and cause exactly one execution. A *first* submission always reports `"status": "QUEUED"` (the state
 it was accepted in, captured before enqueue); a *duplicate* submission returns the current live snapshot of the
 existing job instead, so its `status` may already be `RUNNING`, `COMPLETED` or `FAILED`.
+
+An `idempotencyKey` identifies exactly **one canonical request payload** — the `algorithm` (after trim,
+upper-case and `SHA256`/`SHA-256` alias normalisation), the **ordered** `items` list, and the `secretKey` (where
+`null` and blank are equivalent). An identical retry therefore returns the same `jobId` with no second execution,
+while reusing the key with a **changed** payload is rejected with `409 IDEMPOTENCY_CONFLICT` **instead of**
+returning the cached job. The conflict is detected before registration, so the rejected submission creates no job
+row, hashes nothing and leaves no idempotency residue; the first job is untouched and keeps running.
 
 ```bash
 curl -i -X POST http://localhost:8080/api/v1/utils/jobs/hash \
@@ -922,6 +1116,22 @@ curl -i -X POST http://localhost:8080/api/v1/utils/jobs/hash \
   "timestamp": "2026-10-31T19:12:04.418503Z"
 }
 ```
+
+**Response — `409 Conflict` (same key, different payload):**
+```json
+{
+  "success": false,
+  "message": "Idempotency key 'batch-2026-10-31-001' was already used with a different request payload",
+  "error": "IDEMPOTENCY_CONFLICT",
+  "details": {
+    "idempotencyKey": "batch-2026-10-31-001",
+    "existingJobId": "3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3"
+  },
+  "timestamp": "2026-10-31T19:13:11.204880Z"
+}
+```
+
+The payload never echoes `items` or `secretKey`; only the key and the existing job id are returned.
 
 #### B. Poll the job snapshot
 
@@ -998,6 +1208,7 @@ duplicate submission with the same key observes the `CANCELLED` snapshot until t
 | Bounded executor queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry with the **same** `idempotencyKey` once capacity frees. The rejected submission is rolled back atomically — its job row **and** its idempotency mapping are both removed, so it leaves no residue and the retry with that key starts a brand-new job |
 | Unknown or already-evicted `jobId` | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Resubmit the batch |
 | Cancelling a job that is `RUNNING`, `COMPLETED` or `FAILED` | `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Stop cancelling; poll `GET` for the terminal snapshot. A repeat `DELETE` on an already-`CANCELLED` job is `200`, not a conflict |
+| Same `idempotencyKey` reused with a different `algorithm`, `items` or `secretKey` | `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | The first job is untouched and keeps running; the conflicting submission is discarded before registration (no job, no execution, no key residue). Pick a new `idempotencyKey` for a genuinely new payload |
 | Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit with a **new** `idempotencyKey` (or none). Reusing the failed job's key replays its cached `FAILED` snapshot instead of re-executing |
 | Blank/empty `items` | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Send a non-empty list of non-blank strings (max 1000) |
 
@@ -1120,7 +1331,9 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | `400 BAD_REQUEST` | `BAD_REQUEST` | Malformed HTTP request body |
 | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Unknown or evicted batch job id |
 | `404 NOT_FOUND` | `NOT_FOUND` | Unknown audit journal entry id |
-| `409 CONFLICT` | `REPLAY_CONFLICT` | Replay of a FAILED, non-deterministic, oversized, or still-PENDING entry |
+| `409 CONFLICT` | `REPLAY_CONFLICT` | Replay of a FAILED, non-deterministic, oversized, or still-PENDING entry, or a replay of an entry whose claim is already `IN_PROGRESS` (live lease) or was lost to a lease takeover |
+| `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | Batch job idempotency key reused with a different request payload |
+| `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Cancellation attempted on a batch job that is `RUNNING`, `COMPLETED` or `FAILED` |
 | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Batch job queue is saturated; retry after capacity frees |
 | `429 TOO_MANY_REQUESTS` | `RATE_LIMITED` | Request budget for `/api/v1/utils/*` exhausted (see [Rate Limiting](#-rate-limiting)) |
 | `500 INTERNAL_SERVER_ERROR` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |
@@ -1191,10 +1404,16 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `version=V4|V7` selection, compact UUIDv7, and the 400 unified envelope for an unknown `version`.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries, six-op patch success, rollback to byte-identical original, missing paths, malformed pointers, `-` append, dry runs, input-not-mutated.
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, and empty-`operations` validation rejection.
-- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff.
-- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202, 400, 404 `JOB_NOT_FOUND`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND` and 409 `JOB_CANCELLATION_CONFLICT`).
+- **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`), diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points.
+- **`TextControllerTest`**: Text endpoints MockMvc suite, including the snake-case transform envelope, diacritic slugging, `400 BAD_REQUEST` for an unknown operation, `400 VALIDATION_ERROR` for blank text, and a `TEXT_TRANSFORM` entry listed by `/audit/entries` and replayed as `VERIFIED`.
+- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, key/payload fingerprint conflict detection (changed items, reordered items, changed algorithm or `secretKey`), 8-thread different-payload races, identical-key/identical-payload retries that mint no second execution, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff.
+- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202, 400, 404 `JOB_NOT_FOUND`, 409 `IDEMPOTENCY_CONFLICT`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND` and 409 `JOB_CANCELLATION_CONFLICT`).
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.
 - **`SlidingWindowRateLimiterTest`**: Exact-cap concurrent admission, deterministic window rollover on a mutable `Clock`, denials consuming no capacity, per-client isolation, idle eviction, and cap enforcement under many spoofed keys.
 - **`RateLimitFilterTest`**: MockMvc proof of the `429 RATE_LIMITED` envelope, `Retry-After`/`X-RateLimit-*` headers, and that a rejected call never invokes the controller.
 - **`RateLimitConfigTest`**: Property binding and overrides, filter registration for `/api/v1/utils/*` ahead of Spring MVC, and the `@Scheduled` cleanup wiring.
+- **`CircuitBreakerTest`**: CLOSED→OPEN thresholds, forced `probe()` semantics, and the `HALF_OPEN` probe lease — a concurrent caller inside the lease gets `CIRCUIT_OPEN` "probe already in flight" with no audit row, a clock advance past the lease admits a new probe with exactly one `PROBE_LEASE_EXPIRED` row, late success and late failure from the superseded generation change no counter/state and append no row, and `reapExpiredProbe()` is idempotent.
+- **`ResilienceControllerTest`**: MockMvc coverage of `GET /api/v1/utils/resilience` (`probeInFlight` / `probeLeaseExpiresAt` in the payload) and of `POST /api/v1/utils/resilience/probe` with the unified envelope.
+- **`AuditTrailTest`**: Bounded audit ring buffer ordering and capacity-eviction behaviour.
+- **`JsonQueryCircuitOpenTest`**: End-to-end proof that an `OPEN` breaker maps to a `503` `CIRCUIT_OPEN` envelope on `/api/v1/utils/json/query`.
 - **`UtiltoolsApiApplicationTests`**: Spring ApplicationContext loading verification.

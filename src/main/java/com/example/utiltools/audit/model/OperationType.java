@@ -1,6 +1,6 @@
 package com.example.utiltools.audit.model;
 
-/** The ten journalled utility operations and whether they are deterministic. */
+/** The twelve journalled utility operations and whether they are deterministic. */
 public enum OperationType {
 
     DATETIME_CONVERT(true),
@@ -12,7 +12,9 @@ public enum OperationType {
     CRYPTO_UUID(false),
     JSON_FORMAT(true),
     JSON_VALIDATE(true),
-    JSON_QUERY(true);
+    JSON_QUERY(true),
+    TEXT_TRANSFORM(true),
+    TEXT_STATS(true);
 
     private final boolean deterministic;
 
