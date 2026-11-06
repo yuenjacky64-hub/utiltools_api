@@ -56,6 +56,10 @@ public class AuditJournalService {
 
     private static final String STALE_PENDING_REAPED = "STALE_PENDING_REAPED";
 
+    private static final String MANUALLY_REAPED = "MANUALLY_REAPED";
+
+    private static final String MANUALLY_REAPED_DETAIL = "PENDING entry manually reaped";
+
     private static final String REPLAY_LEASE_EXPIRED_DETAIL = "replay claim lease expired";
 
     private static final String OVERSIZE_PAYLOAD_DETAIL =
@@ -167,6 +171,31 @@ public class AuditJournalService {
     }
 
     /**
+     * Records intent to reclaim a PENDING entry on the next {@link #reap()} pass. Changes no state
+     * and writes no tombstone here.
+     *
+     * <p>Only a PENDING entry can be reclaimed, so a terminal ({@code SUCCEEDED}/{@code FAILED})
+     * entry and an evicted or unknown id are refused — a valid audit row can never be falsified by
+     * a manual reap request, which is the audit-safe rollback guarantee. Repeated requests while
+     * the entry stays PENDING are idempotent; the intent is consumed by the pass that acts on it.</p>
+     *
+     * @return true when the request was recorded; false when the entry is unknown or not PENDING
+     */
+    public boolean requestManualReap(String id) {
+        if (id == null || id.isBlank()) {
+            return false;
+        }
+        synchronized (lock) {
+            JournalRecord record = entries.get(id);
+            if (record == null || record.base.state() != JournalState.PENDING) {
+                return false;
+            }
+            record.manualReapRequested = true;
+            return true;
+        }
+    }
+
+    /**
      * Scheduled cleanup sweep, the single scheduled entry point of the journal. Runs every
      * {@code utiltools.audit.cleanup-interval-ms} (fixed delay, so passes never overlap) and
      * delegates to the clock-free {@link #reap()} body.
@@ -191,7 +220,10 @@ public class AuditJournalService {
      *
      * <p>Each entry is classified with a fixed precedence and receives at most one reason per
      * pass: an expired {@code IN_PROGRESS} replay claim is rolled back to {@code FAILED} without
-     * touching the entry, an orphaned PENDING entry older than
+     * touching the entry, a PENDING entry that was requested through
+     * {@link #requestManualReap(String)} is moved to {@code FAILED} with {@code MANUALLY_REAPED}
+     * (ahead of the age-based sweep, so a manual reclaim is never reported as stale), an orphaned
+     * PENDING entry older than
      * {@code utiltools.audit.stale-pending-seconds} is moved to {@code FAILED} with
      * {@code STALE_PENDING_REAPED}, and an entry that was already terminal when the pass started
      * and whose <em>request</em> exceeded {@code utiltools.audit.max-replay-bytes} at {@code begin()}
@@ -227,6 +259,17 @@ public class AuditJournalService {
                     record.base = withReplay(base, rolledBack);
                     recordReap(id, base.operation(), ReapReason.REPLAY_LEASE_EXPIRED,
                             REPLAY_LEASE_EXPIRED_DETAIL, now);
+                    reapedCount++;
+                    continue;
+                }
+
+                if (stateAtScan == JournalState.PENDING && record.manualReapRequested) {
+                    record.manualReapRequested = false;
+                    record.base = new AuditEntry(base.id(), base.requestId(), base.operation(),
+                            JournalState.FAILED, base.createdAt(), now, base.request(), null,
+                            MANUALLY_REAPED, base.replayable(), record.replay);
+                    recordReap(id, base.operation(), ReapReason.MANUALLY_REAPED,
+                            MANUALLY_REAPED_DETAIL, now);
                     reapedCount++;
                     continue;
                 }
@@ -526,6 +569,8 @@ public class AuditJournalService {
         private final boolean requestOversize;
         private ReplayRecord replay;
         private String replayOwnerToken;
+        /** Set by {@link #requestManualReap(String)} and cleared by the pass that reclaims it. */
+        private boolean manualReapRequested;
 
         private JournalRecord(AuditEntry base, Object originalRequest, ReplayRecord replay,
                               boolean requestOversize) {
