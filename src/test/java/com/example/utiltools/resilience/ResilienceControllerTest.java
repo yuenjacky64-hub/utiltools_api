@@ -11,10 +11,12 @@ import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static org.hamcrest.Matchers.nullValue;
 
 @WebMvcTest(ResilienceController.class)
 @Import({ResilienceConfig.class, GlobalExceptionHandler.class, JsonService.class})
@@ -72,6 +74,19 @@ class ResilienceControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.state").value("OPEN"))
                 .andExpect(jsonPath("$.data.audit[0].trigger").value("PROBE_FAILED"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/resilience exposes the probe claim and its lease deadline")
+    void shouldExposeProbeLeaseStateAndDeadline() throws Exception {
+        assertThat(circuitBreaker.probeInFlight()).isFalse();
+        assertThat(circuitBreaker.probeLeaseExpiresAt()).isNull();
+
+        mockMvc.perform(get("/api/v1/utils/resilience"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.state").value("OPEN"))
+                .andExpect(jsonPath("$.data.probeInFlight").value(false))
+                .andExpect(jsonPath("$.data.probeLeaseExpiresAt").value(nullValue()));
     }
 
     private void tripBreaker() {

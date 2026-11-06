@@ -9,6 +9,8 @@ public record ResilienceResponse(
         int consecutiveFailures,
         int consecutiveSuccesses,
         Instant resetAt,
+        boolean probeInFlight,
+        Instant probeLeaseExpiresAt,
         int auditCapacity,
         List<AuditEntry> audit
 ) {}
