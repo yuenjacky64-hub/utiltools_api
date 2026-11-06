@@ -892,6 +892,13 @@ same `jobId` and cause exactly one execution. A *first* submission always report
 it was accepted in, captured before enqueue); a *duplicate* submission returns the current live snapshot of the
 existing job instead, so its `status` may already be `RUNNING`, `COMPLETED` or `FAILED`.
 
+An `idempotencyKey` identifies exactly **one canonical request payload** — the `algorithm` (after trim,
+upper-case and `SHA256`/`SHA-256` alias normalisation), the **ordered** `items` list, and the `secretKey` (where
+`null` and blank are equivalent). An identical retry therefore returns the same `jobId` with no second execution,
+while reusing the key with a **changed** payload is rejected with `409 IDEMPOTENCY_CONFLICT` **instead of**
+returning the cached job. The conflict is detected before registration, so the rejected submission creates no job
+row, hashes nothing and leaves no idempotency residue; the first job is untouched and keeps running.
+
 ```bash
 curl -i -X POST http://localhost:8080/api/v1/utils/jobs/hash \
   -H "Content-Type: application/json" \
@@ -917,6 +924,22 @@ curl -i -X POST http://localhost:8080/api/v1/utils/jobs/hash \
   "timestamp": "2026-10-31T19:12:04.418503Z"
 }
 ```
+
+**Response — `409 Conflict` (same key, different payload):**
+```json
+{
+  "success": false,
+  "message": "Idempotency key 'batch-2026-10-31-001' was already used with a different request payload",
+  "error": "IDEMPOTENCY_CONFLICT",
+  "details": {
+    "idempotencyKey": "batch-2026-10-31-001",
+    "existingJobId": "3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3"
+  },
+  "timestamp": "2026-10-31T19:13:11.204880Z"
+}
+```
+
+The payload never echoes `items` or `secretKey`; only the key and the existing job id are returned.
 
 #### B. Poll the job snapshot
 
@@ -956,6 +979,7 @@ The state machine is strictly `QUEUED → RUNNING → COMPLETED | FAILED`. A `FA
 | :--- | :--- | :--- | :--- |
 | Bounded executor queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry with the **same** `idempotencyKey` once capacity frees. The rejected submission is rolled back atomically — its job row **and** its idempotency mapping are both removed, so it leaves no residue and the retry with that key starts a brand-new job |
 | Unknown or already-evicted `jobId` | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Resubmit the batch |
+| Same `idempotencyKey` reused with a different `algorithm`, `items` or `secretKey` | `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | The first job is untouched and keeps running; the conflicting submission is discarded before registration (no job, no execution, no key residue). Pick a new `idempotencyKey` for a genuinely new payload |
 | Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit with a **new** `idempotencyKey` (or none). Reusing the failed job's key replays its cached `FAILED` snapshot instead of re-executing |
 | Blank/empty `items` | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Send a non-empty list of non-blank strings (max 1000) |
 
@@ -1078,6 +1102,7 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Unknown or evicted batch job id |
 | `404 NOT_FOUND` | `NOT_FOUND` | Unknown audit journal entry id |
 | `409 CONFLICT` | `REPLAY_CONFLICT` | Replay of a FAILED, non-deterministic, oversized, or still-PENDING entry |
+| `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | Batch job idempotency key reused with a different request payload |
 | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Batch job queue is saturated; retry after capacity frees |
 | `429 TOO_MANY_REQUESTS` | `RATE_LIMITED` | Request budget for `/api/v1/utils/*` exhausted (see [Rate Limiting](#-rate-limiting)) |
 | `500 INTERNAL_SERVER_ERROR` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |
@@ -1148,8 +1173,8 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `version=V4|V7` selection, compact UUIDv7, and the 400 unified envelope for an unknown `version`.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries, six-op patch success, rollback to byte-identical original, missing paths, malformed pointers, `-` append, dry runs, input-not-mutated.
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, and empty-`operations` validation rejection.
-- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety.
-- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202, 400, 404 `JOB_NOT_FOUND`, 429 `QUEUE_FULL`).
+- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, key/payload fingerprint conflict detection (changed items, reordered items, changed algorithm or `secretKey`), 8-thread different-payload races, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety.
+- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202, 400, 404 `JOB_NOT_FOUND`, 409 `IDEMPOTENCY_CONFLICT`, 429 `QUEUE_FULL`).
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.
 - **`SlidingWindowRateLimiterTest`**: Exact-cap concurrent admission, deterministic window rollover on a mutable `Clock`, denials consuming no capacity, per-client isolation, idle eviction, and cap enforcement under many spoofed keys.
 - **`RateLimitFilterTest`**: MockMvc proof of the `429 RATE_LIMITED` envelope, `Retry-After`/`X-RateLimit-*` headers, and that a rejected call never invokes the controller.
