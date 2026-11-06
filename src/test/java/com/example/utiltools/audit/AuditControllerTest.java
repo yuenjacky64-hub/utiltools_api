@@ -141,10 +141,16 @@ class AuditControllerTest {
                 new HashRequest("SHA-256", "Hello World", null), "audit-replay001");
         journal.succeed(entry.id(), new CryptoService().hash(new HashRequest("SHA-256", "Hello World", null)));
 
-        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", entry.id()))
+        MvcResult result = mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", entry.id()))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
-                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"));
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"))
+                .andExpect(jsonPath("$.data.replay.leaseExpiresAt").doesNotExist())
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andReturn();
+
+        assertThat(result.getResponse().getContentAsString()).doesNotContain("leaseExpiresAt");
+        assertThat(journal.find(entry.id()).orElseThrow().replay().leaseExpiresAt()).isNull();
     }
 
     @Test

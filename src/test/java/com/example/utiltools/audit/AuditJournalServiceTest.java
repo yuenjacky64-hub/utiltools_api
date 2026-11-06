@@ -384,6 +384,27 @@ class AuditJournalServiceTest {
     }
 
     @Test
+    @DisplayName("completing an evicted or unknown entry returns false without throwing or writing")
+    void shouldReturnFalseWhenCompletingAnEvictedEntry() {
+        AuditEntry succeeded = succeededEntry();
+        ReplayClaim claim = journal.claimReplay(succeeded.id());
+
+        // fill the bounded journal past max-entries so the claimed entry is evicted
+        journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000002");
+        journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000003");
+        journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000004");
+        assertThat(journal.find(succeeded.id())).isEmpty();
+
+        assertThatCode(() -> assertThat(journal.completeReplay(succeeded.id(), claim.ownerToken(),
+                ReplayState.VERIFIED, "late owner")).isFalse()).doesNotThrowAnyException();
+        assertThat(journal.find(succeeded.id())).isEmpty();
+
+        assertThatCode(() -> assertThat(journal.completeReplay("missing-entry", claim.ownerToken(),
+                ReplayState.FAILED, "unknown")).isFalse()).doesNotThrowAnyException();
+        assertThat(journal.find("missing-entry")).isEmpty();
+    }
+
+    @Test
     @DisplayName("a failed replay detail is bounded to the journal detail limit")
     void shouldBoundReplayDetail() {
         AuditEntry succeeded = succeededEntry();

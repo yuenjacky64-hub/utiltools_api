@@ -245,7 +245,7 @@ public class AuditJournalService {
             AuditEntry base = record.base;
             if (base.state() != JournalState.SUCCEEDED) {
                 throw new ReplayConflictException(id, "entry is " + base.state()
-                        + " and can only replay SUCCEEDED entries");
+                        + " and cannot be replayed");
             }
             if (base.operation() == null || !base.operation().isDeterministic()) {
                 throw new ReplayConflictException(id, "operation " + base.operation()
@@ -253,7 +253,7 @@ public class AuditJournalService {
             }
             if (!base.replayable()) {
                 throw new ReplayConflictException(id,
-                        "entry is not replayable (the stored request is unavailable)");
+                        "entry is not replayable (payload exceeds utiltools.audit.max-replay-bytes)");
             }
             Instant leaseExpiresAt = now.plusSeconds(replayLeaseSeconds);
             ReplayRecord claimed = new ReplayRecord(ReplayState.IN_PROGRESS, now, "replay in progress",

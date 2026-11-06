@@ -891,7 +891,7 @@ in flight:
 "replay": {
   "state": "IN_PROGRESS",
   "replayedAt": "2026-10-31T00:52:09.988Z",
-  "detail": "replay claimed by a single worker",
+  "detail": "replay in progress",
   "leaseExpiresAt": "2026-10-31T00:52:39.988Z"
 }
 ```
@@ -902,7 +902,7 @@ the in-flight record untouched. The claim lease is `utiltools.audit.replay-lease
 
 **Failed replays are audited.** If `replayInvoke` throws (for example the stored payload is no
 longer accepted by the service), the replay is recorded as `FAILED` with a bounded
-`detail` before the claim is released, then `500 INTERNAL_SERVER_ERROR` is returned. The entry's
+`detail` before the claim is released, then `409 REPLAY_CONFLICT` is returned. The entry's
 original `state`, `result` and `completedAt` are unchanged, so the entry stays replayable and a
 later replay can still produce `VERIFIED`:
 
@@ -910,7 +910,7 @@ later replay can still produce `VERIFIED`:
 "replay": {
   "state": "FAILED",
   "replayedAt": "2026-10-31T00:52:10.004Z",
-  "detail": "replayInvoke failed: IllegalArgumentException: unknown algorithm"
+  "detail": "replay failed: unknown algorithm"
 }
 ```
 
