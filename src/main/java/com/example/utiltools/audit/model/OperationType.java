@@ -1,10 +1,11 @@
 package com.example.utiltools.audit.model;
 
-/** The eleven journalled utility operations and whether they are deterministic. */
+/** The twelve journalled utility operations and whether they are deterministic. */
 public enum OperationType {
 
     DATETIME_CONVERT(true),
     DATETIME_DIFF(true),
+    DATETIME_SHIFT(true),
     DATETIME_CURRENT(false),
     CRYPTO_HASH(true),
     CRYPTO_BASE64(true),

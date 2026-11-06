@@ -1,6 +1,9 @@
 package com.example.utiltools.datetime;
 
 import com.example.utiltools.audit.AuditTestSupport;
+import com.example.utiltools.audit.model.AuditEntry;
+import com.example.utiltools.audit.model.JournalState;
+import com.example.utiltools.audit.model.OperationType;
 import com.example.utiltools.audit.service.AuditJournalService;
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.GlobalExceptionHandler;
@@ -19,6 +22,7 @@ import org.springframework.http.MediaType;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.everyItem;
 import static org.hamcrest.Matchers.startsWith;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -35,6 +39,9 @@ class DateTimeControllerTest {
 
     @Autowired
     private MockMvc mockMvc;
+
+    @Autowired
+    private AuditJournalService auditJournal;
 
     @Test
     @DisplayName("POST /api/v1/utils/datetime/convert - should convert epoch millis to Tokyo time")
@@ -350,6 +357,39 @@ class DateTimeControllerTest {
                 .andExpect(jsonPath("$.data.targetTimeZone").value("UTC"))
                 .andExpect(jsonPath("$.data.appliedAmount").value(1))
                 .andExpect(jsonPath("$.data.appliedUnit").value("MONTHS"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/shift - should journal a SUCCEEDED DATETIME_SHIFT entry")
+    void shouldJournalSucceededShiftEntry() throws Exception {
+        String body = """
+                {
+                    "input": "2026-01-31T12:00:00Z",
+                    "amount": 1,
+                    "unit": "MONTHS",
+                    "targetTimeZone": "UTC",
+                    "customPattern": "yyyy-MM-dd HH:mm:ss"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/shift")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+
+        AuditEntry entry = auditJournal.list(1, null).get(0);
+        assertThat(entry.operation()).isEqualTo(OperationType.DATETIME_SHIFT);
+        assertThat(entry.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entry.errorCode()).isNull();
+        assertThat(entry.replayable()).isTrue();
+        assertThat(entry.request().get("input").asText()).isEqualTo("2026-01-31T12:00:00Z");
+        assertThat(entry.request().get("targetTimeZone").asText()).isEqualTo("UTC");
+        assertThat(entry.request().get("amount").asLong()).isEqualTo(1L);
+        assertThat(entry.request().get("unit").asText()).isEqualTo("MONTHS");
+        assertThat(entry.request().get("customPattern").asText()).isEqualTo("yyyy-MM-dd HH:mm:ss");
+        assertThat(entry.request().has("amountNonZero")).isFalse();
+        assertThat(entry.result().get("isoUtc").asText()).isEqualTo("2026-02-28T12:00:00Z");
     }
 
     @Test
