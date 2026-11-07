@@ -25,6 +25,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
@@ -286,5 +287,107 @@ class AuditControllerTest {
                 .andReturn();
 
         assertThat(result.getResponse().getContentAsString()).doesNotContain(claim.ownerToken());
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/audit/verify - aggregates match the bounded per-entry results")
+    void shouldVerifyMixedJournalAndReturnMatchingAggregates() throws Exception {
+        AuditEntry intact = journal.begin(OperationType.CRYPTO_HASH,
+                new HashRequest("SHA-256", "Hello World", null), "audit-verify001");
+        journal.succeed(intact.id(), new CryptoService().hash(new HashRequest("SHA-256", "Hello World", null)));
+        AuditEntry tampered = journal.begin(OperationType.CRYPTO_HASH,
+                new HashRequest("SHA-256", "Goodbye World", null), "audit-verify002");
+        journal.succeed(tampered.id(), new HashResponse("SHA-256", "deadbeef", false));
+
+        MvcResult result = mockMvc.perform(post("/api/v1/utils/audit/verify")
+                        .param("limit", "200")
+                        .header("X-Request-Id", "audit-verify01"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-Request-Id", "audit-verify01"))
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.limit").value(200))
+                .andExpect(jsonPath("$.data.results").isArray())
+                .andReturn();
+
+        String body = result.getResponse().getContentAsString();
+        Integer scanned = com.jayway.jsonpath.JsonPath.read(body, "$.data.scanned");
+        Integer verified = com.jayway.jsonpath.JsonPath.read(body, "$.data.verified");
+        Integer mismatch = com.jayway.jsonpath.JsonPath.read(body, "$.data.mismatch");
+        Integer failed = com.jayway.jsonpath.JsonPath.read(body, "$.data.failed");
+        Integer skipped = com.jayway.jsonpath.JsonPath.read(body, "$.data.skipped");
+        List<Map<String, Object>> rows = com.jayway.jsonpath.JsonPath.read(body, "$.data.results");
+
+        assertThat(verified + mismatch + failed + skipped).isEqualTo(scanned);
+        assertThat(scanned).isEqualTo(rows.size());
+
+        Map<String, Object> intactRow = rows.stream()
+                .filter(row -> intact.id().equals(row.get("entryId"))).findFirst().orElseThrow();
+        Map<String, Object> tamperedRow = rows.stream()
+                .filter(row -> tampered.id().equals(row.get("entryId"))).findFirst().orElseThrow();
+        assertThat(intactRow.get("outcome")).isEqualTo("VERIFIED");
+        assertThat(tamperedRow.get("outcome")).isEqualTo("MISMATCH");
+        assertThat(intactRow).doesNotContainKey("skipReason");
+    }
+
+    @Test
+    @DirtiesContext(methodMode = DirtiesContext.MethodMode.BEFORE_METHOD)
+    @DisplayName("POST /api/v1/utils/audit/verify - an empty journal answers zeroed counts")
+    void shouldVerifyEmptyJournalWithZeroedCounts() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/audit/verify").param("limit", "5"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.limit").value(5))
+                .andExpect(jsonPath("$.data.scanned").value(0))
+                .andExpect(jsonPath("$.data.verified").value(0))
+                .andExpect(jsonPath("$.data.mismatch").value(0))
+                .andExpect(jsonPath("$.data.failed").value(0))
+                .andExpect(jsonPath("$.data.skipped").value(0))
+                .andExpect(jsonPath("$.data.results").isEmpty())
+                .andExpect(jsonPath("$.message").value("Journal verification sweep completed"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/audit/verify - limit=0, limit=-5 and limit=abc answer 400 BAD_REQUEST")
+    void shouldRejectNonPositiveAndNonNumericLimits() throws Exception {
+        for (String limit : List.of("0", "-5")) {
+            mockMvc.perform(post("/api/v1/utils/audit/verify").param("limit", limit))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.success").value(false))
+                    .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                    .andExpect(jsonPath("$.message").value(
+                            org.hamcrest.Matchers.containsString("limit must be >= 1")));
+        }
+
+        mockMvc.perform(post("/api/v1/utils/audit/verify").param("limit", "abc"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/audit/verify - no stored payloads leave the journal, detail is bounded")
+    void verifyResponseOmitsStoredPayloadsAndBoundsDetail() throws Exception {
+        AuditEntry entry = journal.begin(OperationType.CRYPTO_HASH,
+                new HashRequest("SHA-256", "Hello World", "super-secret-value"), "audit-verify003");
+        journal.succeed(entry.id(), new CryptoService().hash(new HashRequest("SHA-256", "Hello World", null)));
+
+        MvcResult result = mockMvc.perform(post("/api/v1/utils/audit/verify").param("limit", "200"))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        String body = result.getResponse().getContentAsString();
+        assertThat(body).doesNotContain("super-secret-value");
+        assertThat(body).doesNotContain("\"request\"");
+        assertThat(body).doesNotContain("\"result\"");
+
+        List<Map<String, Object>> rows = com.jayway.jsonpath.JsonPath.read(body, "$.data.results");
+        assertThat(rows).isNotEmpty();
+        assertThat(rows).allSatisfy(row -> {
+            assertThat(row).containsKeys("entryId", "detail");
+            assertThat(row.get("detail").toString().length()).isLessThanOrEqualTo(200);
+            boolean hasOutcome = row.containsKey("outcome");
+            boolean hasSkipReason = row.containsKey("skipReason");
+            assertThat(hasOutcome ^ hasSkipReason).as("exactly one of outcome/skipReason").isTrue();
+        });
     }
 }
