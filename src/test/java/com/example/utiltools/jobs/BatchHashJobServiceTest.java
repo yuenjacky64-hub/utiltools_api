@@ -3,6 +3,7 @@ package com.example.utiltools.jobs;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
 import com.example.utiltools.audit.model.OperationType;
+import com.example.utiltools.audit.model.ReapRecord;
 import com.example.utiltools.audit.service.AuditJournalService;
 import com.example.utiltools.common.RequestContext;
 import com.example.utiltools.crypto.dto.HashRequest;
@@ -1528,6 +1529,350 @@ class BatchHashJobServiceTest {
             private final CountDownLatch entered = new CountDownLatch(1);
             private final CountDownLatch released = new CountDownLatch(1);
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Execution-lease heartbeat (REQ-01..REQ-07, INV-HB-1..INV-HB-7)
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * DOD-02 / REQ-03, REQ-04: a RUNNING job's heartbeat derives the new expiry from the clock (never
+     * from the stored expiry) and stamps {@code lastHeartbeatAt} with the same instant, while the
+     * attempt's own projection stays RUNNING with no results and no completion instant.
+     */
+    @Test
+    @DisplayName("heartbeat - a RUNNING job renews its lease and stamps lastHeartbeatAt from the clock")
+    void shouldExtendLeaseAndStampHeartbeatAtWhenRunningJobHeartbeats() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("b");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("a", "b"), null, null));
+        assertThat(crypto.awaitEntered("b")).isTrue(); // "a" is committed, the worker is inside "b"
+        try {
+            clock.advanceSeconds(5);
+
+            BatchHashJobResponse renewed = service.heartbeat(accepted.jobId());
+
+            assertThat(renewed.jobId()).isEqualTo(accepted.jobId());
+            assertThat(renewed.status()).isEqualTo(JobStatus.RUNNING);
+            assertThat(renewed.lastHeartbeatAt()).isEqualTo(clock.instant());
+            assertThat(renewed.executionLeaseExpiresAt())
+                    .isEqualTo(clock.instant().plusSeconds(LEASE_SECONDS));
+            assertThat(renewed.results()).isNull();
+            assertThat(renewed.completedAt()).isNull();
+            assertThat(renewed.attempt()).isEqualTo(1);
+            // The renewal is what the reaper reads: the extended lease is live at the new instant.
+            assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+            assertThat(service.getJob(accepted.jobId()).executionLeaseExpiresAt())
+                    .isEqualTo(clock.instant().plusSeconds(LEASE_SECONDS));
+        } finally {
+            crypto.unblock("b");
+        }
+        assertThat(awaitStatus(accepted.jobId(), JobStatus.COMPLETED).results()).hasSize(2);
+    }
+
+    /**
+     * DOD-02 / REQ-02: an unknown or already-evicted id answers like every other job route — a
+     * {@link JobNotFoundException} with nothing registered, journaled or mutated.
+     */
+    @Test
+    @DisplayName("heartbeat - an unknown job id is a 404-worthy JobNotFoundException and writes nothing")
+    void shouldRejectHeartbeatForUnknownJob() {
+        AuditJournalService journal = newJournal();
+        service = new BatchHashJobService(new CryptoService(), 1, 10, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC(), journal);
+        Set<String> registeredBefore = registryKeys("jobs");
+        int journalSizeBefore = journal.list(500, null).size();
+
+        assertThatThrownBy(() -> service.heartbeat("unknown-job-id"))
+                .isInstanceOf(JobNotFoundException.class);
+
+        assertThat(registryKeys("jobs")).isEqualTo(registeredBefore);
+        assertThat(journal.list(500, null)).hasSize(journalSizeBefore);
+    }
+
+    /**
+     * DOD-02 / REQ-02, REQ-07: only a RUNNING attempt may renew. A QUEUED, COMPLETED, CANCELLED or
+     * already reaped FAILED job answers 409 through {@link JobRetryConflictException}, and every one
+     * of those snapshots is byte-identical afterwards with no {@code HEARTBEAT} row written.
+     */
+    @Test
+    @DisplayName("heartbeat - QUEUED, COMPLETED, CANCELLED and reaped FAILED jobs answer 409 unchanged")
+    void shouldRejectHeartbeatWhenJobIsNotRunning() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock, journal);
+
+        BatchHashJobResponse completed = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", List.of("done"), null, null)).jobId(),
+                JobStatus.COMPLETED);
+        BatchHashJobResponse stalled = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stalled"), null, null));
+        assertThat(crypto.awaitEntered("stalled")).isTrue();
+        BatchHashJobResponse queued = service.submit(
+                new BatchHashRequest("SHA-256", List.of("waiting"), null, null));
+        BatchHashJobResponse cancelled = service.cancel(service.submit(
+                new BatchHashRequest("SHA-256", List.of("withdrawn"), null, null)).jobId());
+        assertThat(queued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(cancelled.status()).isEqualTo(JobStatus.CANCELLED);
+
+        for (BatchHashJobResponse notRunning : List.of(queued, completed, cancelled)) {
+            BatchHashJobResponse before = service.getJob(notRunning.jobId());
+            assertThatThrownBy(() -> service.heartbeat(notRunning.jobId()))
+                    .isInstanceOfSatisfying(JobRetryConflictException.class,
+                            e -> assertThat(e.status()).isEqualTo(notRunning.status()));
+            assertThat(service.getJob(notRunning.jobId())).isEqualTo(before);
+            assertThat(heartbeatEntries(journal, notRunning.jobId())).isEmpty();
+        }
+
+        // The reaped attempt is FAILED, not RUNNING: renewal is refused after the reaper claimed it.
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        BatchHashJobResponse reaped = service.getJob(stalled.jobId());
+        assertThat(reaped.status()).isEqualTo(JobStatus.FAILED);
+        assertThatThrownBy(() -> service.heartbeat(stalled.jobId()))
+                .isInstanceOfSatisfying(JobRetryConflictException.class,
+                        e -> assertThat(e.status()).isEqualTo(JobStatus.FAILED));
+        assertThat(service.getJob(stalled.jobId())).isEqualTo(reaped);
+        assertThat(heartbeatEntries(journal, stalled.jobId())).isEmpty();
+
+        crypto.unblock("stalled");
+    }
+
+    /**
+     * DOD-02 / REQ-02, INV-HB-2: renewal is refused once the lease has lapsed — the last live
+     * millisecond still renews, the expiry instant itself does not, and a refused call leaves both
+     * the lease and the status untouched (it never revives an attempt the reaper may claim).
+     */
+    @Test
+    @DisplayName("heartbeat - renewal succeeds one millisecond before expiry and is refused at it")
+    void shouldRejectHeartbeatWhenLeaseHasExpired() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stalled"), null, null));
+        assertThat(crypto.awaitEntered("stalled")).isTrue();
+        try {
+            clock.advanceMillis(LEASE_SECONDS * 1000 - 1); // 1 ms before the original expiry
+            BatchHashJobResponse renewed = service.heartbeat(accepted.jobId());
+            assertThat(renewed.executionLeaseExpiresAt())
+                    .isEqualTo(clock.instant().plusSeconds(LEASE_SECONDS));
+
+            BatchHashJobResponse live = service.getJob(accepted.jobId());
+            Instant expiry = live.executionLeaseExpiresAt();
+            clock.advanceSeconds(LEASE_SECONDS); // the clock now sits exactly on the expiry instant
+            assertThat(clock.instant()).isEqualTo(expiry);
+
+            assertThatThrownBy(() -> service.heartbeat(accepted.jobId()))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("has expired");
+            BatchHashJobResponse refused = service.getJob(accepted.jobId());
+            assertThat(refused).isEqualTo(live);
+            assertThat(refused.status()).isEqualTo(JobStatus.RUNNING);
+            assertThat(refused.executionLeaseExpiresAt()).isEqualTo(expiry);
+            assertThat(refused.lastHeartbeatAt()).isEqualTo(live.lastHeartbeatAt());
+        } finally {
+            crypto.unblock("stalled");
+        }
+        awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+    }
+
+    /**
+     * DOD-02 / REQ-05, INV-HB-4, INV-HB-5: each successful renewal opens and closes exactly one
+     * bounded {@code HEARTBEAT} row, and the attempt's own entry keeps closing with the attempt's
+     * outcome — the heartbeat never steals it.
+     */
+    @Test
+    @DisplayName("heartbeat - every renewal journals one bounded HEARTBEAT row and never closes the attempt row")
+    void shouldJournalHeartbeatEntryWithBoundedDetail() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock, journal);
+
+        RequestContext.set("req-heartbeat1");
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stalled"), null, null));
+        assertThat(crypto.awaitEntered("stalled")).isTrue();
+
+        service.heartbeat(accepted.jobId());
+        clock.advanceSeconds(5);
+        service.heartbeat(accepted.jobId());
+        RequestContext.clear();
+
+        List<AuditEntry> rows = heartbeatEntries(journal, accepted.jobId());
+        assertThat(rows).hasSize(2);
+        for (AuditEntry row : rows) {
+            assertThat(row.operation()).isEqualTo(OperationType.BATCH_HASH);
+            assertThat(row.state()).isEqualTo(JournalState.SUCCEEDED);
+            assertThat(row.requestId()).isEqualTo("req-heartbeat1");
+            assertThat(row.request().path("attempt").asInt()).isEqualTo(1);
+            assertThat(row.request().path("leaseExpiresAt").asText()).isNotBlank();
+            assertThat(row.result().path("status").asText()).isEqualTo("HEARTBEAT");
+            assertThat(row.result().path("detail").asText()).isEqualTo("lease renewed via heartbeat");
+            assertThat(row.result().path("detail").asText().length())
+                    .isLessThanOrEqualTo(ReapRecord.MAX_DETAIL_LENGTH);
+        }
+        String newestExpiry = rows.get(0).result().path("leaseExpiresAt").asText();
+        assertThat(newestExpiry).isEqualTo(clock.instant().plusSeconds(LEASE_SECONDS).toString());
+
+        // The attempt's own entry is still open (PENDING) and is not one of the heartbeat rows.
+        List<AuditEntry> attemptRows = attemptEntries(journal, accepted.jobId());
+        assertThat(attemptRows).hasSize(1);
+        AuditEntry attemptRow = attemptRows.get(0);
+        assertThat(attemptRow.state()).isEqualTo(JournalState.PENDING);
+        assertThat(rows).noneMatch(row -> row.id().equals(attemptRow.id()));
+        assertThat(service.getJob(accepted.jobId()).attempts().get(0).auditEntryId())
+                .isEqualTo(attemptRow.id());
+
+        crypto.unblock("stalled");
+        BatchHashJobResponse completed = awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+        AuditEntry closedAttemptRow = journal.find(attemptRow.id()).orElseThrow();
+        assertThat(closedAttemptRow.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(closedAttemptRow.result().path("outcome").asText()).isEqualTo("COMPLETED");
+        assertThat(completed.attempts().get(0).status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(heartbeatEntries(journal, accepted.jobId())).hasSize(2); // renewal rows unaffected
+    }
+
+    /**
+     * DOD-05 / REQ-06, INV-HB-1, INV-HB-2: the fence is the attempt generation. A heartbeat after
+     * the reaper claimed attempt 1 is refused and journals nothing; once the job is retried the
+     * renewal belongs to attempt 2, and replaying the superseded attempt-1 worker changes neither
+     * the snapshot nor the journal.
+     */
+    @Test
+    @DisplayName("heartbeat - renewal is fenced to the current attempt across reap, retry and a late worker")
+    void shouldFenceHeartbeatToCurrentAttemptAfterReapAndRetry() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        // Two workers: the retried attempt 2 starts on the free thread while the stale attempt-1
+        // worker is still parked inside hash("stalled") -- that is exactly the late-worker race.
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3, LEASE_SECONDS, 5000, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stalled"), null, null));
+        assertThat(crypto.awaitEntered("stalled")).isTrue();
+        try {
+            clock.advanceSeconds(LEASE_SECONDS);
+            assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+            assertThatThrownBy(() -> service.heartbeat(accepted.jobId()))
+                    .isInstanceOf(JobRetryConflictException.class);
+            assertThat(heartbeatEntries(journal, accepted.jobId())).isEmpty();
+
+            BatchHashJobResponse retried = service.retry(accepted.jobId());
+            assertThat(retried.status()).isEqualTo(JobStatus.QUEUED);
+            assertThat(retried.attempt()).isEqualTo(2);
+
+            awaitRunningAttempt(accepted.jobId(), 2);
+            clock.advanceSeconds(5);
+            BatchHashJobResponse renewed = service.heartbeat(accepted.jobId());
+            assertThat(renewed.attempt()).isEqualTo(2);
+            assertThat(renewed.status()).isEqualTo(JobStatus.RUNNING);
+            assertThat(renewed.lastHeartbeatAt()).isEqualTo(clock.instant());
+            assertThat(renewed.executionLeaseExpiresAt())
+                    .isEqualTo(clock.instant().plusSeconds(LEASE_SECONDS));
+
+            List<AuditEntry> rows = heartbeatEntries(journal, accepted.jobId());
+            assertThat(rows).hasSize(1);
+            assertThat(rows.get(0).request().path("attempt").asInt()).isEqualTo(2);
+
+            // The superseded attempt-1 worker is replayed: the generation fence drops it entirely.
+            BatchHashJobResponse before = service.getJob(accepted.jobId());
+            int rowsBefore = batchHashEntries(journal, accepted.jobId()).size();
+            service.executeAttempt(accepted.jobId(), 1);
+            assertThat(service.getJob(accepted.jobId())).isEqualTo(before);
+            assertThat(batchHashEntries(journal, accepted.jobId())).hasSize(rowsBefore);
+        } finally {
+            crypto.unblock("stalled");
+        }
+        BatchHashJobResponse completed = awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.attempt()).isEqualTo(2);
+        assertThat(completed.attempts()).hasSize(2);
+    }
+
+    /**
+     * DOD-02 / REQ-07, INV-HB-3: a mid-batch renewal writes only the lease record and the heartbeat
+     * stamp. The status, the checkpoint prefix, the attempt history, the started/completed instants
+     * and the (still unpublished) results are all untouched.
+     */
+    @Test
+    @DisplayName("heartbeat - only the lease and lastHeartbeatAt change; the attempt outcome does not")
+    void shouldNotMutateJobOutcomeOrCheckpointOnHeartbeat() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("c");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("a", "b", "c"), null, "heartbeat-key"));
+        assertThat(crypto.awaitEntered("c")).isTrue(); // two items committed, the worker is inside "c"
+        try {
+            BatchHashJobResponse before = service.getJob(accepted.jobId());
+            assertThat(before.completedItems()).isEqualTo(2);
+            clock.advanceSeconds(5);
+
+            BatchHashJobResponse after = service.heartbeat(accepted.jobId());
+
+            assertThat(after.status()).isEqualTo(before.status());
+            assertThat(after.itemCount()).isEqualTo(before.itemCount());
+            assertThat(after.completedItems()).isEqualTo(before.completedItems());
+            assertThat(after.attempt()).isEqualTo(before.attempt());
+            assertThat(after.attempts()).isEqualTo(before.attempts());
+            assertThat(after.results()).isNull();
+            assertThat(after.completedAt()).isNull();
+            assertThat(after.startedAt()).isEqualTo(before.startedAt());
+            assertThat(after.createdAt()).isEqualTo(before.createdAt());
+            assertThat(after.idempotencyKey()).isEqualTo("heartbeat-key");
+            assertThat(after.error()).isNull();
+            assertThat(after.lastHeartbeatAt()).isEqualTo(clock.instant());
+            assertThat(after.executionLeaseExpiresAt())
+                    .isEqualTo(clock.instant().plusSeconds(LEASE_SECONDS));
+            // Field by field above, and as a whole: rebuilding the pre-heartbeat snapshot with only
+            // the two lease stamps taken from the post-heartbeat one reproduces it exactly.
+            assertThat(after).isEqualTo(new BatchHashJobResponse(before.jobId(), before.idempotencyKey(),
+                    before.status(), before.itemCount(), before.results(), before.error(),
+                    before.createdAt(), before.startedAt(), before.completedAt(), before.attempt(),
+                    before.maxAttempts(), before.attempts(), after.executionLeaseExpiresAt(),
+                    after.lastHeartbeatAt(), before.completedItems()));
+        } finally {
+            crypto.unblock("c");
+        }
+        BatchHashJobResponse completed = awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.results()).hasSize(3);
+        assertThat(completed.completedAt()).isNotNull();
+    }
+
+    /** Blocks until the job's given attempt is the one actually executing (RUNNING). */
+    private BatchHashJobResponse awaitRunningAttempt(String jobId, int attempt) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline) {
+            BatchHashJobResponse snapshot = service.getJob(jobId);
+            if (snapshot.status() == JobStatus.RUNNING && snapshot.attempt() == attempt) {
+                return snapshot;
+            }
+            Thread.sleep(10);
+        }
+        throw new AssertionError("job " + jobId + " attempt " + attempt
+                + " did not start; last=" + service.getJob(jobId));
+    }
+
+    /** HEARTBEAT rows recorded for one job, newest first; identified by the descriptor's own kind. */
+    private static List<AuditEntry> heartbeatEntries(AuditJournalService journal, String jobId) {
+        return batchHashEntries(journal, jobId).stream()
+                .filter(entry -> entry.request() != null && entry.request().has("kind"))
+                .toList();
+    }
+
+    /** The attempt's own entry for one job (no {@code kind} marker), newest first. */
+    private static List<AuditEntry> attemptEntries(AuditJournalService journal, String jobId) {
+        return batchHashEntries(journal, jobId).stream()
+                .filter(entry -> entry.request() == null || !entry.request().has("kind"))
+                .toList();
     }
 
     // ---------------------------------------------------------------------------------------------

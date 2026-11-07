@@ -15,7 +15,17 @@ public class JobRetryConflictException extends RuntimeException {
     private final int maxAttempts;
 
     public JobRetryConflictException(String jobId, JobStatus status, int attempt, int maxAttempts) {
-        super("Job " + jobId + " cannot be retried from status " + status
+        this(jobId, status, attempt, maxAttempts, "be retried");
+    }
+
+    /**
+     * Same conflict, described with the caller's own verb: a heartbeat on a non-RUNNING job reports
+     * that it cannot <em>renew its execution lease</em>, while a retry keeps the historical
+     * "cannot be retried" message byte for byte.
+     */
+    public JobRetryConflictException(String jobId, JobStatus status, int attempt, int maxAttempts,
+            String verb) {
+        super("Job " + jobId + " cannot " + verb + " from status " + status
                 + " (attempt " + attempt + " of " + maxAttempts + ")");
         this.jobId = jobId;
         this.status = status;
