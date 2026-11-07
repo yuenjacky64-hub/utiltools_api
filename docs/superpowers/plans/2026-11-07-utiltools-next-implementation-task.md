@@ -1,92 +1,98 @@
 # UtilTools — Next Implementation Task (Discovery Report)
 
-**Task:** UTILTOOLS-42 · **Plan:** `Implementation_Plan.md` v1 (Complexity Tier S) · **Gate:** `tools/check_discovery_report.sh`
+**Task:** UTILTOOLS-42 · **Plan:** `Implementation_Plan.md` v1.1 (Complexity Tier S) · **Gate:** `tools/check_discovery_report.sh`
 **Requirements covered:** REQ-01 (structure + patterns), REQ-02 (identify a candidate), REQ-03 (not already implemented, not queued)
-**Outcome:** 10 packages inventoried, 31 route mappings over 30 distinct paths, 6 candidate gaps scored, 1 selected → **GAP-03 — CSV/TSV ⇄ JSON conversion**.
+**Outcome:** every production package inventoried, the house conventions catalogued, candidate gaps scored, one selected → **GAP-03 — CSV/TSV ⇄ JSON conversion**.
 
 This document is a *report*, not an implementation. No file under `src/main`, `src/test`, `pom.xml`, `README.md` or `.ait/` is modified by this task; the only two artifacts are this report and the gate script `tools/check_discovery_report.sh`.
 
 ## 1. Architecture inventory
 
-One Maven module (`pom.xml`, Java 21, Spring Boot 4, JUnit 5 + MockMvc + AssertJ). `src/main/java/com/example/utiltools` holds exactly **10 package directories** and 99 Java sources; `src/test/java/com/example/utiltools` mirrors eight of them with 30 test sources and 425 `@Test` methods.
+- inventory: main-sources=100 pkg-dirs=10 test-dirs=10 mirrored=9 test-sources=30
+- entry-point: src/main/java/com/example/utiltools/UtiltoolsApiApplication.java
+- evidence: `printf 'main-sources=%s pkg-dirs=%s test-dirs=%s mirrored=%s test-sources=%s entry-point=%s\n' "$(find src/main/java/com/example/utiltools -name '*.java' | wc -l)" "$(find src/main/java/com/example/utiltools -mindepth 1 -maxdepth 1 -type d | wc -l)" "$(find src/test/java/com/example/utiltools -mindepth 1 -maxdepth 1 -type d | wc -l)" "$(c=0; for d in src/main/java/com/example/utiltools/*/; do [ -d "src/test/java/com/example/utiltools/$(basename "$d")" ] && c=$((c+1)); done; echo "$c")" "$(find src/test/java/com/example/utiltools -name '*.java' | wc -l)" "$(basename "$(find src/main/java/com/example/utiltools -maxdepth 1 -name '*Application.java')")"`
+- exit: 0
+- output: `main-sources=100 pkg-dirs=10 test-dirs=10 mirrored=9 test-sources=30 entry-point=UtiltoolsApiApplication.java`
 
-The ten blocks below enumerate every package, its role, the HTTP surface it owns, and the shared code it depends on. Counts come from `@RequestMapping` + `@{Get,Post,Put,Patch,Delete}Mapping` annotations (`find src/main/java -name '*Controller.java'` → 8 controllers, 31 route annotations, 30 distinct paths because `GET` and `DELETE` share `/jobs/{jobId}`).
+One Maven module (`pom.xml`, Java 21, Spring Boot 4, JUnit 5 + MockMvc + AssertJ). The inventory line above is the measured shape of the tree and is recomputed field by field by `tools/check_discovery_report.sh --inventory`, so no count in this section is a prose claim. Read it as: the entry point sits at the root of the package tree rather than inside a package — it is the only source file outside a package directory — and the package directories are mirrored almost one-for-one under `src/test/java/com/example/utiltools`, with `config` the single main package lacking a test counterpart because it holds springdoc wiring only; one test directory (`contact`) conversely has no main-source counterpart, and the application test sits at the test root, so the test-source figure is not the sum of the per-package test files.
+
+The blocks below enumerate every package, its role, the HTTP surface it owns, and the shared code it depends on. Route counts are read off `@RequestMapping` + `@{Get,Post,Put,Patch,Delete}Mapping` annotations (`find src/main/java -name '*Controller.java'`), and every controller mapping resolves to a distinct path except `/jobs/{jobId}`, which `GET` and `DELETE` share.
 
 ### PKG-common
 - path: src/main/java/com/example/utiltools/common
 - role: cross-cutting HTTP plumbing — success envelope, error envelope, centralized exception mapping, request-id propagation, journal-lookup exceptions
-- files (7): ApiResponse, ErrorResponse, GlobalExceptionHandler, RequestContext, RequestIdFilter, AuditEntryNotFoundException, ReplayConflictException
+- files: ApiResponse, ErrorResponse, GlobalExceptionHandler, RequestContext, RequestIdFilter, AuditEntryNotFoundException, ReplayConflictException
 - endpoints: none of its own — `RequestIdFilter` wraps every `/api/v1/utils/*` request and stamps `requestId` into every envelope
 - shared-dep: the whole API depends on it; `ApiResponse.success(...)` is the single return type of all 8 controllers, and `GlobalExceptionHandler` imports `resilience.CircuitBreakerOpenException` to map circuit trips to `503`
 
 ### PKG-config
 - path: src/main/java/com/example/utiltools/config
 - role: framework configuration — springdoc OpenAPI metadata only
-- files (1): OpenApiConfig
+- files: OpenApiConfig
 - endpoints: none (no `@RestController`)
 - shared-dep: springdoc reads the annotations placed on the controllers of every other package
 
 ### PKG-crypto
 - path: src/main/java/com/example/utiltools/crypto
 - role: hashing, Base64, URL encoding and UUID generation (stateless)
-- files (9): CryptoController, CryptoService, Hash/Base64/Url/Uuid request+response records
-- endpoints (4): `POST /api/v1/utils/crypto/hash`, `POST /api/v1/utils/crypto/base64`, `POST /api/v1/utils/crypto/url`, `GET /api/v1/utils/crypto/uuid`
+- files: CryptoController, CryptoService, Hash/Base64/Url/Uuid request+response records
+- endpoints: `POST /api/v1/utils/crypto/hash`, `POST /api/v1/utils/crypto/base64`, `POST /api/v1/utils/crypto/url`, `GET /api/v1/utils/crypto/uuid`
 - shared-dep: `audit.service.AuditedOperations` (3 journalled writes) and `common.ApiResponse`; the controller owns no journal code itself
 
 ### PKG-datetime
 - path: src/main/java/com/example/utiltools/datetime
 - role: epoch/ISO conversion, diffing, shifting, "now", and the timezone catalogue
-- files (11): DateTimeController, DateTimeService, 5 request/response pairs plus TimeZoneInfo/TimeZoneListResponse
-- endpoints (5): `POST /api/v1/utils/datetime/convert`, `/diff`, `/shift`, `GET /api/v1/utils/datetime/current`, `GET /api/v1/utils/datetime/timezones`
+- files: DateTimeController, DateTimeService, 5 request/response pairs plus TimeZoneInfo/TimeZoneListResponse
+- endpoints: `POST /api/v1/utils/datetime/convert`, `/diff`, `/shift`, `GET /api/v1/utils/datetime/current`, `GET /api/v1/utils/datetime/timezones`
 - shared-dep: `AuditedOperations` for the 4 journalled calls; `/timezones` is read-only and deliberately not journalled (README:1007)
 
 ### PKG-json
 - path: src/main/java/com/example/utiltools/json
 - role: the largest feature module — format, validate, query, flatten, unflatten, merge-patch and RFC 6902 patch, the last with a reverse-order rollback trail
-- files (18): JsonController, JsonService, 11 request/response records, JsonPatchOperation, JsonPatchRollbackException
-- endpoints (7): `POST /api/v1/utils/json/{format,validate,query,flatten,unflatten,merge-patch,patch}`
+- files: JsonController, JsonService, 11 request/response records, JsonPatchOperation, JsonPatchRollbackException
+- endpoints: `POST /api/v1/utils/json/{format,validate,query,flatten,unflatten,merge-patch,patch}`
 - shared-dep: `AuditedOperations` (6 journalled ops), `common.ApiResponse`, and — uniquely — `resilience.CircuitBreaker`, `CircuitBreakerConfig` and `resilience.AuditTrail` on the `/query` path
 
 ### PKG-jobs
 - path: src/main/java/com/example/utiltools/jobs
 - role: async batch-hash job lifecycle — submission, polling, listing, cancellation, retry, per-client quota and idempotency, backed by a bounded worker pool
-- files (12): BatchJobController, BatchHashJobService, BatchHashRequest/Response, JobAttempt, JobStatus and 6 domain exceptions
-- endpoints (5 mappings / 4 paths): `POST /api/v1/utils/jobs/hash`, `GET /api/v1/utils/jobs`, `GET /api/v1/utils/jobs/{jobId}`, `DELETE /api/v1/utils/jobs/{jobId}`, `POST /api/v1/utils/jobs/{jobId}/retry`
+- files: BatchJobController, BatchHashJobService, BatchHashRequest/Response, JobAttempt, JobStatus and 6 domain exceptions
+- endpoints: `POST /api/v1/utils/jobs/hash`, `GET /api/v1/utils/jobs`, `GET /api/v1/utils/jobs/{jobId}`, `DELETE /api/v1/utils/jobs/{jobId}`, `POST /api/v1/utils/jobs/{jobId}/retry`
 - shared-dep: `audit.service.AuditJournalService` + `audit.model.OperationType.BATCH_HASH` (best-effort journalling at worker admission), `ratelimit.ClientKeyResolver`, `ratelimit.RateLimitProperties`, `common.RequestContext`
 
 ### PKG-audit
 - path: src/main/java/com/example/utiltools/audit
 - role: the operation journal — bounded in-memory record of every journalled call, replay/claim state machine, payload redaction and oversized-payload omission
-- files (14): AuditController, AuditJournalService, AuditReplayService, AuditedOperations, AuditEntry, OperationType, JournalState, ReplayState, ReplayClaim, ReplayRecord, ReapReason, ReapRecord, JournalVerifyRequest/Response/Result
-- endpoints (4): `GET /api/v1/utils/audit/entries`, `GET /api/v1/utils/audit/entries/{id}`, `POST /api/v1/utils/audit/entries/{id}/replay`, `POST /api/v1/utils/audit/verify`
+- files: AuditController, AuditJournalService, AuditReplayService, AuditedOperations, AuditEntry, OperationType, JournalState, ReplayState, ReplayClaim, ReplayRecord, ReapReason, ReapRecord, JournalVerifyRequest/Response/Result
+- endpoints: `GET /api/v1/utils/audit/entries`, `GET /api/v1/utils/audit/entries/{id}`, `POST /api/v1/utils/audit/entries/{id}/replay`, `POST /api/v1/utils/audit/verify`
 - shared-dep: `common.ApiResponse`, `common.AuditEntryNotFoundException`, `common.ReplayConflictException`; it is the *upstream* dependency of crypto, datetime, json, text and jobs
 
 ### PKG-resilience
 - path: src/main/java/com/example/utiltools/resilience
 - role: reusable circuit-breaker primitive (CLOSED/OPEN/HALF_OPEN) with an injection-friendly constructor and its own audit trail, demonstrated by two demo endpoints
-- files (11): CircuitBreaker, CircuitBreakerConfig, CircuitState, CircuitTrigger, CircuitBreakerOpenException, AuditTrail, AuditEntry, ProbeRequest/Response, ResilienceConfig, ResilienceController
-- endpoints (2): `GET /api/v1/utils/resilience` (state probe), `POST /api/v1/utils/resilience/probe`
+- files: CircuitBreaker, CircuitBreakerConfig, CircuitState, CircuitTrigger, CircuitBreakerOpenException, AuditTrail, AuditEntry, ProbeRequest/Response, ResilienceConfig, ResilienceController
+- endpoints: `GET /api/v1/utils/resilience` (state probe), `POST /api/v1/utils/resilience/probe`
 - shared-dep: `common.ApiResponse`; consumed back by `json` (query) and `common.GlobalExceptionHandler`
 
 ### PKG-ratelimit
 - path: src/main/java/com/example/utiltools/ratelimit
 - role: sliding-window rate limiting — client key resolution, quota properties, response headers and a status endpoint
-- files (8): RateLimitFilter, SlidingWindowRateLimiter, ClientKeyResolver, RateLimitProperties, RateLimitConfig, RateLimitHeaders, RateLimitStatusController, RateLimitStatusResponse
-- endpoints (1): `GET /api/v1/utils/rate-limit/status` (class-level `@RequestMapping("/api/v1/utils")`)
+- files: RateLimitFilter, SlidingWindowRateLimiter, ClientKeyResolver, RateLimitProperties, RateLimitConfig, RateLimitHeaders, RateLimitStatusController, RateLimitStatusResponse
+- endpoints: `GET /api/v1/utils/rate-limit/status` (class-level `@RequestMapping("/api/v1/utils")`)
 - shared-dep: `common.ApiResponse`, and `jobs` reuses `ClientKeyResolver` + `RateLimitProperties` for its per-client job quota
 
 ### PKG-text
 - path: src/main/java/com/example/utiltools/text
 - role: string transformation (`UPPER/LOWER/TITLE/CAMEL/SNAKE/KEBAB/SLUG/SENTENCE_CASE`), literal replacement with counts, and text statistics
-- files (8): TextController, TextService, TextTransform/TextReplace/TextStats request+response records
-- endpoints (3): `POST /api/v1/utils/text/transform`, `POST /api/v1/utils/text/replace`, `POST /api/v1/utils/text/stats`
+- files: TextController, TextService, TextTransform/TextReplace/TextStats request+response records
+- endpoints: `POST /api/v1/utils/text/transform`, `POST /api/v1/utils/text/replace`, `POST /api/v1/utils/text/stats`
 - shared-dep: `AuditedOperations` (3 journalled writes — including the failing-validation path exercised by `AuditTrailTest`) and `common.ApiResponse`
 
 **Cross-package dependency shape:** `common` ← everything; `audit` ← {crypto, datetime, json, text, jobs}; `resilience` ← {json, common}; `ratelimit` ← {jobs, all routes via the filter}; feature packages never depend on each other.
 
 ## 2. Convention catalogue
 
-Twelve house patterns were read off the code (not guessed). Each cites the file that establishes it.
+The house patterns below were read off the code (not guessed). Each cites the file that establishes it.
 
 1. **Package-by-feature, `controller`/`service`/`dto`-by-folder.** Every feature package has a controller at `controller/<Feature>Controller.java` (or the package root for `jobs`, `ratelimit`, `resilience`) and a stateless service holding the logic.
    - path: src/main/java/com/example/utiltools/json/service/JsonService.java
@@ -214,7 +220,7 @@ flowchart TD
 ## 5. Selected implementation task
 
 ### SELECTED: GAP-03 — CSV/TSV ⇄ JSON conversion in the json module
-- gap: GAP-03
+- selected-gap: GAP-03
 - scope: Add one capability to the existing `json` feature package — convert between CSV/TSV text and JSON (both directions), reusing `JsonController`'s URL prefix, the validated-record DTO style, the `ApiResponse` envelope, the `JsonServiceTest`/`JsonControllerTest` pair and the `AuditedOperations` journal pattern. No new package, no new dependency, no change to `README.md` or `docs/superpowers/specs` (the next task's plan owns its own doc rows).
 - rationale: It is the only survivor whose impact is 2 — `PROJECT_GOALS.md:8` names "data format conversion" as the growth axis and the service has zero CSV/TSV support (grep exit 1 over `src/main` and `README.md`), so the delta is a genuinely unavailable capability rather than a corrected sentence; it is verifiable at tier 2 because the `json` module already has a service test plus a MockMvc controller test to extend, and it carries no contract risk: it is additive, touches no existing route, and its options (delimiter, header row, quoting) can follow the existing `JsonFormatRequest` boolean/optional-field style.
 - proposed-req: **REQ-02 (next task)** — `POST /api/v1/utils/json/to-csv` converts a JSON array of flat objects to CSV/TSV with a header row derived from the union of keys in first-seen order, honouring an optional `delimiter`.
@@ -229,7 +235,7 @@ flowchart TD
 
 ## 6. Downstream handoff
 
-Turn §5 into a Tier **M** plan for the next task. The scope is already bounded by existing conventions, so the plan needs: (a) the DTO field list for `JsonToCsvRequest/Response` and `JsonFromCsvRequest/Response` following `JsonFormatRequest`'s optional-field style; (b) the two new `OperationType` constants and their `AuditReplayService` dispatch branches — note that GAP-06 records why `json/patch` stays outside the journal, so the Designer must not "fix" that while touching `AuditedOperations`; (c) the CSV parser/emitter rules (RFC 4180 quoting, embedded newlines and delimiters, BOM tolerance, size guard reusing the existing request-size limits) since no CSV dependency may be added; (d) DoD rows bindable to `JsonServiceTest` and `JsonControllerTest` only. Do **not** fold in GAP-01/04/05 (README and spec drift): those are documentation deltas that a `docs/`-scoped task should own separately, and mixing them would break the "one capability per task" pattern the repo follows. Re-run `tools/check_discovery_report.sh` after any edit to this report: it is the machine gate for DOD-01…DOD-08.
+Turn §5 into a Tier **M** plan for the next task. The scope is already bounded by existing conventions, so the plan needs: (a) the DTO field list for `JsonToCsvRequest/Response` and `JsonFromCsvRequest/Response` following `JsonFormatRequest`'s optional-field style; (b) the two new `OperationType` constants and their `AuditReplayService` dispatch branches — note that GAP-06 records why `json/patch` stays outside the journal, so the Designer must not "fix" that while touching `AuditedOperations`; (c) the CSV parser/emitter rules (RFC 4180 quoting, embedded newlines and delimiters, BOM tolerance, size guard reusing the existing request-size limits) since no CSV dependency may be added; (d) DoD rows bindable to `JsonServiceTest` and `JsonControllerTest` only. Do **not** fold in GAP-01/04/05 (README and spec drift): those are documentation deltas that a `docs/`-scoped task should own separately, and mixing them would break the "one capability per task" pattern the repo follows. Re-run `tools/check_discovery_report.sh` after any edit to this report: it is the machine gate for DOD-01…DOD-12.
 
 ## 7. Path appendix
 
