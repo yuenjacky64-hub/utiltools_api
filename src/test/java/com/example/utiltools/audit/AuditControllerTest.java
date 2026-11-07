@@ -191,8 +191,8 @@ class AuditControllerTest {
     }
 
     @Test
-    @DisplayName("POSTing an unsupported hash algorithm over HTTP - 400 envelope plus one FAILED entry with the same request id")
-    void failedHashIsListedWithBadRequestErrorCode() throws Exception {
+    @DisplayName("POSTing an unsupported hash algorithm over HTTP - 400 VALIDATION_ERROR envelope and no CRYPTO_HASH audit row")
+    void failedHashIsRejectedAtBoundaryWithoutAuditRow() throws Exception {
         mockMvc.perform(post("/api/v1/utils/crypto/hash")
                         .header("X-Request-Id", "failed-hash-hdr1")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -202,7 +202,7 @@ class AuditControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(header().string("X-Request-Id", "failed-hash-hdr1"))
                 .andExpect(jsonPath("$.success").value(false))
-                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
                 .andExpect(jsonPath("$.requestId").value("failed-hash-hdr1"));
 
         MvcResult listed = mockMvc.perform(get("/api/v1/utils/audit/entries").param("state", "FAILED")
@@ -217,10 +217,7 @@ class AuditControllerTest {
         List<Map<String, Object>> mine = data.stream()
                 .filter(row -> "failed-hash-hdr1".equals(row.get("requestId")))
                 .toList();
-        assertThat(mine).hasSize(1);
-        assertThat(mine.get(0).get("operation")).isEqualTo("CRYPTO_HASH");
-        assertThat(mine.get(0).get("result")).isNull();
-        assertThat(mine.get(0).get("errorCode")).isEqualTo("BAD_REQUEST");
+        assertThat(mine).isEmpty();
     }
 
     @Test
