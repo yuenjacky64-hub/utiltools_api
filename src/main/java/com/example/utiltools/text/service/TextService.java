@@ -1,5 +1,7 @@
 package com.example.utiltools.text.service;
 
+import com.example.utiltools.text.dto.TextReplaceRequest;
+import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
@@ -10,10 +12,12 @@ import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 /**
- * Deterministic text transformation and statistics.
+ * Deterministic text transformation, find-and-replace and statistics.
  *
  * <p>Every operation is a pure function of the request body: only {@link Locale#ROOT} case
  * mapping is used and no clock, locale or random source is read, so a journalled result always
@@ -26,6 +30,8 @@ public class TextService {
     private static final String ALLOWED_OPERATIONS = "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG";
 
     private static final Pattern SENTENCE_SEPARATORS = Pattern.compile("[.!?]+");
+
+    private static final int MAX_RESULT_CHARS = 1_000_000;
 
     private static final String UPPER = "UPPER";
     private static final String LOWER = "LOWER";
@@ -52,6 +58,133 @@ public class TextService {
         boolean changed = !result.equals(text);
         int length = result.codePointCount(0, result.length());
         return new TextTransformResponse(operation, result, changed, length);
+    }
+
+    public TextReplaceResponse replace(TextReplaceRequest request) {
+        String text = request.text();
+        boolean all = request.all() == null || request.all();
+        boolean literal = Boolean.TRUE.equals(request.literal());
+        boolean caseInsensitive = Boolean.TRUE.equals(request.caseInsensitive());
+        String source = literal ? Pattern.quote(request.pattern()) : request.pattern();
+        Pattern compiled;
+        try {
+            // CASE_INSENSITIVE only: without UNICODE_CASE this folds ASCII letters only, which is
+            // the documented (and plan-pinned) behaviour; UNICODE_CASE is out of scope.
+            compiled = Pattern.compile(source, caseInsensitive ? Pattern.CASE_INSENSITIVE : 0);
+        } catch (PatternSyntaxException e) {
+            throw new IllegalArgumentException("Invalid regex pattern '" + request.pattern()
+                    + "': " + e.getDescription());
+        }
+        Matcher counter = compiled.matcher(text);
+        int matches = 0;
+        while (counter.find()) {
+            matches++;
+        }
+        int replacements = all ? matches : Math.min(matches, 1);
+        String replacement = literal
+                ? Matcher.quoteReplacement(request.replacement())
+                : request.replacement();
+        // The result is accumulated match by match and every append is size-checked against the
+        // exact expanded length of that match's replacement, so a `$n` group reference cannot
+        // inflate the result past MAX_RESULT_CHARS before the check runs. The bound is therefore
+        // enforced *instead of* materialising an oversized string.
+        StringBuilder builder = new StringBuilder(Math.min(MAX_RESULT_CHARS, text.length() + 16));
+        Matcher matcher = compiled.matcher(text);
+        int appended = 0;
+        int position = 0;
+        while (appended < replacements && matcher.find()) {
+            long expanded;
+            try {
+                expanded = expandedReplacementLength(matcher, replacement);
+            } catch (IndexOutOfBoundsException | IllegalArgumentException e) {
+                throw invalidReplacement(request, e);
+            }
+            long projected = (long) builder.length() + (matcher.start() - position) + expanded;
+            if (projected > MAX_RESULT_CHARS) {
+                throw new IllegalArgumentException("replacement result exceeds " + MAX_RESULT_CHARS + " characters");
+            }
+            try {
+                matcher.appendReplacement(builder, replacement);
+            } catch (IndexOutOfBoundsException | IllegalArgumentException e) {
+                throw invalidReplacement(request, e);
+            }
+            position = matcher.end();
+            appended++;
+        }
+        if ((long) builder.length() + (text.length() - position) > MAX_RESULT_CHARS) {
+            throw new IllegalArgumentException("replacement result exceeds " + MAX_RESULT_CHARS + " characters");
+        }
+        matcher.appendTail(builder);
+        String result = builder.toString();
+        return new TextReplaceResponse(result, replacements, !result.equals(text),
+                result.codePointCount(0, result.length()));
+    }
+
+    /**
+     * Exact length the {@code template} contributes for the matcher's current match, following the
+     * {@link Matcher#appendReplacement(StringBuilder, String)} group-reference rules ({@code $n},
+     * {@code ${name}} and {@code \x} escapes; a group that did not participate contributes nothing).
+     * Computed without building the expansion so the caller can enforce {@link #MAX_RESULT_CHARS}
+     * before anything is allocated.
+     */
+    private static long expandedReplacementLength(Matcher matcher, String template) {
+        long length = 0;
+        int size = template.length();
+        int cursor = 0;
+        while (cursor < size) {
+            char current = template.charAt(cursor);
+            if (current == '\\') {
+                if (cursor + 1 == size) {
+                    throw new IllegalArgumentException("character to be escaped is missing");
+                }
+                length++;
+                cursor += 2;
+            } else if (current == '$') {
+                cursor++;
+                if (cursor == size) {
+                    throw new IllegalArgumentException("Illegal group reference: group index is missing");
+                }
+                char next = template.charAt(cursor);
+                if (next == '{') {
+                    int close = template.indexOf('}', cursor);
+                    if (close < 0) {
+                        throw new IllegalArgumentException("named capturing group is missing trailing '}'");
+                    }
+                    String group = matcher.group(template.substring(cursor + 1, close));
+                    length += group == null ? 0 : group.length();
+                    cursor = close + 1;
+                } else {
+                    int groupNumber = next - '0';
+                    if (groupNumber < 0 || groupNumber > 9) {
+                        throw new IllegalArgumentException("Illegal group reference");
+                    }
+                    cursor++;
+                    while (cursor < size) {
+                        int digit = template.charAt(cursor) - '0';
+                        if (digit < 0 || digit > 9) {
+                            break;
+                        }
+                        int candidate = groupNumber * 10 + digit;
+                        if (candidate > matcher.groupCount()) {
+                            break;
+                        }
+                        groupNumber = candidate;
+                        cursor++;
+                    }
+                    String group = matcher.group(groupNumber);
+                    length += group == null ? 0 : group.length();
+                }
+            } else {
+                length++;
+                cursor++;
+            }
+        }
+        return length;
+    }
+
+    private static IllegalArgumentException invalidReplacement(TextReplaceRequest request, Exception cause) {
+        return new IllegalArgumentException("Invalid replacement '" + request.replacement()
+                + "' for pattern '" + request.pattern() + "': " + cause.getMessage());
     }
 
     public TextStatsResponse stats(TextStatsRequest request) {
