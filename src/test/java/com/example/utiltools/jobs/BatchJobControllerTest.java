@@ -3,9 +3,12 @@ package com.example.utiltools.jobs;
 import com.example.utiltools.common.GlobalExceptionHandler;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
+import com.example.utiltools.ratelimit.ClientKeyResolver;
+import com.example.utiltools.ratelimit.RateLimitProperties;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
@@ -20,6 +23,7 @@ import org.springframework.test.web.servlet.MvcResult;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.Clock;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Delayed;
 import java.util.concurrent.ScheduledFuture;
@@ -27,6 +31,8 @@ import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
@@ -41,6 +47,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 // (Mockito CannotStubVoidMethodWithReturnValue) and letting the real getJob answer 404.
 // A scheduler bean that never runs a task keeps this slice deterministic.
 @WebMvcTest(BatchJobController.class)
+@EnableConfigurationProperties(RateLimitProperties.class)
 @Import({BatchHashJobService.class, CryptoService.class, GlobalExceptionHandler.class,
         BatchJobControllerTest.ClockConfig.class})
 class BatchJobControllerTest {
@@ -196,7 +203,7 @@ class BatchJobControllerTest {
     @DisplayName("POST /api/v1/utils/jobs/hash - should map a full queue to 429 QUEUE_FULL")
     void shouldReturn429WhenQueueFull() throws Exception {
         doThrow(new JobQueueFullException("Hash job queue is full (worker-count=2, queue-capacity=100); retry after capacity frees"))
-                .when(jobService).submit(any(BatchHashRequest.class));
+                .when(jobService).submit(any(BatchHashRequest.class), anyString());
 
         String body = """
                 {
@@ -444,5 +451,96 @@ class BatchJobControllerTest {
                 .andExpect(status().isTooManyRequests())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("QUEUE_FULL"));
+    }
+    /**
+     * DOD-13 / REQ-04: the quota refusal surfaces as 429 JOB_QUOTA_EXCEEDED with bounded
+     * {@code limit}/{@code activeJobs} details and no client identity.
+     */
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/hash - should map an exhausted quota to 429 JOB_QUOTA_EXCEEDED")
+    void shouldReturn429WhenQuotaExceeded() throws Exception {
+        doThrow(new JobQuotaExceededException(20, 20))
+                .when(jobService).submit(any(BatchHashRequest.class), anyString());
+
+        String body = """
+                {
+                    "algorithm": "SHA-256",
+                    "items": ["alpha"]
+                }
+                """;
+
+        MvcResult result = mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .with(request -> {
+                            request.setRemoteAddr("203.0.113.70");
+                            return request;
+                        })
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("JOB_QUOTA_EXCEEDED"))
+                .andExpect(jsonPath("$.details.limit").value(20))
+                .andExpect(jsonPath("$.details.activeJobs").value(20))
+                .andExpect(jsonPath("$.message")
+                        .value(org.hamcrest.Matchers.containsString("activeJobs=20")))
+                .andReturn();
+
+        assertThat(result.getResponse().getContentAsString()).doesNotContain("203.0.113.70");
+    }
+
+    /** DOD-13 / REQ-06: an exhausted quota on the retry endpoint is also 429 JOB_QUOTA_EXCEEDED. */
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/retry - should map an exhausted quota to 429")
+    void shouldReturn429WhenRetryQuotaExceeded() throws Exception {
+        doThrow(new JobQuotaExceededException(3, 3)).when(jobService).retry("job-failed");
+
+        mockMvc.perform(post("/api/v1/utils/jobs/job-failed/retry"))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("JOB_QUOTA_EXCEEDED"))
+                .andExpect(jsonPath("$.details.limit").value(3))
+                .andExpect(jsonPath("$.details.activeJobs").value(3));
+    }
+
+    /**
+     * DOD-13 / REQ-02: the quota key is the rate limiter's identity — the remote address, and not an
+     * untrusted {@code X-Forwarded-For} header while {@code trust-forwarded-header} is false.
+     */
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/hash - should charge quota to the resolved client key")
+    void shouldChargeQuotaToTheRateLimiterClientKey() throws Exception {
+        List<String> resolvedKeys = new ArrayList<>();
+        doAnswer(invocation -> {
+            resolvedKeys.add(invocation.getArgument(1));
+            return invocation.callRealMethod();
+        }).when(jobService).submit(any(BatchHashRequest.class), anyString());
+
+        String body = """
+                {
+                    "algorithm": "SHA-256",
+                    "items": ["alpha"]
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .with(request -> {
+                            request.setRemoteAddr("203.0.113.71");
+                            return request;
+                        })
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isAccepted());
+
+        mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .with(request -> {
+                            request.setRemoteAddr("198.51.100.6");
+                            return request;
+                        })
+                        .header(ClientKeyResolver.FORWARDED_HEADER, "203.0.113.99")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isAccepted());
+
+        assertThat(resolvedKeys).containsExactly("203.0.113.71", "198.51.100.6");
     }
 }
