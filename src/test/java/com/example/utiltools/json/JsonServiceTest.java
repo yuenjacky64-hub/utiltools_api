@@ -43,7 +43,7 @@ class JsonServiceTest {
     @DisplayName("Should pretty print JSON correctly")
     void shouldPrettyPrintJson() {
         String compact = "{\"name\":\"Alice\",\"age\":30}";
-        JsonFormatRequest request = new JsonFormatRequest(compact, false, 2);
+        JsonFormatRequest request = new JsonFormatRequest(compact, false, 2, null);
         JsonFormatResponse response = jsonService.format(request);
 
         assertThat(response.formattedJson()).contains("\n");
@@ -60,7 +60,7 @@ class JsonServiceTest {
                    "age": 30
                 }
                 """;
-        JsonFormatRequest request = new JsonFormatRequest(formatted, true, null);
+        JsonFormatRequest request = new JsonFormatRequest(formatted, true, null, null);
         JsonFormatResponse response = jsonService.format(request);
 
         assertThat(response.formattedJson()).isEqualTo("{\"name\":\"Alice\",\"age\":30}");
@@ -69,7 +69,7 @@ class JsonServiceTest {
     @Test
     @DisplayName("Should indent nested JSON with the supplied width of four spaces")
     void shouldIndentNestedOutputWithWidthFour() {
-        JsonFormatRequest request = new JsonFormatRequest("{\"a\":{\"b\":1}}", false, 4);
+        JsonFormatRequest request = new JsonFormatRequest("{\"a\":{\"b\":1}}", false, 4, null);
         JsonFormatResponse response = jsonService.format(request);
 
         String[] lines = response.formattedJson().split("\\R");
@@ -85,7 +85,7 @@ class JsonServiceTest {
     @DisplayName("Should default to two spaces when indent is omitted")
     void shouldDefaultToTwoSpacesWhenIndentOmitted() throws JsonProcessingException {
         String json = "{\"a\":{\"b\":1}}";
-        JsonFormatRequest request = new JsonFormatRequest(json, false, null);
+        JsonFormatRequest request = new JsonFormatRequest(json, false, null, null);
         JsonFormatResponse response = jsonService.format(request);
 
         ObjectMapper mapper = new ObjectMapper();
@@ -97,7 +97,7 @@ class JsonServiceTest {
     @Test
     @DisplayName("Should ignore indent when minify is true")
     void shouldIgnoreIndentWhenMinifyTrue() {
-        JsonFormatRequest request = new JsonFormatRequest("{\"a\":{\"b\":1}}", true, 8);
+        JsonFormatRequest request = new JsonFormatRequest("{\"a\":{\"b\":1}}", true, 8, null);
         JsonFormatResponse response = jsonService.format(request);
 
         assertThat(response.formattedJson()).isEqualTo("{\"a\":{\"b\":1}}");
@@ -108,12 +108,92 @@ class JsonServiceTest {
     @DisplayName("Should compute sizeBytes from the final formatted output")
     void shouldComputeSizeBytesFromFormattedOutput() {
         String json = "{\"a\":{\"b\":1}}";
-        JsonFormatResponse indented = jsonService.format(new JsonFormatRequest(json, false, 4));
-        JsonFormatResponse minified = jsonService.format(new JsonFormatRequest(json, true, null));
+        JsonFormatResponse indented = jsonService.format(new JsonFormatRequest(json, false, 4, null));
+        JsonFormatResponse minified = jsonService.format(new JsonFormatRequest(json, true, null, null));
 
         assertThat(indented.sizeBytes())
                 .isEqualTo(indented.formattedJson().getBytes(StandardCharsets.UTF_8).length);
         assertThat(indented.sizeBytes()).isNotEqualTo(minified.sizeBytes());
+    }
+
+    @Test
+    @DisplayName("Should sort keys recursively when minifying")
+    void shouldSortKeysRecursivelyWhenMinifying() {
+        String json = "{\"z\":1,\"a\":{\"d\":4,\"b\":2},\"list\":[{\"y\":1,\"x\":2}]}";
+        JsonFormatRequest request = new JsonFormatRequest(json, true, null, true);
+        JsonFormatResponse response = jsonService.format(request);
+
+        assertThat(response.formattedJson())
+                .isEqualTo("{\"a\":{\"b\":2,\"d\":4},\"list\":[{\"x\":2,\"y\":1}],\"z\":1}");
+        assertThat(response.sizeBytes())
+                .isEqualTo(response.formattedJson().getBytes(StandardCharsets.UTF_8).length);
+    }
+
+    @Test
+    @DisplayName("Should preserve array element order and scalar values when sorting keys")
+    void shouldPreserveArrayElementOrderAndScalarValuesWhenSorting() {
+        String json = "{\"arr\":[3,{\"b\":1,\"a\":2},\"text\",true,null,2,1]}";
+        JsonFormatRequest request = new JsonFormatRequest(json, true, null, true);
+        JsonFormatResponse response = jsonService.format(request);
+
+        assertThat(response.formattedJson())
+                .isEqualTo("{\"arr\":[3,{\"a\":2,\"b\":1},\"text\",true,null,2,1]}");
+    }
+
+    @Test
+    @DisplayName("Should preserve input order when sortKeys is null")
+    void shouldPreserveInputOrderWhenSortKeysIsNull() {
+        String json = "{\"z\":1,\"a\":{\"d\":4,\"b\":2},\"list\":[{\"y\":1,\"x\":2}]}";
+        JsonFormatRequest request = new JsonFormatRequest(json, true, null, null);
+        JsonFormatResponse response = jsonService.format(request);
+
+        assertThat(response.formattedJson())
+                .isEqualTo("{\"z\":1,\"a\":{\"d\":4,\"b\":2},\"list\":[{\"y\":1,\"x\":2}]}");
+    }
+
+    @Test
+    @DisplayName("Should preserve input order when sortKeys is false")
+    void shouldPreserveInputOrderWhenSortKeysIsFalse() {
+        String json = "{\"z\":1,\"a\":{\"d\":4,\"b\":2},\"list\":[{\"y\":1,\"x\":2}]}";
+        JsonFormatRequest request = new JsonFormatRequest(json, true, null, false);
+        JsonFormatResponse response = jsonService.format(request);
+
+        assertThat(response.formattedJson())
+                .isEqualTo("{\"z\":1,\"a\":{\"d\":4,\"b\":2},\"list\":[{\"y\":1,\"x\":2}]}");
+    }
+
+    @Test
+    @DisplayName("Should keep indent controlling pretty-printed output when sorting keys")
+    void shouldIndentSortedOutput() {
+        String json = "{\"z\":1,\"a\":{\"d\":4,\"b\":2}}";
+        JsonFormatResponse twoSpaces = jsonService.format(new JsonFormatRequest(json, false, null, true));
+        JsonFormatResponse fourSpaces = jsonService.format(new JsonFormatRequest(json, false, 4, true));
+
+        String[] twoLines = twoSpaces.formattedJson().split("\\R");
+        assertThat(twoLines).hasSize(7);
+        assertThat(twoLines[0]).isEqualTo("{");
+        assertThat(twoLines[1]).isEqualTo("  \"a\" : {");
+        assertThat(twoLines[2]).isEqualTo("    \"b\" : 2,");
+        assertThat(twoLines[3]).isEqualTo("    \"d\" : 4");
+        assertThat(twoLines[4]).isEqualTo("  },");
+        assertThat(twoLines[5]).isEqualTo("  \"z\" : 1");
+        assertThat(twoLines[6]).isEqualTo("}");
+
+        String[] fourLines = fourSpaces.formattedJson().split("\\R");
+        assertThat(fourLines[1]).isEqualTo("    \"a\" : {");
+        assertThat(fourLines[2]).isEqualTo("        \"b\" : 2,");
+        assertThat(fourLines[3]).isEqualTo("        \"d\" : 4");
+    }
+
+    @Test
+    @DisplayName("Should compute sizeBytes from the sorted output")
+    void shouldComputeSizeBytesFromSortedOutput() {
+        String json = "{\"z\":1,\"a\":{\"d\":4,\"b\":2}}";
+        JsonFormatResponse response = jsonService.format(new JsonFormatRequest(json, true, null, true));
+
+        assertThat(response.formattedJson()).isEqualTo("{\"a\":{\"b\":2,\"d\":4},\"z\":1}");
+        assertThat(response.sizeBytes())
+                .isEqualTo(response.formattedJson().getBytes(StandardCharsets.UTF_8).length);
     }
 
     @Test

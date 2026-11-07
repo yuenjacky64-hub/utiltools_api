@@ -55,6 +55,9 @@ public class JsonService {
     public JsonFormatResponse format(JsonFormatRequest request) {
         try {
             JsonNode node = objectMapper.readTree(request.json());
+            if (Boolean.TRUE.equals(request.sortKeys())) {
+                node = sortKeysRecursively(node);
+            }
             String formatted;
             if (Boolean.TRUE.equals(request.minify())) {
                 formatted = objectMapper.writeValueAsString(node);
@@ -66,6 +69,32 @@ public class JsonService {
         } catch (JsonProcessingException e) {
             throw new IllegalArgumentException("Invalid JSON content: " + e.getOriginalMessage(), e);
         }
+    }
+
+    /**
+     * Rewrites the parsed tree so that every object's field names appear in ascending
+     * {@link String#compareTo(String)} order. Array element order and scalar values are preserved;
+     * the input node is never mutated, a new tree is returned instead.
+     */
+    private JsonNode sortKeysRecursively(JsonNode node) {
+        if (node.isObject()) {
+            ObjectNode sorted = objectMapper.createObjectNode();
+            List<String> names = new ArrayList<>();
+            node.fieldNames().forEachRemaining(names::add);
+            names.sort(String::compareTo);
+            for (String name : names) {
+                sorted.set(name, sortKeysRecursively(node.get(name)));
+            }
+            return sorted;
+        }
+        if (node.isArray()) {
+            ArrayNode sorted = objectMapper.createArrayNode();
+            for (JsonNode element : node) {
+                sorted.add(sortKeysRecursively(element));
+            }
+            return sorted;
+        }
+        return node;
     }
 
     private PrettyPrinter prettyPrinter(Integer indent) {
