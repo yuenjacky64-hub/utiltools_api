@@ -6,6 +6,7 @@ import com.example.utiltools.common.RequestContext;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
+import com.example.utiltools.ratelimit.ClientKeyResolver;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,6 +33,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * The single owner of all mutable job state.
@@ -74,6 +76,9 @@ public class BatchHashJobService {
     /** Error recorded on a RUNNING attempt whose execution lease lapsed without a renewal. */
     public static final String EXECUTION_LEASE_EXPIRED = "EXECUTION_LEASE_EXPIRED";
 
+    /** Per-client ceiling on non-terminal jobs when the property is not configured. */
+    static final int DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT = 20;
+
     private static final long DEFAULT_EXECUTION_LEASE_SECONDS = 30;
     private static final long DEFAULT_EXECUTION_REAPER_INTERVAL_MS = 5000;
     private static final String BATCH_HASH_FAILED = "BATCH_HASH_FAILED";
@@ -90,6 +95,7 @@ public class BatchHashJobService {
     private final int maxAttempts;
     private final long executionLeaseSeconds;
     private final long executionReaperIntervalMs;
+    private final int maxActiveJobsPerClient;
     private final Clock clock;
 
     /** Null means auditing is disabled (test slices and direct construction). */
@@ -100,13 +106,21 @@ public class BatchHashJobService {
     private final Object registryLock = new Object();
 
     /**
+     * Live (QUEUED or RUNNING) job count per client key. Guarded by {@link #registryLock}; an entry
+     * is removed at zero, so the map stays bounded by the number of non-terminal jobs
+     * ({@code worker-count + queue-capacity}) and not by the client population.
+     */
+    private final Map<String, Integer> activeJobsByClient = new HashMap<>();
+
+    /**
      * Compatibility overload for callers (and tests) that build the service directly: the system
      * clock and the default lease and reaper cadence are used.
      */
     public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
             long retentionSeconds, int maxAttempts) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
-                DEFAULT_EXECUTION_LEASE_SECONDS, DEFAULT_EXECUTION_REAPER_INTERVAL_MS, Clock.systemUTC());
+                DEFAULT_EXECUTION_LEASE_SECONDS, DEFAULT_EXECUTION_REAPER_INTERVAL_MS,
+                DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT, Clock.systemUTC());
     }
 
     /**
@@ -116,7 +130,8 @@ public class BatchHashJobService {
     public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
             long retentionSeconds, int maxAttempts, Clock clock) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
-                DEFAULT_EXECUTION_LEASE_SECONDS, DEFAULT_EXECUTION_REAPER_INTERVAL_MS, clock);
+                DEFAULT_EXECUTION_LEASE_SECONDS, DEFAULT_EXECUTION_REAPER_INTERVAL_MS,
+                DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT, clock);
     }
 
     @Autowired
@@ -127,6 +142,7 @@ public class BatchHashJobService {
             @Value("${utiltools.jobs.max-attempts:3}") int maxAttempts,
             @Value("${utiltools.jobs.execution-lease-seconds:30}") long executionLeaseSeconds,
             @Value("${utiltools.jobs.execution-reaper-interval-ms:5000}") long executionReaperIntervalMs,
+            @Value("${utiltools.jobs.max-active-jobs-per-client:20}") int maxActiveJobsPerClient,
             Clock clock) {
         this.cryptoService = cryptoService;
         this.workerCount = workerCount;
@@ -144,11 +160,28 @@ public class BatchHashJobService {
             throw new IllegalArgumentException("utiltools.jobs.execution-reaper-interval-ms must be positive, was "
                     + executionReaperIntervalMs);
         }
+        // A non-positive quota would refuse every submission, so it is rejected loudly at startup.
+        if (maxActiveJobsPerClient <= 0) {
+            throw new IllegalArgumentException(
+                    "utiltools.jobs.max-active-jobs-per-client must be positive, was " + maxActiveJobsPerClient);
+        }
         this.executionLeaseSeconds = executionLeaseSeconds;
         this.executionReaperIntervalMs = executionReaperIntervalMs;
+        this.maxActiveJobsPerClient = maxActiveJobsPerClient;
         this.clock = clock == null ? Clock.systemUTC() : clock;
         this.executor = new ThreadPoolExecutor(workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(queueCapacity), new ThreadPoolExecutor.AbortPolicy());
+    }
+
+    /**
+     * Test/compatibility overload: same as the {@code @Autowired} constructor, without the
+     * per-client quota (the default applies).
+     */
+    public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
+            long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
+            long executionReaperIntervalMs, Clock clock) {
+        this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
+                executionLeaseSeconds, executionReaperIntervalMs, DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT, clock);
     }
 
     /**
@@ -160,7 +193,20 @@ public class BatchHashJobService {
             long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
             long executionReaperIntervalMs, Clock clock, AuditJournalService journal) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
-                executionLeaseSeconds, executionReaperIntervalMs, clock);
+                executionLeaseSeconds, executionReaperIntervalMs, DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT, clock);
+        this.journal = journal;
+    }
+
+    /**
+     * Test convenience: an explicit per-client quota and journal, so a unit test can assert quota
+     * admission and the per-attempt audit trail without a Spring context.
+     */
+    public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
+            long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
+            long executionReaperIntervalMs, int maxActiveJobsPerClient, Clock clock,
+            AuditJournalService journal) {
+        this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
+                executionLeaseSeconds, executionReaperIntervalMs, maxActiveJobsPerClient, clock);
         this.journal = journal;
     }
 
@@ -182,6 +228,29 @@ public class BatchHashJobService {
      * whose job was rolled back.
      */
     public BatchHashJobResponse submit(BatchHashRequest request) {
+        return submit(request, ClientKeyResolver.UNKNOWN_CLIENT);
+    }
+
+    /**
+     * Registers the job for {@code clientKey}, enqueues it, and returns its snapshot.
+     *
+     * <p>Registration and admission are one critical section: the per-client quota is reserved
+     * (incremented) in the same {@code registryLock} section that publishes the job row and its
+     * idempotency mapping, so no concurrent submitter can observe a job that holds no slot, and a
+     * same-key/same-payload duplicate returns the existing snapshot without consuming a second slot.
+     * {@link JobQuotaExceededException} is thrown before any registration or reservation, so a
+     * refused submission leaves no job row, no idempotency mapping and no counter change.</p>
+     *
+     * @param request   the batch to hash
+     * @param clientKey the identity to charge; {@code null}/blank is charged to
+     *                  {@link ClientKeyResolver#UNKNOWN_CLIENT}
+     * @throws IdempotencyConflictException when the key is reused with a different payload
+     * @throws JobQuotaExceededException    when this client already holds the configured maximum
+     *                                      non-terminal jobs
+     * @throws JobQueueFullException        when the bounded executor rejects the submission
+     */
+    public BatchHashJobResponse submit(BatchHashRequest request, String clientKey) {
+        String quotaKey = normalizeClientKey(clientKey);
         // Captured on the servlet thread: this is the id the accepted request will be audited under,
         // and it must survive the handoff to the pool.
         String requestId = RequestContext.get();
@@ -207,9 +276,19 @@ public class BatchHashJobService {
                 }
             }
 
+            // Read-only: a refusal below leaves the job and idempotency registries untouched.
+            int active = activeJobsByClient.getOrDefault(quotaKey, 0);
+            if (active >= maxActiveJobsPerClient) {
+                throw new JobQuotaExceededException(maxActiveJobsPerClient, active);
+            }
+
             MutableJob job = new MutableJob(UUID.randomUUID().toString(), key,
                     request.algorithm(), request.items(), request.secretKey(), fingerprint, Instant.now(clock),
-                    maxAttempts);
+                    quotaKey, maxAttempts);
+            // Reserve before publishing: the increment and the registrations below share this
+            // registryLock section, so the quota can neither be bypassed nor double-counted.
+            activeJobsByClient.merge(quotaKey, 1, Integer::sum);
+            job.quotaReserved.set(true);
             if (key != null) {
                 idempotencyIndex.put(key, job.jobId);
             }
@@ -237,11 +316,54 @@ public class BatchHashJobService {
                 }
                 // A rejected submission never started, so it must leave no correlation behind either.
                 job.attemptRequestIds.remove(1);
+                // REQ-07: undo the reservation in the same section, so a rejected submission can
+                // never leave a client looking busier than it is.
+                job.quotaReserved.set(false);
+                decrementQuotaLocked(quotaKey);
                 throw new JobQueueFullException("Hash job queue is full (worker-count=" + workerCount
                         + ", queue-capacity=" + queueCapacity + "); retry after capacity frees");
             }
 
             return accepted;
+        }
+    }
+
+    /**
+     * The client's current non-terminal (QUEUED or RUNNING) job count. Package-private test
+     * observability only: it is not exposed by any controller and has no production caller.
+     */
+    int activeJobsForClient(String clientKey) {
+        String quotaKey = normalizeClientKey(clientKey);
+        synchronized (registryLock) {
+            return activeJobsByClient.getOrDefault(quotaKey, 0);
+        }
+    }
+
+    private static String normalizeClientKey(String clientKey) {
+        return (clientKey == null || clientKey.isBlank()) ? ClientKeyResolver.UNKNOWN_CLIENT : clientKey;
+    }
+
+    /** Decrements (and removes at zero) a client's counter entry. Caller must hold {@code registryLock}. */
+    private void decrementQuotaLocked(String clientKey) {
+        Integer current = activeJobsByClient.get(clientKey);
+        if (current == null || current <= 0) {
+            return; // defensively a no-op: a missing entry must never underflow into over-admission
+        }
+        if (current == 1) {
+            activeJobsByClient.remove(clientKey); // zero entries are never retained (REQ-01)
+            return;
+        }
+        activeJobsByClient.put(clientKey, current - 1);
+    }
+
+    /**
+     * Releases one reserved slot. Always called <em>after</em> the job-monitor block that claimed the
+     * reservation, so {@code registryLock} is never acquired while a job monitor is held
+     * (registryLock -&gt; job monitor is the only order this class allows).
+     */
+    private void releaseQuota(String clientKey) {
+        synchronized (registryLock) {
+            decrementQuotaLocked(clientKey);
         }
     }
 
@@ -265,6 +387,8 @@ public class BatchHashJobService {
      *
      * @throws JobNotFoundException        when the id is unknown or was already evicted
      * @throws JobRetryConflictException   when the job is not FAILED, or its attempt budget is spent
+     * @throws JobQuotaExceededException   when the job's client already holds the configured maximum
+     *                                     non-terminal jobs (the FAILED job is left untouched)
      * @throws JobQueueFullException       when the bounded executor rejects the requeued attempt
      */
     public BatchHashJobResponse retry(String jobId) {
@@ -272,36 +396,81 @@ public class BatchHashJobService {
         // never to the id that created (or first retried) the job.
         String requestId = RequestContext.get();
         MutableJob job = requireJob(jobId); // unknown/evicted -> JobNotFoundException (404 JOB_NOT_FOUND)
-        synchronized (job) {
-            // Registry membership is re-checked under the monitor: an eviction pass that acquired
-            // the monitor first has already unregistered this instance, and a 202 for a job the
-            // caller can no longer poll (or that a same-key submit would duplicate) must not happen.
+        // REQ-06: the reservation belongs to the job's client, not to the caller, so a retry cannot
+        // escape to another bucket. It is taken under registryLock *before* the monitor, so an
+        // exhausted quota refuses the retry before a single field of the FAILED snapshot is touched.
+        reserveQuota(job);
+        boolean keepReservation = false;
+        try {
+            synchronized (job) {
+                // Registry membership is re-checked under the monitor: an eviction pass that acquired
+                // the monitor first has already unregistered this instance, and a 202 for a job the
+                // caller can no longer poll (or that a same-key submit would duplicate) must not happen.
+                if (jobs.get(job.jobId) != job) {
+                    throw new JobNotFoundException(job.jobId);
+                }
+                if (job.status != JobStatus.FAILED || job.attempt >= job.maxAttempts) {
+                    // Thrown before a single field is touched: the 409 leaves the snapshot identical.
+                    throw new JobRetryConflictException(job.jobId, job.status, job.attempt, job.maxAttempts);
+                }
+                FailedState before = FailedState.of(job);
+                int admittedAttempt = ++job.attempt;
+                job.status = JobStatus.QUEUED;
+                job.startedAt = null;
+                job.completedAt = null;
+                job.error = null;
+                job.results = null; // a retried attempt starts from nothing
+                job.lastHeartbeatAt = null; // the new attempt stamps its own lease at admission
+                job.executionLeaseExpiresAt = null;
+                job.attemptRequestIds.put(admittedAttempt, requestId);
+                try {
+                    executor.execute(() -> executeAttempt(job.jobId, admittedAttempt));
+                } catch (RejectedExecutionException e) {
+                    before.restore(job); // attempt decremented, status FAILED, error/completedAt back
+                    job.attemptRequestIds.remove(admittedAttempt); // the attempt never started
+                    throw new JobQueueFullException("Hash job queue is full (worker-count=" + workerCount
+                            + ", queue-capacity=" + queueCapacity + "); retry after capacity frees");
+                }
+                keepReservation = true; // only an accepted requeue keeps the slot
+                return snapshot(job); // QUEUED, attempt = 2, attempt-1 entry retained
+            }
+        } finally {
+            if (!keepReservation) {
+                // A refused (409/404/429) retry must restore the client's count: the claim is
+                // dropped and the decrement runs here, outside every job monitor (REQ-08).
+                job.quotaReserved.set(false);
+                releaseQuota(job.clientKey);
+            }
+        }
+    }
+
+    /**
+     * Reserves one slot for {@code job}'s client. Called only under {@code registryLock}; throws
+     * {@link JobQuotaExceededException} (touching nothing) when the client is at its ceiling.
+     */
+    private void reserveQuota(MutableJob job) {
+        synchronized (registryLock) {
             if (jobs.get(job.jobId) != job) {
                 throw new JobNotFoundException(job.jobId);
             }
-            if (job.status != JobStatus.FAILED || job.attempt >= job.maxAttempts) {
-                // Thrown before a single field is touched: the 409 leaves the snapshot identical.
-                throw new JobRetryConflictException(job.jobId, job.status, job.attempt, job.maxAttempts);
+            // I-02: a job holds at most one live reservation. A concurrent retry that already
+            // reserved this job is about to requeue it, so this caller is answered with the same
+            // conflict it would observe after that requeue instead of stealing the live claim.
+            if (!job.quotaReserved.compareAndSet(false, true)) {
+                JobStatus observed;
+                int observedAttempt;
+                synchronized (job) { // registryLock -> job monitor is the only legal order
+                    observed = job.status;
+                    observedAttempt = job.attempt;
+                }
+                throw new JobRetryConflictException(job.jobId, observed, observedAttempt, job.maxAttempts);
             }
-            FailedState before = FailedState.of(job);
-            int admittedAttempt = ++job.attempt;
-            job.status = JobStatus.QUEUED;
-            job.startedAt = null;
-            job.completedAt = null;
-            job.error = null;
-            job.results = null; // a retried attempt starts from nothing
-            job.lastHeartbeatAt = null; // the new attempt stamps its own lease at admission
-            job.executionLeaseExpiresAt = null;
-            job.attemptRequestIds.put(admittedAttempt, requestId);
-            try {
-                executor.execute(() -> executeAttempt(job.jobId, admittedAttempt));
-            } catch (RejectedExecutionException e) {
-                before.restore(job); // attempt decremented, status FAILED, error/completedAt back
-                job.attemptRequestIds.remove(admittedAttempt); // the attempt never started
-                throw new JobQueueFullException("Hash job queue is full (worker-count=" + workerCount
-                        + ", queue-capacity=" + queueCapacity + "); retry after capacity frees");
+            int active = activeJobsByClient.getOrDefault(job.clientKey, 0);
+            if (active >= maxActiveJobsPerClient) {
+                job.quotaReserved.set(false); // nothing was reserved, so give the claim back
+                throw new JobQuotaExceededException(maxActiveJobsPerClient, active);
             }
-            return snapshot(job); // QUEUED, attempt = 2, attempt-1 entry retained
+            activeJobsByClient.merge(job.clientKey, 1, Integer::sum);
         }
     }
 
@@ -317,6 +486,8 @@ public class BatchHashJobService {
      */
     public BatchHashJobResponse cancel(String jobId) {
         MutableJob job = requireJob(jobId);
+        boolean released = false;
+        BatchHashJobResponse cancelled;
         synchronized (job) {
             if (job.status == JobStatus.CANCELLED) {
                 return snapshot(job); // idempotent: nothing is written
@@ -330,8 +501,15 @@ public class BatchHashJobService {
             job.error = null;
             job.lastHeartbeatAt = null;
             job.executionLeaseExpiresAt = null;
-            return snapshot(job);
+            // Same monitor section as the terminal write: exactly one caller can claim the
+            // reservation, so a repeated cancel (or a later eviction) cannot release it again.
+            released = job.quotaReserved.compareAndSet(true, false);
+            cancelled = snapshot(job);
         }
+        if (released) {
+            releaseQuota(job.clientKey);
+        }
+        return cancelled;
     }
 
     @Scheduled(fixedDelayString = "${utiltools.jobs.cleanup-interval-ms:60000}")
@@ -365,6 +543,9 @@ public class BatchHashJobService {
                     if (job.idempotencyKey != null) {
                         idempotencyIndex.remove(job.idempotencyKey, job.jobId);
                     }
+                    // No quota release here on purpose: every terminal status above was written
+                    // together with the reservation claim, so a terminal job holds no slot. Releasing
+                    // on eviction would under-count and over-admit this client later.
                 }
             }
         }
@@ -394,6 +575,7 @@ public class BatchHashJobService {
     public int reapExpiredExecutions(Instant now) {
         int reaped = 0;
         for (MutableJob job : jobs.values()) {
+            boolean released = false;
             synchronized (job) {
                 if (job.status != JobStatus.RUNNING || job.executionLeaseExpiresAt == null) {
                     continue; // QUEUED, terminal, or (defensively) a RUNNING job with no lease
@@ -412,7 +594,13 @@ public class BatchHashJobService {
                 // Close the audit entry the stalled worker opened: the fence keeps that worker from
                 // writing its own (late) outcome, so this is the only terminal write for the attempt.
                 failQuietly(job, job.attempt, EXECUTION_LEASE_EXPIRED);
+                // Claimed in the same section as the terminal write; a late worker fenced by this
+                // reap never reaches its own claim, so the slot is released exactly once.
+                released = job.quotaReserved.compareAndSet(true, false);
                 reaped++;
+            }
+            if (released) {
+                releaseQuota(job.clientKey); // after the monitor block (REQ-08)
             }
         }
         return reaped;
@@ -484,6 +672,7 @@ public class BatchHashJobService {
                     }
                     results.add(cryptoService.hash(new HashRequest(job.algorithm, item, job.secretKey)));
                 }
+                boolean released;
                 synchronized (job) {
                     if (job.attempt != generation || job.status != JobStatus.RUNNING) {
                         // Load-bearing: a reaped attempt keeps its attempt number but is FAILED, so the
@@ -501,9 +690,16 @@ public class BatchHashJobService {
                     // Same section that wrote the terminal status: the audit outcome can never
                     // disagree with the snapshot, and a journal fault cannot change it.
                     succeedQuietly(job, generation, "COMPLETED");
+                    // Claimed in the same section as the terminal write: the slot covering this
+                    // attempt is released exactly once, by the writer that terminated it.
+                    released = job.quotaReserved.compareAndSet(true, false);
+                }
+                if (released) {
+                    releaseQuota(job.clientKey); // after the monitor block (REQ-08)
                 }
             } catch (Throwable t) {
                 // Intentional: an Error must not wedge the pool, later jobs still run.
+                boolean released = false;
                 synchronized (job) {
                     if (job.attempt != generation || job.status != JobStatus.RUNNING) {
                         // Load-bearing, same reasoning as the COMPLETED fence above: a stale failure must
@@ -517,6 +713,10 @@ public class BatchHashJobService {
                     job.executionLeaseExpiresAt = null;
                     recordAttempt(job, generation, JobStatus.FAILED, job.startedAt, job.completedAt, job.error);
                     failQuietly(job, generation, job.error);
+                    released = job.quotaReserved.compareAndSet(true, false);
+                }
+                if (released) {
+                    releaseQuota(job.clientKey); // after the monitor block (REQ-08)
                 }
             }
         } finally {
@@ -744,8 +944,16 @@ public class BatchHashJobService {
         private final List<String> items;
         private final String secretKey;
         private final String fingerprint;
+        /** Client identity the job's reservation is charged to; never copied into a snapshot or journal. */
+        private final String clientKey;
         private final Instant createdAt;
         private final int maxAttempts;
+        /**
+         * True while this job holds a slot in {@code activeJobsByClient}. Flipped to true when the
+         * reservation is taken and claimed ({@code compareAndSet(true, false)}) in the same monitor
+         * section that writes the terminal status, so a slot is released exactly once.
+         */
+        private final AtomicBoolean quotaReserved = new AtomicBoolean(false);
         private final List<JobAttempt> attemptHistory = new ArrayList<>();
         /**
          * Per-attempt correlation id captured on the submit/retry caller thread. Kept per attempt
@@ -766,7 +974,7 @@ public class BatchHashJobService {
         private String error;
 
         private MutableJob(String jobId, String idempotencyKey, String algorithm, List<String> items,
-                String secretKey, String fingerprint, Instant createdAt, int maxAttempts) {
+                String secretKey, String fingerprint, Instant createdAt, String clientKey, int maxAttempts) {
             this.jobId = jobId;
             this.idempotencyKey = idempotencyKey;
             this.algorithm = algorithm;
@@ -774,6 +982,7 @@ public class BatchHashJobService {
             this.secretKey = secretKey;
             this.fingerprint = fingerprint;
             this.createdAt = createdAt;
+            this.clientKey = clientKey;
             this.maxAttempts = maxAttempts;
         }
     }
