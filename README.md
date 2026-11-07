@@ -156,6 +156,7 @@ utiltools_api/
 | `GET` | `/api/v1/utils/audit/entries` | List journal entries (newest first) with optional `limit` & `state` filters |
 | `GET` | `/api/v1/utils/audit/entries/{id}` | Fetch a single journal entry (redacted request/result) |
 | `POST` | `/api/v1/utils/audit/entries/{id}/replay` | Replay a deterministic SUCCEEDED entry and verify the outcome |
+| `POST` | `/api/v1/utils/audit/verify` | Sweep-verify up to `limit` (default `20`, clamped to `max-entries`) SUCCEEDED entries in one pass and report per-entry `VERIFIED` / `MISMATCH` / `FAILED` / `SKIPPED` |
 
 ---
 
@@ -1076,6 +1077,63 @@ owner's `VERIFIED`/`MISMATCH`/`FAILED` is the outcome that is retained. Expiry i
 at claim time; there is no background sweeper. The owner token itself is stored privately and never
 serialized by `list`, `find` or `replay`, so a client can never forge or complete another caller's
 claim.
+
+#### Sweep verification: `POST /api/v1/utils/audit/verify`
+
+`POST /api/v1/utils/audit/verify?limit=N` verifies the journal in one bounded pass instead of one
+call per entry. It snapshots up to `limit` `SUCCEEDED` entries newest-first (`limit` defaults to
+`20`, is clamped to `utiltools.audit.max-entries`, and answers `400 BAD_REQUEST` when it is `< 1`
+or non-numeric) and replays each candidate through **exactly the same** attempt path as
+`POST /entries/{id}/replay`, so the two endpoints can never disagree about eligibility or outcome.
+
+```bash
+curl -X POST "http://localhost:8080/api/v1/utils/audit/verify?limit=50"
+```
+
+```json
+{
+  "success": true,
+  "message": "Journal verification sweep completed",
+  "data": {
+    "limit": 50,
+    "scanned": 3,
+    "verified": 1,
+    "mismatch": 1,
+    "failed": 1,
+    "skipped": 0,
+    "results": [
+      { "entryId": "3b7d9f2a1c5e4a60", "operation": "CRYPTO_HASH", "outcome": "VERIFIED", "detail": "result matches" },
+      { "entryId": "9f1c0d7b2e4a5531", "operation": "CRYPTO_HASH", "outcome": "MISMATCH", "detail": "first mismatch at /digest" },
+      { "entryId": "1a2b3c4d5e6f7081", "operation": "TEXT_STATS", "outcome": "FAILED", "detail": "replay failed: unknown field" }
+    ]
+  },
+  "timestamp": "2026-10-31T00:52:11.120Z"
+}
+```
+
+The sweep is **bounded**: one call inspects at most `limit` entries and never more than
+`utiltools.audit.max-entries`, so an operator can always size the work. Aggregates are counted from
+the rows themselves, so `verified + mismatch + failed + skipped == scanned == results.length`.
+
+The sweep is **single-winner per entry**, exactly like a single replay: every candidate is claimed
+through the same `claimReplay` lease. An entry whose claim is live is reported `SKIPPED` with
+`skipReason = "LIVE_CLAIM"` and its `replay.state` / `leaseExpiresAt` are **not** touched — the
+in-flight owner can still complete its own replay. Non-replayable (`NOT_REPLAYABLE`),
+non-deterministic (`NON_DETERMINISTIC`), no-longer-`SUCCEEDED` (`NOT_SUCCEEDED`) and evicted
+(`EVICTED`) entries are likewise `SKIPPED` with an explicit `skipReason` instead of failing the
+call.
+
+**Failure isolation:** an invocation that throws is recorded as `FAILED` with a bounded `detail`
+(≤ 200 characters) and the sweep **continues** with the remaining candidates — one bad entry never
+aborts the batch. Rows carry only `entryId`, `operation`, `outcome` / `skipReason` and `detail`;
+the stored request and result payloads, owner tokens and lease tokens are never returned.
+
+The sweep is **safe alongside the reaper and eviction**: it holds no journal lock while an
+operation runs, so a concurrent reaper pass or an eviction (the journal is bounded by
+`utiltools.audit.max-entries`) can interleave without deadlock, and an entry evicted mid-sweep is
+reported `SKIPPED` / `EVICTED`. Every original `state`, `result`, `completedAt`, `request` and
+`replayable` value is left exactly as it was — only the attached `replay` record changes. There is
+no background sweep: verification runs only when an operator calls the endpoint.
 
 ---
 

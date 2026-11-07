@@ -373,6 +373,14 @@ public class AuditJournalService {
     }
 
     /**
+     * The configured journal bound ({@code utiltools.audit.max-entries}); consumers clamp their own
+     * limits to it so a sweep can never scan more entries than the journal can hold.
+     */
+    public int maxEntries() {
+        return maxEntries;
+    }
+
+    /**
      * Newest-first snapshot, clamped to {@code [1, maxEntries]}; a null state means all states.
      */
     public List<AuditEntry> list(int limit, JournalState state) {
