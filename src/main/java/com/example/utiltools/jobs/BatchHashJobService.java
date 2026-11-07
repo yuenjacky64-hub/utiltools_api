@@ -15,9 +15,11 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.PriorityQueue;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -58,6 +60,20 @@ public class BatchHashJobService {
 
     private static final long DEFAULT_EXECUTION_LEASE_SECONDS = 30;
     private static final long DEFAULT_EXECUTION_REAPER_INTERVAL_MS = 5000;
+
+    /** Default number of entries returned by {@link #listJobs(JobStatus, int)}. */
+    public static final int DEFAULT_LIST_LIMIT = 20;
+
+    /** Hard ceiling on the number of entries returned by {@link #listJobs(JobStatus, int)}. */
+    public static final int MAX_LIST_LIMIT = 100;
+
+    /** Newest first: createdAt descending, jobId ascending as the deterministic tie-breaker. */
+    private static final Comparator<MutableJob> LIST_ORDER =
+            Comparator.comparing((MutableJob job) -> job.createdAt).reversed()
+                    .thenComparing(job -> job.jobId);
+
+    /** Exact inverse of LIST_ORDER (tie-break included); used only as the bounded-heap eviction order. */
+    private static final Comparator<MutableJob> LIST_ORDER_INVERSE = LIST_ORDER.reversed();
 
     private final CryptoService cryptoService;
     private final ThreadPoolExecutor executor;
@@ -179,6 +195,46 @@ public class BatchHashJobService {
     /** Current snapshot of a job; throws {@link JobNotFoundException} for unknown or evicted ids. */
     public BatchHashJobResponse getJob(String jobId) {
         return snapshot(requireJob(jobId));
+    }
+
+    /**
+     * Lists a bounded, newest-first window of the jobs currently in the registry.
+     *
+     * <p>The registry is iterated without {@code registryLock} (a weakly consistent view), so a job
+     * submitted or evicted while the list is built is simply present or absent. Listing is strictly
+     * read-only: no job field is written, the idempotency index is untouched and no clock is
+     * advanced. The status filter is evaluated under the job monitor, so a half-written transition
+     * is never observed. Every element is built by {@link #snapshot(MutableJob)}, i.e. exactly the
+     * {@code GET /{jobId}} projection, so no {@code secretKey} or raw item payload can leak.</p>
+     *
+     * @param status optional status filter; {@code null} lists every status
+     * @param limit  requested window size, clamped to {@code [1, 100]} (never rejected)
+     * @return matching snapshots, newest first ({@code createdAt} descending, {@code jobId} ascending);
+     *         an empty list when the registry is empty or nothing matches
+     */
+    public List<BatchHashJobResponse> listJobs(JobStatus status, int limit) {
+        int bounded = Math.max(1, Math.min(MAX_LIST_LIMIT, limit));
+        PriorityQueue<MutableJob> kept = new PriorityQueue<>(bounded, LIST_ORDER_INVERSE);
+        for (MutableJob job : jobs.values()) { // weakly consistent view, no registryLock
+            if (status != null) {
+                synchronized (job) {
+                    if (job.status != status) {
+                        continue; // filtered under the job monitor
+                    }
+                }
+            }
+            kept.offer(job);
+            if (kept.size() > bounded) {
+                kept.poll(); // drops the entry that ranks last under LIST_ORDER
+            }
+        }
+        List<MutableJob> selected = new ArrayList<>(kept);
+        selected.sort(LIST_ORDER);
+        List<BatchHashJobResponse> listed = new ArrayList<>(selected.size());
+        for (MutableJob job : selected) {
+            listed.add(snapshot(job)); // the single projection, point-in-time per element
+        }
+        return List.copyOf(listed);
     }
 
     /**
