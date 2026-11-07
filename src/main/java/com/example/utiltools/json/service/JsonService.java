@@ -4,6 +4,8 @@ import com.example.utiltools.json.dto.JsonFlattenRequest;
 import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
+import com.example.utiltools.json.dto.JsonMergePatchRequest;
+import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonPatchOperation;
 import com.example.utiltools.json.dto.JsonPatchRequest;
 import com.example.utiltools.json.dto.JsonPatchResponse;
@@ -225,6 +227,80 @@ public class JsonService {
     }
 
     /**
+     * Applies a declarative RFC 7396 merge-patch document to the target document.
+     *
+     * <p>A patch that is not an object replaces the whole target; when both sides are objects the
+     * members are merged recursively, a {@code null} patch member deletes that key (counting it in
+     * {@code removedKeys} only when the key was actually present), and arrays or scalars replace the
+     * target value wholesale. Neither request string nor the trees parsed from them are mutated, so
+     * re-running the same request yields an identical response and replay can verify it.</p>
+     */
+    public JsonMergePatchResponse mergePatch(JsonMergePatchRequest request) {
+        JsonNode target = parseTree(request.json());
+        JsonNode patch = parseTree(request.patch());
+        if (depthOf(patch) > MAX_DEPTH) {
+            throw new IllegalArgumentException("patch depth must not exceed " + MAX_DEPTH);
+        }
+        if (depthOf(target) > MAX_DEPTH) {
+            throw new IllegalArgumentException("document depth must not exceed " + MAX_DEPTH);
+        }
+        MergeTally tally = new MergeTally();
+        JsonNode merged = mergeInto(target.deepCopy(), patch, tally);
+        String compact = writeCompact(merged);
+        return new JsonMergePatchResponse(merged, compact.getBytes(StandardCharsets.UTF_8).length,
+                !merged.equals(target), tally.removedKeys);
+    }
+
+    private JsonNode mergeInto(JsonNode target, JsonNode patch, MergeTally tally) {
+        if (!patch.isObject()) {
+            return patch.deepCopy();
+        }
+        ObjectNode result = target.isObject()
+                ? ((ObjectNode) target).deepCopy()
+                : objectMapper.createObjectNode();
+        Iterator<Map.Entry<String, JsonNode>> members = patch.fields();
+        while (members.hasNext()) {
+            Map.Entry<String, JsonNode> member = members.next();
+            String key = member.getKey();
+            JsonNode value = member.getValue();
+            if (value.isNull()) {
+                // A null for an absent key is a no-op and is deliberately not counted.
+                if (result.has(key)) {
+                    result.remove(key);
+                    tally.removedKeys++;
+                }
+            } else {
+                result.set(key, mergeInto(result.path(key), value, tally));
+            }
+        }
+        return result;
+    }
+
+    /** A scalar is depth 1; a container is 1 + the deepest child, so the fence is strict. */
+    private static int depthOf(JsonNode node) {
+        if (node == null || node.isMissingNode()) {
+            return 0;
+        }
+        if (!node.isContainerNode()) {
+            return 1;
+        }
+        int deepest = 0;
+        Iterator<JsonNode> children = node.elements();
+        while (children.hasNext()) {
+            deepest = Math.max(deepest, depthOf(children.next()));
+        }
+        return 1 + deepest;
+    }
+
+    private String writeCompact(JsonNode node) {
+        try {
+            return objectMapper.writeValueAsString(node);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Failed to serialize JSON content: " + e.getOriginalMessage(), e);
+        }
+    }
+
+    /**
      * Collapses an object tree into dot-path key/value pairs. Insertion order is preserved, arrays
      * and empty objects stay untouched leaf values, and a key that is empty or already contains the
      * separator is rejected so that {@link #unflatten(JsonUnflattenRequest)} can always rebuild the tree.
@@ -389,6 +465,11 @@ public class JsonService {
     private static final class FlattenTally {
         private int keyCount;
         private int maxDepth;
+    }
+
+    /** Mutable counter for the merge-patch walk: the service bean itself stays stateless. */
+    private static final class MergeTally {
+        private int removedKeys;
     }
 
     private Runnable applyOperation(PatchDocument doc, JsonPatchOperation entry) {

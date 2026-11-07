@@ -23,6 +23,7 @@ import org.springframework.http.MediaType;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -475,6 +476,160 @@ class JsonControllerTest {
                     .andExpect(status().isOk())
                     .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"));
         }
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/merge-patch - should merge, delete null members and count removals")
+    void shouldMergePatchReturnSuccessEnvelope() throws Exception {
+        String body = """
+                {
+                    "json": "{\\"a\\":1,\\"b\\":{\\"c\\":2,\\"d\\":3}}",
+                    "patch": "{\\"b\\":{\\"c\\":null,\\"e\\":4},\\"f\\":[1,2]}"
+                }
+                """;
+
+        String response = mockMvc.perform(post("/api/v1/utils/json/merge-patch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.removedKeys").value(1))
+                .andExpect(jsonPath("$.data.sizeBytes").value(35))
+                .andReturn().getResponse().getContentAsString();
+
+        JsonNode data = new ObjectMapper().readTree(response).path("data");
+        assertThat(data.path("resultJson").toString()).isEqualTo("{\"a\":1,\"b\":{\"d\":3,\"e\":4},\"f\":[1,2]}");
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/merge-patch - non-object patch replaces the target document")
+    void shouldReplaceTargetWithNonObjectMergePatch() throws Exception {
+        String body = """
+                {
+                    "json": "{\\"a\\":1}",
+                    "patch": "7"
+                }
+                """;
+
+        String response = mockMvc.perform(post("/api/v1/utils/json/merge-patch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.removedKeys").value(0))
+                .andReturn().getResponse().getContentAsString();
+
+        JsonNode data = new ObjectMapper().readTree(response).path("data");
+        assertThat(data.path("resultJson").asInt()).isEqualTo(7);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/merge-patch - malformed json or patch returns 400 BAD_REQUEST")
+    void shouldMergePatchReturnBadRequestForMalformedJson() throws Exception {
+        String badJson = """
+                {
+                    "json": "{not json",
+                    "patch": "{}"
+                }
+                """;
+        String badPatch = """
+                {
+                    "json": "{}",
+                    "patch": "[1,"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/merge-patch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(badJson))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message", containsString("Invalid JSON")));
+        mockMvc.perform(post("/api/v1/utils/json/merge-patch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(badPatch))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message", containsString("Invalid JSON")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/merge-patch - blank fields return 400 VALIDATION_ERROR")
+    void shouldMergePatchReturnValidationErrorForBlankFields() throws Exception {
+        String blankJson = """
+                {
+                    "json": "",
+                    "patch": "{}"
+                }
+                """;
+        String blankPatch = """
+                {
+                    "json": "{}",
+                    "patch": "  "
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/merge-patch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(blankJson))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]", containsString("json content is required")));
+        mockMvc.perform(post("/api/v1/utils/json/merge-patch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(blankPatch))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]", containsString("patch content is required")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/merge-patch - journalled as JSON_MERGE_PATCH and replay VERIFIED")
+    void shouldMergePatchBeJournalledAndReplayVerified() throws Exception {
+        String body = """
+                {
+                    "json": "{\\"a\\":1,\\"b\\":{\\"c\\":2,\\"d\\":3}}",
+                    "patch": "{\\"b\\":{\\"c\\":null,\\"e\\":4},\\"f\\":[1,2]}"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/merge-patch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/v1/utils/json/merge-patch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"json\":\"{\\\"a\\\":1}\",\"patch\":\"{\\\"b\\\":2}\"}"))
+                .andExpect(status().isOk());
+
+        String entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[?(@.operation == 'JSON_MERGE_PATCH')]").exists())
+                .andReturn().getResponse().getContentAsString();
+
+        String entryId = entryIdOf(entries, "JSON_MERGE_PATCH");
+        int entryCount = new ObjectMapper().readTree(entries).path("data").size();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", entryId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"));
+
+        // Replay must not append a second journal entry for the same request.
+        String afterReplay = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        JsonNode afterEntries = new ObjectMapper().readTree(afterReplay).path("data");
+        assertThat(afterEntries.size()).isEqualTo(entryCount);
+        JsonNode replayedEntry = null;
+        for (JsonNode entry : afterEntries) {
+            if (entryId.equals(entry.path("id").asText())) {
+                replayedEntry = entry;
+            }
+        }
+        assertThat(replayedEntry).isNotNull();
+        assertThat(replayedEntry.path("operation").asText()).isEqualTo("JSON_MERGE_PATCH");
+        assertThat(replayedEntry.path("state").asText()).isEqualTo("SUCCEEDED");
     }
 
     private static String entryIdOf(String entriesJson, String operation) throws Exception {

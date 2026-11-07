@@ -6,6 +6,8 @@ import com.example.utiltools.json.dto.JsonFlattenRequest;
 import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
+import com.example.utiltools.json.dto.JsonMergePatchRequest;
+import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonPatchRequest;
 import com.example.utiltools.json.dto.JsonPatchResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
@@ -76,6 +78,17 @@ public class JsonController {
     public ApiResponse<JsonUnflattenResponse> unflatten(@Valid @RequestBody JsonUnflattenRequest request) {
         JsonUnflattenResponse result = auditedOperations.unflatten(request);
         return ApiResponse.success(result, "JSON unflattened successfully");
+    }
+
+    @PostMapping("/merge-patch")
+    @Operation(summary = "Apply an RFC 7396 JSON merge patch",
+            description = "Applies a declarative merge-patch document to the target JSON: a null member deletes that key "
+                    + "(counted in removedKeys), objects merge recursively, and arrays or scalars replace the target value wholesale. "
+                    + "A non-object patch such as 7, \"abc\" or [1,2] replaces the whole target. Both documents are parsed but never mutated; "
+                    + "malformed JSON returns 400 BAD_REQUEST and a patch nested beyond 64 object levels is rejected.")
+    public ApiResponse<JsonMergePatchResponse> mergePatch(@Valid @RequestBody JsonMergePatchRequest request) {
+        JsonMergePatchResponse result = auditedOperations.mergePatch(request);
+        return ApiResponse.success(result, "JSON merge patch applied successfully");
     }
 
     @PostMapping("/patch")
