@@ -1,5 +1,7 @@
 package com.example.utiltools.json;
 
+import com.example.utiltools.json.dto.JsonFlattenRequest;
+import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
 import com.example.utiltools.json.dto.JsonPatchOperation;
@@ -7,6 +9,8 @@ import com.example.utiltools.json.dto.JsonPatchResponse;
 import com.example.utiltools.json.dto.JsonPatchRequest;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
+import com.example.utiltools.json.dto.JsonUnflattenRequest;
+import com.example.utiltools.json.dto.JsonUnflattenResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.exception.JsonPatchRollbackException;
@@ -23,6 +27,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.IntStream;
@@ -469,6 +474,200 @@ class JsonServiceTest {
                     .containsExactly(JsonPatchOperation.APPLIED, JsonPatchOperation.APPLIED,
                             JsonPatchOperation.APPLIED);
         }
+    }
+
+    @Test
+    @DisplayName("Should flatten a nested document into ordered dot-path keys")
+    void shouldFlattenNestedJson() {
+        String json = "{\"name\":\"Alice\",\"address\":{\"city\":\"Paris\","
+                + "\"geo\":{\"lat\":48.85,\"lng\":2.35}},\"active\":true}";
+
+        JsonFlattenResponse response = jsonService.flatten(new JsonFlattenRequest(json, null));
+
+        List<String> keys = new ArrayList<>();
+        response.resultJson().fieldNames().forEachRemaining(keys::add);
+        assertThat(keys).containsExactly("name", "address.city", "address.geo.lat", "address.geo.lng", "active");
+        assertThat(response.keyCount()).isEqualTo(5);
+        assertThat(response.maxDepth()).isEqualTo(3);
+        assertThat(response.resultJson().get("address.geo.lat").asDouble()).isEqualTo(48.85);
+        assertThat(response.resultJson().get("active").asBoolean()).isTrue();
+    }
+
+    @Test
+    @DisplayName("Should keep arrays and empty objects as untouched leaves")
+    void shouldKeepArraysAndEmptyObjectsAsLeaves() {
+        JsonFlattenResponse flattened =
+                jsonService.flatten(new JsonFlattenRequest("{\"a\":{\"b\":[]},\"c\":{}}", null));
+
+        assertThat(flattened.keyCount()).isEqualTo(2);
+        assertThat(flattened.maxDepth()).isEqualTo(2);
+        assertThat(flattened.resultJson().get("a.b").isArray()).isTrue();
+        assertThat(flattened.resultJson().get("a.b")).isEmpty();
+        assertThat(flattened.resultJson().get("c").isObject()).isTrue();
+        assertThat(flattened.resultJson().get("c")).isEmpty();
+
+        JsonUnflattenResponse rebuilt =
+                jsonService.unflatten(new JsonUnflattenRequest(flattened.resultJson().toString(), null));
+        assertThat(rebuilt.resultJson().at("/a/b").isArray()).isTrue();
+        assertThat(rebuilt.resultJson().at("/c").isObject()).isTrue();
+        assertThat(rebuilt.resultJson().at("/c")).isEmpty();
+        assertThat(rebuilt.keyCount()).isEqualTo(2);
+        assertThat(rebuilt.maxDepth()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("Should honour a custom separator on both operations")
+    void shouldHonourCustomSeparator() {
+        JsonFlattenResponse flattened =
+                jsonService.flatten(new JsonFlattenRequest("{\"a\":{\"b\":1}}", "/"));
+
+        assertThat(flattened.resultJson().has("a/b")).isTrue();
+        assertThat(flattened.resultJson().get("a/b").asInt()).isEqualTo(1);
+        assertThat(flattened.keyCount()).isEqualTo(1);
+
+        JsonUnflattenResponse rebuilt =
+                jsonService.unflatten(new JsonUnflattenRequest("{\"a/b/c\":2}", "/"));
+        assertThat(rebuilt.resultJson().at("/a/b/c").asInt()).isEqualTo(2);
+        assertThat(rebuilt.maxDepth()).isEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("Should reject object keys that contain the separator")
+    void shouldRejectSeparatorInsideKeys() {
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("{\"a.b\":1}", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must not contain the separator");
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("{\"a\":{\"b/c\":1}}", "/")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must not contain the separator");
+    }
+
+    @Test
+    @DisplayName("Should rebuild nested objects from flat paths")
+    void shouldUnflattenNestedPaths() {
+        JsonUnflattenResponse response = jsonService.unflatten(
+                new JsonUnflattenRequest("{\"a.b.c\":1,\"a.b.d\":2,\"a.e\":3}", null));
+
+        assertThat(response.resultJson().at("/a/b/c").asInt()).isEqualTo(1);
+        assertThat(response.resultJson().at("/a/b/d").asInt()).isEqualTo(2);
+        assertThat(response.resultJson().at("/a/e").asInt()).isEqualTo(3);
+        assertThat(response.keyCount()).isEqualTo(3);
+        assertThat(response.maxDepth()).isEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("Should reject blank or overlong separators, empty segments, non-object roots and deep paths")
+    void shouldRejectInvalidFlatDocuments() {
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("{\"a\":1}", " ")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("separator must not be blank");
+        assertThatThrownBy(() -> jsonService.unflatten(new JsonUnflattenRequest("{\"a\":1}", "")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("separator must not be blank");
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("{\"a\":1}", "abcdefghi")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("separator must be at most 8 characters");
+        assertThatThrownBy(() -> jsonService.unflatten(new JsonUnflattenRequest("{\"a..b\":1}", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("empty path segment in key");
+        assertThatThrownBy(() -> jsonService.unflatten(new JsonUnflattenRequest("{\".a\":1}", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("empty path segment in key");
+        assertThatThrownBy(() -> jsonService.unflatten(new JsonUnflattenRequest("{\"a.\":1}", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("empty path segment in key");
+        assertThatThrownBy(() -> jsonService.unflatten(new JsonUnflattenRequest("[1,2]", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("json root must be a JSON object");
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("[1,2]", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("json root must be a JSON object");
+        assertThatThrownBy(() -> jsonService.unflatten(
+                new JsonUnflattenRequest("{\"" + "a.".repeat(64) + "a\":1}", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("document depth must not exceed 64");
+        String deep = "1";
+        for (int i = 0; i < 65; i++) {
+            deep = "{\"k\":" + deep + "}";
+        }
+        String deepDocument = deep;
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest(deepDocument, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("document depth must not exceed 64");
+    }
+
+    @Test
+    @DisplayName("Should reject conflicting flat paths in both key orders")
+    void shouldRejectConflictingPaths() {
+        assertThatThrownBy(() -> jsonService.unflatten(new JsonUnflattenRequest("{\"a\":1,\"a.b\":2}", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("conflicting path");
+        assertThatThrownBy(() -> jsonService.unflatten(new JsonUnflattenRequest("{\"a.b\":2,\"a\":1}", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("conflicting path");
+        assertThatThrownBy(() -> jsonService.unflatten(
+                new JsonUnflattenRequest("{\"a\":{},\"a.b\":1}", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("conflicting path");
+    }
+
+    @Test
+    @DisplayName("Should enforce the 10000 key bound on both operations")
+    void shouldEnforceKeyCountBound() {
+        assertThatThrownBy(() -> jsonService.unflatten(new JsonUnflattenRequest(flatDocument(10001), null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("flat document must contain at most 10000 keys");
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest(flatDocument(10001), null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("flattened document must contain at most 10000 keys");
+
+        JsonFlattenResponse boundary =
+                jsonService.flatten(new JsonFlattenRequest(flatDocument(10000), null));
+        assertThat(boundary.keyCount()).isEqualTo(10000);
+    }
+
+    @Test
+    @DisplayName("Should round trip flatten to unflatten with structural equality")
+    void shouldRoundTripFlattenThenUnflatten() throws JsonProcessingException {
+        String original = "{\"id\":7,\"tags\":[\"a\",\"b\"],\"meta\":{},\"nested\":{\"one\":{\"two\":null,"
+                + "\"three\":[],\"four\":false},\"five\":\"text\"},\"number\":1.5}";
+        ObjectMapper mapper = new ObjectMapper();
+
+        JsonFlattenResponse flattened = jsonService.flatten(new JsonFlattenRequest(original, null));
+        JsonUnflattenResponse rebuilt = jsonService.unflatten(
+                new JsonUnflattenRequest(mapper.writeValueAsString(flattened.resultJson()), null));
+
+        assertThat(rebuilt.resultJson()).isEqualTo(mapper.readTree(original));
+        assertThat(rebuilt.keyCount()).isEqualTo(flattened.keyCount());
+        assertThat(rebuilt.maxDepth()).isEqualTo(flattened.maxDepth());
+    }
+
+    @Test
+    @DisplayName("Should require a non-blank json body on flatten and unflatten requests")
+    void shouldRequireJsonOnFlattenAndUnflattenRequests() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+
+            assertThat(validator.validate(new JsonFlattenRequest("", null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("json content is required");
+            assertThat(validator.validate(new JsonUnflattenRequest("   ", null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("json content is required");
+            assertThat(validator.validate(new JsonFlattenRequest("{\"a\":1}", null))).isEmpty();
+            assertThat(validator.validate(new JsonUnflattenRequest("{\"a\":1}", "."))).isEmpty();
+        }
+    }
+
+    private static String flatDocument(int keyCount) {
+        StringBuilder json = new StringBuilder("{");
+        for (int i = 0; i < keyCount; i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append("\"k").append(i).append("\":").append(i);
+        }
+        return json.append('}').toString();
     }
 
     private static List<JsonPatchOperation> patchOperations(int count) {

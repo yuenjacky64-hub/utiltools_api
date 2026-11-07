@@ -2,12 +2,16 @@ package com.example.utiltools.json.controller;
 
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.ApiResponse;
+import com.example.utiltools.json.dto.JsonFlattenRequest;
+import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
 import com.example.utiltools.json.dto.JsonPatchRequest;
 import com.example.utiltools.json.dto.JsonPatchResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
+import com.example.utiltools.json.dto.JsonUnflattenRequest;
+import com.example.utiltools.json.dto.JsonUnflattenResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.service.JsonService;
@@ -21,7 +25,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/v1/utils/json")
-@Tag(name = "JSON & Data Processor Utility", description = "Endpoints for formatting, minifying, validating, querying, and atomically patching JSON structures")
+@Tag(name = "JSON & Data Processor Utility", description = "Endpoints for formatting, minifying, validating, querying, flattening, unflattening, and atomically patching JSON structures")
 public class JsonController {
 
     private final AuditedOperations auditedOperations;
@@ -51,6 +55,24 @@ public class JsonController {
     public ApiResponse<JsonQueryResponse> query(@Valid @RequestBody JsonQueryRequest request) {
         JsonQueryResponse result = auditedOperations.query(request);
         return ApiResponse.success(result, "JSONPath executed successfully");
+    }
+
+    @PostMapping("/flatten")
+    @Operation(summary = "Flatten JSON into dot-path keys", description = "Collapses an object tree into separator-joined key/value pairs while preserving insertion order. "
+            + "Arrays and empty objects stay untouched leaf values, keyCount counts leaves and maxDepth counts path segments; "
+            + "a key that already contains the separator is rejected so the result can always be unflattened back.")
+    public ApiResponse<JsonFlattenResponse> flatten(@Valid @RequestBody JsonFlattenRequest request) {
+        JsonFlattenResponse result = auditedOperations.flatten(request);
+        return ApiResponse.success(result, "JSON flattened successfully");
+    }
+
+    @PostMapping("/unflatten")
+    @Operation(summary = "Unflatten dot-path keys into JSON", description = "Rebuilds a nested object from separator-joined keys. "
+            + "Blank or overlong separators, empty path segments, non-object roots, conflicting paths such as 'a' together with 'a.b', "
+            + "depth above 64 and more than 10000 keys are rejected with 400 BAD_REQUEST.")
+    public ApiResponse<JsonUnflattenResponse> unflatten(@Valid @RequestBody JsonUnflattenRequest request) {
+        JsonUnflattenResponse result = auditedOperations.unflatten(request);
+        return ApiResponse.success(result, "JSON unflattened successfully");
     }
 
     @PostMapping("/patch")
