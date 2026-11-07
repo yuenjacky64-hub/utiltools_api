@@ -36,6 +36,10 @@ class BatchHashJobServiceTest {
 
     private static final long TIMEOUT_SECONDS = 10;
 
+    /** Fixed clock origin and lease length for the execution-lease tests. */
+    private static final Instant LEASE_START = Instant.parse("2026-01-01T00:00:00Z");
+    private static final long LEASE_SECONDS = 30;
+
     private BatchHashJobService service;
 
     @AfterEach
@@ -803,6 +807,291 @@ class BatchHashJobServiceTest {
     }
 
     /**
+     * DOD-01 / REQ-03 / REQ-04: a worker blocked inside {@code hash()} is reaped exactly once at the
+     * inclusive lease boundary, and the snapshot it would have written afterwards never lands.
+     */
+    @Test
+    @DisplayName("execution lease - a stalled worker is reaped exactly once and never resurrects the job")
+    void shouldReapStalledWorkerExactlyOnceAndNeverResurrectIt() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stalled"), null, null));
+        assertThat(accepted.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(crypto.awaitEntered("stalled")).isTrue(); // the worker is now inside hash()
+
+        BatchHashJobResponse running = service.getJob(accepted.jobId());
+        assertThat(running.status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(running.lastHeartbeatAt()).isEqualTo(LEASE_START);
+        assertThat(running.executionLeaseExpiresAt()).isEqualTo(LEASE_START.plusSeconds(LEASE_SECONDS));
+
+        // One millisecond before expiry the lease is still live; the boundary instant itself is expired.
+        clock.advanceMillis(LEASE_SECONDS * 1000 - 1);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+        assertThat(service.getJob(accepted.jobId()).status()).isEqualTo(JobStatus.RUNNING);
+
+        clock.advanceMillis(1);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+
+        BatchHashJobResponse reaped = service.getJob(accepted.jobId());
+        assertThat(reaped.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(reaped.error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        assertThat(reaped.completedAt()).isEqualTo(clock.instant());
+        assertThat(reaped.results()).isNull();
+        assertThat(reaped.executionLeaseExpiresAt()).isNull();
+        assertThat(reaped.lastHeartbeatAt()).isNull();
+        assertThat(reaped.attempts()).hasSize(1);
+        assertThat(reaped.attempts().get(0).status()).isEqualTo(JobStatus.FAILED);
+        assertThat(reaped.attempts().get(0).error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+
+        // Release the stalled worker: its late COMPLETED write must be fenced out.
+        clock.advanceSeconds(LEASE_SECONDS);
+        crypto.unblock("stalled");
+        BatchHashJobResponse probe = service.submit(
+                new BatchHashRequest("SHA-256", List.of("probe"), null, null));
+        awaitStatus(probe.jobId(), JobStatus.COMPLETED); // the single worker returned from hash()
+
+        assertThat(service.getJob(accepted.jobId())).isEqualTo(reaped); // FAILED snapshot unchanged
+        assertThat(crypto.count("stalled")).isEqualTo(1);
+    }
+
+    /**
+     * DOD-02 / REQ-02: heartbeat renewal keeps a healthy multi-item attempt alive across clock
+     * advances that are each shorter than the lease.
+     */
+    @Test
+    @DisplayName("execution lease - a healthy worker renews the lease between items and is not reaped")
+    void shouldRenewLeaseBetweenItemsAndCompleteWithoutBeingReaped() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("b", "c");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("a", "b", "c"), null, null));
+        assertThat(crypto.awaitEntered("b")).isTrue(); // "a" is hashed, the worker is inside "b"
+
+        clock.advanceSeconds(20);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+        clock.advanceSeconds(LEASE_SECONDS - 20 - 1); // start + 29: still inside the lease
+        assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+
+        crypto.unblock("b");
+        assertThat(crypto.awaitEntered("c")).isTrue(); // the renewal before "c" already happened
+
+        BatchHashJobResponse renewed = service.getJob(accepted.jobId());
+        assertThat(renewed.status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(renewed.lastHeartbeatAt()).isEqualTo(LEASE_START.plusSeconds(LEASE_SECONDS - 1));
+        assertThat(renewed.executionLeaseExpiresAt())
+                .isEqualTo(LEASE_START.plusSeconds(2 * LEASE_SECONDS - 1));
+
+        // Without the renewal the lease would have expired at start+30; it now runs to start+59.
+        clock.advanceSeconds(25);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+        assertThat(service.getJob(accepted.jobId()).status()).isEqualTo(JobStatus.RUNNING);
+
+        crypto.unblock("c");
+        BatchHashJobResponse completed = awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.results()).hasSize(3);
+        assertThat(completed.executionLeaseExpiresAt()).isNull();
+        assertThat(completed.lastHeartbeatAt()).isNull();
+    }
+
+    /**
+     * DOD-03 / REQ-03 / REQ-04 / REQ-05: the reaper is idempotent, skips QUEUED and terminal jobs,
+     * and a reaped attempt is retryable into a clean {@code attempt + 1} that completes.
+     */
+    @Test
+    @DisplayName("execution lease - reaping is idempotent, skips QUEUED/terminal jobs, and retry reaches attempt 2")
+    void shouldReapIdempotentlySkipQueuedAndTerminalJobsAndRetryToAttemptTwo() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse terminal = service.submit(
+                new BatchHashRequest("SHA-256", List.of("first"), null, null));
+        BatchHashJobResponse completed = awaitStatus(terminal.jobId(), JobStatus.COMPLETED);
+        BatchHashJobResponse stalled = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stalled"), null, null));
+        assertThat(crypto.awaitEntered("stalled")).isTrue();
+        BatchHashJobResponse queued = service.submit(
+                new BatchHashRequest("SHA-256", List.of("waiting"), null, null));
+        BatchHashJobResponse cancelled = service.cancel(service.submit(
+                new BatchHashRequest("SHA-256", List.of("withdrawn"), null, null)).jobId());
+        assertThat(queued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(cancelled.status()).isEqualTo(JobStatus.CANCELLED);
+        BatchHashJobResponse queuedBefore = service.getJob(queued.jobId());
+        BatchHashJobResponse cancelledBefore = service.getJob(cancelled.jobId());
+
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1); // the stalled attempt only
+
+        BatchHashJobResponse reaped = service.getJob(stalled.jobId());
+        assertThat(reaped.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(reaped.error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        assertThat(service.getJob(completed.jobId())).isEqualTo(completed);
+        assertThat(service.getJob(queued.jobId())).isEqualTo(queuedBefore);
+        assertThat(service.getJob(cancelled.jobId())).isEqualTo(cancelledBefore);
+
+        // Idempotency: the same instant reaps nothing and rewrites nothing.
+        assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+        assertThat(service.getJob(stalled.jobId())).isEqualTo(reaped);
+
+        // A reaped FAILED job is retryable: attempt + 1 with the error, results and lease cleared.
+        BatchHashJobResponse retried = service.retry(stalled.jobId());
+        assertThat(retried.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(retried.attempt()).isEqualTo(2);
+        assertThat(retried.error()).isNull();
+        assertThat(retried.results()).isNull();
+        assertThat(retried.executionLeaseExpiresAt()).isNull();
+        assertThat(retried.lastHeartbeatAt()).isNull();
+
+        clock.advanceSeconds(5);
+        crypto.unblock("stalled"); // the stale attempt-1 worker returns and is fenced out
+        BatchHashJobResponse done = awaitStatus(stalled.jobId(), JobStatus.COMPLETED);
+        assertThat(done.attempt()).isEqualTo(2);
+        assertThat(done.error()).isNull();
+        assertThat(done.results()).hasSize(1);
+        assertThat(done.attempts()).hasSize(2);
+        assertThat(done.attempts().get(0).status()).isEqualTo(JobStatus.FAILED);
+        assertThat(done.attempts().get(0).error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        assertThat(done.attempts().get(1).status()).isEqualTo(JobStatus.COMPLETED);
+    }
+
+    /**
+     * DOD-04 / REQ-06: lease state is projected only while RUNNING.
+     */
+    @Test
+    @DisplayName("execution lease - polling exposes the lease fields only while RUNNING")
+    void shouldExposeLeaseFieldsOnlyWhileRunning() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("running");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse submitted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("running"), null, null));
+        assertThat(submitted.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(submitted.executionLeaseExpiresAt()).isNull();
+        assertThat(submitted.lastHeartbeatAt()).isNull();
+        assertThat(crypto.awaitEntered("running")).isTrue();
+
+        BatchHashJobResponse running = service.getJob(submitted.jobId());
+        assertThat(running.status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(running.executionLeaseExpiresAt()).isNotNull();
+        assertThat(running.lastHeartbeatAt()).isNotNull();
+        assertThat(running.executionLeaseExpiresAt())
+                .isEqualTo(running.lastHeartbeatAt().plusSeconds(LEASE_SECONDS));
+
+        BatchHashJobResponse queued = service.submit(
+                new BatchHashRequest("SHA-256", List.of("waiting"), null, null));
+        assertThat(queued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(queued.executionLeaseExpiresAt()).isNull();
+        assertThat(queued.lastHeartbeatAt()).isNull();
+
+        crypto.unblock("running");
+        BatchHashJobResponse completed = awaitStatus(submitted.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.executionLeaseExpiresAt()).isNull();
+        assertThat(completed.lastHeartbeatAt()).isNull();
+
+        // The 12-argument compatibility constructor leaves both lease stamps unset.
+        BatchHashJobResponse legacy = new BatchHashJobResponse("legacy", "key", JobStatus.COMPLETED, 1,
+                List.of(), null, LEASE_START, LEASE_START, LEASE_START, 1, 3, List.of());
+        assertThat(legacy.executionLeaseExpiresAt()).isNull();
+        assertThat(legacy.lastHeartbeatAt()).isNull();
+    }
+
+    /**
+     * DOD-05 / REQ-04: once a lease is reaped, a worker that later succeeds, later fails, or is
+     * replayed by generation cannot overwrite the reaped FAILED snapshot.
+     */
+    @Test
+    @DisplayName("execution lease - a worker that finishes or fails after the reap cannot resurrect the job")
+    void shouldFenceStaleWorkerAfterReap() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled", "stalled-failing");
+        crypto.failAfterRelease("stalled-failing");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        // Scenario 1: the stale worker would have written COMPLETED.
+        BatchHashJobResponse reapedSuccess = reapStalledJob(clock, crypto, "stalled");
+        service.executeAttempt(reapedSuccess.jobId(), 1); // a generation replay is fenced just as well
+        assertThat(service.getJob(reapedSuccess.jobId())).isEqualTo(reapedSuccess);
+        clock.advanceSeconds(LEASE_SECONDS);
+        crypto.unblock("stalled");
+        BatchHashJobResponse probe = service.submit(
+                new BatchHashRequest("SHA-256", List.of("probe-1"), null, null));
+        awaitStatus(probe.jobId(), JobStatus.COMPLETED); // the single worker has returned from hash()
+        assertThat(service.getJob(reapedSuccess.jobId())).isEqualTo(reapedSuccess);
+
+        // Scenario 2: the stale worker throws instead; the reaped error must survive untouched.
+        BatchHashJobResponse reapedFailure = reapStalledJob(clock, crypto, "stalled-failing");
+        clock.advanceSeconds(LEASE_SECONDS);
+        crypto.unblock("stalled-failing");
+        BatchHashJobResponse probe2 = service.submit(
+                new BatchHashRequest("SHA-256", List.of("probe-2"), null, null));
+        awaitStatus(probe2.jobId(), JobStatus.COMPLETED);
+
+        BatchHashJobResponse fenced = service.getJob(reapedFailure.jobId());
+        assertThat(fenced).isEqualTo(reapedFailure);
+        assertThat(fenced.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(fenced.error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        assertThat(fenced.results()).isNull();
+    }
+
+    /**
+     * DOD-06 / REQ-01: non-positive lease/reaper configuration is rejected, a null clock falls back
+     * to the system clock, and the five-argument constructor keeps the 30-second default lease.
+     */
+    @Test
+    @DisplayName("execution lease - non-positive config is rejected and the five-argument constructor still works")
+    void shouldRejectNonPositiveLeaseConfigAndKeepFiveArgumentConstructor() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("blocking");
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+
+        assertThatThrownBy(() -> new BatchHashJobService(crypto, 1, 10, 300, 3, 0, 5000, clock))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("execution-lease-seconds");
+        assertThatThrownBy(() -> new BatchHashJobService(crypto, 1, 10, 300, 3, -1, 5000, clock))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("execution-lease-seconds");
+        assertThatThrownBy(() -> new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 0, clock))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("execution-reaper-interval-ms");
+
+        BatchHashJobService systemClockService =
+                new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, null);
+        systemClockService.shutdown();
+
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3); // system clock, default 30 s lease
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("blocking"), null, null));
+        assertThat(crypto.awaitEntered("blocking")).isTrue();
+        BatchHashJobResponse running = service.getJob(accepted.jobId());
+        assertThat(running.status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(running.executionLeaseExpiresAt()).isNotNull();
+        assertThat(running.executionLeaseExpiresAt()).isEqualTo(running.lastHeartbeatAt().plusSeconds(30));
+        crypto.unblock("blocking");
+    }
+
+    /**
+     * Submits a single-item job, lets the worker stall inside {@code hash()}, advances the clock past
+     * the lease and reaps it, returning the reaped snapshot.
+     */
+    private BatchHashJobResponse reapStalledJob(MutableJobClock clock, LeaseCryptoService crypto, String item)
+            throws InterruptedException {
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of(item), null, null));
+        assertThat(crypto.awaitEntered(item)).isTrue();
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        BatchHashJobResponse reaped = service.getJob(accepted.jobId());
+        assertThat(reaped.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(reaped.error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        return reaped;
+    }
+
+    /**
      * Snapshot of the keys of a private registry map ({@code jobs} / {@code idempotencyIndex}).
      * Reflection keeps the production class free of test-only accessors while still letting the
      * saturation test prove that a rejected submission leaves no job or idempotency residue.
@@ -952,6 +1241,70 @@ class BatchHashJobServiceTest {
         private int count(String item) {
             AtomicInteger counter = invocations.get(item);
             return counter == null ? 0 : counter.get();
+        }
+    }
+
+    /**
+     * Hashing stub for the execution-lease tests: every item named as a gate blocks the worker inside
+     * {@code hash()} on its own latches until {@link #unblock(String)} releases it, so a job can be
+     * stalled across clock advances. A gated item optionally throws after release (a stale worker
+     * whose failure must not overwrite a reaped snapshot); every other item delegates to real hashing.
+     */
+    private static final class LeaseCryptoService extends CryptoService {
+
+        private final Map<String, Gate> gates = new ConcurrentHashMap<>();
+        private final Map<String, AtomicInteger> invocations = new ConcurrentHashMap<>();
+        private final Set<String> failAfterRelease = ConcurrentHashMap.newKeySet();
+
+        private LeaseCryptoService(String... gatedItems) {
+            for (String item : gatedItems) {
+                gates.put(item, new Gate());
+            }
+        }
+
+        private void failAfterRelease(String item) {
+            failAfterRelease.add(item);
+            gates.computeIfAbsent(item, key -> new Gate());
+        }
+
+        private boolean awaitEntered(String item) throws InterruptedException {
+            Gate gate = gates.get(item);
+            return gate != null && gate.entered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+
+        private void unblock(String item) {
+            Gate gate = gates.get(item);
+            if (gate != null) {
+                gate.released.countDown();
+            }
+        }
+
+        private int count(String item) {
+            AtomicInteger counter = invocations.get(item);
+            return counter == null ? 0 : counter.get();
+        }
+
+        @Override
+        public HashResponse hash(HashRequest request) {
+            invocations.computeIfAbsent(request.content(), key -> new AtomicInteger()).incrementAndGet();
+            Gate gate = gates.get(request.content());
+            if (gate != null) {
+                gate.entered.countDown();
+                try {
+                    gate.released.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                if (failAfterRelease.contains(request.content())) {
+                    throw new IllegalStateException("stale worker failure for " + request.content());
+                }
+            }
+            return super.hash(request);
+        }
+
+        private static final class Gate {
+            private final CountDownLatch entered = new CountDownLatch(1);
+            private final CountDownLatch released = new CountDownLatch(1);
         }
     }
 }

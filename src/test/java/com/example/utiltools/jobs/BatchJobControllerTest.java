@@ -6,6 +6,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
@@ -13,6 +15,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
 import java.time.Instant;
+import java.time.Clock;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -26,8 +29,19 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(BatchJobController.class)
-@Import({BatchHashJobService.class, CryptoService.class, GlobalExceptionHandler.class})
+@Import({BatchHashJobService.class, CryptoService.class, GlobalExceptionHandler.class,
+        BatchJobControllerTest.ClockConfig.class})
 class BatchJobControllerTest {
+
+    /** The application-wide clock (see {@code RateLimitConfig}); slices need their own. */
+    @TestConfiguration
+    static class ClockConfig {
+
+        @Bean
+        Clock clock() {
+            return Clock.systemUTC();
+        }
+    }
 
     @Autowired
     private MockMvc mockMvc;
