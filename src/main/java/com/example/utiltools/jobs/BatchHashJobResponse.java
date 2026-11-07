@@ -22,6 +22,16 @@ import java.util.List;
  * /api/v1/utils/jobs/{jobId}/retry} then starts {@code attempt + 1}. The explicit 12-argument
  * constructor keeps callers compiled against the pre-lease shape working, with both lease fields
  * null.</p>
+ *
+ * <p>{@code completedItems} is the additive checkpoint projection: it reports how many leading
+ * items of the batch are durably hashed and retained by the job's private checkpoint prefix. It is
+ * {@code 0} before anything was committed (including on a {@code QUEUED} job and on a
+ * {@code CANCELLED} job, which discards its prefix), the committed prefix size while the job is
+ * {@code RUNNING} or {@code FAILED}, and {@code itemCount} once the job is {@code COMPLETED} and
+ * has published {@code results}. {@code results} stays null until completion, so a partial prefix
+ * is never disclosed as results. Being a primitive, it is serialized on every status; every
+ * pre-existing component keeps its name and meaning, and both earlier constructor shapes are
+ * retained.</p>
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record BatchHashJobResponse(
@@ -38,7 +48,8 @@ public record BatchHashJobResponse(
         int maxAttempts,
         List<JobAttempt> attempts,
         Instant executionLeaseExpiresAt,
-        Instant lastHeartbeatAt
+        Instant lastHeartbeatAt,
+        int completedItems
 ) {
 
     /**
@@ -50,5 +61,19 @@ public record BatchHashJobResponse(
             Instant completedAt, int attempt, int maxAttempts, List<JobAttempt> attempts) {
         this(jobId, idempotencyKey, status, itemCount, results, error, createdAt, startedAt, completedAt,
                 attempt, maxAttempts, attempts, null, null);
+    }
+
+    /**
+     * Backward-compatible constructor for callers compiled against the 14-component lease shape:
+     * such a caller cannot express a partial prefix, so the checkpoint projection is derived from
+     * the published results (0 while a job has not published them).
+     */
+    public BatchHashJobResponse(String jobId, String idempotencyKey, JobStatus status, int itemCount,
+            List<HashResponse> results, String error, Instant createdAt, Instant startedAt,
+            Instant completedAt, int attempt, int maxAttempts, List<JobAttempt> attempts,
+            Instant executionLeaseExpiresAt, Instant lastHeartbeatAt) {
+        this(jobId, idempotencyKey, status, itemCount, results, error, createdAt, startedAt, completedAt,
+                attempt, maxAttempts, attempts, executionLeaseExpiresAt, lastHeartbeatAt,
+                results == null ? 0 : results.size());
     }
 }

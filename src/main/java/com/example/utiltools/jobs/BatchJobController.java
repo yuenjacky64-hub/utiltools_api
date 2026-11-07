@@ -76,7 +76,9 @@ public class BatchJobController {
                     + "A RUNNING job carries an executionLeaseExpiresAt/lastHeartbeatAt lease that its "
                     + "worker renews before hashing each item; a job whose lease lapses is moved to FAILED "
                     + "with error EXECUTION_LEASE_EXPIRED, after which POST /api/v1/utils/jobs/{jobId}/retry "
-                    + "starts attempt+1")
+                    + "starts attempt+1. Hashing is checkpointed per item: completedItems reports how many "
+                    + "leading items are durably hashed (0..itemCount), results stays null until the job is "
+                    + "COMPLETED, and a retry resumes at completedItems instead of rehashing the prefix")
     public ApiResponse<BatchHashJobResponse> status(@PathVariable String jobId) {
         return ApiResponse.success(jobService.getJob(jobId), "Job status retrieved");
     }
