@@ -396,8 +396,21 @@ public class BatchHashJobService {
         // never to the id that created (or first retried) the job.
         String requestId = RequestContext.get();
         MutableJob job = requireJob(jobId); // unknown/evicted -> JobNotFoundException (404 JOB_NOT_FOUND)
+        // A retry that cannot succeed must not touch the client's counter at all: the reservation
+        // below is visible to concurrent submissions by the same client, so an ineligible retry
+        // checked only *after* it would briefly expose a spurious 429 window. This monitor section
+        // is the cheap fail-fast; the authoritative checks repeat after the reservation because the
+        // job can change state in between.
+        synchronized (job) {
+            if (jobs.get(job.jobId) != job) {
+                throw new JobNotFoundException(job.jobId);
+            }
+            if (job.status != JobStatus.FAILED || job.attempt >= job.maxAttempts) {
+                throw new JobRetryConflictException(job.jobId, job.status, job.attempt, job.maxAttempts);
+            }
+        }
         // REQ-06: the reservation belongs to the job's client, not to the caller, so a retry cannot
-        // escape to another bucket. It is taken under registryLock *before* the monitor, so an
+        // escape to another bucket. It is taken under registryLock *before* the monitor below, so an
         // exhausted quota refuses the retry before a single field of the FAILED snapshot is touched.
         reserveQuota(job);
         boolean keepReservation = false;

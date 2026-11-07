@@ -1531,6 +1531,7 @@ duplicate submission with the same key observes the `CANCELLED` snapshot until t
 | Cancelling a job that is `RUNNING`, `COMPLETED` or `FAILED` | `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Stop cancelling; poll `GET` for the terminal snapshot. A repeat `DELETE` on an already-`CANCELLED` job is `200`, not a conflict |
 | Retrying a `QUEUED`, `RUNNING`, `COMPLETED` or `CANCELLED` job, or a `FAILED` job at `maxAttempts` | `409 CONFLICT` | `JOB_RETRY_CONFLICT` | Only a `FAILED` job below `maxAttempts` can be retried. The job snapshot is unchanged by the rejection; resubmit if the attempt budget is spent |
 | Retry rejected because the bounded queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry `POST …/retry` again once capacity frees: the previous `FAILED` snapshot and its `attempt` are restored, so nothing is consumed |
+| The client already holds `utiltools.jobs.max-active-jobs-per-client` non-terminal jobs | `429 TOO_MANY_REQUESTS` | `JOB_QUOTA_EXCEEDED` | Retry once one of your **own** jobs finishes — the quota is per client identity, so other callers are unaffected. `details.limit` is the ceiling and `details.activeJobs` is your current count. Nothing is registered on a rejected submission (no job row, no `idempotencyKey` mapping, no consumed slot), and a rejected `POST …/retry` restores the previous `FAILED` snapshot with its `attempt` unchanged. A resubmission that repeats the same `idempotencyKey` **and** payload is a duplicate, not a new job: it returns the existing snapshot instead of a quota error |
 | Same `idempotencyKey` reused with a different `algorithm`, `items` or `secretKey` | `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | The first job is untouched and keeps running; the conflicting submission is discarded before registration (no job, no execution, no key residue). Pick a new `idempotencyKey` for a genuinely new payload |
 | Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit with a **new** `idempotencyKey` (or none). `POST …/retry` would re-run the same rejected algorithm and fail again; reusing the failed job's key replays its cached `FAILED` snapshot instead of re-executing |
 | Blank/empty `items` | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Send a non-empty list of non-blank strings (max 1000) |
@@ -1544,6 +1545,7 @@ utiltools.jobs.queue-capacity=100
 utiltools.jobs.retention-seconds=300
 utiltools.jobs.cleanup-interval-ms=60000
 utiltools.jobs.max-attempts=3
+utiltools.jobs.max-active-jobs-per-client=20
 ```
 
 | Property | Default | Meaning |
@@ -1553,6 +1555,7 @@ utiltools.jobs.max-attempts=3
 | `utiltools.jobs.retention-seconds` | `300` | How long a `COMPLETED`/`FAILED`/`CANCELLED` job (plus its idempotency key) is kept before eviction |
 | `utiltools.jobs.cleanup-interval-ms` | `60000` | Interval of the scheduled eviction pass (`@EnableScheduling`); `QUEUED`/`RUNNING` jobs are never evicted, and `CANCELLED` jobs are evicted on the same retention cutoff as `COMPLETED`/`FAILED` |
 | `utiltools.jobs.max-attempts` | `3` | Ceiling on execution attempts per job, where the first submission is attempt `1`; a `FAILED` job at this count answers `409 JOB_RETRY_CONFLICT`. Values below `1` are clamped to `1`. Global — it is not settable per request |
+| `utiltools.jobs.max-active-jobs-per-client` | `20` | Ceiling on one client's concurrent **non-terminal** jobs (`QUEUED` or `RUNNING`), keyed by the same identity the rate limiter resolves (see [G](#g-rate-limiting-interaction-explicit-decision)); one more submission answers `429 JOB_QUOTA_EXCEEDED` with `limit` and `activeJobs` in `details`. A slot is released as each job reaches `COMPLETED`, `FAILED` or `CANCELLED`. Values below `1` fail startup. Set it at or above `worker-count + queue-capacity` to restore pre-quota (unbounded per client) admission |
 
 #### G. Rate limiting interaction (explicit decision)
 
@@ -1566,9 +1569,12 @@ was added to `RateLimitFilter.shouldNotFilter` for the retry route either. Conse
 - A caller that submits a batch and then polls aggressively can exhaust its own budget and receive
   `429 RATE_LIMITED` (error `RATE_LIMITED`) *before* the job finishes. This is a client-throttling
   response, not a job failure: the job keeps running and is still retrievable once `Retry-After` elapses.
-- The two `429` classes are distinguishable by the `error` field: `RATE_LIMITED` (too many calls —
+- The three `429` classes are distinguishable by the `error` field: `RATE_LIMITED` (too many calls —
   honour `Retry-After`) vs `QUEUE_FULL` (executor saturated — retry the **same** `idempotencyKey`, or repeat the
-  same `POST …/retry`, since a rejected requeue leaves the job `FAILED` with its attempt count intact).
+  same `POST …/retry`, since a rejected requeue leaves the job `FAILED` with its attempt count intact) vs
+  `JOB_QUOTA_EXCEEDED` (you already hold `utiltools.jobs.max-active-jobs-per-client` non-terminal jobs — wait for
+  one of yours to reach `COMPLETED`, `FAILED` or `CANCELLED`; the exhausted gauge is in `details.limit` /
+  `details.activeJobs` and no job is registered by the rejected call).
 - Recommended polling: a batch completes in milliseconds to a few seconds on the default
   `worker-count=2`, so a small number of polls is enough — **poll no faster than the default rate-limit
   budget** of `utiltools.ratelimit.requests-per-window=60` per `utiltools.ratelimit.window-ms=60000`
@@ -1663,6 +1669,7 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | Batch job idempotency key reused with a different request payload |
 | `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Cancellation attempted on a batch job that is `RUNNING`, `COMPLETED` or `FAILED` |
 | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Batch job queue is saturated; retry after capacity frees |
+| `429 TOO_MANY_REQUESTS` | `JOB_QUOTA_EXCEEDED` | Client holds `utiltools.jobs.max-active-jobs-per-client` non-terminal batch jobs; `details` carries `limit` and `activeJobs` |
 | `429 TOO_MANY_REQUESTS` | `RATE_LIMITED` | Request budget for `/api/v1/utils/*` exhausted (see [Rate Limiting](#-rate-limiting)) |
 | `500 INTERNAL_SERVER_ERROR` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |
 

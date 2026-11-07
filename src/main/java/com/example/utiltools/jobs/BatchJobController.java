@@ -7,6 +7,7 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -25,14 +26,17 @@ public class BatchJobController {
     private final BatchHashJobService jobService;
     private final RateLimitProperties rateLimitProperties;
 
-    @org.springframework.beans.factory.annotation.Autowired
+    @Autowired
     public BatchJobController(BatchHashJobService jobService, RateLimitProperties rateLimitProperties) {
         this.jobService = jobService;
         this.rateLimitProperties = rateLimitProperties;
     }
 
     /**
-     * Compatibility constructor: no rate-limit configuration is available, so quota resolution
+     * Compatibility constructor for callers that inject no rate-limit configuration: the quota key
+     * is resolved against {@link RateLimitProperties}'s defaults (client remote address, with an
+     * untrusted {@code X-Forwarded-For}), i.e. exactly the identity the rate limiter would use under
+     * that configuration. Only {@code BatchHashJobService.submit(request)} without a caller identity
      * falls back to {@link ClientKeyResolver}'s documented {@code unknown} key.
      */
     public BatchJobController(BatchHashJobService jobService) {
