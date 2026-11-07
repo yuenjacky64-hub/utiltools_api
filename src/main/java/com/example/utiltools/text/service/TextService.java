@@ -27,7 +27,7 @@ import java.util.regex.PatternSyntaxException;
 @Service
 public class TextService {
 
-    private static final String ALLOWED_OPERATIONS = "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG";
+    private static final String ALLOWED_OPERATIONS = "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE";
 
     private static final Pattern SENTENCE_SEPARATORS = Pattern.compile("[.!?]+");
 
@@ -40,6 +40,7 @@ public class TextService {
     private static final String SNAKE = "SNAKE";
     private static final String KEBAB = "KEBAB";
     private static final String SLUG = "SLUG";
+    private static final String SENTENCE_CASE = "SENTENCE_CASE";
 
     public TextTransformResponse transform(TextTransformRequest request) {
         String text = request.text();
@@ -52,6 +53,7 @@ public class TextService {
             case SNAKE -> joinTransformed(text, "_", TextService::lowerCase);
             case KEBAB -> joinTransformed(text, "-", TextService::lowerCase);
             case SLUG -> slug(text);
+            case SENTENCE_CASE -> sentenceCase(text);
             default -> throw new IllegalArgumentException("Unsupported operation '" + request.operation()
                     + "'. Allowed values: " + ALLOWED_OPERATIONS);
         };
@@ -302,5 +304,46 @@ public class TextService {
 
     private static String lowerCase(String token) {
         return token.toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * Sentence case: the first letter of each sentence is upper-cased, every other letter in that
+     * sentence is lower-cased, and every non-letter is copied through unchanged. A sentence ends at
+     * each {@link #SENTENCE_SEPARATORS} match; word boundaries use the same predicate as
+     * {@link #tokenize(String)}. Locale.ROOT only, so a journalled result always replays exactly.
+     */
+    private static String sentenceCase(String text) {
+        StringBuilder result = new StringBuilder(text.length());
+        Matcher separators = SENTENCE_SEPARATORS.matcher(text);
+        boolean newSentence = true;
+        int cursor = 0;
+        while (true) {
+            boolean found = separators.find();
+            int end = found ? separators.start() : text.length();
+            newSentence = appendSentenceSegment(result, text.substring(cursor, end), newSentence);
+            if (!found) {
+                return result.toString();
+            }
+            result.append(text, separators.start(), separators.end());
+            newSentence = true;
+            cursor = separators.end();
+        }
+    }
+
+    /** Copies one separator-free segment, upper-casing its first letter/digit when starting a sentence. */
+    private static boolean appendSentenceSegment(StringBuilder result, String segment, boolean startSentence) {
+        boolean newSentence = startSentence;
+        for (int index = 0; index < segment.length(); ) {
+            int codePoint = segment.codePointAt(index);
+            String character = new String(Character.toChars(codePoint));
+            if (Character.isLetterOrDigit(codePoint)) {
+                result.append(newSentence ? character.toUpperCase(Locale.ROOT) : character.toLowerCase(Locale.ROOT));
+                newSentence = false;
+            } else {
+                result.append(character);
+            }
+            index += Character.charCount(codePoint);
+        }
+        return newSentence;
     }
 }

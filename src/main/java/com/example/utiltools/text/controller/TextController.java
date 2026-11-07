@@ -29,7 +29,7 @@ public class TextController {
 
     @PostMapping("/transform")
     @Operation(summary = "Transform text case and format",
-            description = "Applies one deterministic operation to the supplied text: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB or SLUG. "
+            description = "Applies one deterministic operation to the supplied text: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG or SENTENCE_CASE. "
                     + "The response echoes the normalised operation plus the result, whether it changed, and the code-point length of the result. "
                     + "Every call is journalled as TEXT_TRANSFORM and can be replayed.")
     public ApiResponse<TextTransformResponse> transform(@Valid @RequestBody TextTransformRequest request) {
