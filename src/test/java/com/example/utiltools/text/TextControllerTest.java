@@ -168,4 +168,123 @@ class TextControllerTest {
         assertThat(after.completedAt()).isEqualTo(completedAt);
         assertThat(after.result()).isEqualTo(before.result());
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/replace - should replace a regex with group references")
+    void shouldReplaceTextRegexEnvelope() throws Exception {
+        String body = """
+                {
+                    "text": "a1 b2",
+                    "pattern": "(\\\\w)(\\\\d)",
+                    "replacement": "$2$1"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/text/replace")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Text replaced successfully"))
+                .andExpect(jsonPath("$.data.result").value("1a 2b"))
+                .andExpect(jsonPath("$.data.replacements").value(2))
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.length").value(5));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/replace - invalid regex returns 400 BAD_REQUEST and is journalled FAILED")
+    void shouldRejectInvalidRegexWithBadRequest() throws Exception {
+        String body = """
+                {
+                    "text": "abc",
+                    "pattern": "(",
+                    "replacement": "x"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/text/replace")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("Invalid regex pattern '('")));
+
+        mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_REPLACE"))
+                .andExpect(jsonPath("$.data[0].state").value("FAILED"))
+                .andExpect(jsonPath("$.data[0].errorCode").value("BAD_REQUEST"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/replace - blank text, absent replacement and oversized fields return 400 VALIDATION_ERROR")
+    void shouldRejectInvalidReplaceWithValidationError() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/replace")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "   ", "pattern": "a", "replacement": "b"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("text is required")));
+
+        mockMvc.perform(post("/api/v1/utils/text/replace")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "abc", "pattern": "a"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("replacement is required")));
+
+        String oversized = objectMapper.writeValueAsString(
+                java.util.Map.of("text", "abc", "pattern", "a".repeat(513), "replacement", "b"));
+        mockMvc.perform(post("/api/v1/utils/text/replace")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(oversized))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("pattern must be at most 512 characters")));
+    }
+
+    @Test
+    @DisplayName("a replace call is journalled as TEXT_REPLACE and replays as VERIFIED")
+    void shouldJournalAndReplayTextReplace() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/replace")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "Hello HELLO", "pattern": "hello", "replacement": "bye",
+                                 "caseInsensitive": true}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.result").value("bye bye"))
+                .andExpect(jsonPath("$.data.replacements").value(2));
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_REPLACE"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.result").value("bye bye"))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        AuditEntry before = journal.find(id).orElseThrow();
+        Instant completedAt = before.completedAt();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("TEXT_REPLACE"))
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.result.result").value("bye bye"))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"));
+
+        AuditEntry after = journal.find(id).orElseThrow();
+        assertThat(after.operation()).isEqualTo(OperationType.TEXT_REPLACE);
+        assertThat(after.completedAt()).isEqualTo(completedAt);
+        assertThat(after.result()).isEqualTo(before.result());
+    }
 }

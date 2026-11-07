@@ -44,7 +44,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, current global time |
 | **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), UUID v4 batch generation and time-ordered RFC 9562 UUID v7 generation (`version=V4|V7`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit |
-| **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`) and code-point accurate text statistics (characters, words, lines, sentences) |
+| **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
 
 ---
 
@@ -148,6 +148,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/patch` | Apply an ordered RFC 6902-style patch atomically, with reverse-order rollback and audit |
 | `POST` | `/api/v1/utils/text/transform` | Apply a deterministic case/format operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`) to a string |
 | `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
+| `POST` | `/api/v1/utils/text/replace` | Replace every (or, with `all=false`, the first) occurrence of a literal or regex `pattern`, reporting `replacements`, `changed` and code-point `length` |
 | `POST` | `/api/v1/utils/jobs/hash` | Submit a bounded async batch-hash job; `202` with a job id, idempotent via `idempotencyKey` |
 | `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `COMPLETED` / `FAILED` / `CANCELLED` |
 | `DELETE` | `/api/v1/utils/jobs/{jobId}` | Cancel a `QUEUED` job (`200`, idempotent); `409` `JOB_CANCELLATION_CONFLICT` once it is `RUNNING`/`COMPLETED`/`FAILED` |
@@ -929,9 +930,9 @@ ignored — and the next admitted caller claims a fresh generation. The schedule
 
 ## 🧾 Operation Journal & Replay Verification
 
-All thirteen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+All fourteen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
 `datetime/shift`, `crypto/hash`, `crypto/base64`, `crypto/url`, `crypto/uuid`, `json/format`, `json/validate`,
-`json/query`, `text/transform`, `text/stats` — are recorded in a **bounded in-memory journal** so a failed
+`json/query`, `text/transform`, `text/stats`, `text/replace` — are recorded in a **bounded in-memory journal** so a failed
 hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
 can be verified against the original outcome without ever mutating the original entry.
 `GET /api/v1/utils/datetime/timezones` is read-only catalogue metadata and is not journalled.
@@ -1080,8 +1081,8 @@ claim.
 
 ### 4. Text Transformation & Statistics Utility
 
-Deterministic, locale-independent (`Locale.ROOT`) text helpers. Both endpoints are pure functions of
-their request body, so every call is journalled and replayable.
+Deterministic, locale-independent (`Locale.ROOT`) text helpers. Every endpoint here is a pure function of
+its request body, so every call is journalled and replayable.
 
 #### Allowed operations
 
@@ -1159,15 +1160,91 @@ curl -X POST http://localhost:8080/api/v1/utils/text/stats \
 | `lines` | newline-separated segments; `\r\n` and `\r` are normalised to `\n`, so a trailing newline yields a final empty segment |
 | `sentences` | non-blank segments produced by splitting on runs of `.`, `!` and `?` |
 
+#### Replace
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/text/replace \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "a1 b2", "pattern": "(\\w)(\\d)", "replacement": "$2$1"}'
+```
+
+```json
+{
+  "success": true,
+  "message": "Text replaced successfully",
+  "data": {
+    "result": "1a 2b",
+    "replacements": 2,
+    "changed": true,
+    "length": 5
+  },
+  "timestamp": "2026-01-01T00:00:00Z",
+  "requestId": "3d9b7e10-4c2a-4f6b-8e51-9a0c1d2b3e44"
+}
+```
+
+| Field | Type | Required | Default | Meaning |
+| :--- | :--- | :--- | :--- | :--- |
+| `text` | string | yes | — | Input text, at most 100000 characters |
+| `pattern` | string | yes | — | Literal or regular-expression pattern, at most 512 characters |
+| `replacement` | string | yes | — | Replacement text, at most 100000 characters |
+| `all` | boolean | no | `true` | `true` replaces every match, `false` replaces only the first |
+| `literal` | boolean | no | `false` | `true` treats `pattern` and `replacement` verbatim, `false` treats `pattern` as a regex |
+| `caseInsensitive` | boolean | no | `false` | `true` matches regardless of case, folding **ASCII letters only** (`Pattern.CASE_INSENSITIVE` without `UNICODE_CASE`) |
+
+| Response field | Definition |
+| :--- | :--- |
+| `result` | the text after replacement |
+| `replacements` | number of matches actually replaced (`0` when the pattern does not match) |
+| `changed` | `true` when `result` differs from the supplied `text` |
+| `length` | **Unicode code-point count of `result`** (an emoji counts once) |
+
+**Literal vs regex.**
+
+* `literal=false` (default) compiles `pattern` as a `java.util.regex` pattern, so metacharacters are
+  special and `$n` / `${name}` group references expand in `replacement`. For example
+  `{"text": "2026-01-02", "pattern": "(\\d{4})-(\\d{2})-(\\d{2})", "replacement": "$3/$2/$1"}`
+  returns `"02/01/2026"`.
+* `literal=true` quotes both the pattern (`Pattern.quote`) and the replacement
+  (`Matcher.quoteReplacement`), so `{"text": "a.b", "pattern": ".", "replacement": "X", "literal": true}`
+  returns `"aXb"` with `replacements: 1`, and a `$` or `\\` in `replacement` stays a literal character.
+* `all=false` replaces only the first match: `{"text": "aaa", "pattern": "a", "replacement": "b", "all": false}`
+  returns `"baa"` with `replacements: 1`.
+* `caseInsensitive=true`: `{"text": "Hello HELLO", "pattern": "hello", "replacement": "bye", "caseInsensitive": true}`
+  returns `"bye bye"` with `replacements: 2`. Folding is ASCII-only — the pattern is compiled with
+  `Pattern.CASE_INSENSITIVE` and no `UNICODE_CASE`, so `É`/`é` do **not** match each other; spell both cases
+  in the pattern (e.g. `[Éé]`) when you need non-ASCII folding.
+
+**Errors and bounds.** Blank `text`/`pattern`, an absent `replacement` or an over-limit `text`/`pattern`/
+`replacement` answer `400 VALIDATION_ERROR` with the offending constraint messages. An invalid regex (or an
+out-of-range `$n` group reference) answers `400 BAD_REQUEST` with `Invalid regex pattern '<pattern>'`. Because a
+100000-character text with 100000 one-character matches and a 100000-character replacement would allocate 10^10
+characters, the result is bounded to **1000000 characters**. The bound is enforced *before* the result is
+materialised: `replace` accumulates the output match by match with `Matcher.appendReplacement` and checks each
+append against the exact expanded length of that match's replacement (so `$n`/`${name}` group references cannot
+smuggle an oversized expansion past the check), and the trailing unmatched text is checked too. A request that
+would exceed the bound answers `400 BAD_REQUEST` with `replacement result exceeds 1000000 characters` instead of
+allocating, and only the matches actually replaced count — `all=false` is bounded by its single replacement, not
+by every match. There is no regex
+timeout in this service, so keep untrusted patterns simple — the route sits behind the standard
+`/api/v1/utils/**` rate limit.
+
 #### Journal & replay
 
-Both endpoints call `AuditedOperations`, so every call is recorded as `TEXT_TRANSFORM` or
-`TEXT_STATS` in `GET /api/v1/utils/audit/entries`, with the request (redacted like every other
-operation) and the response. Both are deterministic, so
+All three endpoints call `AuditedOperations`, so every call is recorded as `TEXT_TRANSFORM`,
+`TEXT_STATS` or `TEXT_REPLACE` in `GET /api/v1/utils/audit/entries`, with the request (redacted like every other
+operation) and the response. A replace that compiles and reaches `TextService` but then fails — invalid regex,
+an out-of-range `$n` group reference, or the output bound — is recorded as `TEXT_REPLACE` with `state = FAILED`
+and `errorCode = BAD_REQUEST`. A *bean-validation* rejection (blank `text`/`pattern`, absent `replacement`,
+over-limit fields) is raised while Spring MVC resolves the `@Valid` argument, before the controller body runs, so
+— exactly like `/transform` and `/stats` — it answers `400 VALIDATION_ERROR` and is **not** journalled. All three
+are deterministic, so
 `POST /api/v1/utils/audit/entries/{id}/replay` re-runs the stored request and answers
-`replay.state = VERIFIED` without mutating the entry's original `state`, `result` or `completedAt`.
-A body larger than `utiltools.audit.max-replay-bytes` is still transformed but stored as
-non-replayable, so its replay answers the existing `409 REPLAY_CONFLICT`.
+`replay.state = VERIFIED` with `detail = results match` without mutating the entry's original `state`, `result`
+or `completedAt`.
+A body larger than `utiltools.audit.max-replay-bytes` is still processed but stored as
+non-replayable, so its replay answers the existing `409 REPLAY_CONFLICT` (a replace request with a 100000-character
+`text` and `replacement` is large enough to hit this).
 
 ---
 
@@ -1571,8 +1648,8 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `crypto/url` encode/decode, 400 `BAD_REQUEST` vs `VALIDATION_ERROR`, and `CRYPTO_URL` journal/replay (`VERIFIED`), including `version=V4|V7` selection, compact UUIDv7, and the 400 unified envelope for an unknown `version`.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries, six-op patch success, rollback to byte-identical original, missing paths, malformed pointers, `-` append, dry runs, input-not-mutated.
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, and empty-`operations` validation rejection.
-- **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`), diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points.
-- **`TextControllerTest`**: Text endpoints MockMvc suite, including the snake-case transform envelope, diacritic slugging, `400 BAD_REQUEST` for an unknown operation, `400 VALIDATION_ERROR` for blank text, and a `TEXT_TRANSFORM` entry listed by `/audit/entries` and replayed as `VERIFIED`.
+- **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`), diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points; plus replace coverage: `$n` group expansion, literal metacharacters, `all=false` first-match-only, case-insensitive matching, no-match results, invalid-regex rejection, code-point `length`, every request constraint bound, and the 1000000-character result bound.
+- **`TextControllerTest`**: Text endpoints MockMvc suite, including the snake-case transform envelope, diacritic slugging, `400 BAD_REQUEST` for an unknown operation, `400 VALIDATION_ERROR` for blank text, and a `TEXT_TRANSFORM` entry listed by `/audit/entries` and replayed as `VERIFIED`; a replace envelope with `$n` groups, `400 BAD_REQUEST` for an invalid regex (journalled `TEXT_REPLACE`/`FAILED`), `400 VALIDATION_ERROR` for blank text, an absent `replacement` and an oversized `pattern`, and a `TEXT_REPLACE` entry listed by `/audit/entries` and replayed as `VERIFIED`.
 - **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, key/payload fingerprint conflict detection (changed items, reordered items, changed algorithm or `secretKey`), 8-thread different-payload races, identical-key/identical-payload retries that mint no second execution, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff. Retry coverage: transient failure then a successful retry (`attempt` 2, attempt-1 `FAILED` entry retained), `RUNNING`/`COMPLETED`/`CANCELLED` conflicts that leave the snapshot unchanged, attempt exhaustion at `maxAttempts`, stale-worker fencing (a superseded generation writes nothing after a retry), and queue-rejection rollback that leaves the job `FAILED` with an unconsumed attempt while a later retry succeeds.
 - **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202 submit/retry, 400, 404 `JOB_NOT_FOUND`, 409 `IDEMPOTENCY_CONFLICT`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND`, 409 `JOB_CANCELLATION_CONFLICT`, and `POST …/retry` 202 `QUEUED` vs 409 `JOB_RETRY_CONFLICT` with `jobId`/`status`/`attempt`/`maxAttempts` details).
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.
