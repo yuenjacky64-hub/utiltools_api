@@ -8,15 +8,18 @@ import com.example.utiltools.common.RequestContext;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
+import com.example.utiltools.ratelimit.ClientKeyResolver;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.RecordComponent;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -1734,5 +1737,559 @@ class BatchHashJobServiceTest {
         public AuditEntry fail(String id, String errorCode) {
             throw new IllegalStateException("journal fail unavailable");
         }
+    }
+    // ---------------------------------------------------------------------------------------------
+    // Per-client active-job quota: admission, release, rollback, retry and concurrency (REQ-01..REQ-08)
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * DOD-21 / REQ-01, REQ-03, REQ-04: a barrier of submitters on one contended client admits exactly
+     * the configured limit. The refused submissions carry the bounded {@code limit}/{@code activeJobs}
+     * pair, register no job row and no idempotency mapping, and every admitted job executes once.
+     */
+    @Test
+    @DisplayName("quota - a barrier of submitters admits exactly the per-client limit and leaves no residue")
+    void shouldAdmitExactlyThePerClientLimitUnderBarrier() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("blocker");
+        int limit = 3;
+        service = new BatchHashJobService(crypto, 1, 20, 300, 3, LEASE_SECONDS, 5000, limit,
+                Clock.systemUTC());
+        String client = "203.0.113.61";
+        int threads = 12;
+        CyclicBarrier barrier = new CyclicBarrier(threads);
+        ExecutorService submitters = Executors.newFixedThreadPool(threads);
+        List<BatchHashJobResponse> accepted = Collections.synchronizedList(new ArrayList<>());
+        List<JobQuotaExceededException> refused = Collections.synchronizedList(new ArrayList<>());
+        try {
+            List<Future<?>> futures = new ArrayList<>();
+            for (int i = 0; i < threads; i++) {
+                String key = "barrier-key-" + i;
+                futures.add(submitters.submit(() -> {
+                    barrier.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    try {
+                        accepted.add(service.submit(
+                                new BatchHashRequest("SHA-256", List.of("blocker"), null, key), client));
+                    } catch (JobQuotaExceededException e) {
+                        refused.add(e);
+                    }
+                    return null;
+                }));
+            }
+            for (Future<?> future : futures) {
+                future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+        } finally {
+            submitters.shutdownNow();
+        }
+
+        assertThat(accepted).hasSize(limit);
+        assertThat(refused).hasSize(threads - limit);
+        for (JobQuotaExceededException e : refused) {
+            assertThat(e.limit()).isEqualTo(limit);
+            assertThat(e.activeJobs()).isEqualTo(limit);
+        }
+        assertThat(service.activeJobsForClient(client)).isEqualTo(limit);
+        assertThat(registryKeys("jobs")).hasSize(limit);
+        assertThat(registryKeys("idempotencyIndex")).hasSize(limit); // no mapping for a refused key
+
+        crypto.unblock("blocker");
+        for (BatchHashJobResponse response : List.copyOf(accepted)) {
+            assertThat(awaitStatus(response.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+        }
+        awaitActiveJobs(client, 0);
+        assertThat(crypto.count("blocker")).isEqualTo(limit); // only admitted jobs ever ran
+        assertThat(registryKeys("idempotencyIndex")).hasSize(limit); // ...and no orphan entry appeared
+    }
+
+    /**
+     * DOD-02 / REQ-04: a refused submission registers no job row and no idempotency mapping, and the
+     * client's counter is left at the limit it observed.
+     */
+    @Test
+    @DisplayName("quota - a submission at the limit is refused without a job row or idempotency mapping")
+    void shouldRejectSubmissionAtQuotaWithoutLeavingJobOrIdempotencyResidue() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("blocker");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 1,
+                Clock.systemUTC());
+        String client = "203.0.113.62";
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("blocker"), null, "admitted-key"), client);
+        assertThat(crypto.awaitEntered("blocker")).isTrue();
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+        Set<String> jobsBefore = registryKeys("jobs");
+        Set<String> keysBefore = registryKeys("idempotencyIndex");
+
+        assertThatThrownBy(() -> service.submit(
+                new BatchHashRequest("SHA-256", List.of("overflow"), null, "refused-key"), client))
+                .isInstanceOf(JobQuotaExceededException.class)
+                .hasMessageContaining("limit=1")
+                .hasMessageContaining("activeJobs=1");
+
+        assertThat(registryKeys("jobs")).isEqualTo(jobsBefore);
+        assertThat(registryKeys("idempotencyIndex")).isEqualTo(keysBefore).containsExactly("admitted-key");
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+        assertThatThrownBy(() -> service.getJob("refused-key"))
+                .isInstanceOf(JobNotFoundException.class);
+
+        crypto.unblock("blocker");
+        awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+        awaitActiveJobs(client, 0);
+    }
+
+    /**
+     * DOD-03 (COMPLETED half) / REQ-05: the slot held by a COMPLETED job and by a worker-FAILED job is
+     * released, so a single-slot quota admits the next job in both cases.
+     */
+    @Test
+    @DisplayName("quota - release on COMPLETED and on worker FAILED frees the slot for the next job")
+    void shouldReleaseQuotaOnCompletedAndWorkerFailed() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("gate");
+        crypto.failAfterRelease("boom");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 1,
+                Clock.systemUTC());
+        String client = "203.0.113.63";
+
+        BatchHashJobResponse failing = service.submit(
+                new BatchHashRequest("SHA-256", List.of("boom"), null, null), client);
+        assertThat(crypto.awaitEntered("boom")).isTrue();
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+        crypto.unblock("boom");
+        assertThat(awaitStatus(failing.jobId(), JobStatus.FAILED).error()).contains("boom");
+        awaitActiveJobs(client, 0);
+
+        // The released slot admits a second job immediately, and its COMPLETED transition releases it.
+        BatchHashJobResponse succeeding = service.submit(
+                new BatchHashRequest("SHA-256", List.of("gate"), null, null), client);
+        assertThat(crypto.awaitEntered("gate")).isTrue();
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+        crypto.unblock("gate");
+        awaitStatus(succeeding.jobId(), JobStatus.COMPLETED);
+        awaitActiveJobs(client, 0);
+    }
+
+    /**
+     * DOD-03 (reaper + cancel halves) / REQ-05: the scheduled execution reaper's FAILED write and a
+     * QUEUED cancellation each release exactly one slot.
+     */
+    @Test
+    @DisplayName("quota - release on reaper FAILED and on QUEUED cancellation frees one slot each")
+    void shouldReleaseQuotaOnReaperFailedAndCancellation() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stall", "cancelled");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 1, clock);
+        String client = "198.51.100.4";
+
+        BatchHashJobResponse stalled = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stall"), null, null), client);
+        assertThat(crypto.awaitEntered("stall")).isTrue();
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        assertThat(service.getJob(stalled.jobId()).status()).isEqualTo(JobStatus.FAILED);
+        assertThat(service.getJob(stalled.jobId()).error())
+                .isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        awaitActiveJobs(client, 0);
+
+        // The freed slot admits a job while the stale worker is still blocked inside hash(); with one
+        // worker it stays QUEUED, so cancellation is the transition that has to release it.
+        BatchHashJobResponse queued = service.submit(
+                new BatchHashRequest("SHA-256", List.of("cancelled"), null, null), client);
+        assertThat(queued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+        assertThat(service.cancel(queued.jobId()).status()).isEqualTo(JobStatus.CANCELLED);
+        awaitActiveJobs(client, 0);
+
+        crypto.unblock("stall"); // the fenced worker returns and must not release a second slot
+        awaitActiveJobs(client, 0);
+        assertThat(service.getJob(queued.jobId()).status()).isEqualTo(JobStatus.CANCELLED);
+    }
+
+    /**
+     * DOD-03 (no double release) / REQ-05: a worker that returns after the reaper already failed its
+     * attempt cannot decrement the client's counter again — the job it was covering has been replaced
+     * by a live reservation.
+     */
+    @Test
+    @DisplayName("quota - a late worker fenced by the reaper cannot decrement the counter a second time")
+    void shouldNotReleaseQuotaTwiceWhenLateWorkerReturnsAfterReap() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stale", "fresh");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 1, clock);
+        String client = "198.51.100.7";
+
+        BatchHashJobResponse stale = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stale"), null, null), client);
+        assertThat(crypto.awaitEntered("stale")).isTrue();
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        awaitActiveJobs(client, 0);
+
+        BatchHashJobResponse fresh = service.submit(
+                new BatchHashRequest("SHA-256", List.of("fresh"), null, null), client);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+
+        crypto.unblock("stale"); // release the stale worker: it must fail its fence and release nothing
+        assertThat(crypto.awaitEntered("fresh")).isTrue(); // ...and the new attempt takes the worker
+        assertThat(service.getJob(stale.jobId()).status()).isEqualTo(JobStatus.FAILED);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1); // no second decrement
+
+        crypto.unblock("fresh");
+        awaitStatus(fresh.jobId(), JobStatus.COMPLETED);
+        awaitActiveJobs(client, 0);
+    }
+
+    /**
+     * DOD-04 / REQ-05: terminal jobs have already released their slot, so a repeated cancellation and
+     * the eviction pass are both quota-neutral.
+     */
+    @Test
+    @DisplayName("quota - repeated cancellation and eviction release nothing further")
+    void shouldNotReleaseQuotaAgainOnEvictionOrRepeatedCancel() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("blocker");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 2, clock);
+        String holder = "198.51.100.8";
+        String client = "198.51.100.9";
+
+        service.submit(new BatchHashRequest("SHA-256", List.of("blocker"), null, null), holder);
+        assertThat(crypto.awaitEntered("blocker")).isTrue(); // the only worker is occupied
+
+        BatchHashJobResponse queued = service.submit(
+                new BatchHashRequest("SHA-256", List.of("victim"), null, "evict-key"), client);
+        assertThat(queued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+
+        assertThat(service.cancel(queued.jobId()).status()).isEqualTo(JobStatus.CANCELLED);
+        awaitActiveJobs(client, 0);
+        assertThat(service.cancel(queued.jobId()).status()).isEqualTo(JobStatus.CANCELLED); // idempotent
+        assertThat(service.activeJobsForClient(client)).isZero();
+        assertThat(service.activeJobsForClient(holder)).isEqualTo(1);
+
+        assertThat(service.evictExpiredJobs(clock.instant().plusSeconds(301))).isEqualTo(1);
+        assertThatThrownBy(() -> service.getJob(queued.jobId())).isInstanceOf(JobNotFoundException.class);
+        assertThat(service.activeJobsForClient(client)).isZero(); // eviction released nothing
+        assertThat(service.activeJobsForClient(holder)).isEqualTo(1); // RUNNING job keeps its slot
+
+        crypto.unblock("blocker");
+    }
+
+    /**
+     * DOD-05 (both halves) / REQ-06: a retry re-acquires a slot before FAILED -> QUEUED; when the
+     * client is at its limit the job stays FAILED with its attempt count untouched.
+     */
+    @Test
+    @DisplayName("quota - retry re-acquires a slot and leaves the FAILED snapshot intact when exhausted")
+    void shouldReacquireQuotaOnRetryAndLeaveFailedSnapshotWhenExhausted() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("gate");
+        crypto.failAfterRelease("boom");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 1,
+                Clock.systemUTC());
+        String client = "192.0.2.10";
+
+        BatchHashJobResponse submitted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("boom"), null, null), client);
+        assertThat(crypto.awaitEntered("boom")).isTrue();
+        crypto.unblock("boom");
+        BatchHashJobResponse failed = awaitStatus(submitted.jobId(), JobStatus.FAILED);
+        awaitActiveJobs(client, 0);
+
+        BatchHashJobResponse blocking = service.submit(
+                new BatchHashRequest("SHA-256", List.of("gate"), null, null), client);
+        assertThat(crypto.awaitEntered("gate")).isTrue();
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+
+        BatchHashJobResponse atLimit = service.getJob(failed.jobId());
+        assertThatThrownBy(() -> service.retry(failed.jobId()))
+                .isInstanceOf(JobQuotaExceededException.class)
+                .hasMessageContaining("limit=1")
+                .hasMessageContaining("activeJobs=1");
+        assertThat(service.getJob(failed.jobId())).isEqualTo(atLimit); // FAILED, attempt unchanged
+        assertThat(atLimit.attempt()).isEqualTo(1);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1); // refused retry reserved nothing
+
+        crypto.unblock("gate");
+        awaitStatus(blocking.jobId(), JobStatus.COMPLETED);
+        awaitActiveJobs(client, 0);
+
+        BatchHashJobResponse requeued = service.retry(failed.jobId());
+        assertThat(requeued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(requeued.attempt()).isEqualTo(2);
+        // The retry reserved a slot before FAILED -> QUEUED; the single worker may already have
+        // re-failed the attempt (releasing it again) by the time we look, so the observation is
+        // bounded rather than exactly one.
+        assertThat(service.activeJobsForClient(client)).isBetween(0, 1);
+
+        awaitStatus(failed.jobId(), JobStatus.FAILED);
+        awaitActiveJobs(client, 0);
+    }
+
+    /**
+     * DOD-05 (rejected requeue) / REQ-06: when the executor rejects the requeued attempt the previous
+     * FAILED snapshot is restored, the attempt count is not consumed, and the reservation is released.
+     */
+    @Test
+    @DisplayName("quota - a requeued attempt rejected by the executor restores FAILED and releases the slot")
+    void shouldRestoreFailedSnapshotAndReleaseOnRejectedRetry() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("gate");
+        crypto.failAfterRelease("boom");
+        service = new BatchHashJobService(crypto, 1, 1, 300, 3, LEASE_SECONDS, 5000, 3,
+                Clock.systemUTC());
+        String client = "192.0.2.11";
+
+        BatchHashJobResponse submitted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("boom"), null, null), client);
+        assertThat(crypto.awaitEntered("boom")).isTrue();
+        crypto.unblock("boom");
+        BatchHashJobResponse failed = awaitStatus(submitted.jobId(), JobStatus.FAILED);
+        awaitActiveJobs(client, 0);
+
+        service.submit(new BatchHashRequest("SHA-256", List.of("gate"), null, null), client);
+        assertThat(crypto.awaitEntered("gate")).isTrue(); // occupies the only worker
+        BatchHashJobResponse queued = service.submit(
+                new BatchHashRequest("SHA-256", List.of("queued"), null, null), client);
+        assertThat(queued.status()).isEqualTo(JobStatus.QUEUED); // ...and the single queue slot
+        assertThat(service.activeJobsForClient(client)).isEqualTo(2);
+
+        BatchHashJobResponse before = service.getJob(failed.jobId());
+        assertThatThrownBy(() -> service.retry(failed.jobId()))
+                .isInstanceOf(JobQueueFullException.class)
+                .hasMessageContaining("queue-capacity=1");
+
+        assertThat(service.getJob(failed.jobId())).isEqualTo(before); // FAILED + attempt 1 restored
+        assertThat(before.attempt()).isEqualTo(1);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(2); // the retry's slot was released
+
+        crypto.unblock("gate");
+        awaitActiveJobs(client, 0);
+    }
+
+    /**
+     * DOD-07 (duplicate half) / REQ-03: at the quota boundary a same-key/same-payload duplicate returns
+     * the existing job instead of a quota error, and consumes no second slot.
+     */
+    @Test
+    @DisplayName("quota - a duplicate submission at the boundary returns the existing job")
+    void shouldReturnExistingJobForDuplicateSubmissionAtQuotaBoundary() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("gate");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 1,
+                Clock.systemUTC());
+        String client = "203.0.113.20";
+        BatchHashRequest request = new BatchHashRequest("SHA-256", List.of("gate"), null, "boundary-key");
+
+        BatchHashJobResponse first = service.submit(request, client);
+        assertThat(crypto.awaitEntered("gate")).isTrue();
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+
+        BatchHashJobResponse duplicate = service.submit(request, client);
+        assertThat(duplicate.jobId()).isEqualTo(first.jobId());
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1); // no second slot
+        assertThat(registryKeys("jobs")).hasSize(1);
+
+        crypto.unblock("gate");
+        awaitStatus(first.jobId(), JobStatus.COMPLETED);
+        awaitActiveJobs(client, 0);
+    }
+
+    /** DOD-07 (independent clients) / REQ-01: distinct client keys hold distinct counters. */
+    @Test
+    @DisplayName("quota - different clients are admitted independently of each other's limit")
+    void shouldAdmitDifferentClientsIndependently() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("gate");
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3, LEASE_SECONDS, 5000, 1,
+                Clock.systemUTC());
+        String first = "203.0.113.31";
+        String second = "203.0.113.32";
+
+        BatchHashJobResponse firstJob = service.submit(
+                new BatchHashRequest("SHA-256", List.of("gate"), null, null), first);
+        BatchHashJobResponse secondJob = service.submit(
+                new BatchHashRequest("SHA-256", List.of("gate"), null, null), second);
+        assertThat(service.activeJobsForClient(first)).isEqualTo(1);
+        assertThat(service.activeJobsForClient(second)).isEqualTo(1);
+
+        assertThatThrownBy(() -> service.submit(
+                new BatchHashRequest("SHA-256", List.of("other"), null, null), first))
+                .isInstanceOf(JobQuotaExceededException.class);
+        assertThat(service.activeJobsForClient(second)).isEqualTo(1); // untouched by the other client
+
+        crypto.unblock("gate");
+        awaitStatus(firstJob.jobId(), JobStatus.COMPLETED);
+        awaitStatus(secondJob.jobId(), JobStatus.COMPLETED);
+        awaitActiveJobs(first, 0);
+        awaitActiveJobs(second, 0);
+    }
+
+    /**
+     * DOD-07 (conflict half) / REQ-03: the idempotency conflict is decided before any quota is read, so
+     * a conflicting submission at the limit answers CONFLICT rather than a quota error.
+     */
+    @Test
+    @DisplayName("quota - an idempotency conflict is reported before quota is consumed")
+    void shouldRejectIdempotencyConflictBeforeConsumingQuota() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("gate");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 1,
+                Clock.systemUTC());
+        String client = "203.0.113.33";
+
+        BatchHashJobResponse admitted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("gate"), null, "conflict-key"), client);
+        assertThat(crypto.awaitEntered("gate")).isTrue();
+        BatchHashJobResponse before = service.getJob(admitted.jobId());
+
+        assertThatThrownBy(() -> service.submit(
+                new BatchHashRequest("SHA-256", List.of("different"), null, "conflict-key"), client))
+                .isInstanceOf(IdempotencyConflictException.class);
+        assertThat(service.getJob(admitted.jobId())).isEqualTo(before);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+        assertThat(registryKeys("jobs")).hasSize(1);
+
+        crypto.unblock("gate");
+        awaitStatus(admitted.jobId(), JobStatus.COMPLETED);
+        awaitActiveJobs(client, 0);
+    }
+
+    /**
+     * DOD-06 / REQ-07: a first submission rejected by the executor rolls back the job registration, the
+     * idempotency mapping and the quota reservation, keeping the QUEUE_FULL contract intact.
+     */
+    @Test
+    @DisplayName("quota - a rejected first submission rolls back registration, mapping and reservation")
+    void shouldRollbackQuotaAndRegistrationsWhenFirstSubmissionIsRejected() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("gate");
+        service = new BatchHashJobService(crypto, 1, 1, 300, 3, LEASE_SECONDS, 5000, 5,
+                Clock.systemUTC());
+        String client = "203.0.113.40";
+
+        service.submit(new BatchHashRequest("SHA-256", List.of("gate"), null, null), client);
+        assertThat(crypto.awaitEntered("gate")).isTrue(); // the only worker is occupied
+        service.submit(new BatchHashRequest("SHA-256", List.of("queued"), null, "kept-key"), client);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(2);
+        assertThat(registryKeys("jobs")).hasSize(2);
+
+        assertThatThrownBy(() -> service.submit(
+                new BatchHashRequest("SHA-256", List.of("overflow"), null, "rolled-back-key"), client))
+                .isInstanceOf(JobQueueFullException.class)
+                .hasMessageContaining("queue-capacity=1");
+
+        assertThat(registryKeys("jobs")).hasSize(2); // no residual job row
+        assertThat(registryKeys("idempotencyIndex")).containsExactly("kept-key"); // no residual mapping
+        assertThat(service.activeJobsForClient(client)).isEqualTo(2); // no residual active count
+
+        crypto.unblock("gate");
+        awaitActiveJobs(client, 0);
+    }
+
+    /** DOD-13 (anonymous bucket) / REQ-02: the no-identity overload is charged to the unknown key. */
+    @Test
+    @DisplayName("quota - submissions without an identity are charged to the unknown key")
+    void shouldChargeNoIdentitySubmissionToUnknownKey() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("gate");
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3, LEASE_SECONDS, 5000, 1,
+                Clock.systemUTC());
+        String named = "203.0.113.50";
+
+        BatchHashJobResponse anonymous = service.submit(
+                new BatchHashRequest("SHA-256", List.of("gate"), null, null));
+        assertThat(service.activeJobsForClient(ClientKeyResolver.UNKNOWN_CLIENT)).isEqualTo(1);
+        assertThat(service.activeJobsForClient(null)).isEqualTo(1); // null is the same bucket
+        assertThat(service.activeJobsForClient("   ")).isEqualTo(1); // so is a blank key
+        assertThat(service.activeJobsForClient(named)).isZero();
+
+        assertThatThrownBy(() -> service.submit(
+                new BatchHashRequest("SHA-256", List.of("gate"), null, null), " "))
+                .isInstanceOf(JobQuotaExceededException.class); // the anonymous bucket is full
+
+        BatchHashJobResponse identified = service.submit(
+                new BatchHashRequest("SHA-256", List.of("gate"), null, null), named);
+        assertThat(service.activeJobsForClient(named)).isEqualTo(1);
+
+        crypto.unblock("gate");
+        awaitStatus(anonymous.jobId(), JobStatus.COMPLETED);
+        awaitStatus(identified.jobId(), JobStatus.COMPLETED);
+        awaitActiveJobs(ClientKeyResolver.UNKNOWN_CLIENT, 0);
+        awaitActiveJobs(named, 0);
+    }
+
+    /**
+     * DOD-12 / REQ-01: the quota property is validated at startup, and every pre-existing constructor
+     * keeps working with the documented default of 20.
+     */
+    @Test
+    @DisplayName("config - a non-positive max-active-jobs-per-client is rejected and defaults are kept")
+    void shouldRejectNonPositiveMaxActiveJobsPerClientConfig() {
+        CryptoService crypto = new CryptoService();
+        Clock clock = Clock.systemUTC();
+        assertThat(BatchHashJobService.DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT).isEqualTo(20);
+
+        assertThatThrownBy(() -> new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 0, clock))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("utiltools.jobs.max-active-jobs-per-client")
+                .hasMessageContaining("0");
+        assertThatThrownBy(() -> new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, -2, clock))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("utiltools.jobs.max-active-jobs-per-client")
+                .hasMessageContaining("-2");
+
+        // The legacy constructors still build a service: the default quota applies.
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+        BatchHashJobResponse accepted = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", List.of("alpha"), null, null)).jobId(), JobStatus.COMPLETED);
+        assertThat(accepted.status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(service.activeJobsForClient(ClientKeyResolver.UNKNOWN_CLIENT)).isZero();
+    }
+
+    /**
+     * DOD-13 / REQ-04, REQ-08: neither the job snapshot, the audit journal nor the quota exception
+     * carries the client key or any other quota state.
+     */
+    @Test
+    @DisplayName("privacy - the client key and quota state never reach the snapshot, journal or exception")
+    void shouldKeepClientKeyOutOfSnapshotAndAuditJournal() throws Exception {
+        AuditJournalService journal = newJournal();
+        String client = "198.51.100.77";
+        service = new BatchHashJobService(new CryptoService(), 1, 10, 300, 3, LEASE_SECONDS, 5000, 20,
+                Clock.systemUTC(), journal);
+
+        BatchHashJobResponse completed = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", List.of("alpha"), null, null), client).jobId(),
+                JobStatus.COMPLETED);
+        awaitActiveJobs(client, 0);
+
+        assertThat(completed.toString()).doesNotContain(client);
+        assertThat(Arrays.stream(BatchHashJobResponse.class.getRecordComponents())
+                .map(RecordComponent::getName).toList())
+                .noneMatch(name -> name.toLowerCase().contains("client"))
+                .noneMatch(name -> name.toLowerCase().contains("quota"));
+
+        List<AuditEntry> entries = batchHashEntries(journal, completed.jobId());
+        assertThat(entries).hasSize(1);
+        assertThat(entries.get(0).toString()).doesNotContain(client);
+        assertThat(entries.get(0).request().toString()).doesNotContain(client);
+
+        JobQuotaExceededException refusal = new JobQuotaExceededException(20, 20);
+        assertThat(refusal.getMessage())
+                .contains("activeJobs=20")
+                .contains("limit=20")
+                .doesNotContain(client);
+    }
+
+    /** Polls the client's counter: release happens after the terminal monitor block, so it is async. */
+    private void awaitActiveJobs(String clientKey, int expected) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline) {
+            if (service.activeJobsForClient(clientKey) == expected) {
+                return;
+            }
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while awaiting the quota counter", e);
+            }
+        }
+        throw new AssertionError("Client " + clientKey + " active jobs did not reach " + expected
+                + "; last observed " + service.activeJobsForClient(clientKey));
     }
 }
