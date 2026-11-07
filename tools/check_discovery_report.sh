@@ -34,7 +34,14 @@
 #                     verification mode is runnable today, and >=1 selected-identifier.
 #   --not-implemented DOD-10: every `- selected-identifier:` regex has zero matches in
 #                     src/main and README.md (the selected task is not already implemented).
-#   --no-src-changes  DOD-11: no change under src/main, src/test, README.md, pom.xml or .ait/.
+#   --no-src-changes  DOD-11: no change under src/main, src/test, README.md, pom.xml or .ait/ —
+#                     neither in the working tree nor committed on this branch.
+#
+# Failure contract: plan §4.10 pins one exact error substring per condition, so every diagnostic
+# below starts with its pinned literal (`FAIL: inventory <key>`, `FAIL: bare count claim`,
+# `FAIL: absolute '- path:' outside repo`, `FAIL: '- output:' too long`,
+# `FAIL: score sub-scores do not sum`) and only then adds measured detail. Assert on the literal,
+# not the suffix.
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
@@ -49,11 +56,37 @@ MIN_PATHS=25
 MIN_GAPS=5
 MIN_DOD=2
 MAX_OUTPUT=160
+# INV-01 / R-05 (DOD-04): a bare count of a tree entity is a prose claim, not a measurement.
+# Beyond the two sentences plan §4.10 pins verbatim (`exactly N … sources`, `mirrors N of them`),
+# any `<int> [qualifier…] <count-noun>` shape counts — `holds 10 package directories` is the
+# shape that exited 0 before this pattern was widened. Lines whose integers are measured by
+# construction (`- inventory:`, `- output:`) are exempt: DOD-04 names exactly those two carriers.
+BARE_COUNT_ERE='(exactly|precisely)[[:space:]]+\*{0,2}[0-9]+'
+BARE_COUNT_ERE="$BARE_COUNT_ERE"'|mirrors?[[:space:]]+[^.]*of them'
+BARE_COUNT_ERE="$BARE_COUNT_ERE"'|[0-9]+[[:space:]]+([a-zA-Z][a-zA-Z.-]*[[:space:]]+){0,3}(packages|package[[:space:]]+director(y|ies)|directories|dirs|sources|files)\b'
 
 RUN_SECTIONS=0 RUN_PACKAGES=0 RUN_INVENTORY=0 RUN_PATHS=0 RUN_EVIDENCE=0
 RUN_GAPS=0 RUN_SELECTION=0 RUN_NOT_IMPL=0 RUN_NO_SRC=0
 
+# §4.10 of the plan is an ordered table of ten conditions, each with an *exact* error substring;
+# these are those literals, emitted as the prefix of the single `FAIL:` line (`fail_pinned` below
+# appends measured detail after the pinned literal). A consumer is allowed to assert on them, so
+# they must not drift back into free-form prose.
+PINNED_INVENTORY_KEY='inventory'
+PINNED_BARE_COUNT='bare count claim'
+PINNED_ABS_PATH="absolute '- path:' outside repo"
+PINNED_OUTPUT_LEN="'- output:' too long"
+PINNED_SCORE_SUM='score sub-scores do not sum'
+
 fail() { printf 'FAIL: %s\n' "$1"; exit 1; }
+# `fail_pinned <§4.10 literal> [<detail>…]` — the literal comes first, verbatim, so the pinned
+# substring of plan §4.10 is always present in the emitted line.
+fail_pinned() {
+  local literal="$1"; shift
+  if [ $# -gt 0 ]; then printf 'FAIL: %s (%s)\n' "$literal" "$*"
+  else printf 'FAIL: %s\n' "$literal"; fi
+  exit 1
+}
 usage() {
   sed -n '9,16p' "$0" | sed 's/^# //'
   exit 2
@@ -192,22 +225,23 @@ if [ "$RUN_INVENTORY" -eq 1 ]; then
   # Exactly one measured inventory line: the fields are recomputed below, so a second line could
   # publish a different set of numbers under the same key names.
   n_inv=$(grep -cE '^- inventory: ' "$REPORT_ABS")
-  [ "$n_inv" -eq 1 ] || fail "expected exactly one '- inventory:' line, found $n_inv"
+  [ "$n_inv" -eq 1 ] || fail_pinned "$PINNED_INVENTORY_KEY line" "expected exactly one '- inventory:' line, found $n_inv"
   inv=$(grep -E '^- inventory: ' "$REPORT_ABS" | head -1)
   declare -A published=()
   for key in main-sources pkg-dirs test-dirs mirrored test-sources; do
     val=$(printf '%s\n' "$inv" | grep -oE "${key}=[0-9]+" | head -1 | cut -d= -f2)
-    [ -n "$val" ] || fail "'- inventory:' line is missing the '${key}=' field"
+    [ -n "$val" ] || fail_pinned "$PINNED_INVENTORY_KEY $key" "'- inventory:' line publishes no '${key}=' field"
     published["$key"]=$val
   done
 
   # The entry point is the one source the reader hits first and the one file outside a package
   # directory; it must be named and it must resolve.
   n_ep=$(grep -cE '^- entry-point: ' "$REPORT_ABS")
-  [ "$n_ep" -eq 1 ] || fail "expected exactly one '- entry-point:' line, found $n_ep"
+  [ "$n_ep" -eq 1 ] || fail_pinned "$PINNED_INVENTORY_KEY entry-point" \
+    "expected exactly one '- entry-point:' line, found $n_ep"
   ep=$(grep -E '^- entry-point: ' "$REPORT_ABS" | head -1 | sed -E 's/^- entry-point: //' | awk '{print $1}')
-  [ -n "$ep" ] || fail "'- entry-point:' names no path"
-  [ -f "$TOP/$ep" ] || fail "'- entry-point:' does not resolve to a file: $ep"
+  [ -n "$ep" ] || fail_pinned "$PINNED_INVENTORY_KEY entry-point" "'- entry-point:' names no path"
+  [ -f "$TOP/$ep" ] || fail_pinned "$PINNED_INVENTORY_KEY entry-point" "'- entry-point:' does not resolve to a file: $ep"
 
   # The inventory's own evidence triple: an `- evidence:` command whose re-run prints the
   # `- output:` tail verbatim, with a matching `- exit:`.
@@ -218,7 +252,8 @@ if [ "$RUN_INVENTORY" -eq 1 ]; then
   [ -n "$raw_out" ] || fail "§1 has no '- output:' tail"
   out_text=$(untick "$raw_out")
   out_len=${#out_text}
-  [ "$out_len" -le "$MAX_OUTPUT" ] || fail "§1 '- output:' is $out_len chars, over the $MAX_OUTPUT limit"
+  [ "$out_len" -le "$MAX_OUTPUT" ] || fail_pinned "$PINNED_OUTPUT_LEN" \
+    "§1 '- output:' is $out_len chars, over the $MAX_OUTPUT limit"
   inv_cmd=$(printf '%s\n' "$sec1" | grep -E '^- evidence: ' | head -1 | sed -E 's/^- evidence: //')
   inv_cmd=$(untick "$inv_cmd")
   inv_real=$(eval "$inv_cmd" 2>&1)
@@ -238,15 +273,19 @@ if [ "$RUN_INVENTORY" -eq 1 ]; then
               "mirrored:$m_mir" "test-sources:$m_tsrc"; do
     key=${pair%%:*}; measured=${pair#*:}
     [ "${published[$key]}" -eq "$measured" ] \
-      || fail "'- inventory:' ${key} says ${published[$key]}, the tree measures $measured"
+      || fail_pinned "$PINNED_INVENTORY_KEY ${key}" \
+           "'- inventory:' says ${published[$key]}, the tree measures $measured"
   done
 
   # INV-01: every integer in §1/§2 is either an inventory field or an output tail, so a bare
-  # "holds exactly N ..." / "mirrors N of them" sentence is fatal — that shape is what drifted
-  # from the tree in the previous revision.
+  # "holds exactly N ..." / "holds N package directories" / "mirrors N of them" sentence is
+  # fatal — those shapes are what drifted from the tree in the previous revision, and the count
+  # nouns in BARE_COUNT_ERE are the ones §1/§2 use to describe the tree.
   sec12=$(awk '/^## 3\. /{if (p) exit} /^## 1\. /{p=1} p' "$REPORT_ABS")
-  bare=$(printf '%s\n' "$sec12" | grep -nE '(exactly|precisely)[[:space:]]+\*{0,2}[0-9]+|mirrors?[[:space:]]+[^.]*of them' | head -1)
-  [ -z "$bare" ] || fail "bare count claim in §1/§2 (use an '- inventory:' field): $bare"
+  bare=$(printf '%s\n' "$sec12" | grep -vE '^- (inventory|output): ' \
+    | grep -nE "$BARE_COUNT_ERE" | head -1)
+  [ -z "$bare" ] \
+    || fail_pinned "$PINNED_BARE_COUNT" "§1/§2 prose count is not an '- inventory:' field: $bare"
 fi
 
 # ---------------------------------------------------------------- DOD-06
@@ -271,7 +310,7 @@ if [ "$RUN_PATHS" -eq 1 ]; then
   for p in "${cited_paths[@]}"; do
     case "$p" in
       "$TOP"|"$TOP"/*) ;;
-      /*) fail "absolute '- path:' outside repo: $p" ;;
+      /*) fail_pinned "$PINNED_ABS_PATH" "$p" ;;
     esac
   done
   [ "${#cited_paths[@]}" -ge "$MIN_PATHS" ] || fail "only ${#cited_paths[@]} distinct '- path:' citations, need >= $MIN_PATHS"
@@ -298,7 +337,8 @@ if [ "$RUN_EVIDENCE" -eq 1 ]; then
     [ -n "$raw_out" ] || fail "${g} has no '- output:' tail"
     out_text=$(untick "$raw_out")
     out_len=${#out_text}
-    [ "$out_len" -le "$MAX_OUTPUT" ] || fail "${g} '- output:' is $out_len chars, over the $MAX_OUTPUT limit"
+    [ "$out_len" -le "$MAX_OUTPUT" ] || fail_pinned "$PINNED_OUTPUT_LEN" \
+      "${g} '- output:' is $out_len chars, over the $MAX_OUTPUT limit"
     # The tail must be reproduced by the block's own command: a hand-written tail that the
     # evidence does not print is a claim, not evidence.
     ev_cmd=$(printf '%s\n' "$body" | grep -E '^- evidence: ' | head -1 | sed -E 's/^- evidence: //')
@@ -340,7 +380,8 @@ if [ "$RUN_GAPS" -eq 1 ]; then
         [ -n "${!v}" ] || fail "${g} '- score:' parenthesis has no $v sub-score"
       done
       sub_sum=$((2 * s_ev + 2 * s_impact + s_blast + s_verif))
-      [ "$sub_sum" -eq "$score" ] || fail "${g} sub-scores sum to $sub_sum but '- score:' says $score"
+      [ "$sub_sum" -eq "$score" ] || fail_pinned "$PINNED_SCORE_SUM" \
+        "${g} sub-scores sum to $sub_sum but '- score:' says $score"
     fi
   done
 fi
@@ -395,8 +436,23 @@ fi
 
 # ---------------------------------------------------------------- DOD-11
 if [ "$RUN_NO_SRC" -eq 1 ]; then
-  dirty=$(git -C "$TOP" status --porcelain -- src/main src/test README.md pom.xml .ait)
+  PROTECTED=(src/main src/test README.md pom.xml .ait)
+  # The working-tree half is the assertion plan §4.9 pins for this flag.
+  dirty=$(git -C "$TOP" status --porcelain -- "${PROTECTED[@]}")
   [ -z "$dirty" ] || fail "task touched non-report paths: $(printf '%s' "$dirty" | tr '\n' ';')"
+  # DOD-11 also says "the commit adds only the report plus tools/check_discovery_report.sh", so
+  # the committed range is asserted too: a `src/main` edit that is already committed leaves the
+  # working tree clean and would otherwise pass (the blind spot named in the v4 review NIT).
+  base=""
+  for ref in origin/main main; do
+    if git -C "$TOP" rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then base="$ref"; break; fi
+  done
+  fork=$(git -C "$TOP" merge-base "$base" HEAD 2>/dev/null || true)
+  if [ -n "$base" ] && [ -n "$fork" ]; then
+    committed=$(git -C "$TOP" diff --name-only "$fork"...HEAD -- "${PROTECTED[@]}")
+    [ -z "$committed" ] \
+      || fail "committed change to a protected path since $base: $(printf '%s' "$committed" | tr '\n' ';')"
+  fi
 fi
 
 printf 'OK: %s\n' "$REPORT"
