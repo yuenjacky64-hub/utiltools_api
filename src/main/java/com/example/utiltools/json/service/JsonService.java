@@ -199,6 +199,8 @@ public class JsonService {
      * Collapses an object tree into dot-path key/value pairs. Insertion order is preserved, arrays
      * and empty objects stay untouched leaf values, and a key that is empty or already contains the
      * separator is rejected so that {@link #unflatten(JsonUnflattenRequest)} can always rebuild the tree.
+     * Every emitted path is also re-split on the separator and must yield exactly the walked name
+     * chain, which keeps the round trip exact for multi-character separators as well.
      */
     public JsonFlattenResponse flatten(JsonFlattenRequest request) {
         String separator = normaliseSeparator(request.separator());
@@ -209,7 +211,7 @@ public class JsonService {
 
         ObjectNode flattened = objectMapper.createObjectNode();
         FlattenTally tally = new FlattenTally();
-        walkFlatten((ObjectNode) root, "", 1, separator, flattened, tally);
+        walkFlatten((ObjectNode) root, new String[0], "", 1, separator, flattened, tally);
         if (tally.keyCount > MAX_KEYS) {
             throw new IllegalArgumentException(
                     "flattened document must contain at most " + MAX_KEYS + " keys");
@@ -217,7 +219,7 @@ public class JsonService {
         return new JsonFlattenResponse(flattened, tally.keyCount, tally.maxDepth);
     }
 
-    private void walkFlatten(ObjectNode node, String prefix, int depth, String separator,
+    private void walkFlatten(ObjectNode node, String[] chain, String prefix, int depth, String separator,
                              ObjectNode flattened, FlattenTally tally) {
         Iterator<Map.Entry<String, JsonNode>> members = node.fields();
         while (members.hasNext()) {
@@ -233,12 +235,22 @@ public class JsonService {
                         "key '" + key + "' must not contain the separator '" + separator + "'");
             }
             String path = prefix.isEmpty() ? key : prefix + separator + key;
+            // A self-overlapping multi-character separator can swallow a join boundary: with "aa",
+            // {"ba":{"b":1}} joins to "baaab", which unflatten re-splits as ["b","ab"] and rebuilds a
+            // different document. Requiring the emitted path to split back into exactly the walked name
+            // chain refuses those inputs here instead of corrupting them silently there.
+            String[] expected = Arrays.copyOf(chain, chain.length + 1);
+            expected[chain.length] = key;
+            if (!Arrays.equals(path.split(Pattern.quote(separator), -1), expected)) {
+                throw new IllegalArgumentException("ambiguous key path '" + path + "' for separator '"
+                        + separator + "': it does not split back into its own key segments");
+            }
             JsonNode value = member.getValue();
             if (value.isObject() && !value.isEmpty()) {
                 if (depth + 1 > MAX_DEPTH) {
                     throw new IllegalArgumentException("document depth must not exceed " + MAX_DEPTH);
                 }
-                walkFlatten((ObjectNode) value, path, depth + 1, separator, flattened, tally);
+                walkFlatten((ObjectNode) value, expected, path, depth + 1, separator, flattened, tally);
             } else {
                 // Arrays, empty objects and scalars are leaves: they are stored verbatim as their own value.
                 flattened.set(path, value);

@@ -532,6 +532,49 @@ class JsonServiceTest {
     }
 
     @Test
+    @DisplayName("Should round trip a multi-character separator end to end")
+    void shouldRoundTripMultiCharacterSeparator() throws JsonProcessingException {
+        String json = "{\"outer\":{\"inner\":{\"leaf\":1},\"empty\":{},\"list\":[1,2]},\"top\":true}";
+        ObjectMapper mapper = new ObjectMapper();
+
+        JsonFlattenResponse flattened = jsonService.flatten(new JsonFlattenRequest(json, "::"));
+
+        assertThat(flattened.resultJson().has("outer::inner::leaf")).isTrue();
+        assertThat(flattened.resultJson().get("outer::empty")).isEmpty();
+        assertThat(flattened.keyCount()).isEqualTo(4);
+        assertThat(flattened.maxDepth()).isEqualTo(3);
+
+        JsonUnflattenResponse rebuilt = jsonService.unflatten(
+                new JsonUnflattenRequest(mapper.writeValueAsString(flattened.resultJson()), "::"));
+
+        assertThat(rebuilt.resultJson()).isEqualTo(mapper.readTree(json));
+        assertThat(rebuilt.keyCount()).isEqualTo(flattened.keyCount());
+        assertThat(rebuilt.maxDepth()).isEqualTo(flattened.maxDepth());
+    }
+
+    @Test
+    @DisplayName("Should reject paths a multi-character separator would re-split differently")
+    void shouldRejectAmbiguousMultiCharacterSeparator() {
+        // "aa" is self-overlapping: {"ba":{"b":1}} joins to "baaab", which unflatten re-splits as
+        // ["b","ab"] and silently rebuilds {"b":{"ab":1}} instead of {"ba":{"b":1}} (REQ-04).
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("{\"ba\":{\"b\":1}}", "aa")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("ambiguous key path 'baaab'")
+                .hasMessageContaining("'aa'");
+        // The overlap can also introduce an empty segment: {"a":{"x":1}} joins to "aaax".
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("{\"a\":{\"x\":1}}", "aa")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("ambiguous key path 'aaax'");
+        // Proof the refusal is load-bearing rather than cosmetic: the same flat key, handed straight
+        // to unflatten, rebuilds a structurally different document.
+        assertThat(jsonService.unflatten(new JsonUnflattenRequest("{\"baaab\":1}", "aa"))
+                .resultJson().toString()).isEqualTo("{\"b\":{\"ab\":1}}");
+        // Non-overlapping multi-character separators keep working.
+        assertThat(jsonService.flatten(new JsonFlattenRequest("{\"ba\":{\"b\":1}}", "co"))
+                .resultJson().has("ba" + "co" + "b")).isTrue();
+    }
+
+    @Test
     @DisplayName("Should reject object keys that contain the separator")
     void shouldRejectSeparatorInsideKeys() {
         assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("{\"a.b\":1}", null)))
