@@ -3,6 +3,7 @@ package com.example.utiltools.audit.service;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.OperationType;
 import com.example.utiltools.common.RequestContext;
+import com.example.utiltools.common.ReplayConflictException;
 import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
@@ -168,6 +169,11 @@ public class AuditedOperations {
             case TEXT_TRANSFORM -> textService.transform((TextTransformRequest) request);
             case TEXT_STATS -> textService.stats((TextStatsRequest) request);
             case TEXT_REPLACE -> textService.replace((TextReplaceRequest) request);
+            // Asynchronous batch hashing is audit-only: a BATCH_HASH entry can never be replayed,
+            // because there is no servlet-bound payload to re-run and the operation is
+            // non-deterministic. Defence in depth: claimReplay refuses the same entries.
+            case BATCH_HASH -> throw new ReplayConflictException(null,
+                    "batch hashing runs asynchronously and is non-replayable");
         };
     }
 

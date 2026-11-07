@@ -1,13 +1,20 @@
 package com.example.utiltools.jobs;
 
+import com.example.utiltools.audit.model.AuditEntry;
+import com.example.utiltools.audit.model.JournalState;
+import com.example.utiltools.audit.model.OperationType;
+import com.example.utiltools.audit.service.AuditJournalService;
+import com.example.utiltools.common.RequestContext;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -1305,6 +1312,427 @@ class BatchHashJobServiceTest {
         private static final class Gate {
             private final CountDownLatch entered = new CountDownLatch(1);
             private final CountDownLatch released = new CountDownLatch(1);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Per-attempt BATCH_HASH audit journaling (REQ-01..REQ-06)
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * DOD-01 / REQ-02: two consecutive jobs on a single reused pool thread open BATCH_HASH entries
+     * whose {@code requestId} matches their own submit call; each attempt scrubs the context in a
+     * {@code finally} block, so a later job never inherits the previous submitter's id.
+     */
+    @Test
+    @DisplayName("audit - one worker, successive jobs: each attempt sees its own request id and the context is cleared")
+    void shouldCorrelateEachAttemptWithItsOwnRequestId() throws Exception {
+        AuditJournalService journal = newJournal();
+        RequestRecordingCryptoService crypto = new RequestRecordingCryptoService();
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC(), journal);
+
+        RequestContext.set("req-submit-aaaa1");
+        BatchHashJobResponse first = service.submit(
+                new BatchHashRequest("SHA-256", List.of("alpha"), null, null));
+        BatchHashJobResponse firstDone = awaitStatus(first.jobId(), JobStatus.COMPLETED);
+
+        RequestContext.set("req-submit-bbbb2");
+        BatchHashJobResponse second = service.submit(
+                new BatchHashRequest("SHA-256", List.of("beta"), null, null));
+        BatchHashJobResponse secondDone = awaitStatus(second.jobId(), JobStatus.COMPLETED);
+
+        // No caller id at all: the third attempt must observe an empty context, proving the pool
+        // thread was scrubbed by the previous attempt's finally block.
+        RequestContext.clear();
+        BatchHashJobResponse third = service.submit(
+                new BatchHashRequest("SHA-256", List.of("gamma"), null, null));
+        BatchHashJobResponse thirdDone = awaitStatus(third.jobId(), JobStatus.COMPLETED);
+
+        assertThat(crypto.idsObservedFor("alpha")).containsExactly("req-submit-aaaa1");
+        assertThat(crypto.idsObservedFor("beta")).containsExactly("req-submit-bbbb2");
+        assertThat(crypto.idsObservedFor("gamma")).hasSize(1).containsNull();
+
+        List<AuditEntry> firstEntries = batchHashEntries(journal, first.jobId());
+        List<AuditEntry> secondEntries = batchHashEntries(journal, second.jobId());
+        assertThat(firstEntries).hasSize(1);
+        assertThat(secondEntries).hasSize(1);
+        assertThat(firstEntries.get(0).requestId()).isEqualTo("req-submit-aaaa1");
+        assertThat(secondEntries.get(0).requestId()).isEqualTo("req-submit-bbbb2");
+        assertThat(firstDone.attempts().get(0).auditEntryId()).isEqualTo(firstEntries.get(0).id());
+        assertThat(secondDone.attempts().get(0).auditEntryId()).isEqualTo(secondEntries.get(0).id());
+        assertThat(thirdDone.attempts().get(0).auditEntryId()).isNotNull();
+    }
+
+    /** DOD-02 / REQ-03: a successful attempt leaves exactly one SUCCEEDED BATCH_HASH entry, with a payload-free descriptor. */
+    @Test
+    @DisplayName("audit - a successful attempt has exactly one SUCCEEDED BATCH_HASH entry without payload")
+    void shouldJournalOneSucceededEntryPerAttempt() throws Exception {
+        AuditJournalService journal = newJournal();
+        service = new BatchHashJobService(new CryptoService(), 2, 10, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC(), journal);
+
+        RequestContext.set("req-succeed01");
+        BatchHashJobResponse done = awaitStatus(service.submit(new BatchHashRequest("SHA-256",
+                List.of("alpha", "beta"), "s3cr3t-key-value", "idem-key-1")).jobId(), JobStatus.COMPLETED);
+        RequestContext.clear();
+
+        List<AuditEntry> entries = batchHashEntries(journal, done.jobId());
+        assertThat(entries).hasSize(1);
+        AuditEntry entry = entries.get(0);
+        assertThat(entry.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entry.requestId()).isEqualTo("req-succeed01");
+        assertThat(entry.request().path("attempt").asInt()).isEqualTo(1);
+        assertThat(entry.request().path("algorithm").asText()).isEqualTo("SHA-256");
+        assertThat(entry.request().path("itemCount").asInt()).isEqualTo(2);
+        assertThat(entry.request().path("idempotencyKey").asText()).isEqualTo("idem-key-1");
+        assertThat(entry.request().toString()).doesNotContain("alpha").doesNotContain("s3cr3t-key-value");
+        assertThat(entry.result()).isNotNull();
+        assertThat(done.attempts()).hasSize(1);
+        assertThat(done.attempts().get(0).auditEntryId()).isEqualTo(entry.id());
+        assertThat(journal.list(200, JournalState.PENDING)).isEmpty();
+    }
+
+    /** DOD-03 / REQ-04: a hashing failure closes the entry as FAILED with a bounded code and leaves no PENDING sibling. */
+    @Test
+    @DisplayName("audit - a failing attempt has exactly one FAILED BATCH_HASH entry with a bounded code")
+    void shouldJournalFailedEntryWithBoundedCode() throws Exception {
+        AuditJournalService journal = newJournal();
+        RetryCryptoService crypto = new RetryCryptoService("boom", Integer.MAX_VALUE, null, null, null);
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC(), journal);
+
+        RequestContext.set("req-failure01");
+        BatchHashJobResponse failed = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", List.of("boom"), null, null)).jobId(), JobStatus.FAILED);
+        RequestContext.clear();
+
+        List<AuditEntry> entries = batchHashEntries(journal, failed.jobId());
+        assertThat(entries).hasSize(1);
+        AuditEntry entry = entries.get(0);
+        assertThat(entry.state()).isEqualTo(JournalState.FAILED);
+        assertThat(entry.errorCode()).isNotBlank();
+        assertThat(entry.errorCode().length()).isLessThanOrEqualTo(200);
+        assertThat(entry.requestId()).isEqualTo("req-failure01");
+        assertThat(failed.attempts()).hasSize(1);
+        assertThat(failed.attempts().get(0).auditEntryId()).isEqualTo(entry.id());
+        assertThat(batchHashEntries(journal, failed.jobId(), JournalState.PENDING)).isEmpty();
+    }
+
+    /**
+     * DOD-04 / REQ-05: when a stalled RUNNING attempt is reaped, the job and its BATCH_HASH entry
+     * both read FAILED with EXECUTION_LEASE_EXPIRED and the attempt history exposes that entry id;
+     * a second reaper pass writes nothing.
+     */
+    @Test
+    @DisplayName("audit - the reaper and the journal agree on EXECUTION_LEASE_EXPIRED")
+    void shouldAgreeWithReaperOnLeaseExpiry() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock, journal);
+
+        RequestContext.set("req-reaper001");
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stalled"), null, null));
+        assertThat(crypto.awaitEntered("stalled")).isTrue();
+        RequestContext.clear();
+
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        BatchHashJobResponse reaped = service.getJob(accepted.jobId());
+        assertThat(reaped.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(reaped.error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+
+        List<AuditEntry> reapedEntries = batchHashEntries(journal, accepted.jobId());
+        assertThat(reapedEntries).hasSize(1);
+        AuditEntry reapedEntry = reapedEntries.get(0);
+        assertThat(reapedEntry.state()).isEqualTo(JournalState.FAILED);
+        assertThat(reapedEntry.errorCode()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        assertThat(reapedEntry.requestId()).isEqualTo("req-reaper001");
+        assertThat(reaped.attempts()).hasSize(1);
+        assertThat(reaped.attempts().get(0).auditEntryId()).isEqualTo(reapedEntry.id());
+
+        // A second pass reaps and journals nothing: the FAILED fence already closed this attempt.
+        assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+        assertThat(batchHashEntries(journal, accepted.jobId())).hasSize(1);
+    }
+
+    /**
+     * DOD-05 / REQ-05: a retry after a reaped attempt opens a separate BATCH_HASH entry correlated
+     * to the retry caller's request id, and the late worker from the reaped attempt cannot rewrite
+     * the entry the reaper closed.
+     */
+    @Test
+    @DisplayName("audit - the retried attempt journals its own entry under the retry caller's id")
+    void shouldCorrelateRetryAttemptWithRetryRequest() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock, journal);
+
+        RequestContext.set("req-reaper001");
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stalled"), null, null));
+        assertThat(crypto.awaitEntered("stalled")).isTrue();
+        RequestContext.clear();
+
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        AuditEntry reapedEntry = batchHashEntries(journal, accepted.jobId()).get(0);
+        assertThat(reapedEntry.state()).isEqualTo(JournalState.FAILED);
+        assertThat(reapedEntry.errorCode()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+
+        // The retry is its own audited request: attempt 2 is correlated to *this* caller's id.
+        RequestContext.set("req-retry0002");
+        BatchHashJobResponse retried = service.retry(accepted.jobId());
+        assertThat(retried.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(retried.attempt()).isEqualTo(2);
+        RequestContext.clear();
+
+        // Releasing the stalled worker lets the late attempt-1 thread finish; it is fenced by the
+        // generation check and must not touch the reaped entry, and attempt 2 then runs to completion.
+        crypto.unblock("stalled");
+        BatchHashJobResponse completed = awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.attempt()).isEqualTo(2);
+
+        List<AuditEntry> allEntries = batchHashEntries(journal, accepted.jobId());
+        assertThat(allEntries).hasSize(2); // the retry opened a second entry; the reaped one survived
+        AuditEntry reapedAfterLateWorker = journal.find(reapedEntry.id()).orElseThrow();
+        assertThat(reapedAfterLateWorker.state()).isEqualTo(JournalState.FAILED);
+        assertThat(reapedAfterLateWorker.errorCode()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        assertThat(reapedAfterLateWorker.requestId()).isEqualTo("req-reaper001");
+        AuditEntry retryEntry = allEntries.stream()
+                .filter(entry -> !entry.id().equals(reapedEntry.id()))
+                .findFirst()
+                .orElseThrow();
+        assertThat(retryEntry.requestId()).isEqualTo("req-retry0002");
+        assertThat(retryEntry.request().path("attempt").asInt()).isEqualTo(2);
+        assertThat(retryEntry.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(completed.attempts()).hasSize(2);
+        assertThat(completed.attempts().get(0).auditEntryId()).isEqualTo(reapedEntry.id());
+        assertThat(completed.attempts().get(1).auditEntryId()).isEqualTo(retryEntry.id());
+    }
+
+    /**
+     * DOD-06 / REQ-03: a saturated-queue rejection and a retry refused by the exhausted attempt
+     * budget each create no job row and no BATCH_HASH audit entry.
+     */
+    @Test
+    @DisplayName("audit - rejected submissions and retries open no BATCH_HASH entries")
+    void shouldNotCreateAuditEntryForRejectedSubmissionOrRetry() throws Exception {
+        // A saturated-queue rejection registers no job row and opens no journal entry.
+        AuditJournalService journal = newJournal();
+        LeaseCryptoService crypto = new LeaseCryptoService("blocker");
+        service = new BatchHashJobService(crypto, 1, 1, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC(), journal);
+
+        RequestContext.set("req-reject001");
+        service.submit(new BatchHashRequest("SHA-256", List.of("blocker"), null, null));
+        assertThat(crypto.awaitEntered("blocker")).isTrue(); // the only worker is occupied
+        BatchHashJobResponse queued = service.submit(
+                new BatchHashRequest("SHA-256", List.of("queued"), null, null));
+        assertThat(queued.status()).isEqualTo(JobStatus.QUEUED); // ...and the single queue slot is taken
+
+        assertThatThrownBy(() -> service.submit(
+                new BatchHashRequest("SHA-256", List.of("overflow"), null, null)))
+                .isInstanceOf(JobQueueFullException.class);
+        RequestContext.clear();
+
+        assertThat(registryKeys("jobs")).hasSize(2); // the rejected submission registered nothing
+        assertThat(journal.list(200, null))
+                .filteredOn(entry -> entry.operation() == OperationType.BATCH_HASH)
+                .hasSize(1); // only the running attempt opened an entry
+
+        // A retry refused by the exhausted attempt budget writes no entry and leaves the failed
+        // attempt's single entry untouched.
+        AuditJournalService retryJournal = newJournal();
+        RetryCryptoService failingCrypto = new RetryCryptoService("boom", Integer.MAX_VALUE, null, null, null);
+        service = new BatchHashJobService(failingCrypto, 1, 10, 300, 1, LEASE_SECONDS, 5000,
+                Clock.systemUTC(), retryJournal);
+
+        RequestContext.set("req-budget001");
+        BatchHashJobResponse failed = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", List.of("boom"), null, null)).jobId(), JobStatus.FAILED);
+
+        assertThatThrownBy(() -> service.retry(failed.jobId()))
+                .isInstanceOf(JobRetryConflictException.class);
+        RequestContext.clear();
+
+        assertThat(batchHashEntries(retryJournal, failed.jobId())).hasSize(1);
+        assertThat(service.getJob(failed.jobId()).status()).isEqualTo(JobStatus.FAILED);
+        assertThat(service.getJob(failed.jobId()).attempt()).isEqualTo(1);
+    }
+
+    /**
+     * DOD-08 / REQ-03: the attempt history exposes the entry id of the BATCH_HASH audit entry, and
+     * the 5-arg backward-compatible JobAttempt constructor still compiles and yields a null
+     * {@code auditEntryId} that is omitted from the snapshot JSON.
+     */
+    @Test
+    @DisplayName("audit - the attempt history exposes the entry id, and the legacy constructor yields null")
+    void shouldExposeAuditEntryIdOnAttemptHistory() throws Exception {
+        Instant started = Instant.parse("2026-01-01T00:00:00Z");
+        Instant finished = Instant.parse("2026-01-01T00:00:01Z");
+
+        // Pre-journalling call sites keep compiling: the 5-arg constructor yields a null entry id.
+        JobAttempt legacy = new JobAttempt(1, JobStatus.COMPLETED, started, finished, null);
+        assertThat(legacy.auditEntryId()).isNull();
+
+        // With a journal wired, the started attempt's history entry carries the entry's id.
+        AuditJournalService journal = newJournal();
+        service = new BatchHashJobService(new CryptoService(), 1, 10, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC(), journal);
+        RequestContext.set("req-history01");
+        BatchHashJobResponse done = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", List.of("alpha"), null, null)).jobId(), JobStatus.COMPLETED);
+        RequestContext.clear();
+        AuditEntry entry = batchHashEntries(journal, done.jobId()).get(0);
+        assertThat(done.attempts().get(0).auditEntryId()).isEqualTo(entry.id());
+
+        // Without a journal the field stays null and the snapshot omits it entirely.
+        service = new BatchHashJobService(new CryptoService(), 1, 10, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC());
+        BatchHashJobResponse unjournalled = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", List.of("beta"), null, null)).jobId(), JobStatus.COMPLETED);
+        assertThat(unjournalled.attempts().get(0).auditEntryId()).isNull();
+    }
+
+    /**
+     * DOD-11 / REQ-03: the bounded descriptor carries the job id, attempt, algorithm, item count
+     * and truncated idempotency key - never the item contents or the secret key.
+     */
+    @Test
+    @DisplayName("audit - items and secretKey never reach the BATCH_HASH descriptor")
+    void shouldNotLeakItemsOrSecretKeyIntoAuditEntry() throws Exception {
+        AuditJournalService journal = newJournal();
+        service = new BatchHashJobService(new CryptoService(), 1, 10, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC(), journal);
+
+        String longKey = "idem".repeat(75); // 300 chars: exceeds the 200-char audit bound
+        RequestContext.set("req-noleak01");
+        BatchHashJobResponse done = awaitStatus(service.submit(new BatchHashRequest("SHA-256",
+                List.of("alpha", "bravo", "charlie"), "s3cr3t-key-value", longKey)).jobId(),
+                JobStatus.COMPLETED);
+        RequestContext.clear();
+
+        AuditEntry entry = batchHashEntries(journal, done.jobId()).get(0);
+        assertThat(entry.request().path("jobId").asText()).isEqualTo(done.jobId());
+        assertThat(entry.request().path("attempt").asInt()).isEqualTo(1);
+        assertThat(entry.request().path("algorithm").asText()).isEqualTo("SHA-256");
+        assertThat(entry.request().path("itemCount").asInt()).isEqualTo(3);
+        assertThat(entry.request().path("idempotencyKey").asText()).isEqualTo(longKey.substring(0, 200));
+        String requestTree = entry.request().toString();
+        assertThat(requestTree)
+                .doesNotContain("alpha")
+                .doesNotContain("bravo")
+                .doesNotContain("charlie")
+                .doesNotContain("s3cr3t-key-value");
+    }
+
+    /**
+     * DOD-07 / REQ-04: journal begin/succeed/fail faults never change job status or result, and a
+     * failed {@code begin} simply leaves the attempt unjournalled.
+     */
+    @Test
+    @DisplayName("audit - journal faults are isolated from job status, result and error text")
+    void shouldKeepJobStatusWhenJournalFails() throws Exception {
+        // begin() throws: the attempt still runs and completes, it just has no entry id.
+        service = new BatchHashJobService(new CryptoService(), 1, 10, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC(), new FailingJournal(true));
+        BatchHashJobResponse noEntry = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", List.of("alpha"), null, null)).jobId(), JobStatus.COMPLETED);
+        assertThat(noEntry.results()).hasSize(1);
+        assertThat(noEntry.attempts().get(0).auditEntryId()).isNull();
+
+        // succeed()/fail() throw: the terminal snapshot is written regardless of the journal fault.
+        AuditJournalService closedFaults = new FailingJournal(false);
+        RetryCryptoService crypto = new RetryCryptoService("boom", Integer.MAX_VALUE, null, null, null);
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC(), closedFaults);
+
+        BatchHashJobResponse succeeded = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", List.of("alpha"), null, null)).jobId(), JobStatus.COMPLETED);
+        assertThat(succeeded.status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(succeeded.results()).hasSize(1);
+        assertThat(succeeded.attempts().get(0).auditEntryId()).isNotNull(); // begin() worked
+        assertThat(batchHashEntries(closedFaults, succeeded.jobId()).get(0).state())
+                .isEqualTo(JournalState.PENDING); // succeed() threw, so the entry stays open
+
+        BatchHashJobResponse failed = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", List.of("boom"), null, null)).jobId(), JobStatus.FAILED);
+        assertThat(failed.error()).contains("boom");
+        assertThat(failed.results()).isNull();
+        assertThat(batchHashEntries(closedFaults, failed.jobId()).get(0).state())
+                .isEqualTo(JournalState.PENDING); // fail() threw, so the entry stays open
+    }
+
+    private static AuditJournalService newJournal() {
+        return new AuditJournalService(new ObjectMapper(), 200, 65536, 300L);
+    }
+
+    /** BATCH_HASH entries recorded for one job, newest first (the journal itself is newest-first). */
+    private static List<AuditEntry> batchHashEntries(AuditJournalService journal, String jobId) {
+        return batchHashEntries(journal, jobId, null);
+    }
+
+    private static List<AuditEntry> batchHashEntries(AuditJournalService journal, String jobId,
+            JournalState state) {
+        return journal.list(500, state).stream()
+                .filter(entry -> entry.operation() == OperationType.BATCH_HASH)
+                .filter(entry -> entry.request() != null
+                        && jobId.equals(entry.request().path("jobId").asText()))
+                .toList();
+    }
+
+    /** Records, per item, which request id the pool thread carried while hashing it. */
+    private static final class RequestRecordingCryptoService extends CryptoService {
+
+        private final Map<String, List<String>> observed = new ConcurrentHashMap<>();
+
+        @Override
+        public HashResponse hash(HashRequest request) {
+            observed.computeIfAbsent(request.content(),
+                            key -> Collections.synchronizedList(new ArrayList<>()))
+                    .add(RequestContext.get());
+            return super.hash(request);
+        }
+
+        private List<String> idsObservedFor(String item) {
+            List<String> ids = observed.get(item);
+            return ids == null ? List.of() : new ArrayList<>(ids);
+        }
+    }
+
+    /**
+     * Journal stub for the fault-isolation test: optionally throws from {@code begin}, and always
+     * throws from {@code succeed}/{@code fail} once an entry exists.
+     */
+    private static final class FailingJournal extends AuditJournalService {
+
+        private final boolean failBegin;
+
+        private FailingJournal(boolean failBegin) {
+            super(new ObjectMapper(), 200, 65536, 300L);
+            this.failBegin = failBegin;
+        }
+
+        @Override
+        public AuditEntry begin(OperationType operation, Object request, String requestId) {
+            if (failBegin) {
+                throw new IllegalStateException("journal begin unavailable");
+            }
+            return super.begin(operation, request, requestId);
+        }
+
+        @Override
+        public AuditEntry succeed(String id, Object result) {
+            throw new IllegalStateException("journal succeed unavailable");
+        }
+
+        @Override
+        public AuditEntry fail(String id, String errorCode) {
+            throw new IllegalStateException("journal fail unavailable");
         }
     }
 }

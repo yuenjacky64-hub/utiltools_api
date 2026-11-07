@@ -18,7 +18,8 @@ public enum OperationType {
     JSON_UNFLATTEN(true),
     TEXT_TRANSFORM(true),
     TEXT_STATS(true),
-    TEXT_REPLACE(true);
+    TEXT_REPLACE(true),
+    BATCH_HASH(false);
 
     private final boolean deterministic;
 

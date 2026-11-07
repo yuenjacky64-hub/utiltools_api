@@ -1,9 +1,14 @@
 package com.example.utiltools.jobs;
 
+import com.example.utiltools.audit.model.OperationType;
+import com.example.utiltools.audit.service.AuditJournalService;
+import com.example.utiltools.common.RequestContext;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
 import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -15,9 +20,12 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -49,6 +57,16 @@ import java.util.concurrent.TimeUnit;
  * {@code CryptoService.hash} can no longer leave a job RUNNING forever. Reaping reuses the
  * generation fence: a reaped attempt keeps its attempt number but is no longer RUNNING, so a late
  * worker from that attempt writes nothing, and the FAILED job stays retryable.</p>
+ *
+ * <p>Every <em>started</em> attempt is journalled exactly once as a {@code BATCH_HASH} entry. The
+ * correlation id ({@link RequestContext}) is captured on the caller thread at
+ * {@link #submit(BatchHashRequest)} / {@link #retry(String)} time and carried on the attempt, then
+ * installed on the worker thread for the duration of the attempt and cleared in a {@code finally}
+ * block, so a reused pool thread never leaks one job's {@code X-Request-Id} into the next. The
+ * journal entry is opened at worker admission and closed in the same job-monitor section that
+ * stamps the attempt's terminal status (worker completion, worker failure, or reaper fencing), so
+ * the audit state can never disagree with the job snapshot; every journal call is best effort and
+ * cannot move a job's status, results or error.</p>
  */
 @Service
 public class BatchHashJobService {
@@ -58,6 +76,11 @@ public class BatchHashJobService {
 
     private static final long DEFAULT_EXECUTION_LEASE_SECONDS = 30;
     private static final long DEFAULT_EXECUTION_REAPER_INTERVAL_MS = 5000;
+    private static final String BATCH_HASH_FAILED = "BATCH_HASH_FAILED";
+    /** Bound shared by every client-controlled string that enters the audit journal. */
+    private static final int MAX_AUDIT_TEXT = 200;
+
+    private static final Logger log = LoggerFactory.getLogger(BatchHashJobService.class);
 
     private final CryptoService cryptoService;
     private final ThreadPoolExecutor executor;
@@ -68,6 +91,9 @@ public class BatchHashJobService {
     private final long executionLeaseSeconds;
     private final long executionReaperIntervalMs;
     private final Clock clock;
+
+    /** Null means auditing is disabled (test slices and direct construction). */
+    private volatile AuditJournalService journal;
 
     private final ConcurrentHashMap<String, MutableJob> jobs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> idempotencyIndex = new ConcurrentHashMap<>();
@@ -81,6 +107,16 @@ public class BatchHashJobService {
             long retentionSeconds, int maxAttempts) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 DEFAULT_EXECUTION_LEASE_SECONDS, DEFAULT_EXECUTION_REAPER_INTERVAL_MS, Clock.systemUTC());
+    }
+
+    /**
+     * Compatibility overload for callers (and tests) that pass an explicit clock but not the
+     * execution lease / reaper cadence.
+     */
+    public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
+            long retentionSeconds, int maxAttempts, Clock clock) {
+        this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
+                DEFAULT_EXECUTION_LEASE_SECONDS, DEFAULT_EXECUTION_REAPER_INTERVAL_MS, clock);
     }
 
     @Autowired
@@ -116,12 +152,39 @@ public class BatchHashJobService {
     }
 
     /**
+     * Test convenience: the same service with an explicit journal, so a unit test can assert the
+     * per-attempt audit trail without a Spring context. Unannotated on purpose — Spring must keep
+     * selecting the {@code @Autowired} constructor above.
+     */
+    public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
+            long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
+            long executionReaperIntervalMs, Clock clock, AuditJournalService journal) {
+        this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
+                executionLeaseSeconds, executionReaperIntervalMs, clock);
+        this.journal = journal;
+    }
+
+    /**
+     * Optional journal injection: auditing stays absent in test slices and in direct construction,
+     * in which case attempts run unjournalled and {@link JobAttempt#auditEntryId()} stays null.
+     *
+     * @param journal the audit journal, or null to disable per-attempt journaling
+     */
+    @Autowired(required = false)
+    public void setAuditJournal(AuditJournalService journal) {
+        this.journal = journal;
+    }
+
+    /**
      * Registers the job, enqueues it, and returns its snapshot. Registration, {@code execute} and
      * the rejection rollback share one critical section, so "remove the job and its idempotency
      * mapping atomically" is literally true: no concurrent submitter can ever observe a job id
      * whose job was rolled back.
      */
     public BatchHashJobResponse submit(BatchHashRequest request) {
+        // Captured on the servlet thread: this is the id the accepted request will be audited under,
+        // and it must survive the handoff to the pool.
+        String requestId = RequestContext.get();
         String key = (request.idempotencyKey() == null || request.idempotencyKey().isBlank())
                 ? null
                 : request.idempotencyKey();
@@ -158,6 +221,10 @@ public class BatchHashJobService {
             // current live snapshot of the already-registered job, which may already be COMPLETED.
             BatchHashJobResponse accepted = snapshot(job);
 
+            // Correlation is recorded before the handoff, so the worker can install the *submitter's*
+            // id rather than whatever the reused pool thread happened to carry.
+            job.attemptRequestIds.put(1, requestId);
+
             try {
                 // The first attempt's generation is explicit rather than implicit.
                 executor.execute(() -> executeAttempt(job.jobId, 1));
@@ -168,6 +235,8 @@ public class BatchHashJobService {
                 if (key != null) {
                     idempotencyIndex.remove(key, job.jobId);
                 }
+                // A rejected submission never started, so it must leave no correlation behind either.
+                job.attemptRequestIds.remove(1);
                 throw new JobQueueFullException("Hash job queue is full (worker-count=" + workerCount
                         + ", queue-capacity=" + queueCapacity + "); retry after capacity frees");
             }
@@ -199,6 +268,9 @@ public class BatchHashJobService {
      * @throws JobQueueFullException       when the bounded executor rejects the requeued attempt
      */
     public BatchHashJobResponse retry(String jobId) {
+        // The retry is its own audited request: the new attempt is correlated to *this* caller's id,
+        // never to the id that created (or first retried) the job.
+        String requestId = RequestContext.get();
         MutableJob job = requireJob(jobId); // unknown/evicted -> JobNotFoundException (404 JOB_NOT_FOUND)
         synchronized (job) {
             // Registry membership is re-checked under the monitor: an eviction pass that acquired
@@ -220,10 +292,12 @@ public class BatchHashJobService {
             job.results = null; // a retried attempt starts from nothing
             job.lastHeartbeatAt = null; // the new attempt stamps its own lease at admission
             job.executionLeaseExpiresAt = null;
+            job.attemptRequestIds.put(admittedAttempt, requestId);
             try {
                 executor.execute(() -> executeAttempt(job.jobId, admittedAttempt));
             } catch (RejectedExecutionException e) {
                 before.restore(job); // attempt decremented, status FAILED, error/completedAt back
+                job.attemptRequestIds.remove(admittedAttempt); // the attempt never started
                 throw new JobQueueFullException("Hash job queue is full (worker-count=" + workerCount
                         + ", queue-capacity=" + queueCapacity + "); retry after capacity frees");
             }
@@ -335,6 +409,9 @@ public class BatchHashJobService {
                 job.lastHeartbeatAt = null;
                 recordAttempt(job, job.attempt, JobStatus.FAILED, job.startedAt, now,
                         EXECUTION_LEASE_EXPIRED);
+                // Close the audit entry the stalled worker opened: the fence keeps that worker from
+                // writing its own (late) outcome, so this is the only terminal write for the attempt.
+                failQuietly(job, job.attempt, EXECUTION_LEASE_EXPIRED);
                 reaped++;
             }
         }
@@ -380,55 +457,71 @@ public class BatchHashJobService {
     }
 
     private void executeJob(MutableJob job, int generation) {
-        synchronized (job) {
-            if (job.status != JobStatus.QUEUED || job.attempt != generation) {
-                return; // fenced: a superseded generation (or a cancelled/retried job) writes nothing
-            }
-            Instant now = Instant.now(clock);
-            job.status = JobStatus.RUNNING;
-            job.startedAt = now;
-            job.lastHeartbeatAt = now;
-            job.executionLeaseExpiresAt = now.plusSeconds(executionLeaseSeconds);
-            recordAttempt(job, generation, JobStatus.RUNNING, job.startedAt, null, null);
-        }
         try {
-            List<HashResponse> results = new ArrayList<>(job.items.size());
-            for (String item : job.items) {
-                if (!renewLease(job, generation)) {
-                    return; // fenced: the attempt was reaped, retried or cancelled while hashing
-                }
-                results.add(cryptoService.hash(new HashRequest(job.algorithm, item, job.secretKey)));
-            }
             synchronized (job) {
-                if (job.attempt != generation || job.status != JobStatus.RUNNING) {
-                    // Load-bearing: a reaped attempt keeps its attempt number but is FAILED, so the
-                    // status half of this fence is what stops a late COMPLETED write; the generation
-                    // half covers an attempt superseded by retry.
-                    return; // fenced: the attempt was requeued or reaped while hashing
+                if (job.status != JobStatus.QUEUED || job.attempt != generation) {
+                    return; // fenced: a superseded generation (or a cancelled/retried job) writes nothing
                 }
-                job.results = List.copyOf(results);
-                job.error = null;
-                job.status = JobStatus.COMPLETED;
-                job.completedAt = Instant.now(clock);
-                job.lastHeartbeatAt = null;
-                job.executionLeaseExpiresAt = null;
-                recordAttempt(job, generation, JobStatus.COMPLETED, job.startedAt, job.completedAt, null);
-            }
-        } catch (Throwable t) {
-            // Intentional: an Error must not wedge the pool, later jobs still run.
-            synchronized (job) {
-                if (job.attempt != generation || job.status != JobStatus.RUNNING) {
-                    // Load-bearing, same reasoning as the COMPLETED fence above: a stale failure must
-                    // not overwrite a reaped or retried attempt.
-                    return; // fenced: a superseded failure must not overwrite the retried attempt
+                Instant now = Instant.now(clock);
+                job.status = JobStatus.RUNNING;
+                job.startedAt = now;
+                job.lastHeartbeatAt = now;
+                job.executionLeaseExpiresAt = now.plusSeconds(executionLeaseSeconds);
+                // Admission is the moment the attempt "starts": install the submitter's correlation
+                // id on this (possibly reused) pool thread and open exactly one audit entry here.
+                RequestContext.set(job.attemptRequestIds.get(generation));
+                String entryId = beginQuietly(job, generation);
+                if (entryId != null) {
+                    job.attemptAuditEntryIds.put(generation, entryId);
                 }
-                job.error = describe(t);
-                job.status = JobStatus.FAILED;
-                job.completedAt = Instant.now(clock);
-                job.lastHeartbeatAt = null;
-                job.executionLeaseExpiresAt = null;
-                recordAttempt(job, generation, JobStatus.FAILED, job.startedAt, job.completedAt, job.error);
+                recordAttempt(job, generation, JobStatus.RUNNING, job.startedAt, null, null);
             }
+            try {
+                List<HashResponse> results = new ArrayList<>(job.items.size());
+                for (String item : job.items) {
+                    if (!renewLease(job, generation)) {
+                        return; // fenced: the attempt was reaped, retried or cancelled while hashing
+                    }
+                    results.add(cryptoService.hash(new HashRequest(job.algorithm, item, job.secretKey)));
+                }
+                synchronized (job) {
+                    if (job.attempt != generation || job.status != JobStatus.RUNNING) {
+                        // Load-bearing: a reaped attempt keeps its attempt number but is FAILED, so the
+                        // status half of this fence is what stops a late COMPLETED write; the generation
+                        // half covers an attempt superseded by retry.
+                        return; // fenced: the attempt was requeued or reaped while hashing
+                    }
+                    job.results = List.copyOf(results);
+                    job.error = null;
+                    job.status = JobStatus.COMPLETED;
+                    job.completedAt = Instant.now(clock);
+                    job.lastHeartbeatAt = null;
+                    job.executionLeaseExpiresAt = null;
+                    recordAttempt(job, generation, JobStatus.COMPLETED, job.startedAt, job.completedAt, null);
+                    // Same section that wrote the terminal status: the audit outcome can never
+                    // disagree with the snapshot, and a journal fault cannot change it.
+                    succeedQuietly(job, generation, "COMPLETED");
+                }
+            } catch (Throwable t) {
+                // Intentional: an Error must not wedge the pool, later jobs still run.
+                synchronized (job) {
+                    if (job.attempt != generation || job.status != JobStatus.RUNNING) {
+                        // Load-bearing, same reasoning as the COMPLETED fence above: a stale failure must
+                        // not overwrite a reaped or retried attempt.
+                        return; // fenced: a superseded failure must not overwrite the retried attempt
+                    }
+                    job.error = describe(t);
+                    job.status = JobStatus.FAILED;
+                    job.completedAt = Instant.now(clock);
+                    job.lastHeartbeatAt = null;
+                    job.executionLeaseExpiresAt = null;
+                    recordAttempt(job, generation, JobStatus.FAILED, job.startedAt, job.completedAt, job.error);
+                    failQuietly(job, generation, job.error);
+                }
+            }
+        } finally {
+            // Runs on the pool thread: the next job admitted on it must never inherit this id.
+            RequestContext.clear();
         }
     }
 
@@ -460,7 +553,8 @@ public class BatchHashJobService {
      */
     private void recordAttempt(MutableJob job, int attempt, JobStatus status, Instant startedAt,
             Instant completedAt, String error) {
-        JobAttempt entry = new JobAttempt(attempt, status, startedAt, completedAt, error);
+        JobAttempt entry = new JobAttempt(attempt, status, startedAt, completedAt, error,
+                job.attemptAuditEntryIds.get(attempt));
         for (int i = 0; i < job.attemptHistory.size(); i++) {
             if (job.attemptHistory.get(i).attempt() == attempt) {
                 job.attemptHistory.set(i, entry);
@@ -468,6 +562,82 @@ public class BatchHashJobService {
             }
         }
         job.attemptHistory.add(entry);
+    }
+
+    /**
+     * Opens the {@code BATCH_HASH} audit entry for {@code generation} at worker admission.
+     *
+     * <p>Best effort by contract: an audit failure must never change whether an attempt starts, so
+     * every throwable is swallowed and a null id simply means "this attempt has no journal entry".
+     * The descriptor is bounded and carries no payload: {@code items} and {@code secretKey} never
+     * leave the job.</p>
+     */
+    private String beginQuietly(MutableJob job, int generation) {
+        AuditJournalService audit = this.journal;
+        if (audit == null) {
+            return null;
+        }
+        try {
+            return audit.begin(OperationType.BATCH_HASH, BatchHashAuditDescriptor.of(job, generation),
+                    RequestContext.get()).id();
+        } catch (RuntimeException e) {
+            log.debug("BATCH_HASH audit begin failed for job {} attempt {}: {}", job.jobId, generation,
+                    e.toString());
+            return null;
+        }
+    }
+
+    /** Closes the attempt's entry as SUCCEEDED; a missing or already-terminal entry is ignored. */
+    private void succeedQuietly(MutableJob job, int generation, String outcome) {
+        AuditJournalService audit = this.journal;
+        String entryId = job.attemptAuditEntryIds.remove(generation);
+        if (audit == null || entryId == null) {
+            return;
+        }
+        try {
+            audit.succeed(entryId, Map.of("outcome", outcome, "resultCount", job.items.size()));
+        } catch (RuntimeException e) {
+            log.debug("BATCH_HASH audit succeed failed for job {} attempt {}: {}", job.jobId, generation,
+                    e.toString());
+        }
+    }
+
+    /** Closes the attempt's entry as FAILED with a bounded code; a missing entry is ignored. */
+    private void failQuietly(MutableJob job, int generation, String error) {
+        AuditJournalService audit = this.journal;
+        String entryId = job.attemptAuditEntryIds.remove(generation);
+        if (audit == null || entryId == null) {
+            return;
+        }
+        try {
+            audit.fail(entryId, boundedAuditText(error, BATCH_HASH_FAILED));
+        } catch (RuntimeException e) {
+            log.debug("BATCH_HASH audit fail failed for job {} attempt {}: {}", job.jobId, generation,
+                    e.toString());
+        }
+    }
+
+    /** Clamps client-controlled text so a pathological payload cannot bloat the bounded journal. */
+    private static String boundedAuditText(String value, String fallback) {
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+        return value.length() <= MAX_AUDIT_TEXT ? value : value.substring(0, MAX_AUDIT_TEXT);
+    }
+
+    /**
+     * The audit descriptor of one attempt. Deliberately payload-free: the job id, attempt number,
+     * algorithm, item count and idempotency key describe the work without storing item contents or
+     * the secret key in the journal.
+     */
+    private record BatchHashAuditDescriptor(String jobId, int attempt, String algorithm, int itemCount,
+            String idempotencyKey) {
+
+        private static BatchHashAuditDescriptor of(MutableJob job, int generation) {
+            return new BatchHashAuditDescriptor(job.jobId, generation,
+                    boundedAuditText(job.algorithm, "UNKNOWN"), job.items.size(),
+                    boundedAuditText(job.idempotencyKey, null));
+        }
     }
 
     private String describe(Throwable t) {
@@ -577,6 +747,14 @@ public class BatchHashJobService {
         private final Instant createdAt;
         private final int maxAttempts;
         private final List<JobAttempt> attemptHistory = new ArrayList<>();
+        /**
+         * Per-attempt correlation id captured on the submit/retry caller thread. Kept per attempt
+         * (not per job) so a retry is correlated to the retry caller, and only for the attempts
+         * this instance admitted.
+         */
+        private final Map<Integer, String> attemptRequestIds = new HashMap<>();
+        /** Audit entry id of every attempt that actually started, keyed by attempt number. */
+        private final Map<Integer, String> attemptAuditEntryIds = new HashMap<>();
 
         private int attempt = 1;
         private JobStatus status = JobStatus.QUEUED;
