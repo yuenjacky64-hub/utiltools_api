@@ -4,6 +4,7 @@ import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
 import jakarta.annotation.PreDestroy;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -11,6 +12,7 @@ import org.springframework.stereotype.Service;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HexFormat;
@@ -39,9 +41,23 @@ import java.util.concurrent.TimeUnit;
  * captures its generation at admission and writes RUNNING, COMPLETED or FAILED only while
  * {@code job.attempt} still equals it, so a late worker from a superseded attempt cannot overwrite
  * the retried attempt's status, results or error.</p>
+ *
+ * <p>Each admitted attempt also holds an execution lease: the worker stamps
+ * {@code lastHeartbeatAt} and {@code executionLeaseExpiresAt} at admission and renews the lease
+ * before hashing every item. A scheduled reaper moves a RUNNING job whose lease has lapsed to
+ * FAILED with error {@code EXECUTION_LEASE_EXPIRED}, so a worker stalled inside
+ * {@code CryptoService.hash} can no longer leave a job RUNNING forever. Reaping reuses the
+ * generation fence: a reaped attempt keeps its attempt number but is no longer RUNNING, so a late
+ * worker from that attempt writes nothing, and the FAILED job stays retryable.</p>
  */
 @Service
 public class BatchHashJobService {
+
+    /** Error recorded on a RUNNING attempt whose execution lease lapsed without a renewal. */
+    public static final String EXECUTION_LEASE_EXPIRED = "EXECUTION_LEASE_EXPIRED";
+
+    private static final long DEFAULT_EXECUTION_LEASE_SECONDS = 30;
+    private static final long DEFAULT_EXECUTION_REAPER_INTERVAL_MS = 5000;
 
     private final CryptoService cryptoService;
     private final ThreadPoolExecutor executor;
@@ -49,22 +65,52 @@ public class BatchHashJobService {
     private final int queueCapacity;
     private final long retentionSeconds;
     private final int maxAttempts;
+    private final long executionLeaseSeconds;
+    private final long executionReaperIntervalMs;
+    private final Clock clock;
 
     private final ConcurrentHashMap<String, MutableJob> jobs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> idempotencyIndex = new ConcurrentHashMap<>();
     private final Object registryLock = new Object();
 
+    /**
+     * Compatibility overload for callers (and tests) that build the service directly: the system
+     * clock and the default lease and reaper cadence are used.
+     */
+    public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
+            long retentionSeconds, int maxAttempts) {
+        this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
+                DEFAULT_EXECUTION_LEASE_SECONDS, DEFAULT_EXECUTION_REAPER_INTERVAL_MS, Clock.systemUTC());
+    }
+
+    @Autowired
     public BatchHashJobService(CryptoService cryptoService,
             @Value("${utiltools.jobs.worker-count:2}") int workerCount,
             @Value("${utiltools.jobs.queue-capacity:100}") int queueCapacity,
             @Value("${utiltools.jobs.retention-seconds:300}") long retentionSeconds,
-            @Value("${utiltools.jobs.max-attempts:3}") int maxAttempts) {
+            @Value("${utiltools.jobs.max-attempts:3}") int maxAttempts,
+            @Value("${utiltools.jobs.execution-lease-seconds:30}") long executionLeaseSeconds,
+            @Value("${utiltools.jobs.execution-reaper-interval-ms:5000}") long executionReaperIntervalMs,
+            Clock clock) {
         this.cryptoService = cryptoService;
         this.workerCount = workerCount;
         this.queueCapacity = queueCapacity;
         this.retentionSeconds = retentionSeconds;
         // A non-positive configuration must not authorise unlimited retries.
         this.maxAttempts = Math.max(1, maxAttempts);
+        // A non-positive lease would fail every attempt mid-hash and a non-positive reaper cadence
+        // is meaningless, so both are rejected loudly at startup instead of being clamped.
+        if (executionLeaseSeconds <= 0) {
+            throw new IllegalArgumentException(
+                    "utiltools.jobs.execution-lease-seconds must be positive, was " + executionLeaseSeconds);
+        }
+        if (executionReaperIntervalMs <= 0) {
+            throw new IllegalArgumentException("utiltools.jobs.execution-reaper-interval-ms must be positive, was "
+                    + executionReaperIntervalMs);
+        }
+        this.executionLeaseSeconds = executionLeaseSeconds;
+        this.executionReaperIntervalMs = executionReaperIntervalMs;
+        this.clock = clock == null ? Clock.systemUTC() : clock;
         this.executor = new ThreadPoolExecutor(workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(queueCapacity), new ThreadPoolExecutor.AbortPolicy());
     }
@@ -99,7 +145,7 @@ public class BatchHashJobService {
             }
 
             MutableJob job = new MutableJob(UUID.randomUUID().toString(), key,
-                    request.algorithm(), request.items(), request.secretKey(), fingerprint, Instant.now(),
+                    request.algorithm(), request.items(), request.secretKey(), fingerprint, Instant.now(clock),
                     maxAttempts);
             if (key != null) {
                 idempotencyIndex.put(key, job.jobId);
@@ -172,6 +218,8 @@ public class BatchHashJobService {
             job.completedAt = null;
             job.error = null;
             job.results = null; // a retried attempt starts from nothing
+            job.lastHeartbeatAt = null; // the new attempt stamps its own lease at admission
+            job.executionLeaseExpiresAt = null;
             try {
                 executor.execute(() -> executeAttempt(job.jobId, admittedAttempt));
             } catch (RejectedExecutionException e) {
@@ -203,16 +251,18 @@ public class BatchHashJobService {
                 throw new JobCancellationConflictException(job.jobId, job.status);
             }
             job.status = JobStatus.CANCELLED;
-            job.completedAt = Instant.now();
+            job.completedAt = Instant.now(clock);
             job.results = null; // explicit: nothing was hashed
             job.error = null;
+            job.lastHeartbeatAt = null;
+            job.executionLeaseExpiresAt = null;
             return snapshot(job);
         }
     }
 
     @Scheduled(fixedDelayString = "${utiltools.jobs.cleanup-interval-ms:60000}")
     public void evictExpiredJobs() {
-        evictExpiredJobs(Instant.now().minusSeconds(retentionSeconds));
+        evictExpiredJobs(Instant.now(clock).minusSeconds(retentionSeconds));
     }
 
     /**
@@ -247,6 +297,50 @@ public class BatchHashJobService {
         return evicted;
     }
 
+    @Scheduled(fixedDelayString = "${utiltools.jobs.execution-reaper-interval-ms:5000}")
+    public void reapExpiredExecutions() {
+        reapExpiredExecutions(Instant.now(clock));
+    }
+
+    /**
+     * Fails every RUNNING attempt whose execution lease expired at or before {@code now}, exactly
+     * once per attempt. QUEUED jobs hold no lease, and terminal jobs (including an already reaped
+     * FAILED job) are skipped, so a second pass over the same {@code now} reaps nothing and writes
+     * nothing. The reaped attempt keeps its attempt number, so the worker that stalled inside
+     * {@code hash} fails its status fence when it finally returns and cannot overwrite this
+     * snapshot; {@link #retry(String)} then starts {@code attempt + 1}.
+     *
+     * <p>The pass is clock-free, holds one job monitor at a time and never removes a job, so monitor
+     * hold time stays a function of the scalar writes below and the pass cannot deadlock with the
+     * worker or with {@link #evictExpiredJobs(Instant)}.</p>
+     *
+     * @param now the instant lease expiry is compared against
+     * @return the number of attempts reaped by this pass
+     */
+    public int reapExpiredExecutions(Instant now) {
+        int reaped = 0;
+        for (MutableJob job : jobs.values()) {
+            synchronized (job) {
+                if (job.status != JobStatus.RUNNING || job.executionLeaseExpiresAt == null) {
+                    continue; // QUEUED, terminal, or (defensively) a RUNNING job with no lease
+                }
+                if (job.executionLeaseExpiresAt.isAfter(now)) {
+                    continue; // lease still live
+                }
+                job.status = JobStatus.FAILED;
+                job.error = EXECUTION_LEASE_EXPIRED;
+                job.completedAt = now;
+                job.results = null;
+                job.executionLeaseExpiresAt = null;
+                job.lastHeartbeatAt = null;
+                recordAttempt(job, job.attempt, JobStatus.FAILED, job.startedAt, now,
+                        EXECUTION_LEASE_EXPIRED);
+                reaped++;
+            }
+        }
+        return reaped;
+    }
+
     @PreDestroy
     public void shutdown() {
         executor.shutdownNow();
@@ -262,9 +356,14 @@ public class BatchHashJobService {
 
     private BatchHashJobResponse snapshot(MutableJob job) {
         synchronized (job) {
+            // Lease state is a property of RUNNING alone: admission always stamps both instants, and
+            // every non-RUNNING status projects null regardless of any leftover field.
+            boolean running = job.status == JobStatus.RUNNING;
             return new BatchHashJobResponse(job.jobId, job.idempotencyKey, job.status, job.items.size(),
                     job.results, job.error, job.createdAt, job.startedAt, job.completedAt,
-                    job.attempt, job.maxAttempts, List.copyOf(job.attemptHistory));
+                    job.attempt, job.maxAttempts, List.copyOf(job.attemptHistory),
+                    running ? job.executionLeaseExpiresAt : null,
+                    running ? job.lastHeartbeatAt : null);
         }
     }
 
@@ -285,39 +384,72 @@ public class BatchHashJobService {
             if (job.status != JobStatus.QUEUED || job.attempt != generation) {
                 return; // fenced: a superseded generation (or a cancelled/retried job) writes nothing
             }
+            Instant now = Instant.now(clock);
             job.status = JobStatus.RUNNING;
-            job.startedAt = Instant.now();
+            job.startedAt = now;
+            job.lastHeartbeatAt = now;
+            job.executionLeaseExpiresAt = now.plusSeconds(executionLeaseSeconds);
             recordAttempt(job, generation, JobStatus.RUNNING, job.startedAt, null, null);
         }
         try {
             List<HashResponse> results = new ArrayList<>(job.items.size());
             for (String item : job.items) {
+                if (!renewLease(job, generation)) {
+                    return; // fenced: the attempt was reaped, retried or cancelled while hashing
+                }
                 results.add(cryptoService.hash(new HashRequest(job.algorithm, item, job.secretKey)));
             }
             synchronized (job) {
                 if (job.attempt != generation || job.status != JobStatus.RUNNING) {
-                    // Defence-in-depth only: the load-bearing fence is the admission check above,
-                    // because RUNNING jobs are neither retryable nor evictable today.
+                    // Load-bearing: a reaped attempt keeps its attempt number but is FAILED, so the
+                    // status half of this fence is what stops a late COMPLETED write; the generation
+                    // half covers an attempt superseded by retry.
                     return; // fenced: the attempt was requeued or reaped while hashing
                 }
                 job.results = List.copyOf(results);
                 job.error = null;
                 job.status = JobStatus.COMPLETED;
-                job.completedAt = Instant.now();
+                job.completedAt = Instant.now(clock);
+                job.lastHeartbeatAt = null;
+                job.executionLeaseExpiresAt = null;
                 recordAttempt(job, generation, JobStatus.COMPLETED, job.startedAt, job.completedAt, null);
             }
         } catch (Throwable t) {
             // Intentional: an Error must not wedge the pool, later jobs still run.
             synchronized (job) {
                 if (job.attempt != generation || job.status != JobStatus.RUNNING) {
-                    // Defence-in-depth only, same reasoning as the COMPLETED fence above.
+                    // Load-bearing, same reasoning as the COMPLETED fence above: a stale failure must
+                    // not overwrite a reaped or retried attempt.
                     return; // fenced: a superseded failure must not overwrite the retried attempt
                 }
                 job.error = describe(t);
                 job.status = JobStatus.FAILED;
-                job.completedAt = Instant.now();
+                job.completedAt = Instant.now(clock);
+                job.lastHeartbeatAt = null;
+                job.executionLeaseExpiresAt = null;
                 recordAttempt(job, generation, JobStatus.FAILED, job.startedAt, job.completedAt, job.error);
             }
+        }
+    }
+
+    /**
+     * Renews the execution lease of {@code generation} before the next item is hashed.
+     *
+     * <p>Under the job monitor it re-checks {@code job.attempt == generation && status == RUNNING},
+     * so an attempt that was reaped, retried or cancelled while hashing is never re-armed: the lease
+     * cannot be revived, and the worker stops hashing instead of burning CPU for a job it can no
+     * longer complete.</p>
+     *
+     * @return {@code true} when the lease was renewed, {@code false} when the attempt was fenced
+     */
+    private boolean renewLease(MutableJob job, int generation) {
+        synchronized (job) {
+            if (job.attempt != generation || job.status != JobStatus.RUNNING) {
+                return false;
+            }
+            job.lastHeartbeatAt = Instant.now(clock);
+            job.executionLeaseExpiresAt = job.lastHeartbeatAt.plusSeconds(executionLeaseSeconds);
+            return true;
         }
     }
 
@@ -352,18 +484,23 @@ public class BatchHashJobService {
         private final Instant completedAt;
         private final String error;
         private final List<HashResponse> results;
+        private final Instant lastHeartbeatAt;
+        private final Instant executionLeaseExpiresAt;
 
         private FailedState(int attempt, Instant startedAt, Instant completedAt, String error,
-                List<HashResponse> results) {
+                List<HashResponse> results, Instant lastHeartbeatAt, Instant executionLeaseExpiresAt) {
             this.attempt = attempt;
             this.startedAt = startedAt;
             this.completedAt = completedAt;
             this.error = error;
             this.results = results;
+            this.lastHeartbeatAt = lastHeartbeatAt;
+            this.executionLeaseExpiresAt = executionLeaseExpiresAt;
         }
 
         private static FailedState of(MutableJob job) {
-            return new FailedState(job.attempt, job.startedAt, job.completedAt, job.error, job.results);
+            return new FailedState(job.attempt, job.startedAt, job.completedAt, job.error, job.results,
+                    job.lastHeartbeatAt, job.executionLeaseExpiresAt);
         }
 
         private void restore(MutableJob job) {
@@ -373,6 +510,8 @@ public class BatchHashJobService {
             job.completedAt = completedAt;
             job.error = error;
             job.results = results;
+            job.lastHeartbeatAt = lastHeartbeatAt;
+            job.executionLeaseExpiresAt = executionLeaseExpiresAt;
         }
     }
 
@@ -443,6 +582,8 @@ public class BatchHashJobService {
         private JobStatus status = JobStatus.QUEUED;
         private Instant startedAt;
         private Instant completedAt;
+        private Instant lastHeartbeatAt;
+        private Instant executionLeaseExpiresAt;
         private List<HashResponse> results;
         private String error;
 
