@@ -146,6 +146,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/validate` | Check JSON syntax validity and report exact syntax error line/col |
 | `POST` | `/api/v1/utils/json/query` | Evaluate JSONPath queries and extract matching nodes |
 | `POST` | `/api/v1/utils/json/patch` | Apply an ordered RFC 6902-style patch atomically, with reverse-order rollback and audit |
+| `POST` | `/api/v1/utils/json/merge-patch` | Apply an RFC 7396 merge-patch document (`null` deletes, objects merge recursively, arrays/scalars replace) as a journalled `JSON_MERGE_PATCH` |
 | `POST` | `/api/v1/utils/text/transform` | Apply a deterministic case/format operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`) to a string |
 | `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
 | `POST` | `/api/v1/utils/text/replace` | Replace every (or, with `all=false`, the first) occurrence of a literal or regex `pattern`, reporting `replacements`, `changed` and code-point `length` |
@@ -911,7 +912,48 @@ curl -X POST http://localhost:8080/api/v1/utils/json/patch \
 }
 ```
 
-#### E. Circuit breaker & probe lease recovery
+#### E. Declarative Merge Patch (RFC 7396)
+
+`POST /api/v1/utils/json/merge-patch` applies a *merge-patch document* instead of an ordered operation list:
+a `null` member removes that key, objects merge recursively, and arrays/scalars replace the target value
+wholesale. A non-object patch (`7`, `[1,2]`, `"x"`, `null`) replaces the whole target. The journalled operation
+is `json/merge-patch` (`JSON_MERGE_PATCH`), so the call appears in the audit journal and replays like the other
+JSON utilities.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/json/merge-patch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "json": "{\"a\":1,\"b\":{\"c\":2,\"d\":3}}",
+    "patch": "{\"b\":{\"c\":null,\"e\":4},\"f\":[1,2]}"
+  }'
+```
+
+**Response (200):**
+
+```json
+{
+  "success": true,
+  "message": "JSON merge patch applied successfully",
+  "data": {
+    "resultJson": { "a": 1, "b": { "d": 3, "e": 4 }, "f": [1, 2] },
+    "sizeBytes": 35,
+    "changed": true,
+    "removedKeys": 1
+  },
+  "timestamp": "2026-10-30T16:50:39.127057574Z"
+}
+```
+
+`removedKeys` counts the members deleted by a `null` in the patch, `sizeBytes` is the UTF-8 byte length of the
+compact `resultJson`, and `changed` is `false` when the patch leaves the document byte-identical. Both inputs are
+parsed and never mutated, so the same request is replay-stable.
+
+**Errors:** malformed `json` or `patch` returns **HTTP 400** `BAD_REQUEST` (`Invalid JSON content ...`); blank
+fields return **HTTP 400** `VALIDATION_ERROR`; a patch nested deeper than 64 object levels is rejected with
+**HTTP 400** instead of overflowing the stack.
+
+#### F. Circuit breaker & probe lease recovery
 
 The JSONPath query path runs behind a single `CLOSED` / `OPEN` / `HALF_OPEN` circuit breaker, exposed
 read-only by `GET /api/v1/utils/resilience` and driven by hand with `POST /api/v1/utils/resilience/probe`.
@@ -957,9 +999,9 @@ ignored — and the next admitted caller claims a fresh generation. The schedule
 
 ## 🧾 Operation Journal & Replay Verification
 
-All fourteen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+All fifteen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
 `datetime/shift`, `crypto/hash`, `crypto/base64`, `crypto/url`, `crypto/uuid`, `json/format`, `json/validate`,
-`json/query`, `text/transform`, `text/stats`, `text/replace` — are recorded in a **bounded in-memory journal** so a failed
+`json/query`, `json/merge-patch`, `text/transform`, `text/stats`, `text/replace` — are recorded in a **bounded in-memory journal** so a failed
 hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
 can be verified against the original outcome without ever mutating the original entry.
 `GET /api/v1/utils/datetime/timezones` is read-only catalogue metadata and is not journalled.

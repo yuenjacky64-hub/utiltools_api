@@ -4,6 +4,8 @@ import com.example.utiltools.json.dto.JsonFlattenRequest;
 import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
+import com.example.utiltools.json.dto.JsonMergePatchRequest;
+import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonPatchOperation;
 import com.example.utiltools.json.dto.JsonPatchResponse;
 import com.example.utiltools.json.dto.JsonPatchRequest;
@@ -808,6 +810,176 @@ class JsonServiceTest {
                     .containsExactly("json content is required");
             assertThat(validator.validate(new JsonFlattenRequest("{\"a\":1}", null))).isEmpty();
             assertThat(validator.validate(new JsonUnflattenRequest("{\"a\":1}", "."))).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("Should merge nested objects and delete null members with merge patch")
+    void shouldMergePatchNestedObjectsAndDeleteNullMembers() throws JsonProcessingException {
+        JsonMergePatchRequest request = new JsonMergePatchRequest(
+                "{\"a\":1,\"b\":{\"c\":2,\"d\":3}}",
+                "{\"b\":{\"c\":null,\"e\":4},\"f\":[1,2]}");
+
+        JsonMergePatchResponse response = jsonService.mergePatch(request);
+
+        ObjectMapper mapper = new ObjectMapper();
+        assertThat(response.resultJson())
+                .isEqualTo(mapper.readTree("{\"a\":1,\"b\":{\"d\":3,\"e\":4},\"f\":[1,2]}"));
+        assertThat(response.changed()).isTrue();
+        assertThat(response.removedKeys()).isEqualTo(1);
+        assertThat(response.sizeBytes())
+                .isEqualTo(mapper.writeValueAsString(response.resultJson()).getBytes(StandardCharsets.UTF_8).length);
+        assertThat(mapper.writeValueAsString(response.resultJson())).doesNotContain("\n");
+    }
+
+    @Test
+    @DisplayName("Should replace the whole target when the merge patch is not an object")
+    void shouldReplaceTargetWithNonObjectPatch() throws JsonProcessingException {
+        ObjectMapper mapper = new ObjectMapper();
+
+        JsonMergePatchResponse numberPatch = jsonService.mergePatch(
+                new JsonMergePatchRequest("{\"a\":1,\"b\":{\"c\":2}}", "7"));
+        assertThat(numberPatch.resultJson()).isEqualTo(mapper.readTree("7"));
+        assertThat(numberPatch.changed()).isTrue();
+        assertThat(numberPatch.removedKeys()).isZero();
+
+        JsonMergePatchResponse arrayPatch = jsonService.mergePatch(
+                new JsonMergePatchRequest("{\"a\":1}", "[1,2]"));
+        assertThat(arrayPatch.resultJson()).isEqualTo(mapper.readTree("[1,2]"));
+        assertThat(arrayPatch.changed()).isTrue();
+
+        JsonMergePatchResponse scalarPatch = jsonService.mergePatch(
+                new JsonMergePatchRequest("\"text\"", "\"other\""));
+        assertThat(scalarPatch.resultJson()).isEqualTo(mapper.readTree("\"other\""));
+
+        JsonMergePatchResponse unchanged = jsonService.mergePatch(
+                new JsonMergePatchRequest("7", "7"));
+        assertThat(unchanged.changed()).isFalse();
+    }
+
+    @Test
+    @DisplayName("Should build a fresh object when the merge patch target is not an object")
+    void shouldMergeObjectPatchIntoNonObjectTarget() throws JsonProcessingException {
+        ObjectMapper mapper = new ObjectMapper();
+
+        JsonMergePatchResponse response = jsonService.mergePatch(
+                new JsonMergePatchRequest("[1,2]", "{\"a\":1,\"b\":{\"c\":null}}"));
+
+        assertThat(response.resultJson()).isEqualTo(mapper.readTree("{\"a\":1,\"b\":{}}"));
+        assertThat(response.changed()).isTrue();
+        // "c" never existed in the (non-object) target, so nothing was removed.
+        assertThat(response.removedKeys()).isZero();
+    }
+
+    @Test
+    @DisplayName("Should replace arrays and scalars wholesale during merge patch")
+    void shouldReplaceArraysAndScalars() throws JsonProcessingException {
+        ObjectMapper mapper = new ObjectMapper();
+
+        JsonMergePatchResponse response = jsonService.mergePatch(new JsonMergePatchRequest(
+                "{\"a\":[1,2],\"b\":{\"c\":1},\"d\":\"x\"}",
+                "{\"a\":[3],\"b\":5,\"d\":{\"e\":true}}"));
+
+        assertThat(response.resultJson())
+                .isEqualTo(mapper.readTree("{\"a\":[3],\"b\":5,\"d\":{\"e\":true}}"));
+        assertThat(response.changed()).isTrue();
+        assertThat(response.removedKeys()).isZero();
+    }
+
+    @Test
+    @DisplayName("Should ignore and not count null merge patch members for absent keys")
+    void shouldDeleteOnlyNullPatchMembers() throws JsonProcessingException {
+        ObjectMapper mapper = new ObjectMapper();
+
+        JsonMergePatchResponse response = jsonService.mergePatch(new JsonMergePatchRequest(
+                "{\"a\":1,\"b\":{\"c\":2,\"d\":3}}",
+                "{\"a\":null,\"b\":{\"c\":null,\"z\":null},\"missing\":null}"));
+
+        assertThat(response.resultJson()).isEqualTo(mapper.readTree("{\"b\":{\"d\":3}}"));
+        assertThat(response.removedKeys()).isEqualTo(2);
+        assertThat(response.changed()).isTrue();
+
+        JsonMergePatchResponse noop = jsonService.mergePatch(
+                new JsonMergePatchRequest("{\"a\":1}", "{\"missing\":null}"));
+        assertThat(noop.resultJson()).isEqualTo(mapper.readTree("{\"a\":1}"));
+        assertThat(noop.changed()).isFalse();
+        assertThat(noop.removedKeys()).isZero();
+    }
+
+    @Test
+    @DisplayName("Should treat an empty merge patch as a no-op without changing size")
+    void shouldTreatEmptyMergePatchAsNoop() {
+        JsonMergePatchRequest request = new JsonMergePatchRequest("{\"a\":1}", "{}");
+
+        JsonMergePatchResponse response = jsonService.mergePatch(request);
+
+        assertThat(response.changed()).isFalse();
+        assertThat(response.removedKeys()).isZero();
+        assertThat(response.sizeBytes()).isEqualTo("{\"a\":1}".getBytes(StandardCharsets.UTF_8).length);
+    }
+
+    @Test
+    @DisplayName("Should not mutate merge patch inputs across repeated calls")
+    void shouldNotMutateMergePatchInputs() {
+        String json = "{\"a\":1,\"b\":{\"c\":2}}";
+        String patch = "{\"b\":{\"c\":null,\"d\":3},\"e\":[1]}";
+        JsonMergePatchRequest request = new JsonMergePatchRequest(json, patch);
+
+        JsonMergePatchResponse first = jsonService.mergePatch(request);
+        JsonMergePatchResponse second = jsonService.mergePatch(request);
+
+        assertThat(request.json()).isEqualTo("{\"a\":1,\"b\":{\"c\":2}}");
+        assertThat(request.patch()).isEqualTo("{\"b\":{\"c\":null,\"d\":3},\"e\":[1]}");
+        assertThat(second.resultJson()).isEqualTo(first.resultJson());
+        assertThat(second.removedKeys()).isEqualTo(first.removedKeys());
+        assertThat(second.changed()).isEqualTo(first.changed());
+        assertThat(first.resultJson().toString()).isEqualTo("{\"a\":1,\"b\":{\"d\":3},\"e\":[1]}");
+    }
+
+    @Test
+    @DisplayName("Should reject malformed JSON in merge patch requests")
+    void shouldRejectMalformedMergePatchJson() {
+        assertThatThrownBy(() -> jsonService.mergePatch(new JsonMergePatchRequest("{", "{\"a\":1}")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid JSON");
+        assertThatThrownBy(() -> jsonService.mergePatch(new JsonMergePatchRequest("{\"a\":1}", "[1,")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid JSON");
+    }
+
+    @Test
+    @DisplayName("Should reject merge patches nested beyond the depth bound")
+    void shouldRejectDeepMergePatchBeyondMaxDepth() {
+        String deep = "1";
+        for (int i = 0; i < 64; i++) {
+            deep = "{\"k\":" + deep + "}";
+        }
+        String deepPatch = deep;
+        assertThatThrownBy(() -> jsonService.mergePatch(new JsonMergePatchRequest("{\"k\":1}", deepPatch)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("patch depth must not exceed 64");
+
+        String allowed = "1";
+        for (int i = 0; i < 63; i++) {
+            allowed = "{\"k\":" + allowed + "}";
+        }
+        String allowedPatch = allowed;
+        assertThat(jsonService.mergePatch(new JsonMergePatchRequest("{\"k\":1}", allowedPatch)).resultJson())
+                .isNotNull();
+    }
+
+    @Test
+    @DisplayName("Should validate merge patch request fields")
+    void shouldValidateMergePatchRequest() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+            assertThat(validator.validate(new JsonMergePatchRequest("", "{}")))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("json content is required");
+            assertThat(validator.validate(new JsonMergePatchRequest("{}", " ")))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("patch content is required");
+            assertThat(validator.validate(new JsonMergePatchRequest("{}", "{}"))).isEmpty();
         }
     }
 
