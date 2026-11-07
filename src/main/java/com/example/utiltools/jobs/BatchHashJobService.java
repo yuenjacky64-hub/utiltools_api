@@ -93,6 +93,10 @@ public class BatchHashJobService {
     private static final long DEFAULT_EXECUTION_LEASE_SECONDS = 30;
     private static final long DEFAULT_EXECUTION_REAPER_INTERVAL_MS = 5000;
     private static final String BATCH_HASH_FAILED = "BATCH_HASH_FAILED";
+    /** Bounded, payload-free detail of a heartbeat row; compile-time constant (27 chars, far under 200). */
+    private static final String HEARTBEAT_DETAIL = "lease renewed via heartbeat";
+    /** Result marker that distinguishes a lease-renewal row from an attempt row. */
+    private static final String HEARTBEAT_STATUS = "HEARTBEAT";
     /** Bound shared by every client-controlled string that enters the audit journal. */
     private static final int MAX_AUDIT_TEXT = 200;
 
@@ -603,6 +607,48 @@ public class BatchHashJobService {
         return cancelled;
     }
 
+    /**
+     * Renews the execution lease of the attempt that is currently RUNNING.
+     *
+     * <p>A worker calls this to say "still working": the check and both lease writes happen inside a
+     * single monitor section, so the only attempt a heartbeat can extend is the one that owns the
+     * job at that instant ({@code INV-HB-1}). The new expiry is derived from
+     * {@link Instant#now(Clock)}, never from the stored expiry, and an expired lease is refused
+     * instead of revived ({@code INV-HB-2}), so a heartbeat arriving after
+     * {@link #reapExpiredExecutions(Instant)} claimed the attempt cannot resurrect it. Nothing but
+     * {@code lastHeartbeatAt} and {@code executionLeaseExpiresAt} is written ({@code INV-HB-3}).</p>
+     *
+     * <p>The {@code HEARTBEAT} journal row is opened and closed within this call and its id is never
+     * stored in {@code attemptAuditEntryIds}, so the attempt's own entry keeps closing with the
+     * attempt's outcome ({@code INV-HB-4}).</p>
+     *
+     * @param jobId the job whose lease should be renewed
+     * @return the post-renewal snapshot
+     * @throws JobNotFoundException      when the id is unknown or was already evicted
+     * @throws JobRetryConflictException when the job exists but is not RUNNING
+     * @throws IllegalArgumentException  when the job is RUNNING but holds no live lease
+     */
+    public BatchHashJobResponse heartbeat(String jobId) {
+        MutableJob job = requireJob(jobId); // order 1: unknown/evicted -> 404 JOB_NOT_FOUND
+        synchronized (job) {
+            if (job.status != JobStatus.RUNNING) { // order 2: QUEUED/COMPLETED/FAILED/CANCELLED -> 409
+                throw new JobRetryConflictException(job.jobId, job.status, job.attempt, job.maxAttempts,
+                        "renew its execution lease");
+            }
+            Instant now = Instant.now(clock);
+            Instant current = job.executionLeaseExpiresAt;
+            if (current == null || !current.isAfter(now)) { // order 3: dead lease -> 400
+                throw new IllegalArgumentException("Execution lease for job " + jobId
+                        + " has expired; the attempt is reaped and can be retried from attempt "
+                        + (job.attempt + 1));
+            }
+            job.lastHeartbeatAt = now;
+            job.executionLeaseExpiresAt = now.plusSeconds(executionLeaseSeconds);
+            recordHeartbeatQuietly(job, job.attempt, job.executionLeaseExpiresAt);
+        }
+        return snapshot(job);
+    }
+
     @Scheduled(fixedDelayString = "${utiltools.jobs.cleanup-interval-ms:60000}")
     public void evictExpiredJobs() {
         evictExpiredJobs(Instant.now(clock).minusSeconds(retentionSeconds));
@@ -957,6 +1003,37 @@ public class BatchHashJobService {
         }
     }
 
+    /**
+     * Opens and immediately closes one {@code HEARTBEAT} row for the renewed attempt.
+     *
+     * <p>Best effort by contract, exactly like {@link #beginQuietly}: a journal fault must never
+     * change the heartbeat outcome, so every throwable is swallowed and the lease extension stands
+     * ({@code INV-HB-7}). The descriptor and the result payload carry no item contents, no secret key
+     * and no caller-controlled text; {@code leaseExpiresAt} is journaled as an ISO-8601
+     * {@code String} because the journal's {@code ObjectMapper} has no {@code JavaTimeModule}
+     * ({@code INV-HB-5}, {@code INV-HB-6}).</p>
+     */
+    private void recordHeartbeatQuietly(MutableJob job, int generation, Instant expiresAt) {
+        AuditJournalService audit = this.journal;
+        if (audit == null) {
+            return;
+        }
+        try {
+            String id = audit.begin(OperationType.BATCH_HASH,
+                    HeartbeatAuditDescriptor.of(job.jobId, generation, expiresAt),
+                    RequestContext.get()).id();
+            audit.succeed(id, Map.of(
+                    "status", HEARTBEAT_STATUS,
+                    "detail", HEARTBEAT_DETAIL,
+                    "jobId", job.jobId,
+                    "attempt", generation,
+                    "leaseExpiresAt", expiresAt.toString()));
+        } catch (RuntimeException e) {
+            log.debug("BATCH_HASH heartbeat audit failed for job {} attempt {}: {}",
+                    job.jobId, generation, e.toString());
+        }
+    }
+
     /** Clamps client-controlled text so a pathological payload cannot bloat the bounded journal. */
     private static String boundedAuditText(String value, String fallback) {
         if (value == null || value.isBlank()) {
@@ -978,6 +1055,18 @@ public class BatchHashJobService {
                     boundedAuditText(job.algorithm, "UNKNOWN"), job.items.size(),
                     boundedAuditText(job.idempotencyKey, null),
                     job.attemptResumedFrom.getOrDefault(generation, 0), job.checkpoint.size());
+        }
+    }
+
+    /**
+     * The audit descriptor of one heartbeat. Deliberately payload-free: the job id, attempt number,
+     * heartbeat marker and the new expiry describe the renewal without storing item contents or the
+     * secret key in the journal.
+     */
+    private record HeartbeatAuditDescriptor(String jobId, int attempt, String kind, String leaseExpiresAt) {
+
+        private static HeartbeatAuditDescriptor of(String jobId, int generation, Instant expiresAt) {
+            return new HeartbeatAuditDescriptor(jobId, generation, HEARTBEAT_STATUS, expiresAt.toString());
         }
     }
 

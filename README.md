@@ -154,6 +154,7 @@ utiltools_api/
 | `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `COMPLETED` / `FAILED` / `CANCELLED` |
 | `DELETE` | `/api/v1/utils/jobs/{jobId}` | Cancel a `QUEUED` job (`200`, idempotent); `409` `JOB_CANCELLATION_CONFLICT` once it is `RUNNING`/`COMPLETED`/`FAILED` |
 | `POST` | `/api/v1/utils/jobs/{jobId}/retry` | Requeue a `FAILED` job (`202`); `409` `JOB_RETRY_CONFLICT` for any other status or once `attempt` reaches `maxAttempts` |
+| `POST` | `/api/v1/utils/jobs/{jobId}/heartbeat` | Renew a `RUNNING` job's execution lease (`200`); `404` `JOB_NOT_FOUND`, `409` `JOB_RETRY_CONFLICT` unless `RUNNING`, `400` `BAD_REQUEST` once the lease has expired |
 | `GET` | `/api/v1/utils/jobs` | List job snapshots newest first; optional `status` filter and `limit` (default `20`, clamped to `1..100`) |
 | `GET` | `/api/v1/utils/audit/entries` | List journal entries (newest first) with optional `limit` & `state` filters |
 | `GET` | `/api/v1/utils/audit/entries/{id}` | Fetch a single journal entry (redacted request/result) |
@@ -1567,6 +1568,18 @@ that generation is still current. A late worker from attempt 1 therefore cannot 
 overwrite the retried attempt's status, results or error — and the attempt history shows where each execution
 started via `resumedFrom`.
 
+A `RUNNING` worker may also **renew its execution lease** with
+`POST /api/v1/utils/jobs/{jobId}/heartbeat` (no request body). Each successful renewal sets
+`executionLeaseExpiresAt` to `Instant.now(clock)` plus `utiltools.jobs.execution-lease-seconds` (default `30`),
+stamps `lastHeartbeatAt` with that same instant and writes one closed `BATCH_HASH` journal row marked
+`HEARTBEAT` with the bounded detail `lease renewed via heartbeat`; nothing else in the snapshot changes —
+`status`, `results`, `error`, `completedAt`, `startedAt`, `checkpoint` and `attemptHistory` are untouched. Only
+the attempt that is currently `RUNNING` can renew: an unknown or already-evicted `jobId` is `404 JOB_NOT_FOUND`,
+a `QUEUED`, `COMPLETED` or `CANCELLED` job is `409 JOB_RETRY_CONFLICT`, and a lease that has **already expired**
+is `400 BAD_REQUEST` rather than being revived, so a late worker from a superseded attempt cannot buy its
+generation more time. A lease that is never renewed still lapses on schedule, `reapExpiredExecutions` marks the
+job `FAILED` exactly as before, and the retry path then starts `attempt + 1`.
+
 Ineligible retries are rejected **without mutating state**: an unknown or already-evicted `jobId` is
 `404 JOB_NOT_FOUND`; a `QUEUED`, `RUNNING`, `COMPLETED` or `CANCELLED` job is `409 JOB_RETRY_CONFLICT`; and a
 `FAILED` job whose `attempt` already equals `maxAttempts` answers the same `409` with `attempt` and
@@ -1618,11 +1631,13 @@ utiltools.jobs.max-active-jobs-per-client=20
 
 #### G. Rate limiting interaction (explicit decision)
 
-All five jobs endpoints live under `/api/v1/utils/**`, so they are **not exempt** from `RateLimitFilter`
+All six jobs endpoints live under `/api/v1/utils/**`, so they are **not exempt** from `RateLimitFilter`
 (see [Rate Limiting](#-rate-limiting)): every `POST /api/v1/utils/jobs/hash`, every
 `GET /api/v1/utils/jobs/{jobId}` poll, every `DELETE /api/v1/utils/jobs/{jobId}` cancellation, every
-`POST /api/v1/utils/jobs/{jobId}/retry` **and** every `GET /api/v1/utils/jobs` listing consumes one slot of the
-caller's window budget, because polling, cancelling, retrying or listing a job is a normal API call. Being jobs,
+`POST /api/v1/utils/jobs/{jobId}/retry`, every `POST /api/v1/utils/jobs/{jobId}/heartbeat` renewal **and** every
+`GET /api/v1/utils/jobs` listing consumes one slot of the
+caller's window budget, because polling, cancelling, retrying, heartbeating or listing a job is a normal API
+call. Being jobs,
 they are **not** additionally exempted — no entry was added to `RateLimitFilter.shouldNotFilter` for the retry
 route either. Consequences:
 
@@ -1881,7 +1896,8 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`), sentence-case idempotence and `[.!?]`-run boundaries, diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points; plus replace coverage: `$n` group expansion, literal metacharacters, `all=false` first-match-only, case-insensitive matching, no-match results, invalid-regex rejection, code-point `length`, every request constraint bound, and the 1000000-character result bound.
 - **`TextControllerTest`**: Text endpoints MockMvc suite, including the snake-case and sentence-case transform envelopes, diacritic slugging, `400 BAD_REQUEST` for an unknown operation, `400 VALIDATION_ERROR` for blank text, and a `TEXT_TRANSFORM` entry listed by `/audit/entries` and replayed as `VERIFIED`; a replace envelope with `$n` groups, `400 BAD_REQUEST` for an invalid regex (journalled `TEXT_REPLACE`/`FAILED`), `400 VALIDATION_ERROR` for blank text, an absent `replacement` and an oversized `pattern`, and a `TEXT_REPLACE` entry listed by `/audit/entries` and replayed as `VERIFIED`.
 - **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, key/payload fingerprint conflict detection (changed items, reordered items, changed algorithm or `secretKey`), 8-thread different-payload races, identical-key/identical-payload retries that mint no second execution, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff. Retry coverage: transient failure then a successful retry (`attempt` 2, attempt-1 `FAILED` entry retained), `RUNNING`/`COMPLETED`/`CANCELLED` conflicts that leave the snapshot unchanged, attempt exhaustion at `maxAttempts`, stale-worker fencing (a superseded generation writes nothing after a retry), and queue-rejection rollback that leaves the job `FAILED` with an unconsumed attempt while a later retry succeeds. Checkpoint coverage: a transient failure at a chosen item reports `completedItems` equal to the hashes that succeeded, leaves `results` absent and does not reach later items; the retry rehashes only the suffix (per-item invocation counts) and publishes the full batch in input order with `resumedFrom` on the second attempt; a stale worker from a reaped or superseded generation cannot advance or overwrite the checkpoint (replaying `executeAttempt` leaves the snapshot identical); a `429 QUEUE_FULL` retry restores the exact pre-retry `FAILED` snapshot including attempt, `completedItems` and the checkpoint; the journal descriptor and outcome carry `resumedFrom`/`completedItems` but never items or `secretKey`; and a cancelled job exposes no checkpoint results.
-- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202 submit/retry, 400, 404 `JOB_NOT_FOUND`, 409 `IDEMPOTENCY_CONFLICT`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND`, 409 `JOB_CANCELLATION_CONFLICT`, and `POST …/retry` 202 `QUEUED` vs 409 `JOB_RETRY_CONFLICT` with `jobId`/`status`/`attempt`/`maxAttempts` details, plus the additive `completedItems` on a `FAILED` snapshot beside every pre-existing field).
+Heartbeat coverage: a `RUNNING` job with a live lease extends `executionLeaseExpiresAt` to `Instant.now(clock) + executionLeaseSeconds` and stamps `lastHeartbeatAt` with the same instant; an unknown `jobId` is `404 JOB_NOT_FOUND`, a `QUEUED`/`COMPLETED`/`CANCELLED` job is `409 JOB_RETRY_CONFLICT`, and an already-expired lease is `400 BAD_REQUEST` without reviving it; a heartbeat from a superseded attempt generation writes neither the lease nor a journal row; the success writes exactly one `HEARTBEAT` row with the bounded detail `lease renewed via heartbeat`; and the entry's `status`, `results`, `error`, `completedAt`, `startedAt`, `checkpoint` and `attemptHistory` are byte-identical afterwards.
+- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202 submit/retry, 400, 404 `JOB_NOT_FOUND`, 409 `IDEMPOTENCY_CONFLICT`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND`, 409 `JOB_CANCELLATION_CONFLICT`, and `POST …/retry` 202 `QUEUED` vs 409 `JOB_RETRY_CONFLICT` with `jobId`/`status`/`attempt`/`maxAttempts` details, plus the additive `completedItems` on a `FAILED` snapshot beside every pre-existing field, and `POST …/heartbeat` returning the `200` success envelope with the renewed `executionLeaseExpiresAt`/`lastHeartbeatAt` beside `404 JOB_NOT_FOUND`, `409 JOB_RETRY_CONFLICT` and `400 BAD_REQUEST` error envelopes for each failure case).
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.
 - **`SlidingWindowRateLimiterTest`**: Exact-cap concurrent admission, deterministic window rollover on a mutable `Clock`, denials consuming no capacity, per-client isolation, idle eviction, and cap enforcement under many spoofed keys.
 - **`RateLimitFilterTest`**: MockMvc proof of the `429 RATE_LIMITED` envelope, `Retry-After`/`X-RateLimit-*` headers, and that a rejected call never invokes the controller.
