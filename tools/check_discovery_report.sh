@@ -16,7 +16,7 @@
 #                     directory, each citing a `- path:` that exists on disk.
 #   --sections        DOD-03: the seven literal H2 headings of plan §4.1 exist in order, the
 #                     report carries no scaffold placeholder and no bare backlog marker.
-#   --paths           DOD-04: at least 25 `- path:` citations; each failure prints
+#   --paths           DOD-04: at least 25 distinct `- path:` citations (duplicates collapse); each failure prints
 #                     `MISSING: <path>` and the run ends with a `FAIL:` line.
 #   --evidence        DOD-05: at least five `### GAP-` blocks, each with `- evidence:`,
 #                     `- exit:` (integer) and `- output:`.
@@ -88,6 +88,15 @@ block_of() {
 gap_headings() {
   grep -nE '^### GAP-[0-9]+' "$REPORT_ABS" | sed -E 's/^([0-9]+):### (GAP-[0-9]+).*/\2/'
 }
+# First line number whose text matches ERE $1, ignoring anything inside a fenced code block:
+# a heading that only exists inside an example fence is documentation, not a section.
+# ENVIRON (not -v) is used so the pattern's backslashes are not escape-processed by awk.
+section_line() {
+  SECTION_PAT="$1" awk '
+    /^[[:space:]]*```/ { infence = !infence; next }
+    !infence && $0 ~ ENVIRON["SECTION_PAT"] { print NR; exit }
+  ' "$REPORT_ABS"
+}
 
 # ---------------------------------------------------------------- DOD-01
 if [ "$RUN_SECTIONS" -eq 1 ]; then
@@ -102,13 +111,13 @@ if [ "$RUN_SECTIONS" -eq 1 ]; then
   )
   prev=0
   for pat in "${sections[@]}"; do
-    lineno=$(grep -nE "$pat" "$REPORT_ABS" | head -1 | cut -d: -f1)
+    lineno=$(section_line "$pat")
     [ -n "${lineno:-}" ] || fail "section missing: ${pat#^## }"
     [ "$lineno" -gt "$prev" ] || fail "section out of order: ${pat#^## } (line $lineno after $prev)"
     prev=$lineno
   done
-  grep -qE '^### 3\.1 TODO sweep' "$REPORT_ABS" || fail "section missing: ### 3.1 TODO sweep"
-  grep -qE '^### 3\.2 Gap register' "$REPORT_ABS" || fail "section missing: ### 3.2 Gap register"
+  [ -n "$(section_line '^### 3\.1 TODO sweep')" ] || fail "section missing: ### 3.1 TODO sweep"
+  [ -n "$(section_line '^### 3\.2 Gap register')" ] || fail "section missing: ### 3.2 Gap register"
   # Scaffold placeholders are always fatal.
   if grep -qE '\[unfilled\]|\[paste output verbatim\]' "$REPORT_ABS"; then
     fail "scaffold placeholder left in report ([unfilled] / [paste output verbatim])"
@@ -139,8 +148,11 @@ fi
 
 # ---------------------------------------------------------------- DOD-03
 if [ "$RUN_PATHS" -eq 1 ]; then
-  mapfile -t cited_paths < <(grep -E '^- path: ' "$REPORT_ABS" | sed -E 's/^- path: //' | awk '{print $1}')
-  [ "${#cited_paths[@]}" -ge "$MIN_PATHS" ] || fail "only ${#cited_paths[@]} '- path:' citations, need >= $MIN_PATHS"
+  # Deduplicated: N copies of one `- path:` line prove the line count, not the coverage, so the
+  # threshold is applied to distinct values (see Open_Findings NIT on --paths).
+  mapfile -t cited_paths < <(grep -E '^- path: ' "$REPORT_ABS" | sed -E 's/^- path: //' \
+    | awk '{print $1}' | sort -u)
+  [ "${#cited_paths[@]}" -ge "$MIN_PATHS" ] || fail "only ${#cited_paths[@]} distinct '- path:' citations, need >= $MIN_PATHS"
   missing=0
   for p in "${cited_paths[@]}"; do
     if [ ! -e "$TOP/$p" ]; then printf 'MISSING: %s\n' "$p"; missing=$((missing + 1)); fi

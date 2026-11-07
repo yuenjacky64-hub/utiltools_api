@@ -130,13 +130,24 @@ Consequence: there is no literal backlog to lift a task from, so every candidate
 Each block records the reproducing command, its exit code, the observed output, the three filters from the plan (F1 = not already implemented in `src/main`; F2 = not queued in `docs/superpowers/specs`, `docs/superpowers/plans` or README backlog prose; F3 = a delta exists that a future gate could verify), a blast-radius tier (S ≤3 files, M 4–10, L >10) and the 0–14 score.
 
 ### GAP-01: README endpoint table is stale: 5 shipped routes are missing
-- evidence: `sed -n '132,165p' README.md | grep -c 'flatten'` compared against the 31 collected route annotations
-- exit: 1
-- output: `0` — README's "⚡ API Endpoints Reference" table has 25 rows, while the controllers register 30 distinct paths; missing rows: `/json/flatten`, `/json/unflatten`, `/rate-limit/status`, `/resilience`, `/resilience/probe`
-- gate: F1=PASS (all five are implemented, so the defect is documentation-only), F2=PASS (no spec/plan entry promises a table refresh), F3=PASS (row count 25 → 30 is observable)
+- evidence: the three probes fenced below, re-run verbatim today — the plan §4.7 seed row count over `README.md`, then the distinct documented paths, then the route walk over `src/main/java`
+- exit: 0
+- output: `26` rows / `25` distinct documented paths / `31` route annotations / `30` distinct routed paths — the 26 rows carry only 25 unique paths because `GET` and `DELETE` both list `/api/v1/utils/jobs/{jobId}`, so five routed paths have no row: `/json/flatten`, `/json/unflatten`, `/rate-limit/status`, `/resilience`, `/resilience/probe`
+- gate: F1=PASS (all five are implemented, so the defect is documentation-only), F2=PASS (no spec/plan entry promises a table refresh), F3=PASS (distinct paths 25 → 30 is observable)
 - tier: S — README.md only
 - score: 9 (evidence 2, impact 1, blast 2, verifiability 1) — impact is "misleading index", not "unavailable capability", because the five routes *are* described in the detailed guides further down (`README.md:960` documents unflatten, `README.md:1715` documents rate limiting)
-- note: A docs-scoped task would regenerate the README endpoint table from the controllers so the 25 rows match the 30 routable paths.
+- note: A docs-scoped task would regenerate the README endpoint table from the controllers so all 30 routable paths have a row — 25 distinct documented today, five missing.
+
+```text
+$ grep -c '^| `\(GET\|POST\|PUT\|DELETE\|PATCH\)`' README.md
+26
+$ grep -oE '^\| `(GET|POST|PUT|DELETE|PATCH)` \| `[^`]+`' README.md | sed -E 's/.*\| `([^`]+)`/\1/' | sort -u | wc -l
+25
+$ grep -rhoE '@(Get|Post|Put|Delete|Patch)Mapping' src/main/java --include='*Controller.java' | wc -l
+31
+$ for f in $(find src/main/java -name '*Controller.java' | sort); do b=$(sed -nE 's/^@RequestMapping\("([^"]*)"\).*/\1/p' "$f"); grep -ohE '@(Get|Post|Put|Delete|Patch)Mapping(\(("[^"]*")?\))?' "$f" | sed -E 's/@[A-Za-z]+Mapping(\(("[^"]*")?\))?/\2/; s/"//g; s/^$/\//' | sed "s|^|$b|"; done | sort -u | wc -l
+30
+```
 
 ### GAP-02: No inline backlog markers exist
 - evidence: `grep -rnE 'TODO|FIXME|XXX|HACK' src/main README.md PROJECT_GOALS.md docs`
@@ -150,7 +161,7 @@ Each block records the reproducing command, its exit code, the observed output, 
 ### GAP-03: No CSV/TSV ⇄ JSON conversion anywhere in the service
 - evidence: `grep -rniE '\bcsv\b|\btsv\b' src/main README.md`
 - exit: 1
-- output: *(empty)* — zero matches in the whole main tree and in README; the single repo-wide hit is an unrelated comment inside `src/test/java/com/example/utiltools/text/TextServiceTest.java`, and `grep -rinE '\bcsv\b|\btsv\b' docs PROJECT_GOALS.md` is also empty
+- output: *(empty)* — zero matches in the whole main tree and in README; the only repo-wide hits of the boundary-free pattern `grep -rniE 'csv|tsv' src README.md` are the identifier `statsViolations` at `src/test/java/com/example/utiltools/text/TextServiceTest.java:110` and `:112` (it contains `tsV`, hence the case-insensitive `tsv` match), and `grep -rinE '\bcsv\b|\btsv\b' docs PROJECT_GOALS.md` is also empty
 - gate: F1=PASS (nothing named CSV/TSV exists in `src/main`), F2=PASS (absent from `docs/superpowers/specs/2026-10-31-utiltools-api-design.md`, from `docs/superpowers/plans/2026-10-31-utiltools-api.md` and from README prose — the only forward statement is `PROJECT_GOALS.md:8`'s generic "data format conversion"), F3=PASS (absence is byte-for-byte re-runnable, and the delta is a new endpoint with a testable round-trip)
 - tier: M — one service method pair + request/response records + controller route + service test + controller test ≈ 6 files
 - score: 11 (evidence 2, impact 2, blast 1, verifiability 2) — impact is 2 because a whole conversion capability named in `PROJECT_GOALS.md` is unavailable, and verifiability is 2 because it slots into the existing `json` module's test pair (`JsonServiceTest`, `JsonControllerTest`) and the existing `AuditedOperations` journal pattern
@@ -166,9 +177,9 @@ Each block records the reproducing command, its exit code, the observed output, 
 - note: A specs-scoped task would rewrite the design spec package tree and route list to the ten shipped packages.
 
 ### GAP-05: Test-count claims in README disagree with the suite
-- evidence: `grep -n '41 \|48 unit' README.md` and `grep -rc '@Test' --include='*.java' src/test/java | awk -F: '{s+=$2} END {print s}'`
+- evidence: `grep -nE 'Tests-41|48 unit' README.md` and `grep -rc '@Test' --include='*.java' src/test/java | awk -F: '{s+=$2} END {print s}'`
 - exit: 0
-- output: README:5 badge `Tests-41 Passed (100%)`, README:67 "48 unit and integration tests", actual `425` `@Test` methods across 30 test sources
+- output: `README.md:5:[![Build & Tests](...badge/Tests-41%20Passed%20(100%25)...)]`, `README.md:67:- **Testing**: ... 48 unit and integration tests`, actual `425` `@Test` methods across 30 test sources
 - gate: F1=PASS (tests exist; the drift is in the doc), F2=PASS, F3=PASS (a number in README can be asserted against the counted value)
 - tier: S — README.md only
 - score: 9 (evidence 2, impact 1, blast 2, verifiability 1) — impact is 1 (misleading quality signal), verifiability 1 (no test class can own README numbers without a new gate)
