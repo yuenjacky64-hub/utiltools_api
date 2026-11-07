@@ -1467,7 +1467,8 @@ curl http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c
     ],
     "createdAt": "2026-10-31T19:12:04.418273Z",
     "startedAt": "2026-10-31T19:12:04.420118Z",
-    "completedAt": "2026-10-31T19:12:04.421907Z"
+    "completedAt": "2026-10-31T19:12:04.421907Z",
+    "completedItems": 3
   },
   "timestamp": "2026-10-31T19:12:05.012775Z"
 }
@@ -1480,9 +1481,17 @@ blocks later jobs.
 
 Every snapshot also carries the attempt bookkeeping: `attempt` (1-based, `1` for a first submission and
 incremented by each accepted retry), `maxAttempts` (the configured ceiling) and `attempts`, a bounded history
-where each entry is `{ "attempt", "status", "startedAt", "completedAt", "error" }`. The history holds at most one
-entry per attempt, so it can never exceed `maxAttempts`. All three fields are additive: existing fields keep
-their names and meaning.
+where each entry is `{ "attempt", "status", "startedAt", "completedAt", "error", "resumedFrom" }`, with
+`resumedFrom` the 0-based input index the execution started at (`0` for a first attempt). The history holds at
+most one entry per attempt, so it can never exceed `maxAttempts`. All three fields are additive: existing fields
+keep their names and meaning.
+
+Hashing is **checkpointed per item**. `completedItems` (additive, `0..itemCount`) reports how many leading items
+are durably hashed: it advances one item at a time as the worker commits each digest, so a `RUNNING` job shows
+real progress and a `FAILED` one shows how much survived. The prefix is private to the job — `results` stays
+absent until the job `COMPLETES`, and a `CANCELLED` job reports `completedItems: 0` — so a poller can watch
+progress without ever seeing a partial digest. The checkpoint lives in memory with the rest of the job registry:
+eviction, expiry and restart discard it.
 
 #### C. Cancel a queued job (200 OK, idempotent)
 
@@ -1538,26 +1547,32 @@ curl -i -X POST http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d47-
     "maxAttempts": 3,
     "attempts": [
       { "attempt": 1, "status": "FAILED", "startedAt": "2026-10-31T19:12:04.420118Z",
-        "completedAt": "2026-10-31T19:12:04.421907Z", "error": "IllegalArgumentException: Unsupported hash algorithm: SHA-9" }
+        "completedAt": "2026-10-31T19:12:04.421907Z", "error": "IllegalArgumentException: Unsupported hash algorithm: SHA-9",
+        "resumedFrom": 0 }
     ],
-    "createdAt": "2026-10-31T19:12:04.418273Z"
+    "createdAt": "2026-10-31T19:12:04.418273Z",
+    "completedItems": 0
   },
   "timestamp": "2026-10-31T19:12:09.004112Z"
 }
 ```
 
-`startedAt`, `completedAt`, `results` and `error` are cleared by the requeue, so the retried attempt starts from
-nothing and its outcome is written fresh on the next poll. Workers are fenced by generation: each execution
-captures the `attempt` it was admitted under and writes `RUNNING`, `COMPLETED` or `FAILED` **only** if that
-generation is still current. A late worker from attempt 1 therefore cannot overwrite the retried attempt's
-status, results or error.
+`startedAt`, `completedAt`, `results` and `error` are cleared by the requeue, so the retried attempt's outcome is
+written fresh on the next poll. A retry does **not** rehash from item `0`: the durable prefix survives the
+`FAILED → QUEUED` transition, `completedItems` keeps reporting it (still without publishing `results`), and the
+retried attempt resumes at `completedItems`. For a batch of up to 1000 items that turns a late transient failure
+into a suffix-sized retry instead of a full re-run. Workers are fenced by generation: each execution captures the
+`attempt` it was admitted under and commits an item, or writes `RUNNING`, `COMPLETED` or `FAILED`, **only** if
+that generation is still current. A late worker from attempt 1 therefore cannot append to the checkpoint or
+overwrite the retried attempt's status, results or error — and the attempt history shows where each execution
+started via `resumedFrom`.
 
 Ineligible retries are rejected **without mutating state**: an unknown or already-evicted `jobId` is
 `404 JOB_NOT_FOUND`; a `QUEUED`, `RUNNING`, `COMPLETED` or `CANCELLED` job is `409 JOB_RETRY_CONFLICT`; and a
 `FAILED` job whose `attempt` already equals `maxAttempts` answers the same `409` with `attempt` and
 `maxAttempts` in `details`. If the queue is saturated the requeue is rolled back — the previous `FAILED`
-snapshot is restored, the attempt is **not** consumed, and the caller gets the same `429 QUEUE_FULL` as on
-submission, so the retry can simply be repeated once capacity frees.
+snapshot is restored, checkpoint and `completedItems` included, the attempt is **not** consumed, and the caller
+gets the same `429 QUEUE_FULL` as on submission, so the retry can simply be repeated once capacity frees.
 
 Cancellation is idempotent: repeating the same `DELETE` on an already-`CANCELLED` job returns **`200`** with the
 identical snapshot (`jobId`, `status`, `completedAt` unchanged) rather than a conflict. A `RUNNING`, `COMPLETED`
@@ -1865,8 +1880,8 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, and empty-`operations` validation rejection.
 - **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`), sentence-case idempotence and `[.!?]`-run boundaries, diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points; plus replace coverage: `$n` group expansion, literal metacharacters, `all=false` first-match-only, case-insensitive matching, no-match results, invalid-regex rejection, code-point `length`, every request constraint bound, and the 1000000-character result bound.
 - **`TextControllerTest`**: Text endpoints MockMvc suite, including the snake-case and sentence-case transform envelopes, diacritic slugging, `400 BAD_REQUEST` for an unknown operation, `400 VALIDATION_ERROR` for blank text, and a `TEXT_TRANSFORM` entry listed by `/audit/entries` and replayed as `VERIFIED`; a replace envelope with `$n` groups, `400 BAD_REQUEST` for an invalid regex (journalled `TEXT_REPLACE`/`FAILED`), `400 VALIDATION_ERROR` for blank text, an absent `replacement` and an oversized `pattern`, and a `TEXT_REPLACE` entry listed by `/audit/entries` and replayed as `VERIFIED`.
-- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, key/payload fingerprint conflict detection (changed items, reordered items, changed algorithm or `secretKey`), 8-thread different-payload races, identical-key/identical-payload retries that mint no second execution, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff. Retry coverage: transient failure then a successful retry (`attempt` 2, attempt-1 `FAILED` entry retained), `RUNNING`/`COMPLETED`/`CANCELLED` conflicts that leave the snapshot unchanged, attempt exhaustion at `maxAttempts`, stale-worker fencing (a superseded generation writes nothing after a retry), and queue-rejection rollback that leaves the job `FAILED` with an unconsumed attempt while a later retry succeeds.
-- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202 submit/retry, 400, 404 `JOB_NOT_FOUND`, 409 `IDEMPOTENCY_CONFLICT`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND`, 409 `JOB_CANCELLATION_CONFLICT`, and `POST …/retry` 202 `QUEUED` vs 409 `JOB_RETRY_CONFLICT` with `jobId`/`status`/`attempt`/`maxAttempts` details).
+- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, key/payload fingerprint conflict detection (changed items, reordered items, changed algorithm or `secretKey`), 8-thread different-payload races, identical-key/identical-payload retries that mint no second execution, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff. Retry coverage: transient failure then a successful retry (`attempt` 2, attempt-1 `FAILED` entry retained), `RUNNING`/`COMPLETED`/`CANCELLED` conflicts that leave the snapshot unchanged, attempt exhaustion at `maxAttempts`, stale-worker fencing (a superseded generation writes nothing after a retry), and queue-rejection rollback that leaves the job `FAILED` with an unconsumed attempt while a later retry succeeds. Checkpoint coverage: a transient failure at a chosen item reports `completedItems` equal to the hashes that succeeded, leaves `results` absent and does not reach later items; the retry rehashes only the suffix (per-item invocation counts) and publishes the full batch in input order with `resumedFrom` on the second attempt; a stale worker from a reaped or superseded generation cannot advance or overwrite the checkpoint (replaying `executeAttempt` leaves the snapshot identical); a `429 QUEUE_FULL` retry restores the exact pre-retry `FAILED` snapshot including attempt, `completedItems` and the checkpoint; the journal descriptor and outcome carry `resumedFrom`/`completedItems` but never items or `secretKey`; and a cancelled job exposes no checkpoint results.
+- **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202 submit/retry, 400, 404 `JOB_NOT_FOUND`, 409 `IDEMPOTENCY_CONFLICT`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND`, 409 `JOB_CANCELLATION_CONFLICT`, and `POST …/retry` 202 `QUEUED` vs 409 `JOB_RETRY_CONFLICT` with `jobId`/`status`/`attempt`/`maxAttempts` details, plus the additive `completedItems` on a `FAILED` snapshot beside every pre-existing field).
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.
 - **`SlidingWindowRateLimiterTest`**: Exact-cap concurrent admission, deterministic window rollover on a mutable `Clock`, denials consuming no capacity, per-client isolation, idle eviction, and cap enforcement under many spoofed keys.
 - **`RateLimitFilterTest`**: MockMvc proof of the `429 RATE_LIMITED` envelope, `Retry-After`/`X-RateLimit-*` headers, and that a rejected call never invokes the controller.

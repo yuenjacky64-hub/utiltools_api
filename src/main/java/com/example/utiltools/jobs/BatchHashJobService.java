@@ -62,6 +62,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * generation fence: a reaped attempt keeps its attempt number but is no longer RUNNING, so a late
  * worker from that attempt writes nothing, and the FAILED job stays retryable.</p>
  *
+ * <p>Progress is checkpointed per item. A private ordered prefix of hashed {@link HashResponse}
+ * values lives on the job, and each successful hash is committed to it only while the worker still
+ * owns the job ({@code job.attempt == generation && job.status == RUNNING}), so a fenced, cancelled,
+ * reaped or superseded worker never appends. An attempt resumes at the prefix's next index, and a
+ * {@code FAILED -> QUEUED} retry keeps the prefix, so a transient fault late in a batch no longer
+ * rehashes everything before it. The prefix is published as {@code results} and cleared only on
+ * {@code COMPLETED}; {@code completedItems} reports its size while the job is not completed, and a
+ * {@code CANCELLED} job clears it so a withdrawal never retains partial digests.</p>
+ *
  * <p>Every <em>started</em> attempt is journalled exactly once as a {@code BATCH_HASH} entry. The
  * correlation id ({@link RequestContext}) is captured on the caller thread at
  * {@link #submit(BatchHashRequest)} / {@link #retry(String)} time and carried on the attempt, then
@@ -137,6 +146,15 @@ public class BatchHashJobService {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 DEFAULT_EXECUTION_LEASE_SECONDS, DEFAULT_EXECUTION_REAPER_INTERVAL_MS,
                 DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT, Clock.systemUTC());
+    }
+
+    /** The checkpoint projection used by the audit outcome; mirrors {@link #snapshot(MutableJob)}. */
+    private static int completedItems(MutableJob job) {
+        return switch (job.status) {
+            case COMPLETED -> job.items.size();
+            case CANCELLED -> 0;
+            default -> job.checkpoint.size();
+        };
     }
 
     /**
@@ -488,7 +506,10 @@ public class BatchHashJobService {
                 job.startedAt = null;
                 job.completedAt = null;
                 job.error = null;
-                job.results = null; // a retried attempt starts from nothing
+                // A retried attempt continues from the durable checkpoint prefix: it resumes at the
+                // next uncommitted index and the prefix is preserved here (a rejected retry therefore
+                // has nothing to undo in it). Only the published results are cleared.
+                job.results = null;
                 job.lastHeartbeatAt = null; // the new attempt stamps its own lease at admission
                 job.executionLeaseExpiresAt = null;
                 job.attemptRequestIds.put(admittedAttempt, requestId);
@@ -567,6 +588,7 @@ public class BatchHashJobService {
             job.status = JobStatus.CANCELLED;
             job.completedAt = Instant.now(clock);
             job.results = null; // explicit: nothing was hashed
+            job.checkpoint.clear(); // a withdrawn job retains no partial digests
             job.error = null;
             job.lastHeartbeatAt = null;
             job.executionLeaseExpiresAt = null;
@@ -693,11 +715,19 @@ public class BatchHashJobService {
             // Lease state is a property of RUNNING alone: admission always stamps both instants, and
             // every non-RUNNING status projects null regardless of any leftover field.
             boolean running = job.status == JobStatus.RUNNING;
+            // The checkpoint projection is derived, never stored: a second counter could drift across
+            // the reap / retry / cancel edges.
+            int completedItems = switch (job.status) {
+                case COMPLETED -> job.items.size(); // the prefix was cleared when results were published
+                case CANCELLED -> 0; // never expose a withdrawn job's prefix
+                default -> job.checkpoint.size(); // QUEUED / RUNNING / FAILED
+            };
             return new BatchHashJobResponse(job.jobId, job.idempotencyKey, job.status, job.items.size(),
                     job.results, job.error, job.createdAt, job.startedAt, job.completedAt,
                     job.attempt, job.maxAttempts, List.copyOf(job.attemptHistory),
                     running ? job.executionLeaseExpiresAt : null,
-                    running ? job.lastHeartbeatAt : null);
+                    running ? job.lastHeartbeatAt : null,
+                    completedItems);
         }
     }
 
@@ -724,6 +754,10 @@ public class BatchHashJobService {
                 job.startedAt = now;
                 job.lastHeartbeatAt = now;
                 job.executionLeaseExpiresAt = now.plusSeconds(executionLeaseSeconds);
+                // The attempt continues at the checkpoint's next index; recorded before the audit
+                // descriptor is built so both attempt history and journal agree on where it started.
+                int resumedFrom = job.checkpoint.size();
+                job.attemptResumedFrom.put(generation, resumedFrom);
                 // Admission is the moment the attempt "starts": install the submitter's correlation
                 // id on this (possibly reused) pool thread and open exactly one audit entry here.
                 RequestContext.set(job.attemptRequestIds.get(generation));
@@ -734,12 +768,16 @@ public class BatchHashJobService {
                 recordAttempt(job, generation, JobStatus.RUNNING, job.startedAt, null, null);
             }
             try {
-                List<HashResponse> results = new ArrayList<>(job.items.size());
-                for (String item : job.items) {
+                int resumedFrom = job.attemptResumedFrom.getOrDefault(generation, 0);
+                for (int i = resumedFrom; i < job.items.size(); i++) {
                     if (!renewLease(job, generation)) {
                         return; // fenced: the attempt was reaped, retried or cancelled while hashing
                     }
-                    results.add(cryptoService.hash(new HashRequest(job.algorithm, item, job.secretKey)));
+                    HashResponse hashed = cryptoService.hash(
+                            new HashRequest(job.algorithm, job.items.get(i), job.secretKey));
+                    if (!commitCheckpoint(job, generation, i, hashed)) {
+                        return; // fenced mid-hash: nothing is written, not even the item just hashed
+                    }
                 }
                 boolean released;
                 synchronized (job) {
@@ -749,7 +787,13 @@ public class BatchHashJobService {
                         // half covers an attempt superseded by retry.
                         return; // fenced: the attempt was requeued or reaped while hashing
                     }
-                    job.results = List.copyOf(results);
+                    if (job.checkpoint.size() != job.items.size()) {
+                        // Unreachable through input; surfaces as an ordinary FAILED job rather than
+                        // publishing a short result list.
+                        throw new IllegalStateException("checkpoint prefix does not cover the batch");
+                    }
+                    job.results = List.copyOf(job.checkpoint); // the full ordered prefix, input order
+                    job.checkpoint.clear(); // results now own the values; retained state stays bounded
                     job.error = null;
                     job.status = JobStatus.COMPLETED;
                     job.completedAt = Instant.now(clock);
@@ -816,6 +860,31 @@ public class BatchHashJobService {
     }
 
     /**
+     * Commits one hashed item to the job's checkpoint prefix.
+     *
+     * <p>The fence is deliberately re-checked <em>after</em> the hash: {@code CryptoService.hash}
+     * can outlive the attempt (reaped, retried or superseded while the worker was inside it), and a
+     * pre-hash-only fence would let a stale worker splice item {@code index} into a fresh
+     * generation's prefix. The {@code checkpoint.size() == index} guard additionally guarantees an
+     * attempt can only continue the prefix, never append out of order.</p>
+     *
+     * @return {@code true} when the item was committed, {@code false} when this generation no longer
+     *         owns the job and nothing at all was written
+     */
+    private static boolean commitCheckpoint(MutableJob job, int generation, int index, HashResponse hashed) {
+        synchronized (job) {
+            if (job.attempt != generation || job.status != JobStatus.RUNNING) {
+                return false; // fenced, cancelled, reaped or superseded
+            }
+            if (job.checkpoint.size() != index) {
+                return false; // drifted prefix: never append at the wrong index
+            }
+            job.checkpoint.add(hashed);
+            return true;
+        }
+    }
+
+    /**
      * Upserts the single history entry for {@code attempt}: it first appears as RUNNING and is then
      * replaced in place by its terminal status, so the history stays bounded by {@code maxAttempts}
      * and no entry is ever duplicated.
@@ -823,7 +892,7 @@ public class BatchHashJobService {
     private void recordAttempt(MutableJob job, int attempt, JobStatus status, Instant startedAt,
             Instant completedAt, String error) {
         JobAttempt entry = new JobAttempt(attempt, status, startedAt, completedAt, error,
-                job.attemptAuditEntryIds.get(attempt));
+                job.attemptAuditEntryIds.get(attempt), job.attemptResumedFrom.getOrDefault(attempt, 0));
         for (int i = 0; i < job.attemptHistory.size(); i++) {
             if (job.attemptHistory.get(i).attempt() == attempt) {
                 job.attemptHistory.set(i, entry);
@@ -864,7 +933,9 @@ public class BatchHashJobService {
             return;
         }
         try {
-            audit.succeed(entryId, Map.of("outcome", outcome, "resultCount", job.items.size()));
+            audit.succeed(entryId, Map.of("outcome", outcome, "resultCount", job.items.size(),
+                    "resumedFrom", job.attemptResumedFrom.getOrDefault(generation, 0),
+                    "completedItems", completedItems(job)));
         } catch (RuntimeException e) {
             log.debug("BATCH_HASH audit succeed failed for job {} attempt {}: {}", job.jobId, generation,
                     e.toString());
@@ -900,12 +971,13 @@ public class BatchHashJobService {
      * the secret key in the journal.
      */
     private record BatchHashAuditDescriptor(String jobId, int attempt, String algorithm, int itemCount,
-            String idempotencyKey) {
+            String idempotencyKey, int resumedFrom, int completedItems) {
 
         private static BatchHashAuditDescriptor of(MutableJob job, int generation) {
             return new BatchHashAuditDescriptor(job.jobId, generation,
                     boundedAuditText(job.algorithm, "UNKNOWN"), job.items.size(),
-                    boundedAuditText(job.idempotencyKey, null));
+                    boundedAuditText(job.idempotencyKey, null),
+                    job.attemptResumedFrom.getOrDefault(generation, 0), job.checkpoint.size());
         }
     }
 
@@ -923,23 +995,26 @@ public class BatchHashJobService {
         private final Instant completedAt;
         private final String error;
         private final List<HashResponse> results;
+        private final List<HashResponse> checkpoint;
         private final Instant lastHeartbeatAt;
         private final Instant executionLeaseExpiresAt;
 
         private FailedState(int attempt, Instant startedAt, Instant completedAt, String error,
-                List<HashResponse> results, Instant lastHeartbeatAt, Instant executionLeaseExpiresAt) {
+                List<HashResponse> results, List<HashResponse> checkpoint, Instant lastHeartbeatAt,
+                Instant executionLeaseExpiresAt) {
             this.attempt = attempt;
             this.startedAt = startedAt;
             this.completedAt = completedAt;
             this.error = error;
             this.results = results;
+            this.checkpoint = checkpoint;
             this.lastHeartbeatAt = lastHeartbeatAt;
             this.executionLeaseExpiresAt = executionLeaseExpiresAt;
         }
 
         private static FailedState of(MutableJob job) {
             return new FailedState(job.attempt, job.startedAt, job.completedAt, job.error, job.results,
-                    job.lastHeartbeatAt, job.executionLeaseExpiresAt);
+                    List.copyOf(job.checkpoint), job.lastHeartbeatAt, job.executionLeaseExpiresAt);
         }
 
         private void restore(MutableJob job) {
@@ -949,6 +1024,8 @@ public class BatchHashJobService {
             job.completedAt = completedAt;
             job.error = error;
             job.results = results;
+            job.checkpoint.clear();
+            job.checkpoint.addAll(checkpoint);
             job.lastHeartbeatAt = lastHeartbeatAt;
             job.executionLeaseExpiresAt = executionLeaseExpiresAt;
         }
@@ -1032,6 +1109,10 @@ public class BatchHashJobService {
         private final Map<Integer, String> attemptRequestIds = new HashMap<>();
         /** Audit entry id of every attempt that actually started, keyed by attempt number. */
         private final Map<Integer, String> attemptAuditEntryIds = new HashMap<>();
+        /** Durable ordered prefix of this job: entries 0..size-1 are hashed and committed. */
+        private final List<HashResponse> checkpoint = new ArrayList<>();
+        /** Where each admitted attempt started, keyed by attempt number. */
+        private final Map<Integer, Integer> attemptResumedFrom = new HashMap<>();
 
         private int attempt = 1;
         private JobStatus status = JobStatus.QUEUED;
