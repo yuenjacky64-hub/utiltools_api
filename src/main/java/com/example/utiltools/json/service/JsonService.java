@@ -1,5 +1,7 @@
 package com.example.utiltools.json.service;
 
+import com.example.utiltools.json.dto.JsonFlattenRequest;
+import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
 import com.example.utiltools.json.dto.JsonPatchOperation;
@@ -7,6 +9,8 @@ import com.example.utiltools.json.dto.JsonPatchRequest;
 import com.example.utiltools.json.dto.JsonPatchResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
+import com.example.utiltools.json.dto.JsonUnflattenRequest;
+import com.example.utiltools.json.dto.JsonUnflattenResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.exception.JsonPatchRollbackException;
@@ -30,13 +34,27 @@ import org.springframework.stereotype.Service;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
 
 @Service
 public class JsonService {
 
     private static final int DEFAULT_INDENT_WIDTH = 2;
     private static final int DEFAULT_AUDIT_CAPACITY = 1024;
+    /** Separator used by flatten/unflatten when the request does not supply one. */
+    static final String DEFAULT_SEPARATOR = ".";
+    private static final int MAX_SEPARATOR_LENGTH = 8;
+    /** Deepest accepted path: 64 keys joined by the separator. */
+    static final int MAX_DEPTH = 64;
+    /** Most leaves a flatten response, or keys a flat document, may carry. */
+    static final int MAX_KEYS = 10000;
 
     private final ObjectMapper objectMapper;
     private final CircuitBreaker circuitBreaker;
@@ -204,6 +222,173 @@ public class JsonService {
 
         int applied = dryRun ? 0 : audit.size();
         return new JsonPatchResponse(dryRun ? null : doc.root(), applied, 0, dryRun, List.copyOf(audit));
+    }
+
+    /**
+     * Collapses an object tree into dot-path key/value pairs. Insertion order is preserved, arrays
+     * and empty objects stay untouched leaf values, and a key that is empty or already contains the
+     * separator is rejected so that {@link #unflatten(JsonUnflattenRequest)} can always rebuild the tree.
+     * Every emitted path is also re-split on the separator and must yield exactly the walked name
+     * chain, which keeps the round trip exact for multi-character separators as well.
+     */
+    public JsonFlattenResponse flatten(JsonFlattenRequest request) {
+        String separator = normaliseSeparator(request.separator());
+        JsonNode root = parseTree(request.json());
+        if (!root.isObject()) {
+            throw new IllegalArgumentException("json root must be a JSON object");
+        }
+
+        ObjectNode flattened = objectMapper.createObjectNode();
+        FlattenTally tally = new FlattenTally();
+        walkFlatten((ObjectNode) root, new String[0], "", 1, separator, flattened, tally);
+        if (tally.keyCount > MAX_KEYS) {
+            throw new IllegalArgumentException(
+                    "flattened document must contain at most " + MAX_KEYS + " keys");
+        }
+        return new JsonFlattenResponse(flattened, tally.keyCount, tally.maxDepth);
+    }
+
+    private void walkFlatten(ObjectNode node, String[] chain, String prefix, int depth, String separator,
+                             ObjectNode flattened, FlattenTally tally) {
+        Iterator<Map.Entry<String, JsonNode>> members = node.fields();
+        while (members.hasNext()) {
+            Map.Entry<String, JsonNode> member = members.next();
+            String key = member.getKey();
+            // An empty member name would flatten to a path with an empty segment, which unflatten rejects
+            // (row 4), so it is refused here to keep the round-trip invariant true for every accepted document.
+            if (key.isEmpty()) {
+                throw new IllegalArgumentException("key must not be empty");
+            }
+            if (key.contains(separator)) {
+                throw new IllegalArgumentException(
+                        "key '" + key + "' must not contain the separator '" + separator + "'");
+            }
+            String path = prefix.isEmpty() ? key : prefix + separator + key;
+            // A self-overlapping multi-character separator can swallow a join boundary: with "aa",
+            // {"ba":{"b":1}} joins to "baaab", which unflatten re-splits as ["b","ab"] and rebuilds a
+            // different document. Requiring the emitted path to split back into exactly the walked name
+            // chain refuses those inputs here instead of corrupting them silently there.
+            String[] expected = Arrays.copyOf(chain, chain.length + 1);
+            expected[chain.length] = key;
+            if (!Arrays.equals(path.split(Pattern.quote(separator), -1), expected)) {
+                throw new IllegalArgumentException("ambiguous key path '" + path + "' for separator '"
+                        + separator + "': it does not split back into its own key segments");
+            }
+            JsonNode value = member.getValue();
+            if (value.isObject() && !value.isEmpty()) {
+                if (depth + 1 > MAX_DEPTH) {
+                    throw new IllegalArgumentException("document depth must not exceed " + MAX_DEPTH);
+                }
+                walkFlatten((ObjectNode) value, expected, path, depth + 1, separator, flattened, tally);
+            } else {
+                // Arrays, empty objects and scalars are leaves: they are stored verbatim as their own value.
+                flattened.set(path, value);
+                tally.keyCount++;
+                tally.maxDepth = Math.max(tally.maxDepth, depth);
+            }
+        }
+    }
+
+    /**
+     * Rebuilds a nested object from flat separator-delimited keys. Every reject is an
+     * {@link IllegalArgumentException} whose message names the offending key or limit.
+     */
+    public JsonUnflattenResponse unflatten(JsonUnflattenRequest request) {
+        String separator = normaliseSeparator(request.separator());
+        JsonNode root = parseTree(request.json());
+        if (!root.isObject()) {
+            throw new IllegalArgumentException("json root must be a JSON object");
+        }
+
+        ObjectNode flat = (ObjectNode) root;
+        List<String[]> paths = new ArrayList<>();
+        List<JsonNode> values = new ArrayList<>();
+        int maxDepth = 0;
+        Iterator<Map.Entry<String, JsonNode>> members = flat.fields();
+        while (members.hasNext()) {
+            Map.Entry<String, JsonNode> member = members.next();
+            String key = member.getKey();
+            // -1 keeps trailing empty segments so that 'a.' is reported instead of silently dropped.
+            String[] segments = key.split(Pattern.quote(separator), -1);
+            for (String segment : segments) {
+                if (segment.isEmpty()) {
+                    throw new IllegalArgumentException("empty path segment in key '" + key + "'");
+                }
+            }
+            if (segments.length > MAX_DEPTH) {
+                throw new IllegalArgumentException("document depth must not exceed " + MAX_DEPTH);
+            }
+            maxDepth = Math.max(maxDepth, segments.length);
+            paths.add(segments);
+            values.add(member.getValue());
+        }
+        int keyCount = paths.size();
+        if (keyCount > MAX_KEYS) {
+            throw new IllegalArgumentException(
+                    "flat document must contain at most " + MAX_KEYS + " keys");
+        }
+
+        ObjectNode nested = objectMapper.createObjectNode();
+        // Identity set of nodes this call created as interior containers: a container that arrived as a
+        // leaf value must never be descended into, otherwise a key like 'a' with value {} plus 'a.b'
+        // would silently swallow the leaf.
+        Set<ObjectNode> branches = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (int i = 0; i < paths.size(); i++) {
+            String[] segments = paths.get(i);
+            String key = String.join(separator, segments);
+            ObjectNode current = nested;
+            for (int s = 0; s < segments.length - 1; s++) {
+                JsonNode child = current.get(segments[s]);
+                if (child == null) {
+                    ObjectNode created = current.putObject(segments[s]);
+                    branches.add(created);
+                    current = created;
+                } else if (child.isObject() && branches.contains(child)) {
+                    current = (ObjectNode) child;
+                } else {
+                    throw new IllegalArgumentException("conflicting path: '" + key
+                            + "' cannot be nested under '" + String.join(separator,
+                            Arrays.copyOf(segments, s + 1)) + "' which is already a leaf");
+                }
+            }
+            String leaf = segments[segments.length - 1];
+            if (current.has(leaf)) {
+                throw new IllegalArgumentException("conflicting path: '" + key
+                        + "' duplicates an existing key or leaf");
+            }
+            current.set(leaf, values.get(i));
+        }
+        return new JsonUnflattenResponse(nested, keyCount, maxDepth);
+    }
+
+    private static String normaliseSeparator(String separator) {
+        String value = separator == null ? DEFAULT_SEPARATOR : separator;
+        if (value.isBlank()) {
+            throw new IllegalArgumentException("separator must not be blank");
+        }
+        if (value.length() > MAX_SEPARATOR_LENGTH) {
+            throw new IllegalArgumentException(
+                    "separator must be at most " + MAX_SEPARATOR_LENGTH + " characters");
+        }
+        return value;
+    }
+
+    private JsonNode parseTree(String json) {
+        try {
+            JsonNode node = objectMapper.readTree(json);
+            if (node == null) {
+                throw new IllegalArgumentException("Invalid JSON content: document is empty");
+            }
+            return node;
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException("Invalid JSON content: " + e.getOriginalMessage(), e);
+        }
+    }
+
+    /** Mutable counters for the flatten walk: the service bean itself stays stateless. */
+    private static final class FlattenTally {
+        private int keyCount;
+        private int maxDepth;
     }
 
     private Runnable applyOperation(PatchDocument doc, JsonPatchOperation entry) {

@@ -1,7 +1,9 @@
 package com.example.utiltools.json;
 
 import com.example.utiltools.audit.AuditTestSupport;
+import com.example.utiltools.audit.controller.AuditController;
 import com.example.utiltools.audit.service.AuditJournalService;
+import com.example.utiltools.audit.service.AuditReplayService;
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.GlobalExceptionHandler;
 import com.example.utiltools.crypto.service.CryptoService;
@@ -10,6 +12,7 @@ import com.example.utiltools.json.service.JsonService;
 import com.example.utiltools.json.controller.JsonController;
 import com.example.utiltools.text.service.TextService;
 import com.example.utiltools.resilience.ResilienceConfig;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -21,13 +24,15 @@ import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.hamcrest.Matchers.containsString;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-@WebMvcTest(JsonController.class)
-@Import({AuditTestSupport.class, AuditJournalService.class, AuditedOperations.class, CryptoService.class, DateTimeService.class,
+@WebMvcTest({JsonController.class, AuditController.class})
+@Import({AuditTestSupport.class, AuditJournalService.class, AuditedOperations.class, AuditReplayService.class,
+        CryptoService.class, DateTimeService.class,
         JsonService.class, TextService.class, GlobalExceptionHandler.class, ResilienceConfig.class})
 @TestPropertySource(properties = {"utiltools.audit.max-entries=200", "utiltools.audit.max-replay-bytes=65536"})
 class JsonControllerTest {
@@ -357,6 +362,129 @@ class JsonControllerTest {
                 .andExpect(jsonPath("$.data.audit[0].index").value(0))
                 .andExpect(jsonPath("$.data.audit[99].index").value(99))
                 .andExpect(jsonPath("$.data.audit[99].status").value("APPLIED"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/flatten - should return dot-path keys with keyCount and maxDepth")
+    void shouldFlattenJson() throws Exception {
+        String body = """
+                {
+                    "json": "{\\"name\\":\\"Alice\\",\\"address\\":{\\"city\\":\\"Paris\\"},\\"tags\\":[\\"a\\"]}"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/flatten")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.resultJson.name").value("Alice"))
+                .andExpect(jsonPath("$.data.resultJson['address.city']").value("Paris"))
+                .andExpect(jsonPath("$.data.resultJson.tags[0]").value("a"))
+                .andExpect(jsonPath("$.data.keyCount").value(3))
+                .andExpect(jsonPath("$.data.maxDepth").value(2));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/unflatten - should rebuild nested JSON from dot-path keys")
+    void shouldUnflattenJson() throws Exception {
+        String body = """
+                {
+                    "json": "{\\"a.b\\":1,\\"a.c\\":2}"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/unflatten")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.resultJson.a.b").value(1))
+                .andExpect(jsonPath("$.data.resultJson.a.c").value(2))
+                .andExpect(jsonPath("$.data.keyCount").value(2))
+                .andExpect(jsonPath("$.data.maxDepth").value(2));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/unflatten - conflicting paths return 400 BAD_REQUEST")
+    void shouldRejectUnflattenConflictWithBadRequest() throws Exception {
+        String body = """
+                {
+                    "json": "{\\"a\\":1,\\"a.b\\":2}"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/unflatten")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("conflicting path")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/flatten - blank json returns 400 VALIDATION_ERROR")
+    void shouldRejectBlankJsonOnFlatten() throws Exception {
+        String body = """
+                {
+                    "json": ""
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/flatten")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/flatten and unflatten - journalled as JSON_FLATTEN / JSON_UNFLATTEN and replay VERIFIED")
+    void shouldJournalAndVerifyFlattenAndUnflatten() throws Exception {
+        String flattenBody = """
+                {
+                    "json": "{\\"a\\":{\\"b\\":1}}"
+                }
+                """;
+        String unflattenBody = """
+                {
+                    "json": "{\\"a.b\\":1}"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/flatten")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(flattenBody))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/v1/utils/json/unflatten")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(unflattenBody))
+                .andExpect(status().isOk());
+
+        String entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[?(@.operation == 'JSON_FLATTEN')]").exists())
+                .andExpect(jsonPath("$.data[?(@.operation == 'JSON_UNFLATTEN')]").exists())
+                .andReturn().getResponse().getContentAsString();
+
+        for (String operation : new String[]{"JSON_FLATTEN", "JSON_UNFLATTEN"}) {
+            String entryId = entryIdOf(entries, operation);
+            mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", entryId))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"));
+        }
+    }
+
+    private static String entryIdOf(String entriesJson, String operation) throws Exception {
+        JsonNode entries = new ObjectMapper().readTree(entriesJson).path("data");
+        for (JsonNode entry : entries) {
+            if (operation.equals(entry.path("operation").asText())) {
+                return entry.path("id").asText();
+            }
+        }
+        throw new AssertionError("no audit entry for " + operation + " in " + entriesJson);
     }
 
     private static String patchBodyWithOperations(int count, boolean dryRun) {
