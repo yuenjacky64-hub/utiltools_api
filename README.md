@@ -153,6 +153,7 @@ utiltools_api/
 | `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `COMPLETED` / `FAILED` / `CANCELLED` |
 | `DELETE` | `/api/v1/utils/jobs/{jobId}` | Cancel a `QUEUED` job (`200`, idempotent); `409` `JOB_CANCELLATION_CONFLICT` once it is `RUNNING`/`COMPLETED`/`FAILED` |
 | `POST` | `/api/v1/utils/jobs/{jobId}/retry` | Requeue a `FAILED` job (`202`); `409` `JOB_RETRY_CONFLICT` for any other status or once `attempt` reaches `maxAttempts` |
+| `GET` | `/api/v1/utils/jobs` | List job snapshots newest first; optional `status` filter and `limit` (default `20`, clamped to `1..100`) |
 | `GET` | `/api/v1/utils/audit/entries` | List journal entries (newest first) with optional `limit` & `state` filters |
 | `GET` | `/api/v1/utils/audit/entries/{id}` | Fetch a single journal entry (redacted request/result) |
 | `POST` | `/api/v1/utils/audit/entries/{id}/replay` | Replay a deterministic SUCCEEDED entry and verify the outcome |
@@ -1556,12 +1557,13 @@ utiltools.jobs.max-attempts=3
 
 #### G. Rate limiting interaction (explicit decision)
 
-All four jobs endpoints live under `/api/v1/utils/**`, so they are **not exempt** from `RateLimitFilter`
+All five jobs endpoints live under `/api/v1/utils/**`, so they are **not exempt** from `RateLimitFilter`
 (see [Rate Limiting](#-rate-limiting)): every `POST /api/v1/utils/jobs/hash`, every
-`GET /api/v1/utils/jobs/{jobId}` poll, every `DELETE /api/v1/utils/jobs/{jobId}` cancellation **and** every
-`POST /api/v1/utils/jobs/{jobId}/retry` consumes one slot of the caller's window budget, because polling,
-cancelling or retrying a job is a normal API call. Being jobs, they are **not** additionally exempted — no entry
-was added to `RateLimitFilter.shouldNotFilter` for the retry route either. Consequences:
+`GET /api/v1/utils/jobs/{jobId}` poll, every `DELETE /api/v1/utils/jobs/{jobId}` cancellation, every
+`POST /api/v1/utils/jobs/{jobId}/retry` **and** every `GET /api/v1/utils/jobs` listing consumes one slot of the
+caller's window budget, because polling, cancelling, retrying or listing a job is a normal API call. Being jobs,
+they are **not** additionally exempted — no entry was added to `RateLimitFilter.shouldNotFilter` for the retry
+route either. Consequences:
 
 - A caller that submits a batch and then polls aggressively can exhaust its own budget and receive
   `429 RATE_LIMITED` (error `RATE_LIMITED`) *before* the job finishes. This is a client-throttling
@@ -1579,6 +1581,85 @@ was added to `RateLimitFilter.shouldNotFilter` for the retry route either. Conse
 - The job itself is unaffected by rate limiting and stays retrievable for `utiltools.jobs.retention-seconds`
   after it becomes terminal — `COMPLETED`, `FAILED` **or** `CANCELLED` (the scheduled eviction pass runs every
   `utiltools.jobs.cleanup-interval-ms`).
+
+#### H. List jobs (200 OK, bounded & newest first)
+
+`GET /api/v1/utils/jobs` enumerates the jobs the in-memory registry currently holds, so a client that lost a
+`jobId` — or an operator inspecting the live `QUEUED` / `RUNNING` workload — can recover without guessing ids.
+Two optional query parameters bound the response:
+
+| Parameter | Default | Bound | Behaviour |
+| :-------- | :------ | :---- | :-------- |
+| `status`  | *(none)* | `JobStatus` | Exact-match filter: `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED` or `CANCELLED`. Omitted ⇒ every status |
+| `limit`   | `20` | clamped to `1..100` | Maximum number of entries returned; `0`, negative or `>100` values are clamped rather than rejected |
+
+```bash
+# newest 20 jobs, any status
+curl http://localhost:8080/api/v1/utils/jobs
+
+# only the jobs still waiting for a worker, capped at 5
+curl 'http://localhost:8080/api/v1/utils/jobs?status=QUEUED&limit=5'
+```
+
+Each element is the **same point-in-time projection** as a poll response — `snapshot(job)` is reused — so
+`secretKey` and the raw input items are never exposed, and the `RUNNING` lease fields (`startedAt`,
+`executionLeaseExpiresAt`, `lastHeartbeatAt`) appear only while the job is `RUNNING`, exactly as on
+`GET /api/v1/utils/jobs/{jobId}`. The array is ordered newest first by `createdAt` with `jobId` as a
+deterministic tie-breaker, so two jobs created in the same instant always keep the same relative order.
+
+```json
+{
+  "success": true,
+  "message": "Job list retrieved",
+  "data": [
+    {
+      "jobId": "9a1f0b7c-2f4d-4a51-8f0b-2c6d8e1a7b33",
+      "status": "RUNNING",
+      "itemCount": 2,
+      "attempt": 1,
+      "maxAttempts": 3,
+      "attempts": [
+        { "attempt": 1, "status": "RUNNING", "startedAt": "2026-11-07T13:41:02.113004Z" }
+      ],
+      "createdAt": "2026-11-07T13:41:02.108621Z",
+      "startedAt": "2026-11-07T13:41:02.113004Z",
+      "executionLeaseExpiresAt": "2026-11-07T13:41:32.113004Z",
+      "lastHeartbeatAt": "2026-11-07T13:41:02.113004Z"
+    },
+    {
+      "jobId": "1c7e5d40-6b29-4f88-9d0e-77ab1f3c5e88",
+      "idempotencyKey": "batch-2026-11-07-002",
+      "status": "COMPLETED",
+      "itemCount": 1,
+      "results": [
+        { "algorithm": "SHA-512", "digest": "a5e019350fd755cb21a23f61f05f85b4e55aa6acc987436084fed97db11da5ad", "isHmac": false }
+      ],
+      "attempt": 1,
+      "maxAttempts": 3,
+      "attempts": [
+        { "attempt": 1, "status": "COMPLETED", "startedAt": "2026-11-07T13:40:58.004117Z",
+          "completedAt": "2026-11-07T13:40:58.006902Z" }
+      ],
+      "createdAt": "2026-11-07T13:40:58.001550Z",
+      "startedAt": "2026-11-07T13:40:58.004117Z",
+      "completedAt": "2026-11-07T13:40:58.006902Z"
+    }
+  ],
+  "timestamp": "2026-11-07T13:41:03.500210Z"
+}
+```
+
+The endpoint is **read-only and total**: it never mutates a job, never reorders or evicts the registry, and
+returns **`200` with `"data": []`** when nothing matches — an empty registry is an empty success, never a `404`.
+`status` is bound to the `JobStatus` enum, so an unknown value such as `?status=BOGUS` is a **`400`**
+(`error: BAD_REQUEST`, message `Invalid value 'BOGUS' for parameter 'status'`) raised by the existing
+`MethodArgumentTypeMismatchException` handler before the service is called — the same contract as any other
+enum-typed query parameter in this API.
+
+As with polling, listing reflects only what the registry still holds: `COMPLETED`, `FAILED` and `CANCELLED`
+jobs disappear once `utiltools.jobs.retention-seconds` elapses, so the list is a live view, not a history log.
+It is deliberately bounded (default `20`, ceiling `100`) and not paginated — for the full history use
+`GET /api/v1/utils/audit/entries`.
 
 ---
 

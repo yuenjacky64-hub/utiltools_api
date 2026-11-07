@@ -22,6 +22,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -316,6 +318,58 @@ class BatchJobControllerTest {
         mockMvc.perform(post("/api/v1/utils/jobs/evicted-1/retry"))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.error").value("JOB_NOT_FOUND"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/jobs - should return 200 with a newest-first list envelope")
+    void shouldReturn200WithJobList() throws Exception {
+        Instant newestStamp = Instant.parse("2026-11-06T10:00:02Z");
+        Instant olderStamp = Instant.parse("2026-11-06T10:00:00Z");
+        doReturn(List.of(
+                new BatchHashJobResponse("job-newest", null, JobStatus.COMPLETED, 1, List.of(),
+                        null, newestStamp, newestStamp, newestStamp, 1, 3, List.of()),
+                new BatchHashJobResponse("job-older", null, JobStatus.CANCELLED, 2, null,
+                        null, olderStamp, null, olderStamp, 1, 3, List.of())))
+                .when(jobService).listJobs(null, 20);
+
+        mockMvc.perform(get("/api/v1/utils/jobs"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Job list retrieved"))
+                .andExpect(jsonPath("$.data").isArray())
+                .andExpect(jsonPath("$.data.length()").value(2))
+                .andExpect(jsonPath("$.data[0].jobId").value("job-newest"))
+                .andExpect(jsonPath("$.data[0].status").value("COMPLETED"))
+                .andExpect(jsonPath("$.data[0].results").isArray())
+                .andExpect(jsonPath("$.data[1].jobId").value("job-older"))
+                .andExpect(jsonPath("$.data[1].status").value("CANCELLED"))
+                .andExpect(jsonPath("$.data[1].results").doesNotExist());
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/jobs - should forward the status filter and the limit")
+    void shouldForwardStatusAndLimit() throws Exception {
+        doReturn(List.of()).when(jobService).listJobs(JobStatus.RUNNING, 50);
+
+        mockMvc.perform(get("/api/v1/utils/jobs")
+                        .param("status", "RUNNING")
+                        .param("limit", "50"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data").isArray())
+                .andExpect(jsonPath("$.data").isEmpty());
+
+        verify(jobService).listJobs(JobStatus.RUNNING, 50);
+        verify(jobService, never()).listJobs(JobStatus.RUNNING, 20);
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/jobs - an unknown status answers 400 BAD_REQUEST")
+    void shouldReturn400ForUnknownStatus() throws Exception {
+        mockMvc.perform(get("/api/v1/utils/jobs").param("status", "NOT_A_STATUS"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
     }
 
     @Test

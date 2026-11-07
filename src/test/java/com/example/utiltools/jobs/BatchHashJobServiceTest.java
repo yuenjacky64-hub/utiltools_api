@@ -1075,6 +1075,206 @@ class BatchHashJobServiceTest {
     }
 
     /**
+     * DOD-01 / REQ-02: the newest job by {@code createdAt} is first, oldest last.
+     */
+    @Test
+    @DisplayName("listJobs - returns the registry newest-first by createdAt")
+    void shouldListJobsNewestFirst() {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        service = new BatchHashJobService(new CryptoService(), 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse oldest = service.submit(new BatchHashRequest("SHA-256", List.of("alpha"), null, null));
+        clock.advanceSeconds(1);
+        BatchHashJobResponse middle = service.submit(new BatchHashRequest("SHA-256", List.of("beta"), null, null));
+        clock.advanceSeconds(1);
+        BatchHashJobResponse newest = service.submit(new BatchHashRequest("SHA-256", List.of("gamma"), null, null));
+
+        List<String> listed = service.listJobs(null, 20).stream().map(BatchHashJobResponse::jobId).toList();
+        assertThat(listed).containsExactly(newest.jobId(), middle.jobId(), oldest.jobId());
+
+        List<Instant> timestamps = service.listJobs(null, 20).stream().map(BatchHashJobResponse::createdAt).toList();
+        assertThat(timestamps).containsExactly(LEASE_START.plusSeconds(2), LEASE_START.plusSeconds(1), LEASE_START);
+    }
+
+    /**
+     * DOD-01 / REQ-02: equal {@code createdAt} stamps are ordered by {@code jobId} ascending, so the
+     * order is deterministic rather than dependent on map iteration order.
+     */
+    @Test
+    @DisplayName("listJobs - breaks createdAt ties by jobId ascending")
+    void shouldBreakCreatedAtTiesByJobId() {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        service = new BatchHashJobService(new CryptoService(), 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        List<String> submitted = new ArrayList<>();
+        for (String item : List.of("alpha", "beta", "gamma")) {
+            submitted.add(service.submit(new BatchHashRequest("SHA-256", List.of(item), null, null)).jobId());
+        }
+
+        List<BatchHashJobResponse> listed = service.listJobs(null, 20);
+        assertThat(listed).hasSize(3);
+        assertThat(listed).allSatisfy(job -> assertThat(job.createdAt()).isEqualTo(LEASE_START));
+        assertThat(listed.stream().map(BatchHashJobResponse::jobId).toList())
+                .containsExactlyElementsOf(submitted.stream().sorted().toList());
+    }
+
+    /**
+     * DOD-02 / REQ-02 / REQ-04: a supplied status keeps only matching jobs, and a status with no
+     * match yields an empty list instead of an error.
+     */
+    @Test
+    @DisplayName("listJobs - filters by status and returns an empty list when nothing matches")
+    void shouldFilterJobsByStatus() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("running");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
+
+        BatchHashJobResponse running = service.submit(new BatchHashRequest("SHA-256", List.of("running"), null, null));
+        assertThat(crypto.awaitEntered("running")).isTrue();
+        BatchHashJobResponse cancelled = service.submit(new BatchHashRequest("SHA-256", List.of("cancel-me"), null, null));
+        service.cancel(cancelled.jobId());
+
+        assertThat(idsOf(service.listJobs(JobStatus.CANCELLED, 20))).containsExactly(cancelled.jobId());
+        assertThat(idsOf(service.listJobs(JobStatus.RUNNING, 20))).containsExactly(running.jobId());
+        assertThat(service.listJobs(JobStatus.COMPLETED, 20)).isEmpty();
+        assertThat(service.listJobs(JobStatus.FAILED, 20)).isEmpty();
+
+        crypto.unblock("running");
+        awaitStatus(running.jobId(), JobStatus.COMPLETED);
+        assertThat(idsOf(service.listJobs(JobStatus.COMPLETED, 20))).containsExactly(running.jobId());
+        assertThat(service.listJobs(JobStatus.QUEUED, 20)).isEmpty();
+        assertThat(service.listJobs(null, 20)).hasSize(2);
+    }
+
+    /**
+     * DOD-02 / REQ-02: {@code limit} is clamped to {@code [1, 100]} — a non-positive value still
+     * answers the newest single job and an oversized value is capped at the ceiling.
+     */
+    @Test
+    @DisplayName("listJobs - clamps limit to 1..100")
+    void shouldClampLimitToBoundedRange() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        service = new BatchHashJobService(new CryptoService(), 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+        for (String item : List.of("alpha", "beta", "gamma")) {
+            service.submit(new BatchHashRequest("SHA-256", List.of(item), null, null));
+            clock.advanceSeconds(1);
+        }
+        assertThat(service.listJobs(null, 0)).hasSize(1);
+        assertThat(service.listJobs(null, -5)).hasSize(1);
+        assertThat(service.listJobs(null, 2)).hasSize(2);
+
+        // A registry larger than the ceiling: one gated job occupies the worker, the rest stay QUEUED.
+        service.shutdown();
+        LeaseCryptoService crypto = new LeaseCryptoService("blocking");
+        service = new BatchHashJobService(crypto, 1, 200, 300, 3);
+        service.submit(new BatchHashRequest("SHA-256", List.of("blocking"), null, null));
+        assertThat(crypto.awaitEntered("blocking")).isTrue();
+        for (int i = 0; i < 105; i++) {
+            service.submit(new BatchHashRequest("SHA-256", List.of("queued-" + i), null, null));
+        }
+
+        List<BatchHashJobResponse> capped = service.listJobs(null, 500);
+        assertThat(capped).hasSize(100);
+        assertThat(service.listJobs(null, 101)).hasSize(100);
+        assertThat(service.listJobs(null, 500)).isEqualTo(capped);
+
+        List<BatchHashJobResponse> twenty = service.listJobs(null, 20);
+        assertThat(twenty).hasSize(20);
+        assertThat(idsOf(twenty)).containsExactlyElementsOf(idsOf(capped).subList(0, 20));
+
+        crypto.unblock("blocking");
+    }
+
+    /**
+     * DOD-01 / REQ-04: an empty registry is a successful empty list, for both the filtered and the
+     * unfiltered call.
+     */
+    @Test
+    @DisplayName("listJobs - returns an empty list for an empty registry")
+    void shouldReturnEmptyListWhenRegistryEmpty() {
+        service = new BatchHashJobService(new CryptoService(), 1, 10, 300, 3);
+
+        assertThat(service.listJobs(null, 20)).isEmpty();
+        assertThat(service.listJobs(JobStatus.COMPLETED, 20)).isEmpty();
+        assertThat(service.listJobs(JobStatus.QUEUED, 0)).isEmpty();
+    }
+
+    /**
+     * DOD-03 / REQ-02 / REQ-03: listing is read-only — registry membership and every job snapshot are
+     * identical before and after a list call.
+     */
+    @Test
+    @DisplayName("listJobs - never mutates the registry or a job")
+    void shouldNotMutateJobsWhenListing() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("running");
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse running = service.submit(new BatchHashRequest("SHA-256", List.of("running"), null, null));
+        assertThat(crypto.awaitEntered("running")).isTrue();
+        BatchHashJobResponse queued = service.submit(new BatchHashRequest("SHA-256", List.of("waiting"), null, null));
+
+        Set<String> registryBefore = registryKeys("jobs");
+        BatchHashJobResponse runningBefore = service.getJob(running.jobId());
+        BatchHashJobResponse queuedBefore = service.getJob(queued.jobId());
+
+        service.listJobs(null, 100);
+        service.listJobs(JobStatus.RUNNING, 100);
+
+        assertThat(registryKeys("jobs")).isEqualTo(registryBefore);
+        assertThat(service.getJob(running.jobId())).isEqualTo(runningBefore);
+        assertThat(service.getJob(queued.jobId())).isEqualTo(queuedBefore);
+
+        crypto.unblock("running");
+    }
+
+    /**
+     * DOD-01 / DOD-03 / REQ-03: each element is the {@code GET /{jobId}} projection — lease fields
+     * appear only for RUNNING and the record carries no secret key or raw item component.
+     */
+    @Test
+    @DisplayName("listJobs - every element equals the poll snapshot and exposes no secret")
+    void shouldListJobsProjectionMatchesSnapshot() throws Exception {
+        LeaseCryptoService crypto = new LeaseCryptoService("running");
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse running = service.submit(
+                new BatchHashRequest("SHA-256", List.of("running"), "s3cret", null));
+        assertThat(crypto.awaitEntered("running")).isTrue();
+        BatchHashJobResponse queued = service.submit(
+                new BatchHashRequest("SHA-256", List.of("waiting"), "s3cret", null));
+
+        Map<String, BatchHashJobResponse> listed = new ConcurrentHashMap<>();
+        for (BatchHashJobResponse job : service.listJobs(null, 20)) {
+            listed.put(job.jobId(), job);
+        }
+        assertThat(listed.keySet()).containsExactlyInAnyOrder(running.jobId(), queued.jobId());
+
+        BatchHashJobResponse listedRunning = listed.get(running.jobId());
+        assertThat(listedRunning).isEqualTo(service.getJob(running.jobId()));
+        assertThat(listedRunning.status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(listedRunning.executionLeaseExpiresAt()).isNotNull();
+        assertThat(listedRunning.lastHeartbeatAt()).isNotNull();
+        assertThat(listedRunning.executionLeaseExpiresAt())
+                .isEqualTo(listedRunning.lastHeartbeatAt().plusSeconds(LEASE_SECONDS));
+
+        BatchHashJobResponse listedQueued = listed.get(queued.jobId());
+        assertThat(listedQueued).isEqualTo(service.getJob(queued.jobId()));
+        assertThat(listedQueued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(listedQueued.executionLeaseExpiresAt()).isNull();
+        assertThat(listedQueued.lastHeartbeatAt()).isNull();
+        assertThat(listedQueued.itemCount()).isEqualTo(1);
+
+        Set<String> components = new HashSet<>();
+        for (java.lang.reflect.RecordComponent component : BatchHashJobResponse.class.getRecordComponents()) {
+            components.add(component.getName());
+        }
+        assertThat(components).doesNotContain("secretKey", "items", "contents");
+
+        crypto.unblock("running");
+    }
+
+    /**
      * Submits a single-item job, lets the worker stall inside {@code hash()}, advances the clock past
      * the lease and reaps it, returning the reaped snapshot.
      */
@@ -1089,6 +1289,15 @@ class BatchHashJobServiceTest {
         assertThat(reaped.status()).isEqualTo(JobStatus.FAILED);
         assertThat(reaped.error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
         return reaped;
+    }
+
+    /** Projection of a list result onto job ids, keeping the list order intact. */
+    private static List<String> idsOf(List<BatchHashJobResponse> jobs) {
+        List<String> ids = new ArrayList<>(jobs.size());
+        for (BatchHashJobResponse job : jobs) {
+            ids.add(job.jobId());
+        }
+        return ids;
     }
 
     /**
