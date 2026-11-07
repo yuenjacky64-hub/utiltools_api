@@ -197,8 +197,8 @@ public class JsonService {
 
     /**
      * Collapses an object tree into dot-path key/value pairs. Insertion order is preserved, arrays
-     * and empty objects stay untouched leaf values, and a key that already contains the separator
-     * is rejected so that {@link #unflatten(JsonUnflattenRequest)} can always rebuild the tree.
+     * and empty objects stay untouched leaf values, and a key that is empty or already contains the
+     * separator is rejected so that {@link #unflatten(JsonUnflattenRequest)} can always rebuild the tree.
      */
     public JsonFlattenResponse flatten(JsonFlattenRequest request) {
         String separator = normaliseSeparator(request.separator());
@@ -223,6 +223,11 @@ public class JsonService {
         while (members.hasNext()) {
             Map.Entry<String, JsonNode> member = members.next();
             String key = member.getKey();
+            // An empty member name would flatten to a path with an empty segment, which unflatten rejects
+            // (row 4), so it is refused here to keep the round-trip invariant true for every accepted document.
+            if (key.isEmpty()) {
+                throw new IllegalArgumentException("key must not be empty");
+            }
             if (key.contains(separator)) {
                 throw new IllegalArgumentException(
                         "key '" + key + "' must not contain the separator '" + separator + "'");

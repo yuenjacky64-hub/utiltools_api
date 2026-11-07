@@ -543,8 +543,29 @@ class JsonServiceTest {
     }
 
     @Test
+    @DisplayName("Should reject empty member names so flatten output always round-trips")
+    void shouldRejectEmptyMemberName() {
+        // An empty name would flatten to the flat key "" (or "a."), which unflatten rejects as an empty
+        // path segment: refusing it in flatten keeps REQ-04 exact for every document flatten accepts.
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("{\"\":1}", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("key must not be empty");
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("{\"a\":{\"\":1}}", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("key must not be empty");
+
+        // A whitespace-only name is not an empty segment, so it is accepted and survives the round trip.
+        JsonFlattenResponse flattened =
+                jsonService.flatten(new JsonFlattenRequest("{\"a\":{\" \":1}}", null));
+        assertThat(flattened.resultJson().has("a. ")).isTrue();
+        JsonUnflattenResponse rebuilt =
+                jsonService.unflatten(new JsonUnflattenRequest(flattened.resultJson().toString(), null));
+        assertThat(rebuilt.resultJson().at("/a/ ").asInt()).isEqualTo(1);
+    }
+
+    @Test
     @DisplayName("Should rebuild nested objects from flat paths")
-    void shouldUnflattenNestedPaths() {
+    void shouldUnflattenIntoNestedJson() {
         JsonUnflattenResponse response = jsonService.unflatten(
                 new JsonUnflattenRequest("{\"a.b.c\":1,\"a.b.d\":2,\"a.e\":3}", null));
 
@@ -556,7 +577,21 @@ class JsonServiceTest {
     }
 
     @Test
-    @DisplayName("Should reject blank or overlong separators, empty segments, non-object roots and deep paths")
+    @DisplayName("Should reject non-object roots on flatten and unflatten")
+    void shouldRejectNonObjectRootForFlattenAndUnflatten() {
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("[1,2]", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("json root must be a JSON object");
+        assertThatThrownBy(() -> jsonService.unflatten(new JsonUnflattenRequest("[1,2]", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("json root must be a JSON object");
+        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("42", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("json root must be a JSON object");
+    }
+
+    @Test
+    @DisplayName("Should reject blank or overlong separators, empty segments and deep paths")
     void shouldRejectInvalidFlatDocuments() {
         assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("{\"a\":1}", " ")))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -576,12 +611,6 @@ class JsonServiceTest {
         assertThatThrownBy(() -> jsonService.unflatten(new JsonUnflattenRequest("{\"a.\":1}", null)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("empty path segment in key");
-        assertThatThrownBy(() -> jsonService.unflatten(new JsonUnflattenRequest("[1,2]", null)))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("json root must be a JSON object");
-        assertThatThrownBy(() -> jsonService.flatten(new JsonFlattenRequest("[1,2]", null)))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("json root must be a JSON object");
         assertThatThrownBy(() -> jsonService.unflatten(
                 new JsonUnflattenRequest("{\"" + "a.".repeat(64) + "a\":1}", null)))
                 .isInstanceOf(IllegalArgumentException.class)
