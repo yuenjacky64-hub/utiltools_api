@@ -14,7 +14,8 @@
 # Flags (each maps to one DoD row):
 #   --packages        DOD-01: exactly ten `### PKG-<name>` blocks, one per real package
 #                     directory, each citing a `- path:` that exists on disk and declaring
-#                     `- role:`, `- endpoints:` and `- shared-dep:`.
+#                     `- role:`, `- endpoints:` and `- shared-dep:`; plus the §1 paragraph that
+#                     names the request pipeline in plan order.
 #   --sections        DOD-05: the seven literal H2 headings of plan §4.1 exist in order, the
 #                     report carries no scaffold placeholder and no bare backlog marker.
 #   --inventory       DOD-03/DOD-04: one `- inventory:` line with the five measured integers of
@@ -218,6 +219,29 @@ if [ "$RUN_PACKAGES" -eq 1 ]; then
         || fail "PKG-${pkg} has no '- ${field}:' row"
     done
   done
+  # Plan §4.1 makes §1 open with the `- inventory:` block *and then one paragraph naming the request
+  # pipeline in order*, and DOD-01 binds that clause to this flag — so a report that inventories every
+  # package but never states the ordered path is not a DOD-01 pass (Test_Result_v5 B-01/B-01a: the
+  # clause was absent while this branch still exited 0).
+  # The paragraph is the first non-blank, non-`- ` line after the block's `- output:` row; the stages
+  # of plan §4.1's chain are matched by first byte offset, so "in order" means increasing position
+  # rather than mere presence, and the scope literal DOD-01 names is required alongside the filter
+  # itself. `controller` is matched case-insensitively because the paragraph names it as the generic
+  # owning-controller stage rather than as a class.
+  pipeline=$(awk '/^## 1\. /{p=1; next} p && /^## /{exit} p' "$REPORT_ABS" \
+    | awk '/^- output: /{seen=1; next} seen && /^[[:space:]]*$/ {next} seen && /^- /{next} seen {print; exit}')
+  [ -n "${pipeline:-}" ] \
+    || fail "§1 has no paragraph after the '- inventory:' block naming the request pipeline in order"
+  prev_off=-1
+  for stage in RequestIdFilter RateLimitFilter controller AuditedOperations AuditJournalService CircuitBreaker; do
+    off=$(printf '%s\n' "$pipeline" | grep -boi -- "$stage" | head -1 | cut -d: -f1)
+    [ -n "${off:-}" ] || fail "§1 pipeline paragraph does not name $stage"
+    [ "$off" -gt "$prev_off" ] \
+      || fail "§1 pipeline paragraph names $stage out of order (byte $off not after $prev_off)"
+    prev_off=$off
+  done
+  printf '%s\n' "$pipeline" | grep -qF -- '/api/v1/utils/' \
+    || fail "§1 pipeline paragraph does not state the RateLimitFilter scope '/api/v1/utils/*'"
 fi
 
 # ------------------------------------------------- DOD-03 + DOD-04 (INV-01)
@@ -251,14 +275,6 @@ if [ "$RUN_INVENTORY" -eq 1 ]; then
   raw_out=$(printf '%s\n' "$sec1" | grep -E '^- output: ' | head -1 | sed -E 's/^- output: //')
   [ -n "$raw_out" ] || fail "§1 has no '- output:' tail"
   out_text=$(untick "$raw_out")
-  out_len=${#out_text}
-  [ "$out_len" -le "$MAX_OUTPUT" ] || fail_pinned "$PINNED_OUTPUT_LEN" \
-    "§1 '- output:' is $out_len chars, over the $MAX_OUTPUT limit"
-  inv_cmd=$(printf '%s\n' "$sec1" | grep -E '^- evidence: ' | head -1 | sed -E 's/^- evidence: //')
-  inv_cmd=$(untick "$inv_cmd")
-  inv_real=$(eval "$inv_cmd" 2>&1)
-  printf '%s' "$inv_real" | grep -qF -- "$out_text" \
-    || fail "§1 '- output:' is not printed by its own '- evidence:' command: $out_text"
 
   # Recompute every field from the tree and compare.
   m_main=$(find "$SRC_MAIN" -name '*.java' | wc -l | tr -d ' ')
@@ -286,6 +302,19 @@ if [ "$RUN_INVENTORY" -eq 1 ]; then
     | grep -nE "$BARE_COUNT_ERE" | head -1)
   [ -z "$bare" ] \
     || fail_pinned "$PINNED_BARE_COUNT" "§1/§2 prose count is not an '- inventory:' field: $bare"
+
+  # §4.10 rows 9 and the tail half of the evidence triple run *after* the row 1-5 recompute
+  # (Test_Result_v5 N-01): an incoherent inventory edit used to surface the unpinned
+  # "'- output:' is not printed by its own '- evidence:' command" line before the pinned
+  # `FAIL: inventory <key>` literal, which is the first-failure identity §4.10 row 1 promises.
+  out_len=${#out_text}
+  [ "$out_len" -le "$MAX_OUTPUT" ] || fail_pinned "$PINNED_OUTPUT_LEN" \
+    "§1 '- output:' is $out_len chars, over the $MAX_OUTPUT limit"
+  inv_cmd=$(printf '%s\n' "$sec1" | grep -E '^- evidence: ' | head -1 | sed -E 's/^- evidence: //')
+  inv_cmd=$(untick "$inv_cmd")
+  inv_real=$(eval "$inv_cmd" 2>&1)
+  printf '%s' "$inv_real" | grep -qF -- "$out_text" \
+    || fail "§1 '- output:' is not printed by its own '- evidence:' command: $out_text"
 fi
 
 # ---------------------------------------------------------------- DOD-06
@@ -447,12 +476,20 @@ if [ "$RUN_NO_SRC" -eq 1 ]; then
   for ref in origin/main main; do
     if git -C "$TOP" rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then base="$ref"; break; fi
   done
+  # Fail closed (Review_Result_v5 SHOULD_FIX / Test_Result_v5 N-04): the previous guard wrapped the
+  # committed-range half in `if [ -n "$base" ]`, so with neither origin/main nor main present the
+  # assertion silently skipped and an already-committed `src/main` edit passed. A probe that cannot
+  # establish its baseline must not report success, so an unresolvable base or merge-base is a FAIL
+  # with an explicit diagnostic. The root commit is deliberately *not* used as a fallback: it would
+  # also flag every historical commit of the repo as if it belonged to this task.
+  [ -n "$base" ] \
+    || fail "no base ref resolvable (neither origin/main nor main); cannot verify the committed range"
   fork=$(git -C "$TOP" merge-base "$base" HEAD 2>/dev/null || true)
-  if [ -n "$base" ] && [ -n "$fork" ]; then
-    committed=$(git -C "$TOP" diff --name-only "$fork"...HEAD -- "${PROTECTED[@]}")
-    [ -z "$committed" ] \
-      || fail "committed change to a protected path since $base: $(printf '%s' "$committed" | tr '\n' ';')"
-  fi
+  [ -n "$fork" ] \
+    || fail "no merge-base between $base and HEAD; cannot verify the committed range"
+  committed=$(git -C "$TOP" diff --name-only "$fork"...HEAD -- "${PROTECTED[@]}")
+  [ -z "$committed" ] \
+    || fail "committed change to a protected path since $base: $(printf '%s' "$committed" | tr '\n' ';')"
 fi
 
 printf 'OK: %s\n' "$REPORT"
