@@ -14,6 +14,8 @@ public enum OperationType {
     JSON_FORMAT(true),
     JSON_VALIDATE(true),
     JSON_QUERY(true),
+    JSON_FLATTEN(true),
+    JSON_UNFLATTEN(true),
     TEXT_TRANSFORM(true),
     TEXT_STATS(true),
     TEXT_REPLACE(true);
