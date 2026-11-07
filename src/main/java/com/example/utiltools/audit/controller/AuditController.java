@@ -1,5 +1,6 @@
 package com.example.utiltools.audit.controller;
 
+import com.example.utiltools.audit.dto.JournalVerifyResponse;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
 import com.example.utiltools.audit.service.AuditJournalService;
@@ -58,5 +59,20 @@ public class AuditController {
             elapses.""")
     public ApiResponse<AuditEntry> replay(@PathVariable String id) {
         return ApiResponse.success(replayService.replay(id), "Replay verification completed");
+    }
+
+    @PostMapping("/verify")
+    @Operation(summary = "Sweep-verify the journal",
+               description = "Replays up to `limit` (default 20, clamped to utiltools.audit.max-entries) "
+                   + "newest SUCCEEDED entries and records VERIFIED / MISMATCH / FAILED per entry. Bounded: at most "
+                   + "max-entries entries per call. Single-winner per entry: each entry is claimed through the same "
+                   + "claimReplay lease as POST /entries/{id}/replay, so a live claim is reported SKIPPED with reason "
+                   + "LIVE_CLAIM and its lease is untouched, and a failed invocation is recorded FAILED without "
+                   + "aborting the sweep. Safe alongside the reaper and eviction: the sweep holds no journal lock while "
+                   + "an operation runs, an entry evicted mid-sweep is reported SKIPPED with reason EVICTED, and the "
+                   + "original state, result, completedAt, request and replayable flag are never rewritten.")
+    public ApiResponse<JournalVerifyResponse> verify(
+            @RequestParam(value = "limit", required = false, defaultValue = "20") int limit) {
+        return ApiResponse.success(replayService.verify(limit), "Journal verification sweep completed");
     }
 }
