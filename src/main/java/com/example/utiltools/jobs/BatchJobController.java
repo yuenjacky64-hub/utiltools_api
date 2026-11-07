@@ -35,7 +35,11 @@ public class BatchJobController {
 
     @GetMapping("/{jobId}")
     @Operation(summary = "Poll batch hash job status",
-            description = "Returns the current job snapshot; 404 when the id is unknown or was evicted")
+            description = "Returns the current job snapshot; 404 when the id is unknown or was evicted. "
+                    + "A RUNNING job carries an executionLeaseExpiresAt/lastHeartbeatAt lease that its "
+                    + "worker renews before hashing each item; a job whose lease lapses is moved to FAILED "
+                    + "with error EXECUTION_LEASE_EXPIRED, after which POST /api/v1/utils/jobs/{jobId}/retry "
+                    + "starts attempt+1")
     public ApiResponse<BatchHashJobResponse> status(@PathVariable String jobId) {
         return ApiResponse.success(jobService.getJob(jobId), "Job status retrieved");
     }
