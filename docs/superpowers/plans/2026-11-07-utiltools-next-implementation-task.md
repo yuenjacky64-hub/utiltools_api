@@ -6,7 +6,7 @@
 
 This document is a *report*, not an implementation. No file under `src/main`, `src/test`, `pom.xml`, `README.md` or `.ait/` is modified by this task; the only two artifacts are this report and the gate script `tools/check_discovery_report.sh`.
 
-## 1. Project structure inventory
+## 1. Architecture inventory
 
 One Maven module (`pom.xml`, Java 21, Spring Boot 4, JUnit 5 + MockMvc + AssertJ). `src/main/java/com/example/utiltools` holds exactly **10 package directories** and 99 Java sources; `src/test/java/com/example/utiltools` mirrors eight of them with 30 test sources and 425 `@Test` methods.
 
@@ -113,9 +113,9 @@ Twelve house patterns were read off the code (not guessed). Each cites the file 
 12. **Verification entry points are declared, not improvised.** The project fixates one canonical test command and timeout; discovery-side checks likewise belong in `tools/` as exit-code gates.
     - path: .ait/verify.toml
 
-## 3. TODO sweep and gap register
+## 3. Gap register
 
-### 3.1 TODO sweep result
+### 3.1 TODO sweep
 
 | Sweep | Command | Exit | Result |
 | :--- | :--- | :-- | :----- |
@@ -129,55 +129,61 @@ Consequence: there is no literal backlog to lift a task from, so every candidate
 
 Each block records the reproducing command, its exit code, the observed output, the three filters from the plan (F1 = not already implemented in `src/main`; F2 = not queued in `docs/superpowers/specs`, `docs/superpowers/plans` or README backlog prose; F3 = a delta exists that a future gate could verify), a blast-radius tier (S ≤3 files, M 4–10, L >10) and the 0–14 score.
 
-### GAP-01 — README endpoint table is stale: 5 shipped routes are missing
+### GAP-01: README endpoint table is stale: 5 shipped routes are missing
 - evidence: `sed -n '132,165p' README.md | grep -c 'flatten'` compared against the 31 collected route annotations
 - exit: 1
 - output: `0` — README's "⚡ API Endpoints Reference" table has 25 rows, while the controllers register 30 distinct paths; missing rows: `/json/flatten`, `/json/unflatten`, `/rate-limit/status`, `/resilience`, `/resilience/probe`
 - gate: F1=PASS (all five are implemented, so the defect is documentation-only), F2=PASS (no spec/plan entry promises a table refresh), F3=PASS (row count 25 → 30 is observable)
 - tier: S — README.md only
 - score: 9 (evidence 2, impact 1, blast 2, verifiability 1) — impact is "misleading index", not "unavailable capability", because the five routes *are* described in the detailed guides further down (`README.md:960` documents unflatten, `README.md:1715` documents rate limiting)
+- note: A docs-scoped task would regenerate the README endpoint table from the controllers so the 25 rows match the 30 routable paths.
 
-### GAP-02 — No inline backlog markers exist
+### GAP-02: No inline backlog markers exist
 - evidence: `grep -rnE 'TODO|FIXME|XXX|HACK' src/main README.md PROJECT_GOALS.md docs`
 - exit: 1
 - output: *(empty)* — zero matches over 99 main sources, 30 test sources and all docs
 - gate: F1=PASS (nothing is implemented), F2=PASS, **F3=FAIL** — "there are no markers" has no verifiable delta: any future gate would pass whether or not work was done
 - tier: S — nominal bound only; unsized because the candidate is dropped at F3
 - score: 0 — dropped at F3, so the scoring rubric is not applied (evidence 2 alone would be meaningless for an unimplementable candidate)
+- note: Nothing is implementable here; a future task should instead keep the marker count at zero (a lint, not a feature).
 
-### GAP-03 — No CSV/TSV ⇄ JSON conversion anywhere in the service
+### GAP-03: No CSV/TSV ⇄ JSON conversion anywhere in the service
 - evidence: `grep -rniE '\bcsv\b|\btsv\b' src/main README.md`
 - exit: 1
 - output: *(empty)* — zero matches in the whole main tree and in README; the single repo-wide hit is an unrelated comment inside `src/test/java/com/example/utiltools/text/TextServiceTest.java`, and `grep -rinE '\bcsv\b|\btsv\b' docs PROJECT_GOALS.md` is also empty
 - gate: F1=PASS (nothing named CSV/TSV exists in `src/main`), F2=PASS (absent from `docs/superpowers/specs/2026-10-31-utiltools-api-design.md`, from `docs/superpowers/plans/2026-10-31-utiltools-api.md` and from README prose — the only forward statement is `PROJECT_GOALS.md:8`'s generic "data format conversion"), F3=PASS (absence is byte-for-byte re-runnable, and the delta is a new endpoint with a testable round-trip)
 - tier: M — one service method pair + request/response records + controller route + service test + controller test ≈ 6 files
 - score: 11 (evidence 2, impact 2, blast 1, verifiability 2) — impact is 2 because a whole conversion capability named in `PROJECT_GOALS.md` is unavailable, and verifiability is 2 because it slots into the existing `json` module's test pair (`JsonServiceTest`, `JsonControllerTest`) and the existing `AuditedOperations` journal pattern
+- note: A future task would add `POST /api/v1/utils/json/to-csv` and `/from-csv` to the `json` module with RFC 4180 quoting and journal entries.
 
-### GAP-04 — Design spec is two feature waves behind the code
+### GAP-04: Design spec is two feature waves behind the code
 - evidence: `grep -cE '^(├──|└──) ' docs/superpowers/specs/2026-10-31-utiltools-api-design.md` and `grep -c 'api/v1/utils' docs/superpowers/specs/2026-10-31-utiltools-api-design.md`
 - exit: 0
 - output: `5` package entries and `21` route mentions — the spec's package tree (`docs/superpowers/specs/2026-10-31-utiltools-api-design.md:42-70`) lists only `common`, `datetime`, `crypto`, `json`, omitting `audit`, `jobs`, `ratelimit`, `resilience`, `text`, `config`; its route list stops at the same three tool families
 - gate: F1=PASS (the described subset exists; the drift is in the doc), F2=PASS, F3=PASS (package count 4 → 10 is countable)
 - tier: M — the spec file plus the README section that mirrors it ≈ 2 files, but 272 lines of rewrites
 - score: 9 (evidence 2, impact 1, blast 2, verifiability 1) — impact is 1 because contributors are misled, not API consumers, and verifiability is 1 because the check is audit-only
+- note: A specs-scoped task would rewrite the design spec package tree and route list to the ten shipped packages.
 
-### GAP-05 — Test-count claims in README disagree with the suite
+### GAP-05: Test-count claims in README disagree with the suite
 - evidence: `grep -n '41 \|48 unit' README.md` and `grep -rc '@Test' --include='*.java' src/test/java | awk -F: '{s+=$2} END {print s}'`
 - exit: 0
 - output: README:5 badge `Tests-41 Passed (100%)`, README:67 "48 unit and integration tests", actual `425` `@Test` methods across 30 test sources
 - gate: F1=PASS (tests exist; the drift is in the doc), F2=PASS, F3=PASS (a number in README can be asserted against the counted value)
 - tier: S — README.md only
 - score: 9 (evidence 2, impact 1, blast 2, verifiability 1) — impact is 1 (misleading quality signal), verifiability 1 (no test class can own README numbers without a new gate)
+- note: A docs task would replace the hardcoded test counts in the README badge and prose with the counted 425 `@Test` methods.
 
-### GAP-06 — `POST /json/patch` is not journalled, unlike the other six JSON ops
+### GAP-06: `POST /json/patch` is not journalled, unlike the other six JSON ops
 - evidence: `sed -n '1001,1027p' README.md | grep -c 'json/patch'` and `sed -n '94,100p' src/main/java/com/example/utiltools/json/controller/JsonController.java | grep -c 'audited\|AuditedOperations'`
 - exit: 1
 - output: `0` and `0` — the `patch` handler calls `jsonService.patch(...)` directly, bypassing `AuditedOperations`, and README's journal section does **not** list `json/patch` among its operations
 - gate: F1=PASS (no `JSON_PATCH` constant exists), **F2=FAIL**, F3=PASS (a `JSON_PATCH` journal constant would be countable) — but F2 already disposes of it — README:1003-1005 enumerates the journalled set *by name* as "fifteen journalled utility operations" and deliberately excludes `json/patch` (its reverse-order rollback trail is returned in the response instead), so journalling it is a design change, not a gap fix; `JsonControllerTest` already asserts the rollback contract
 - tier: M — nominal bound kept for register uniformity; the candidate is dropped at F2
 - score: 0 — dropped at F2 (the exclusion is documented, so this is a queued-by-design boundary and the work would be an architectural change)
+- note: Journalling `json/patch` would be a design change (its rollback trail is already returned), so no gap task should be opened.
 
-## 4. Scoring summary and selection procedure
+## 4. Selection gate
 
 The rubric is the plan's: `score = 2·evidence + 2·impact + blast + verifiability`, each sub-score 0–2, range 0–14, computed only for candidates that survive F1/F2/F3.
 
@@ -205,7 +211,7 @@ flowchart TD
     G --> H[SELECTED: CSV/TSV conversion]
 ```
 
-## 5. Selected task
+## 5. Selected implementation task
 
 ### SELECTED: GAP-03 — CSV/TSV ⇄ JSON conversion in the json module
 - gap: GAP-03
@@ -221,11 +227,11 @@ flowchart TD
 - selected-identifier: (CsvService|JsonCsvService|CsvToJson|JsonToCsv|to-csv|from-csv)
 - selected-identifier: \b(csv|tsv)\b
 
-## 6. Handoff notes for the System Designer
+## 6. Downstream handoff
 
 Turn §5 into a Tier **M** plan for the next task. The scope is already bounded by existing conventions, so the plan needs: (a) the DTO field list for `JsonToCsvRequest/Response` and `JsonFromCsvRequest/Response` following `JsonFormatRequest`'s optional-field style; (b) the two new `OperationType` constants and their `AuditReplayService` dispatch branches — note that GAP-06 records why `json/patch` stays outside the journal, so the Designer must not "fix" that while touching `AuditedOperations`; (c) the CSV parser/emitter rules (RFC 4180 quoting, embedded newlines and delimiters, BOM tolerance, size guard reusing the existing request-size limits) since no CSV dependency may be added; (d) DoD rows bindable to `JsonServiceTest` and `JsonControllerTest` only. Do **not** fold in GAP-01/04/05 (README and spec drift): those are documentation deltas that a `docs/`-scoped task should own separately, and mixing them would break the "one capability per task" pattern the repo follows. Re-run `tools/check_discovery_report.sh` after any edit to this report: it is the machine gate for DOD-01…DOD-08.
 
-## 7. Read paths (evidence trail)
+## 7. Path appendix
 
 Every file below was opened or grepped while producing this report.
 

@@ -12,22 +12,25 @@
 #                                   [--no-src-changes] [--all] [--report PATH]
 #
 # Flags (each maps to one DoD row):
-#   --sections        DOD-01: the seven H2 sections exist, in order, and the report carries no
-#                     scaffold placeholder and no bare backlog marker outside backticks.
-#   --packages        DOD-02: exactly ten `### PKG-<name>` blocks, one per real package
+#   --packages        DOD-01: exactly ten `### PKG-<name>` blocks, one per real package
 #                     directory, each citing a `- path:` that exists on disk.
-#   --paths           DOD-03: at least 25 `- path:` citations and every cited path resolves.
-#   --evidence        DOD-04: at least five `### GAP-` blocks, each with `- evidence:`,
+#   --sections        DOD-03: the seven literal H2 headings of plan §4.1 exist in order, the
+#                     report carries no scaffold placeholder and no bare backlog marker.
+#   --paths           DOD-04: at least 25 `- path:` citations; each failure prints
+#                     `MISSING: <path>` and the run ends with a `FAIL:` line.
+#   --evidence        DOD-05: at least five `### GAP-` blocks, each with `- evidence:`,
 #                     `- exit:` (integer) and `- output:`.
-#   --gaps            DOD-05: every GAP block declares all three filters (F1/F2/F3), a tier in
+#   --gaps            DOD-06: every GAP block declares all three filters (F1/F2/F3), a tier in
 #                     {S,M,L} and an integer score in 0..14.
-#   --selection       DOD-06: exactly one `### SELECTED:` block, pointing at a GAP block, with
+#   --selection       DOD-07: exactly one `### SELECTED:` block, pointing at a GAP block, with
 #                     scope, rationale, >=1 proposed-req, >=2 proposed-dod rows whose
 #                     verification mode is runnable today, and >=1 selected-identifier.
-#   --not-implemented DOD-07: every `- selected-identifier:` regex has zero matches in
+#   --not-implemented DOD-08: every `- selected-identifier:` regex has zero matches in
 #                     src/main and README.md (the selected task is not already implemented).
-#   --no-src-changes  DOD-08: no change under src/main, src/test, README.md, pom.xml or .ait/.
+#   --no-src-changes  DOD-09: no change under src/main, src/test, README.md, pom.xml or .ait/.
 set -uo pipefail
+
+cd "$(dirname "$0")/.." || exit 1
 
 REPORT="docs/superpowers/plans/2026-11-07-utiltools-next-implementation-task.md"
 PACKAGES=(audit common config crypto datetime jobs json ratelimit resilience text)
@@ -89,13 +92,13 @@ gap_headings() {
 # ---------------------------------------------------------------- DOD-01
 if [ "$RUN_SECTIONS" -eq 1 ]; then
   sections=(
-    '^## 1\. Project structure inventory'
+    '^## 1\. Architecture inventory'
     '^## 2\. Convention catalogue'
-    '^## 3\. TODO sweep'
-    '^## 4\. Scoring summary'
-    '^## 5\. Selected task'
-    '^## 6\. Handoff notes'
-    '^## 7\. Read paths'
+    '^## 3\. Gap register'
+    '^## 4\. Selection gate'
+    '^## 5\. Selected implementation task'
+    '^## 6\. Downstream handoff'
+    '^## 7\. Path appendix'
   )
   prev=0
   for pat in "${sections[@]}"; do
@@ -104,6 +107,8 @@ if [ "$RUN_SECTIONS" -eq 1 ]; then
     [ "$lineno" -gt "$prev" ] || fail "section out of order: ${pat#^## } (line $lineno after $prev)"
     prev=$lineno
   done
+  grep -qE '^### 3\.1 TODO sweep' "$REPORT_ABS" || fail "section missing: ### 3.1 TODO sweep"
+  grep -qE '^### 3\.2 Gap register' "$REPORT_ABS" || fail "section missing: ### 3.2 Gap register"
   # Scaffold placeholders are always fatal.
   if grep -qE '\[unfilled\]|\[paste output verbatim\]' "$REPORT_ABS"; then
     fail "scaffold placeholder left in report ([unfilled] / [paste output verbatim])"
@@ -136,9 +141,11 @@ fi
 if [ "$RUN_PATHS" -eq 1 ]; then
   mapfile -t cited_paths < <(grep -E '^- path: ' "$REPORT_ABS" | sed -E 's/^- path: //' | awk '{print $1}')
   [ "${#cited_paths[@]}" -ge "$MIN_PATHS" ] || fail "only ${#cited_paths[@]} '- path:' citations, need >= $MIN_PATHS"
+  missing=0
   for p in "${cited_paths[@]}"; do
-    [ -e "$TOP/$p" ] || fail "cited path does not exist: $p"
+    if [ ! -e "$TOP/$p" ]; then printf 'MISSING: %s\n' "$p"; missing=$((missing + 1)); fi
   done
+  [ "$missing" -eq 0 ] || fail "$missing cited path(s) unresolved"
 fi
 
 # ---------------------------------------------------------------- DOD-04
