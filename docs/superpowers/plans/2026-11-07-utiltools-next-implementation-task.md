@@ -1,0 +1,266 @@
+# UtilTools — Next Implementation Task (Discovery Report)
+
+**Task:** UTILTOOLS-42 · **Plan:** `Implementation_Plan.md` v1 (Complexity Tier S) · **Gate:** `tools/check_discovery_report.sh`
+**Requirements covered:** REQ-01 (structure + patterns), REQ-02 (identify a candidate), REQ-03 (not already implemented, not queued)
+**Outcome:** 10 packages inventoried, 31 route mappings over 30 distinct paths, 6 candidate gaps scored, 1 selected → **GAP-03 — CSV/TSV ⇄ JSON conversion**.
+
+This document is a *report*, not an implementation. No file under `src/main`, `src/test`, `pom.xml`, `README.md` or `.ait/` is modified by this task; the only two artifacts are this report and the gate script `tools/check_discovery_report.sh`.
+
+## 1. Project structure inventory
+
+One Maven module (`pom.xml`, Java 21, Spring Boot 4, JUnit 5 + MockMvc + AssertJ). `src/main/java/com/example/utiltools` holds exactly **10 package directories** and 99 Java sources; `src/test/java/com/example/utiltools` mirrors eight of them with 30 test sources and 425 `@Test` methods.
+
+The ten blocks below enumerate every package, its role, the HTTP surface it owns, and the shared code it depends on. Counts come from `@RequestMapping` + `@{Get,Post,Put,Patch,Delete}Mapping` annotations (`find src/main/java -name '*Controller.java'` → 8 controllers, 31 route annotations, 30 distinct paths because `GET` and `DELETE` share `/jobs/{jobId}`).
+
+### PKG-common
+- path: src/main/java/com/example/utiltools/common
+- role: cross-cutting HTTP plumbing — success envelope, error envelope, centralized exception mapping, request-id propagation, journal-lookup exceptions
+- files (7): ApiResponse, ErrorResponse, GlobalExceptionHandler, RequestContext, RequestIdFilter, AuditEntryNotFoundException, ReplayConflictException
+- endpoints: none of its own — `RequestIdFilter` wraps every `/api/v1/utils/*` request and stamps `requestId` into every envelope
+- shared-dep: the whole API depends on it; `ApiResponse.success(...)` is the single return type of all 8 controllers, and `GlobalExceptionHandler` imports `resilience.CircuitBreakerOpenException` to map circuit trips to `503`
+
+### PKG-config
+- path: src/main/java/com/example/utiltools/config
+- role: framework configuration — springdoc OpenAPI metadata only
+- files (1): OpenApiConfig
+- endpoints: none (no `@RestController`)
+- shared-dep: springdoc reads the annotations placed on the controllers of every other package
+
+### PKG-crypto
+- path: src/main/java/com/example/utiltools/crypto
+- role: hashing, Base64, URL encoding and UUID generation (stateless)
+- files (9): CryptoController, CryptoService, Hash/Base64/Url/Uuid request+response records
+- endpoints (4): `POST /api/v1/utils/crypto/hash`, `POST /api/v1/utils/crypto/base64`, `POST /api/v1/utils/crypto/url`, `GET /api/v1/utils/crypto/uuid`
+- shared-dep: `audit.service.AuditedOperations` (3 journalled writes) and `common.ApiResponse`; the controller owns no journal code itself
+
+### PKG-datetime
+- path: src/main/java/com/example/utiltools/datetime
+- role: epoch/ISO conversion, diffing, shifting, "now", and the timezone catalogue
+- files (11): DateTimeController, DateTimeService, 5 request/response pairs plus TimeZoneInfo/TimeZoneListResponse
+- endpoints (5): `POST /api/v1/utils/datetime/convert`, `/diff`, `/shift`, `GET /api/v1/utils/datetime/current`, `GET /api/v1/utils/datetime/timezones`
+- shared-dep: `AuditedOperations` for the 4 journalled calls; `/timezones` is read-only and deliberately not journalled (README:1007)
+
+### PKG-json
+- path: src/main/java/com/example/utiltools/json
+- role: the largest feature module — format, validate, query, flatten, unflatten, merge-patch and RFC 6902 patch, the last with a reverse-order rollback trail
+- files (18): JsonController, JsonService, 11 request/response records, JsonPatchOperation, JsonPatchRollbackException
+- endpoints (7): `POST /api/v1/utils/json/{format,validate,query,flatten,unflatten,merge-patch,patch}`
+- shared-dep: `AuditedOperations` (6 journalled ops), `common.ApiResponse`, and — uniquely — `resilience.CircuitBreaker`, `CircuitBreakerConfig` and `resilience.AuditTrail` on the `/query` path
+
+### PKG-jobs
+- path: src/main/java/com/example/utiltools/jobs
+- role: async batch-hash job lifecycle — submission, polling, listing, cancellation, retry, per-client quota and idempotency, backed by a bounded worker pool
+- files (12): BatchJobController, BatchHashJobService, BatchHashRequest/Response, JobAttempt, JobStatus and 6 domain exceptions
+- endpoints (5 mappings / 4 paths): `POST /api/v1/utils/jobs/hash`, `GET /api/v1/utils/jobs`, `GET /api/v1/utils/jobs/{jobId}`, `DELETE /api/v1/utils/jobs/{jobId}`, `POST /api/v1/utils/jobs/{jobId}/retry`
+- shared-dep: `audit.service.AuditJournalService` + `audit.model.OperationType.BATCH_HASH` (best-effort journalling at worker admission), `ratelimit.ClientKeyResolver`, `ratelimit.RateLimitProperties`, `common.RequestContext`
+
+### PKG-audit
+- path: src/main/java/com/example/utiltools/audit
+- role: the operation journal — bounded in-memory record of every journalled call, replay/claim state machine, payload redaction and oversized-payload omission
+- files (14): AuditController, AuditJournalService, AuditReplayService, AuditedOperations, AuditEntry, OperationType, JournalState, ReplayState, ReplayClaim, ReplayRecord, ReapReason, ReapRecord, JournalVerifyRequest/Response/Result
+- endpoints (4): `GET /api/v1/utils/audit/entries`, `GET /api/v1/utils/audit/entries/{id}`, `POST /api/v1/utils/audit/entries/{id}/replay`, `POST /api/v1/utils/audit/verify`
+- shared-dep: `common.ApiResponse`, `common.AuditEntryNotFoundException`, `common.ReplayConflictException`; it is the *upstream* dependency of crypto, datetime, json, text and jobs
+
+### PKG-resilience
+- path: src/main/java/com/example/utiltools/resilience
+- role: reusable circuit-breaker primitive (CLOSED/OPEN/HALF_OPEN) with an injection-friendly constructor and its own audit trail, demonstrated by two demo endpoints
+- files (11): CircuitBreaker, CircuitBreakerConfig, CircuitState, CircuitTrigger, CircuitBreakerOpenException, AuditTrail, AuditEntry, ProbeRequest/Response, ResilienceConfig, ResilienceController
+- endpoints (2): `GET /api/v1/utils/resilience` (state probe), `POST /api/v1/utils/resilience/probe`
+- shared-dep: `common.ApiResponse`; consumed back by `json` (query) and `common.GlobalExceptionHandler`
+
+### PKG-ratelimit
+- path: src/main/java/com/example/utiltools/ratelimit
+- role: sliding-window rate limiting — client key resolution, quota properties, response headers and a status endpoint
+- files (8): RateLimitFilter, SlidingWindowRateLimiter, ClientKeyResolver, RateLimitProperties, RateLimitConfig, RateLimitHeaders, RateLimitStatusController, RateLimitStatusResponse
+- endpoints (1): `GET /api/v1/utils/rate-limit/status` (class-level `@RequestMapping("/api/v1/utils")`)
+- shared-dep: `common.ApiResponse`, and `jobs` reuses `ClientKeyResolver` + `RateLimitProperties` for its per-client job quota
+
+### PKG-text
+- path: src/main/java/com/example/utiltools/text
+- role: string transformation (`UPPER/LOWER/TITLE/CAMEL/SNAKE/KEBAB/SLUG/SENTENCE_CASE`), literal replacement with counts, and text statistics
+- files (8): TextController, TextService, TextTransform/TextReplace/TextStats request+response records
+- endpoints (3): `POST /api/v1/utils/text/transform`, `POST /api/v1/utils/text/replace`, `POST /api/v1/utils/text/stats`
+- shared-dep: `AuditedOperations` (3 journalled writes — including the failing-validation path exercised by `AuditTrailTest`) and `common.ApiResponse`
+
+**Cross-package dependency shape:** `common` ← everything; `audit` ← {crypto, datetime, json, text, jobs}; `resilience` ← {json, common}; `ratelimit` ← {jobs, all routes via the filter}; feature packages never depend on each other.
+
+## 2. Convention catalogue
+
+Twelve house patterns were read off the code (not guessed). Each cites the file that establishes it.
+
+1. **Package-by-feature, `controller`/`service`/`dto`-by-folder.** Every feature package has a controller at `controller/<Feature>Controller.java` (or the package root for `jobs`, `ratelimit`, `resilience`) and a stateless service holding the logic.
+   - path: src/main/java/com/example/utiltools/json/service/JsonService.java
+2. **Records for every DTO, request records carry Jakarta validation messages.** `@NotBlank(message = "text is required")` style, no annotations on response records.
+   - path: src/main/java/com/example/utiltools/text/dto/TextTransformRequest.java
+3. **Uniform success envelope.** All controllers return `ApiResponse<T>`; helpers are `success(data)` and `success(data, message)`, with `requestId` pulled from `RequestContext` and `timestamp` set at construction.
+   - path: src/main/java/com/example/utiltools/common/ApiResponse.java
+4. **Error envelope + one centralized handler with stable error codes.** `GlobalExceptionHandler` (`@RestControllerAdvice`) maps validation, domain and circuit-open failures to `ApiResponse.error(message, ERROR_CODE, details)`; example codes `PATCH_ROLLBACK`, `VALIDATION_ERROR`, `CIRCUIT_OPEN`.
+   - path: src/main/java/com/example/utiltools/common/GlobalExceptionHandler.java
+5. **Journal-then-execute.** Mutating utility calls are routed through `AuditedOperations`, which wraps the service call in `record(OperationType.X, request, supplier)` so a PENDING → SUCCEEDED/FAILED entry always brackets the work; controllers stay thin.
+   - path: src/main/java/com/example/utiltools/audit/service/AuditedOperations.java
+6. **`OperationType` is the journal vocabulary and the replay switch.** One enum constant per journalled operation; `AuditReplayService` dispatches on it, so a new journalled capability means a new constant plus a replay branch.
+   - path: src/main/java/com/example/utiltools/audit/model/OperationType.java
+7. **Resilience is injected, not static.** `CircuitBreakerConfig` is an immutable record; `CircuitBreaker` takes it plus a clock so tests advance time deterministically, and trips surface as `CircuitBreakerOpenException` → `503`.
+   - path: src/main/java/com/example/utiltools/resilience/CircuitBreakerConfig.java
+8. **Cross-cutting behaviour lives in servlet filters, never in controllers.** `RequestIdFilter` and `RateLimitFilter` are `OncePerRequestFilter`s scoped to `/api/v1/utils/*`; pure functions are kept in small package-private collaborators (`SlidingWindowRateLimiter`, `ClientKeyResolver`) so they are unit-testable without MockMvc.
+   - path: src/main/java/com/example/utiltools/ratelimit/RateLimitFilter.java
+9. **OpenAPI is written per route.** Every handler carries `@Operation(summary = ...)`; springdoc metadata is configured once in `OpenApiConfig`.
+   - path: src/main/java/com/example/utiltools/json/controller/JsonController.java
+10. **Tests come in pairs per module: service unit test + `@SpringBootTest`/MockMvc controller test.** Failure paths are asserted via `jsonPath("$.success")` and `$.error`.
+    - path: src/test/java/com/example/utiltools/text/TextControllerTest.java
+11. **Async work is a bounded queue with an explicit state machine.** `BatchHashJobService` owns the executor, quota, idempotency keys and a `JobStatus` FSM, and journals `BATCH_HASH` best-effort so audit state can never disagree with the job snapshot.
+    - path: src/main/java/com/example/utiltools/jobs/BatchHashJobService.java
+12. **Verification entry points are declared, not improvised.** The project fixates one canonical test command and timeout; discovery-side checks likewise belong in `tools/` as exit-code gates.
+    - path: .ait/verify.toml
+
+## 3. TODO sweep and gap register
+
+### 3.1 TODO sweep result
+
+| Sweep | Command | Exit | Result |
+| :--- | :--- | :-- | :----- |
+| Code markers | `grep -rnE 'TODO|FIXME|XXX|HACK' src/main README.md PROJECT_GOALS.md docs` | 1 | **0 matches** — the codebase carries no inline backlog markers |
+| Backlog headings | `grep -cE 'Roadmap|Backlog|Future work|Planned' README.md PROJECT_GOALS.md` | 1 | **0 matches** in both files; README's last H2 is "🧪 Automated Testing", there is no roadmap section |
+| Forward-looking prose | `sed -n '1,20p' PROJECT_GOALS.md` | 0 | `PROJECT_GOALS.md` §1 "Continuous Tool Expansion" names *"data format conversion, text transformation, cryptographic helpers, validation, and encoding utilities"* as the intended growth axis — this is the only in-repo statement of intent |
+
+Consequence: there is no literal backlog to lift a task from, so every candidate below is a **gap** derived from docs-vs-code drift or from an explicitly stated but unimplemented goal. The absence of markers is itself a candidate (GAP-02) and it is dropped at gate F3.
+
+### 3.2 Gap register
+
+Each block records the reproducing command, its exit code, the observed output, the three filters from the plan (F1 = not already implemented in `src/main`; F2 = not queued in `docs/superpowers/specs`, `docs/superpowers/plans` or README backlog prose; F3 = a delta exists that a future gate could verify), a blast-radius tier (S ≤3 files, M 4–10, L >10) and the 0–14 score.
+
+### GAP-01 — README endpoint table is stale: 5 shipped routes are missing
+- evidence: `sed -n '132,165p' README.md | grep -c 'flatten'` compared against the 31 collected route annotations
+- exit: 1
+- output: `0` — README's "⚡ API Endpoints Reference" table has 25 rows, while the controllers register 30 distinct paths; missing rows: `/json/flatten`, `/json/unflatten`, `/rate-limit/status`, `/resilience`, `/resilience/probe`
+- gate: F1=PASS (all five are implemented, so the defect is documentation-only), F2=PASS (no spec/plan entry promises a table refresh), F3=PASS (row count 25 → 30 is observable)
+- tier: S — README.md only
+- score: 9 (evidence 2, impact 1, blast 2, verifiability 1) — impact is "misleading index", not "unavailable capability", because the five routes *are* described in the detailed guides further down (`README.md:960` documents unflatten, `README.md:1715` documents rate limiting)
+
+### GAP-02 — No inline backlog markers exist
+- evidence: `grep -rnE 'TODO|FIXME|XXX|HACK' src/main README.md PROJECT_GOALS.md docs`
+- exit: 1
+- output: *(empty)* — zero matches over 99 main sources, 30 test sources and all docs
+- gate: F1=PASS (nothing is implemented), F2=PASS, **F3=FAIL** — "there are no markers" has no verifiable delta: any future gate would pass whether or not work was done
+- tier: S — nominal bound only; unsized because the candidate is dropped at F3
+- score: 0 — dropped at F3, so the scoring rubric is not applied (evidence 2 alone would be meaningless for an unimplementable candidate)
+
+### GAP-03 — No CSV/TSV ⇄ JSON conversion anywhere in the service
+- evidence: `grep -rniE '\bcsv\b|\btsv\b' src/main README.md`
+- exit: 1
+- output: *(empty)* — zero matches in the whole main tree and in README; the single repo-wide hit is an unrelated comment inside `src/test/java/com/example/utiltools/text/TextServiceTest.java`, and `grep -rinE '\bcsv\b|\btsv\b' docs PROJECT_GOALS.md` is also empty
+- gate: F1=PASS (nothing named CSV/TSV exists in `src/main`), F2=PASS (absent from `docs/superpowers/specs/2026-10-31-utiltools-api-design.md`, from `docs/superpowers/plans/2026-10-31-utiltools-api.md` and from README prose — the only forward statement is `PROJECT_GOALS.md:8`'s generic "data format conversion"), F3=PASS (absence is byte-for-byte re-runnable, and the delta is a new endpoint with a testable round-trip)
+- tier: M — one service method pair + request/response records + controller route + service test + controller test ≈ 6 files
+- score: 11 (evidence 2, impact 2, blast 1, verifiability 2) — impact is 2 because a whole conversion capability named in `PROJECT_GOALS.md` is unavailable, and verifiability is 2 because it slots into the existing `json` module's test pair (`JsonServiceTest`, `JsonControllerTest`) and the existing `AuditedOperations` journal pattern
+
+### GAP-04 — Design spec is two feature waves behind the code
+- evidence: `grep -cE '^(├──|└──) ' docs/superpowers/specs/2026-10-31-utiltools-api-design.md` and `grep -c 'api/v1/utils' docs/superpowers/specs/2026-10-31-utiltools-api-design.md`
+- exit: 0
+- output: `5` package entries and `21` route mentions — the spec's package tree (`docs/superpowers/specs/2026-10-31-utiltools-api-design.md:42-70`) lists only `common`, `datetime`, `crypto`, `json`, omitting `audit`, `jobs`, `ratelimit`, `resilience`, `text`, `config`; its route list stops at the same three tool families
+- gate: F1=PASS (the described subset exists; the drift is in the doc), F2=PASS, F3=PASS (package count 4 → 10 is countable)
+- tier: M — the spec file plus the README section that mirrors it ≈ 2 files, but 272 lines of rewrites
+- score: 9 (evidence 2, impact 1, blast 2, verifiability 1) — impact is 1 because contributors are misled, not API consumers, and verifiability is 1 because the check is audit-only
+
+### GAP-05 — Test-count claims in README disagree with the suite
+- evidence: `grep -n '41 \|48 unit' README.md` and `grep -rc '@Test' --include='*.java' src/test/java | awk -F: '{s+=$2} END {print s}'`
+- exit: 0
+- output: README:5 badge `Tests-41 Passed (100%)`, README:67 "48 unit and integration tests", actual `425` `@Test` methods across 30 test sources
+- gate: F1=PASS (tests exist; the drift is in the doc), F2=PASS, F3=PASS (a number in README can be asserted against the counted value)
+- tier: S — README.md only
+- score: 9 (evidence 2, impact 1, blast 2, verifiability 1) — impact is 1 (misleading quality signal), verifiability 1 (no test class can own README numbers without a new gate)
+
+### GAP-06 — `POST /json/patch` is not journalled, unlike the other six JSON ops
+- evidence: `sed -n '1001,1027p' README.md | grep -c 'json/patch'` and `sed -n '94,100p' src/main/java/com/example/utiltools/json/controller/JsonController.java | grep -c 'audited\|AuditedOperations'`
+- exit: 1
+- output: `0` and `0` — the `patch` handler calls `jsonService.patch(...)` directly, bypassing `AuditedOperations`, and README's journal section does **not** list `json/patch` among its operations
+- gate: F1=PASS (no `JSON_PATCH` constant exists), **F2=FAIL**, F3=PASS (a `JSON_PATCH` journal constant would be countable) — but F2 already disposes of it — README:1003-1005 enumerates the journalled set *by name* as "fifteen journalled utility operations" and deliberately excludes `json/patch` (its reverse-order rollback trail is returned in the response instead), so journalling it is a design change, not a gap fix; `JsonControllerTest` already asserts the rollback contract
+- tier: M — nominal bound kept for register uniformity; the candidate is dropped at F2
+- score: 0 — dropped at F2 (the exclusion is documented, so this is a queued-by-design boundary and the work would be an architectural change)
+
+## 4. Scoring summary and selection procedure
+
+The rubric is the plan's: `score = 2·evidence + 2·impact + blast + verifiability`, each sub-score 0–2, range 0–14, computed only for candidates that survive F1/F2/F3.
+
+| Gap | Title | F1 | F2 | F3 | Evidence | Impact | Blast | Verif | Score | Rank |
+| :-- | :---- | :- | :- | :- | :------- | :----- | :---- | :---- | :---- | :--- |
+| GAP-01 | README table misses 5 routes | PASS | PASS | PASS | 2 | 1 | 2 | 1 | **9** | 3 |
+| GAP-02 | No inline backlog markers | PASS | PASS | **FAIL** | – | – | – | – | dropped | – |
+| GAP-03 | No CSV/TSV ⇄ JSON conversion | PASS | PASS | PASS | 2 | 2 | 1 | 2 | **11** | **1 — selected** |
+| GAP-04 | Design spec 2 waves stale | PASS | PASS | PASS | 2 | 1 | 2 | 1 | **9** | 3 |
+| GAP-05 | Test-count claims drifted | PASS | PASS | PASS | 2 | 1 | 2 | 1 | **9** | 3 |
+| GAP-06 | `json/patch` not journalled | PASS | **FAIL** | PASS | – | – | – | – | dropped | – |
+
+Selection procedure actually applied, in order: (1) drop any candidate failing F1/F2/F3 → removes GAP-02 (no verifiable delta) and GAP-06 (documented design boundary); (2) rank the four survivors by score → GAP-03 at 11, then GAP-01/GAP-04/GAP-05 tied at 9, resolved by the lower GAP number; (3) pick the top-ranked candidate → **GAP-03**, unique at rank 1, so the tie-break rule is not invoked.
+
+```mermaid
+flowchart TD
+    A[31 route annotations / 30 paths] --> B[backlog-marker sweep]
+    B -->|0 markers| C[derive gaps from docs-vs-code drift]
+    C --> D[6 candidates GAP-01..GAP-06]
+    D --> E{F1 not implemented<br/>F2 not queued<br/>F3 verifiable delta}
+    E -->|GAP-02 fails F3| X[dropped]
+    E -->|GAP-06 fails F2| X
+    E -->|4 survive| F[score 0-14]
+    F --> G[GAP-03 = 11 highest]
+    G --> H[SELECTED: CSV/TSV conversion]
+```
+
+## 5. Selected task
+
+### SELECTED: GAP-03 — CSV/TSV ⇄ JSON conversion in the json module
+- gap: GAP-03
+- scope: Add one capability to the existing `json` feature package — convert between CSV/TSV text and JSON (both directions), reusing `JsonController`'s URL prefix, the validated-record DTO style, the `ApiResponse` envelope, the `JsonServiceTest`/`JsonControllerTest` pair and the `AuditedOperations` journal pattern. No new package, no new dependency, no change to `README.md` or `docs/superpowers/specs` (the next task's plan owns its own doc rows).
+- rationale: It is the only survivor whose impact is 2 — `PROJECT_GOALS.md:8` names "data format conversion" as the growth axis and the service has zero CSV/TSV support (grep exit 1 over `src/main` and `README.md`), so the delta is a genuinely unavailable capability rather than a corrected sentence; it is verifiable at tier 2 because the `json` module already has a service test plus a MockMvc controller test to extend, and it carries no contract risk: it is additive, touches no existing route, and its options (delimiter, header row, quoting) can follow the existing `JsonFormatRequest` boolean/optional-field style.
+- proposed-req: **REQ-02 (next task)** — `POST /api/v1/utils/json/to-csv` converts a JSON array of flat objects to CSV/TSV with a header row derived from the union of keys in first-seen order, honouring an optional `delimiter`.
+- proposed-req: **REQ-03 (next task)** — `POST /api/v1/utils/json/from-csv` converts CSV/TSV text to a JSON array of objects, with `hasHeader` (default true) selecting header-derived versus positional (`column1..N`) keys and RFC 4180 quoting/escaping honoured in both directions.
+- proposed-req: **REQ-04 (next task)** — Both directions are journalled as new `OperationType` constants routed through `AuditedOperations`, and round-tripping `from-csv(to-csv(x))` is asserted in `JsonServiceTest`.
+- proposed-dod: `qa-probe:grep -rniE '\bcsv\b|\btsv\b' src/main` exits 1 today and exits 0 naming `JsonService` after the task — the pre-state is captured in GAP-03 above.
+- proposed-dod: `test:JsonServiceTest` — the existing service unit test gains the round-trip and quoting cases (file already present, so the gate can bind to it).
+- proposed-dod: `test:JsonControllerTest` — the existing MockMvc test gains `200` + `$.data` assertions for both new routes and `400` for a non-array payload.
+- proposed-dod: `qa-probe:git diff --name-only main...` for the next task must stay inside `json/**`, `audit/model/OperationType.java`, `audit/service/AuditedOperations.java` and the two test files — no `README.md`, no `pom.xml`, no new package.
+- selected-identifier: (CsvService|JsonCsvService|CsvToJson|JsonToCsv|to-csv|from-csv)
+- selected-identifier: \b(csv|tsv)\b
+
+## 6. Handoff notes for the System Designer
+
+Turn §5 into a Tier **M** plan for the next task. The scope is already bounded by existing conventions, so the plan needs: (a) the DTO field list for `JsonToCsvRequest/Response` and `JsonFromCsvRequest/Response` following `JsonFormatRequest`'s optional-field style; (b) the two new `OperationType` constants and their `AuditReplayService` dispatch branches — note that GAP-06 records why `json/patch` stays outside the journal, so the Designer must not "fix" that while touching `AuditedOperations`; (c) the CSV parser/emitter rules (RFC 4180 quoting, embedded newlines and delimiters, BOM tolerance, size guard reusing the existing request-size limits) since no CSV dependency may be added; (d) DoD rows bindable to `JsonServiceTest` and `JsonControllerTest` only. Do **not** fold in GAP-01/04/05 (README and spec drift): those are documentation deltas that a `docs/`-scoped task should own separately, and mixing them would break the "one capability per task" pattern the repo follows. Re-run `tools/check_discovery_report.sh` after any edit to this report: it is the machine gate for DOD-01…DOD-08.
+
+## 7. Read paths (evidence trail)
+
+Every file below was opened or grepped while producing this report.
+
+- path: pom.xml
+- path: PROJECT_GOALS.md
+- path: README.md
+- path: .ait/verify.toml
+- path: docs/superpowers/specs/2026-10-31-utiltools-api-design.md
+- path: docs/superpowers/plans/2026-10-31-utiltools-api.md
+- path: src/main/java/com/example/utiltools/common/ApiResponse.java
+- path: src/main/java/com/example/utiltools/common/ErrorResponse.java
+- path: src/main/java/com/example/utiltools/common/GlobalExceptionHandler.java
+- path: src/main/java/com/example/utiltools/common/RequestIdFilter.java
+- path: src/main/java/com/example/utiltools/config/OpenApiConfig.java
+- path: src/main/java/com/example/utiltools/audit/service/AuditedOperations.java
+- path: src/main/java/com/example/utiltools/audit/service/AuditReplayService.java
+- path: src/main/java/com/example/utiltools/audit/service/AuditJournalService.java
+- path: src/main/java/com/example/utiltools/audit/model/OperationType.java
+- path: src/main/java/com/example/utiltools/audit/controller/AuditController.java
+- path: src/main/java/com/example/utiltools/crypto/controller/CryptoController.java
+- path: src/main/java/com/example/utiltools/datetime/controller/DateTimeController.java
+- path: src/main/java/com/example/utiltools/json/controller/JsonController.java
+- path: src/main/java/com/example/utiltools/json/service/JsonService.java
+- path: src/main/java/com/example/utiltools/json/dto/JsonPatchRequest.java
+- path: src/main/java/com/example/utiltools/text/controller/TextController.java
+- path: src/main/java/com/example/utiltools/text/service/TextService.java
+- path: src/main/java/com/example/utiltools/text/dto/TextTransformRequest.java
+- path: src/main/java/com/example/utiltools/jobs/BatchJobController.java
+- path: src/main/java/com/example/utiltools/jobs/BatchHashJobService.java
+- path: src/main/java/com/example/utiltools/resilience/CircuitBreakerConfig.java
+- path: src/main/java/com/example/utiltools/resilience/ResilienceController.java
+- path: src/main/java/com/example/utiltools/ratelimit/RateLimitFilter.java
+- path: src/main/java/com/example/utiltools/ratelimit/RateLimitStatusController.java
+- path: src/test/java/com/example/utiltools/json/JsonServiceTest.java
+- path: src/test/java/com/example/utiltools/json/JsonControllerTest.java
+- path: src/test/java/com/example/utiltools/text/TextServiceTest.java
+- path: src/test/java/com/example/utiltools/text/TextControllerTest.java
+- path: src/test/java/com/example/utiltools/contact/ContactFormStateMachineTest.java
