@@ -177,6 +177,53 @@ class CryptoControllerTest {
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
     }
     @Test
+    @DisplayName("POST /api/v1/utils/crypto/hash - should reject unsupported algorithm with validation error")
+    void shouldRejectUnsupportedAlgorithmWithValidationError() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/hash")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"algorithm": "INVALID", "content": "test"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.message").value("Validation failed"))
+                .andExpect(jsonPath("$.details[0]")
+                        .value("Unsupported hash algorithm. Supported: SHA-256, SHA-512, MD5, SHA-1"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/hash - should accept all supported algorithms case-insensitively")
+    void shouldAcceptAllSupportedAlgorithmsCaseInsensitively() throws Exception {
+        for (String algorithm : List.of("SHA-256", "SHA-512", "SHA-1", "MD5",
+                "sha-256", "Sha-512", "md5", "sha-1")) {
+            mockMvc.perform(post("/api/v1/utils/crypto/hash")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("""
+                                    {"algorithm": "%s", "content": "test"}
+                                    """.formatted(algorithm)))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.success").value(true))
+                    .andExpect(jsonPath("$.data.algorithm").value(algorithm.toUpperCase()));
+        }
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/hash - should reject algorithm with surrounding whitespace")
+    void shouldRejectAlgorithmWithSurroundingWhitespace() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/hash")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"algorithm": " SHA-256 ", "content": "test"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]")
+                        .value("Unsupported hash algorithm. Supported: SHA-256, SHA-512, MD5, SHA-1"));
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/crypto/hash - echoes X-Request-Id on success and error envelopes")
     void shouldCarryRequestIdInEnvelope() throws Exception {
         mockMvc.perform(post("/api/v1/utils/crypto/hash")
@@ -197,7 +244,7 @@ class CryptoControllerTest {
                                 """))
                 .andExpect(status().isBadRequest())
                 .andExpect(header().string("X-Request-Id", "corr-crypto5678"))
-                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
                 .andExpect(jsonPath("$.requestId").value("corr-crypto5678"));
     }
 
