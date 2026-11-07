@@ -5,15 +5,147 @@ threshold. Units follow the brief verbatim: the aging interval is expressed in
 milliseconds (``prioritization_aging_interval_ms``) while the injected clock
 reports seconds, so the single conversion site is
 :attr:`MaintainerConfig.aging_threshold_seconds`.
+
+The values can come from five layers, merged lowest-precedence first by
+:meth:`MaintainerConfig.load`: built-in defaults < ``must_config.py`` <
+``<maintainer_root>/config.json`` < ``MAINTAINER_*`` environment variables <
+keyword overrides ("CLI"). Only ``load()`` reads files or the environment;
+construction through ``MaintainerConfig(...)`` never does.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import importlib.util
+import json
+import os
+from dataclasses import dataclass, fields
+from pathlib import Path
+from typing import Any, Mapping
 
 DEFAULT_AGING_INTERVAL_MS = 300_000
 DEFAULT_RECENCY_BOOST_CYCLES = 3
 DEFAULT_MAX_STEPS_PER_CYCLE = 8
+
+DEFAULT_PRIMARY_CLI: str | None = None
+DEFAULT_PRIMARY_MODEL: str | None = None
+DEFAULT_SECONDARY_CLI: str | None = None
+DEFAULT_SECONDARY_MODEL: str | None = None
+
+# Fail-closed allowlist: an empty set means "no model is known to be free",
+# never "every model is free". Register ids here or tag them with ``:free``.
+FREE_MODEL_IDS: frozenset[str] = frozenset()
+FREE_MODEL_SUFFIX = ":free"
+
+MAINTAINER_ROOT_ENV = "MAINTAINER_ROOT"
+ENV_PREFIX = "MAINTAINER_"
+CONFIG_JSON_NAME = "config.json"
+MUST_CONFIG_MODULE = "must_config"
+MUST_CONFIG_ATTRIBUTE = "MUST_CONFIG"
+
+_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
+_FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def is_free_model(model: str | None) -> bool:
+    """Return ``True`` when ``model`` is unset, allowlisted or ``:free`` tagged."""
+
+    if model is None:
+        return True
+    if not isinstance(model, str):
+        return False
+    if not model.strip():
+        return True
+    if model in FREE_MODEL_IDS:
+        return True
+    return model.endswith(FREE_MODEL_SUFFIX)
+
+
+def load_config_file(path: str | Path) -> dict[str, Any]:
+    """Read a JSON config file and validate its keys and scalar types."""
+
+    file_path = Path(path)
+    raw = file_path.read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:  # pragma: no cover - message passthrough
+        raise ValueError(f"config.json is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("config.json must contain a JSON object")
+    return _coerce_mapping(data, "config.json")
+
+
+def _default_maintainer_root() -> Path:
+    """Resolve the maintainer root lazily, per call (never at import time)."""
+
+    configured = os.environ.get(MAINTAINER_ROOT_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return Path(__file__).resolve().parents[2]
+
+
+def _load_must_config() -> dict[str, Any]:
+    """Optional soft dependency: a top-level ``must_config.MUST_CONFIG`` mapping."""
+
+    try:
+        spec = importlib.util.find_spec(MUST_CONFIG_MODULE)
+    except ModuleNotFoundError:
+        return {}
+    if spec is None:
+        return {}
+    module = importlib.import_module(MUST_CONFIG_MODULE)
+    raw = getattr(module, MUST_CONFIG_ATTRIBUTE, None)
+    if not raw:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("must_config.py must provide a mapping")
+    return _coerce_mapping({str(key).lower(): value for key, value in raw.items()}, "must_config.py")
+
+
+def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
+    """Validate keys against the dataclass fields and coerce scalar types."""
+
+    known = {field.name for field in fields(MaintainerConfig)}
+    unknown = sorted(key for key in raw if key not in known)
+    if unknown:
+        raise ValueError(f"unknown config key(s) in {source}: {unknown}")
+
+    coerced: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key in ("prioritization_aging_interval_ms", "recency_boost_cycles", "max_steps_per_cycle"):
+            if isinstance(value, bool):
+                raise ValueError(f"{key} must be an integer")
+            try:
+                coerced[key] = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{key} must be an integer") from exc
+        elif key == "priority_preemption_enabled":
+            coerced[key] = _coerce_bool(key, value)
+        else:
+            coerced[key] = value
+    return coerced
+
+
+def _coerce_bool(key: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _TRUE_TOKENS:
+            return True
+        if token in _FALSE_TOKENS:
+            return False
+    raise ValueError(f"{key} must be a boolean")
+
+
+def _env_layer(env: Mapping[str, str]) -> dict[str, Any]:
+    """Build the env-var layer; absent variables are omitted, never ``None``."""
+
+    candidate: dict[str, Any] = {}
+    for field in fields(MaintainerConfig):
+        env_name = ENV_PREFIX + field.name.upper()
+        if env_name in env:
+            candidate[field.name] = env[env_name]
+    return _coerce_mapping(candidate, "environment")
 
 
 @dataclass(frozen=True)
@@ -24,6 +156,10 @@ class MaintainerConfig:
     recency_boost_cycles: int = DEFAULT_RECENCY_BOOST_CYCLES
     priority_preemption_enabled: bool = True
     max_steps_per_cycle: int = DEFAULT_MAX_STEPS_PER_CYCLE
+    primary_cli: str | None = DEFAULT_PRIMARY_CLI
+    primary_model: str | None = DEFAULT_PRIMARY_MODEL
+    secondary_cli: str | None = DEFAULT_SECONDARY_CLI
+    secondary_model: str | None = DEFAULT_SECONDARY_MODEL
 
     def __post_init__(self) -> None:
         interval = self.prioritization_aging_interval_ms
@@ -35,9 +171,46 @@ class MaintainerConfig:
         steps = self.max_steps_per_cycle
         if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
             raise ValueError("max_steps_per_cycle must be >= 1")
+        for name in ("primary_cli", "secondary_cli"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{name} must be a non-empty string")
+        for name in ("primary_model", "secondary_model"):
+            value = getattr(self, name)
+            if value is not None and not is_free_model(value):
+                raise ValueError(f"{name} is not a free model: {value}")
 
     @property
     def aging_threshold_seconds(self) -> float:
         """Aging threshold in the unit the clock reports (seconds)."""
 
         return self.prioritization_aging_interval_ms / 1000.0
+
+    @classmethod
+    def load(
+        cls,
+        *,
+        config_path: str | Path | None = None,
+        maintainer_root: str | Path | None = None,
+        env: Mapping[str, str] | None = None,
+        **overrides: Any,
+    ) -> "MaintainerConfig":
+        """Build a config from the five documented layers, lowest precedence first."""
+
+        root = Path(maintainer_root) if maintainer_root is not None else _default_maintainer_root()
+
+        file_path: Path | None
+        if config_path is not None:
+            file_path = Path(config_path).expanduser()
+            if not file_path.is_file():
+                raise FileNotFoundError(f"config path does not exist: {file_path}")
+        else:
+            candidate = root / CONFIG_JSON_NAME
+            file_path = candidate if candidate.is_file() else None
+
+        merged: dict[str, Any] = dict(_load_must_config())
+        if file_path is not None:
+            merged.update(load_config_file(file_path))
+        merged.update(_env_layer(os.environ if env is None else env))
+        merged.update(_coerce_mapping(overrides, "overrides"))
+        return cls(**merged)
