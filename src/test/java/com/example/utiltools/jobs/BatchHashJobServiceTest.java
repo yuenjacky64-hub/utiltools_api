@@ -1671,6 +1671,323 @@ class BatchHashJobServiceTest {
         return new AuditJournalService(new ObjectMapper(), 200, 65536, 300L);
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Fenced checkpoint resume (REQ-01..REQ-06)
+    // ---------------------------------------------------------------------------------------------
+
+    /** A four-item batch: big enough that losing the prefix would be visible in the counters. */
+    private static final List<String> CHECKPOINT_ITEMS = List.of("alpha", "bravo", "charlie", "delta");
+
+    /**
+     * DOD-01 / REQ-01..REQ-03: a transient fault on item 2 leaves the two committed digests in the
+     * private prefix, reports them as {@code completedItems} and publishes nothing as results.
+     */
+    @Test
+    @DisplayName("checkpoint - a transient failure keeps the durable prefix and leaves results null")
+    void shouldExposeCheckpointPrefixOnFailureAndKeepResultsNull() {
+        CheckpointCryptoService crypto = new CheckpointCryptoService(Map.of("charlie", 1), null);
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, Clock.systemUTC());
+
+        BatchHashJobResponse failed = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", CHECKPOINT_ITEMS, null, null)).jobId(), JobStatus.FAILED);
+
+        assertThat(failed.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(failed.itemCount()).isEqualTo(4);
+        assertThat(failed.completedItems()).isEqualTo(2); // the two hashes that succeeded
+        assertThat(failed.results()).isNull(); // a prefix is never disclosed as results
+        assertThat(failed.error()).contains("charlie");
+        assertThat(failed.attempts()).hasSize(1);
+        assertThat(failed.attempts().get(0).status()).isEqualTo(JobStatus.FAILED);
+        assertThat(failed.attempts().get(0).resumedFrom()).isZero();
+
+        assertThat(crypto.count("alpha")).isEqualTo(1);
+        assertThat(crypto.count("bravo")).isEqualTo(1);
+        assertThat(crypto.count("charlie")).isEqualTo(1);
+        assertThat(crypto.count("delta")).isZero(); // never reached
+    }
+
+    /**
+     * DOD-02 / REQ-02, REQ-03: the retry resumes at the prefix's next index, so only the suffix is
+     * hashed and the completed results equal the full batch in input order.
+     */
+    @Test
+    @DisplayName("checkpoint - retry resumes at the prefix's next index and publishes the full ordered batch")
+    void shouldResumeAtCheckpointIndexOnRetryWithoutRehashingCompletedItems() {
+        CheckpointCryptoService crypto = new CheckpointCryptoService(Map.of("charlie", 1), null);
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, Clock.systemUTC());
+
+        BatchHashJobResponse failed = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", CHECKPOINT_ITEMS, null, null)).jobId(), JobStatus.FAILED);
+        assertThat(failed.completedItems()).isEqualTo(2);
+
+        BatchHashJobResponse requeued = service.retry(failed.jobId());
+        assertThat(requeued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(requeued.attempt()).isEqualTo(2);
+        assertThat(requeued.completedItems()).isEqualTo(2); // the prefix survives the requeue
+        assertThat(requeued.results()).isNull(); // ...but stays unpublished
+
+        BatchHashJobResponse completed = awaitStatus(failed.jobId(), JobStatus.COMPLETED);
+        CryptoService reference = new CryptoService();
+        List<HashResponse> expected = new ArrayList<>();
+        for (String item : CHECKPOINT_ITEMS) {
+            expected.add(reference.hash(new HashRequest("SHA-256", item, null)));
+        }
+        assertThat(completed.results()).isEqualTo(expected); // whole batch, input order
+        assertThat(completed.completedItems()).isEqualTo(4);
+        assertThat(completed.attempts()).hasSize(2);
+        assertThat(completed.attempts().get(0).resumedFrom()).isZero();
+        assertThat(completed.attempts().get(1).resumedFrom()).isEqualTo(2);
+        assertThat(completed.attempts().get(1).status()).isEqualTo(JobStatus.COMPLETED);
+
+        // Only the suffix ran again: the item that threw is retried, nothing before it.
+        assertThat(crypto.count("alpha")).isEqualTo(1);
+        assertThat(crypto.count("bravo")).isEqualTo(1);
+        assertThat(crypto.count("charlie")).isEqualTo(2);
+        assertThat(crypto.count("delta")).isEqualTo(1);
+    }
+
+    /**
+     * DOD-03 / REQ-02, REQ-03: a worker whose attempt was reaped cannot advance the checkpoint, and
+     * replaying a superseded or already-finished generation writes nothing.
+     */
+    @Test
+    @DisplayName("checkpoint - a stale worker from a reaped or superseded attempt cannot advance it")
+    void shouldFenceStaleWorkerFromAdvancingCheckpoint() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse accepted = service.submit(new BatchHashRequest("SHA-256",
+                List.of("first", "stalled", "third", "fourth"), null, null));
+        assertThat(crypto.awaitEntered("stalled")).isTrue(); // "first" is hashed and committed
+        assertThat(service.getJob(accepted.jobId()).completedItems()).isEqualTo(1);
+
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        BatchHashJobResponse before = service.getJob(accepted.jobId());
+        assertThat(before.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(before.error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        assertThat(before.completedItems()).isEqualTo(1);
+        assertThat(before.results()).isNull();
+
+        // The late worker returns from hash() inside a job it no longer owns: the fenced commit
+        // writes nothing - no prefix append, no results, no error, no status.
+        crypto.unblock("stalled");
+        BatchHashJobResponse probe = service.submit(
+                new BatchHashRequest("SHA-256", List.of("probe"), null, null));
+        awaitStatus(probe.jobId(), JobStatus.COMPLETED); // the stale worker has returned by now
+        assertThat(service.getJob(accepted.jobId())).isEqualTo(before);
+        assertThat(service.getJob(accepted.jobId()).completedItems()).isEqualTo(1);
+
+        // Replaying the reaped generation is a no-op: the job is not QUEUED any more.
+        service.executeAttempt(accepted.jobId(), 1);
+        assertThat(service.getJob(accepted.jobId())).isEqualTo(before);
+
+        // The prefix survived the reap, and the stale worker did not append "stalled" to it.
+        service.retry(accepted.jobId());
+        BatchHashJobResponse completed = awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.attempts().get(1).resumedFrom()).isEqualTo(1);
+        assertThat(crypto.count("first")).isEqualTo(1); // never rehashed
+        assertThat(crypto.count("stalled")).isEqualTo(2); // once for the reaped attempt, once now
+        assertThat(crypto.count("third")).isEqualTo(1);
+        assertThat(crypto.count("fourth")).isEqualTo(1);
+
+        // ...and replaying a finished generation writes nothing either.
+        service.executeAttempt(accepted.jobId(), 1);
+        service.executeAttempt(accepted.jobId(), 2);
+        assertThat(service.getJob(accepted.jobId())).isEqualTo(completed);
+    }
+
+    /**
+     * DOD-04 / REQ-04: a queue-full rejection restores the exact pre-retry FAILED snapshot -
+     * including the attempt counter and the checkpoint - so the retry can be repeated for free.
+     */
+    @Test
+    @DisplayName("checkpoint - a queue-full retry restores the FAILED snapshot and loses no progress")
+    void shouldRestoreCheckpointOnQueueFullRetry() throws Exception {
+        CheckpointCryptoService crypto = new CheckpointCryptoService(Map.of("charlie", 1), "blocker");
+        service = new BatchHashJobService(crypto, 1, 1, 300, 3, LEASE_SECONDS, 5000, Clock.systemUTC());
+
+        BatchHashJobResponse failed = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", CHECKPOINT_ITEMS, null, null)).jobId(), JobStatus.FAILED);
+        assertThat(failed.completedItems()).isEqualTo(2);
+
+        // Saturate the single worker and its single queue slot so the retry is rejected.
+        BatchHashJobResponse blocker = service.submit(
+                new BatchHashRequest("SHA-256", List.of("blocker"), null, null));
+        assertThat(crypto.awaitGate()).isTrue();
+        BatchHashJobResponse filler = service.submit(
+                new BatchHashRequest("SHA-256", List.of("filler"), null, null));
+        assertThat(filler.status()).isEqualTo(JobStatus.QUEUED);
+
+        BatchHashJobResponse before = service.getJob(failed.jobId());
+        assertThatThrownBy(() -> service.retry(failed.jobId())).isInstanceOf(JobQueueFullException.class);
+        BatchHashJobResponse after = service.getJob(failed.jobId());
+        assertThat(after).isEqualTo(before); // status, attempt and checkpoint all restored
+        assertThat(after.attempt()).isEqualTo(1);
+        assertThat(after.completedItems()).isEqualTo(2);
+
+        // Capacity frees, so the same retry now runs - and completes from the checkpoint.
+        crypto.releaseGate();
+        awaitStatus(blocker.jobId(), JobStatus.COMPLETED);
+        awaitStatus(filler.jobId(), JobStatus.COMPLETED);
+        service.retry(failed.jobId());
+        BatchHashJobResponse completed = awaitStatus(failed.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.attempt()).isEqualTo(2);
+        assertThat(completed.attempts().get(1).resumedFrom()).isEqualTo(2);
+        assertThat(completed.results()).hasSize(4);
+        assertThat(completed.completedItems()).isEqualTo(4);
+        assertThat(crypto.count("alpha")).isEqualTo(1);
+        assertThat(crypto.count("bravo")).isEqualTo(1);
+        assertThat(crypto.count("charlie")).isEqualTo(2);
+        assertThat(crypto.count("delta")).isEqualTo(1);
+    }
+
+    /**
+     * DOD-07 / REQ-05: attempt history shows {@code resumedFrom}, the journal descriptor and the
+     * SUCCEEDED outcome carry {@code resumedFrom}/{@code completedItems}, no item or secret key ever
+     * reaches either, and a throwing journal leaves the checkpoint projection untouched.
+     */
+    @Test
+    @DisplayName("checkpoint - attempt history and the BATCH_HASH journal record counts only, never items")
+    void shouldRecordResumedFromAndCompletedItemsInAttemptHistoryAndAudit() throws Exception {
+        AuditJournalService journal = newJournal();
+        CheckpointCryptoService crypto = new CheckpointCryptoService(Map.of("charlie", 1), null);
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC(), journal);
+        String secretKey = "s3cr3t-key-value";
+
+        BatchHashJobResponse failed = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", CHECKPOINT_ITEMS, secretKey, null)).jobId(),
+                JobStatus.FAILED);
+        List<AuditEntry> afterFailure = batchHashEntries(journal, failed.jobId());
+        assertThat(afterFailure).hasSize(1);
+        AuditEntry firstEntry = afterFailure.get(0);
+        assertThat(firstEntry.state()).isEqualTo(JournalState.FAILED);
+        assertThat(firstEntry.request().path("resumedFrom").asInt()).isZero();
+        assertThat(firstEntry.request().path("completedItems").asInt()).isZero(); // nothing was committed yet
+
+        service.retry(failed.jobId());
+        BatchHashJobResponse completed = awaitStatus(failed.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.attempts().get(0).resumedFrom()).isZero();
+        assertThat(completed.attempts().get(1).resumedFrom()).isEqualTo(2);
+
+        AuditEntry retryEntry = batchHashEntries(journal, failed.jobId()).stream()
+                .filter(entry -> !entry.id().equals(firstEntry.id()))
+                .findFirst()
+                .orElseThrow();
+        assertThat(retryEntry.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(retryEntry.request().path("attempt").asInt()).isEqualTo(2);
+        assertThat(retryEntry.request().path("resumedFrom").asInt()).isEqualTo(2);
+        assertThat(retryEntry.request().path("completedItems").asInt()).isEqualTo(2);
+        assertThat(retryEntry.result().path("outcome").asText()).isEqualTo("COMPLETED");
+        assertThat(retryEntry.result().path("resultCount").asInt()).isEqualTo(4);
+        assertThat(retryEntry.result().path("resumedFrom").asInt()).isEqualTo(2);
+        assertThat(retryEntry.result().path("completedItems").asInt()).isEqualTo(4);
+        String serialized = retryEntry.request() + "|" + retryEntry.result();
+        assertThat(serialized)
+                .doesNotContain("alpha")
+                .doesNotContain("bravo")
+                .doesNotContain("charlie")
+                .doesNotContain("delta")
+                .doesNotContain(secretKey);
+
+        // A throwing journal cannot change whether the prefix is retained and reported.
+        CheckpointCryptoService faultyCrypto = new CheckpointCryptoService(Map.of("charlie", 1), null);
+        service = new BatchHashJobService(faultyCrypto, 1, 10, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC(), new FailingJournal(false));
+        BatchHashJobResponse journalFault = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", CHECKPOINT_ITEMS, null, null)).jobId(), JobStatus.FAILED);
+        assertThat(journalFault.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(journalFault.results()).isNull();
+        assertThat(journalFault.completedItems()).isEqualTo(2);
+    }
+
+    /**
+     * DOD-08 / REQ-06: withdrawing a QUEUED job that already carries a durable prefix discards the
+     * prefix, so a cancelled job never publishes or exposes checkpoint results.
+     */
+    @Test
+    @DisplayName("checkpoint - a cancelled job publishes no checkpoint results")
+    void shouldNotExposeCheckpointForCancelledJob() throws Exception {
+        CheckpointCryptoService crypto = new CheckpointCryptoService(Map.of("charlie", 1), "blocker");
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, Clock.systemUTC());
+
+        BatchHashJobResponse failed = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", CHECKPOINT_ITEMS, null, null)).jobId(), JobStatus.FAILED);
+        assertThat(failed.completedItems()).isEqualTo(2);
+
+        BatchHashJobResponse blocker = service.submit(
+                new BatchHashRequest("SHA-256", List.of("blocker"), null, null));
+        assertThat(crypto.awaitGate()).isTrue(); // the only worker is busy, so the retry stays QUEUED
+        BatchHashJobResponse requeued = service.retry(failed.jobId());
+        assertThat(requeued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(requeued.completedItems()).isEqualTo(2); // the prefix is carried into the requeue
+
+        BatchHashJobResponse cancelled = service.cancel(failed.jobId());
+        assertThat(cancelled.status()).isEqualTo(JobStatus.CANCELLED);
+        assertThat(cancelled.results()).isNull();
+        assertThat(cancelled.completedItems()).isZero(); // the prefix was discarded
+        assertThat(service.getJob(failed.jobId())).isEqualTo(cancelled);
+
+        crypto.releaseGate();
+        awaitStatus(blocker.jobId(), JobStatus.COMPLETED);
+        assertThat(service.getJob(failed.jobId()).completedItems()).isZero();
+        assertThat(service.getJob(failed.jobId()).results()).isNull();
+        assertThat(crypto.count("delta")).isZero(); // the cancelled attempt hashed nothing more
+    }
+
+    /**
+     * Hashing stub for the checkpoint tests: counts invocations per item, fails a designated item a
+     * configurable number of times (a transient fault) and optionally blocks the worker inside
+     * {@code hash()} on a designated item so a job can be held in QUEUED / RUNNING. Every other item
+     * delegates to real hashing so digests stay comparable with {@link CryptoService}.
+     */
+    private static final class CheckpointCryptoService extends CryptoService {
+
+        private final Map<String, AtomicInteger> invocations = new ConcurrentHashMap<>();
+        private final Map<String, AtomicInteger> remainingFailures = new ConcurrentHashMap<>();
+        private final CountDownLatch gateEntered = new CountDownLatch(1);
+        private final CountDownLatch gateReleased = new CountDownLatch(1);
+        private final String gateItem;
+
+        private CheckpointCryptoService(Map<String, Integer> failures, String gateItem) {
+            failures.forEach((item, count) -> remainingFailures.put(item, new AtomicInteger(count)));
+            this.gateItem = gateItem;
+        }
+
+        private boolean awaitGate() throws InterruptedException {
+            return gateItem != null && gateEntered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+
+        private void releaseGate() {
+            gateReleased.countDown();
+        }
+
+        private int count(String item) {
+            AtomicInteger counter = invocations.get(item);
+            return counter == null ? 0 : counter.get();
+        }
+
+        @Override
+        public HashResponse hash(HashRequest request) {
+            invocations.computeIfAbsent(request.content(), key -> new AtomicInteger()).incrementAndGet();
+            AtomicInteger remaining = remainingFailures.get(request.content());
+            if (remaining != null && remaining.getAndUpdate(n -> n > 0 ? n - 1 : 0) > 0) {
+                throw new IllegalStateException("transient hashing failure for " + request.content());
+            }
+            if (gateItem != null && gateItem.equals(request.content())) {
+                gateEntered.countDown();
+                try {
+                    gateReleased.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return super.hash(request);
+        }
+    }
+
     /** BATCH_HASH entries recorded for one job, newest first (the journal itself is newest-first). */
     private static List<AuditEntry> batchHashEntries(AuditJournalService journal, String jobId) {
         return batchHashEntries(journal, jobId, null);

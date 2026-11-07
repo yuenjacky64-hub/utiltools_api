@@ -410,6 +410,39 @@ class BatchJobControllerTest {
     }
 
     @Test
+    @DisplayName("GET /api/v1/utils/jobs/{jobId} - should expose completedItems additively beside every existing field")
+    void shouldExposeCompletedItemsInJobSnapshot() throws Exception {
+        Instant createdAt = Instant.parse("2026-11-06T10:00:00Z");
+        Instant failedAt = Instant.parse("2026-11-06T10:00:02Z");
+        // A FAILED job that checkpointed two of its four items: the count is public, the digests are not.
+        BatchHashJobResponse failed = new BatchHashJobResponse("job-checkpoint-1", "controller-checkpoint-key",
+                JobStatus.FAILED, 4, null, "IllegalStateException: transient", createdAt, createdAt, failedAt,
+                1, 3, List.of(new JobAttempt(1, JobStatus.FAILED, createdAt, failedAt,
+                        "IllegalStateException: transient", null, 0)),
+                null, null, 2);
+        doReturn(failed).when(jobService).getJob("job-checkpoint-1");
+
+        mockMvc.perform(get("/api/v1/utils/jobs/job-checkpoint-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.jobId").value("job-checkpoint-1"))
+                .andExpect(jsonPath("$.data.idempotencyKey").value("controller-checkpoint-key"))
+                .andExpect(jsonPath("$.data.status").value("FAILED"))
+                .andExpect(jsonPath("$.data.itemCount").value(4))
+                .andExpect(jsonPath("$.data.completedItems").value(2))
+                .andExpect(jsonPath("$.data.results").doesNotExist())
+                .andExpect(jsonPath("$.data.error").value("IllegalStateException: transient"))
+                .andExpect(jsonPath("$.data.createdAt").exists())
+                .andExpect(jsonPath("$.data.startedAt").exists())
+                .andExpect(jsonPath("$.data.completedAt").exists())
+                .andExpect(jsonPath("$.data.attempt").value(1))
+                .andExpect(jsonPath("$.data.maxAttempts").value(3))
+                .andExpect(jsonPath("$.data.attempts[0].attempt").value(1))
+                .andExpect(jsonPath("$.data.attempts[0].status").value("FAILED"))
+                .andExpect(jsonPath("$.data.attempts[0].resumedFrom").value(0));
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/jobs/{jobId}/retry - the three retry failure modes answer 409, 429 and 404 in one run")
     void shouldReturn409Then429Then404ForRetryFailuresInOneRun() throws Exception {
         doThrow(new JobRetryConflictException("job-completed-1", JobStatus.COMPLETED, 3, 3))
