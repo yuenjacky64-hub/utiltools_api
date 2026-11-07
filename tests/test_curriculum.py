@@ -177,6 +177,80 @@ def test_aging_boost_raises_normal_to_high_at_threshold() -> None:
     assert effective_priority(easy, cycle=0, now=0.0, config=config) is Priority.LOW
 
 
+def test_late_added_spec_aging_clock_starts_at_first_observation() -> None:
+    """MUST_FIX-3: an unstamped spec entering ``specs`` later is not "aged"."""
+
+    clock = FrozenClock(10_000.0)
+    config = MaintainerConfig(max_steps_per_cycle=1)
+    curriculum = TaskCurriculum(specs=[], config=config, clock=clock)
+    late = TaskSpec(
+        name="late",
+        difficulty=Difficulty.HARD,
+        steps_required=4,
+        last_proposed_cycle=100,
+    )
+
+    # Unobserved is not "pending since epoch": a mid-scale monotonic clock
+    # must not fake a HIGH rank for a task that just arrived.
+    assert late.pending_since is None
+    assert effective_priority(late, cycle=0, now=clock(), config=config) is Priority.NORMAL
+
+    # ``generate_task`` stamps the first observation moment.
+    curriculum.specs.append(late)
+    assert curriculum.generate_task() is late
+    assert late.pending_since == 10_000.0
+    assert effective_priority(late, cycle=1, now=clock(), config=config) is Priority.NORMAL
+
+    # The engine stamps too, and never re-stamps an already-stamped task.
+    engine = MaintainerEngine(curriculum, config=config, clock=clock)
+    assert engine.run_cycle().monitored == "late"
+    assert late.pending_since == 10_000.0
+
+    late_second = TaskSpec(
+        name="late-2",
+        difficulty=Difficulty.MEDIUM,
+        steps_required=4,
+        last_proposed_cycle=100,
+    )
+    curriculum.specs.append(late_second)
+    assert late_second.pending_since is None
+    engine.run_cycle()
+    assert late_second.pending_since == 10_000.0
+
+    # Aging counts from the stamp, so one rank is bought after the threshold.
+    clock.advance(300.001)
+    assert effective_priority(late, cycle=1, now=clock(), config=config) is Priority.HIGH
+    assert (
+        effective_priority(late_second, cycle=1, now=clock(), config=config)
+        is Priority.NORMAL
+    )
+
+
+def test_task_spec_rejects_non_finite_pending_since_and_bool_ints() -> None:
+    """NIT-1/NIT-2: no silent defaulting on the aging clock, bools excluded."""
+
+    for bad in (float("nan"), float("inf"), float("-inf"), -1.0):
+        with pytest.raises(ValueError, match="pending_since must be None or a finite float"):
+            TaskSpec(name="bad-clock", pending_since=bad)
+    with pytest.raises(ValueError, match="progress must be an int >= 0"):
+        TaskSpec(name="bool-progress", progress=True)
+    with pytest.raises(ValueError, match="steps_required must be an int >= 1"):
+        TaskSpec(name="bool-steps", steps_required=True)
+
+    # A terminal task never ages, stamped or not.
+    terminal = TaskSpec(
+        name="done",
+        difficulty=Difficulty.HARD,
+        state=TaskState.COMPLETED,
+        last_proposed_cycle=9,
+    )
+    assert terminal.pending_since is None
+    assert (
+        effective_priority(terminal, cycle=9, now=10**9, config=MaintainerConfig())
+        is Priority.NORMAL
+    )
+
+
 def test_maintainer_config_aging_interval_default_is_300000_ms() -> None:
     """DOD-05: the aging knob is configurable and defaulted to 300000 ms."""
 

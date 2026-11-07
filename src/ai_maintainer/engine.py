@@ -22,6 +22,7 @@ from ai_maintainer.tasks.curriculum import (
     TaskSpec,
     TaskState,
     effective_priority,
+    stamp_pending_since,
 )
 
 __all__ = ["CycleResult", "MaintainerEngine"]
@@ -134,7 +135,7 @@ class MaintainerEngine:
                     continue
                 if error is not None:
                     task.state = TaskState.FAILED
-                    task.pending_since = 0.0
+                    task.pending_since = None
                     self._monitored = None
                     self._events.append(
                         {"event": "FAILED", "task": task.name, "cycle": cycle}
@@ -144,7 +145,7 @@ class MaintainerEngine:
                 task.progress = max(task.progress, next_progress)
                 if task.progress >= task.steps_required:
                     task.state = TaskState.COMPLETED
-                    task.pending_since = 0.0
+                    task.pending_since = None
                     self._monitored = None
                     self._events.append(
                         {"event": "COMPLETED", "task": task.name, "cycle": cycle}
@@ -171,6 +172,7 @@ class MaintainerEngine:
                     continue
                 if monitored is not None and task is monitored:
                     continue
+                stamp_pending_since(task, now)
                 pending[task.name] = effective_priority(
                     task, cycle=self._cycles, now=now, config=self._config
                 ).name
@@ -194,6 +196,7 @@ class MaintainerEngine:
         for index, task in enumerate(self._curriculum.specs):
             if task.state not in NON_TERMINAL:
                 continue
+            stamp_pending_since(task, now)
             level = effective_priority(
                 task, cycle=self._cycles, now=now, config=self._config
             ).value
@@ -209,6 +212,8 @@ class MaintainerEngine:
             return False
         if monitored.state not in NON_TERMINAL:
             return False
+        stamp_pending_since(incoming, now)
+        stamp_pending_since(monitored, now)
         incoming_level = effective_priority(
             incoming, cycle=self._cycles, now=now, config=self._config
         ).value

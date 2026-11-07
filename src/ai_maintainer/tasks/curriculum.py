@@ -9,6 +9,7 @@ idempotent and the serialized JSON stays deterministic.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field, fields
 from enum import Enum, IntEnum
@@ -25,6 +26,7 @@ __all__ = [
     "TaskSpec",
     "TaskState",
     "effective_priority",
+    "stamp_pending_since",
 ]
 
 PRIORITY_NAMES = "HIGH, NORMAL, LOW"
@@ -138,7 +140,12 @@ class TaskSpec:
     progress: int = 0
     steps_required: int = 1
     last_proposed_cycle: int | None = None
-    pending_since: float = 0.0
+    # ``None`` means "not observed yet": the aging clock is stamped with the
+    # first ``clock()`` value at which the task is seen in a non-terminal
+    # state. A sentinel of ``0.0`` would be ambiguous (a real monotonic clock
+    # is never 0.0 in practice, but a spec added to a live curriculum would
+    # then read as "pending since epoch" and age instantly).
+    pending_since: float | None = None
     preempted_count: int = 0
 
     def __post_init__(self) -> None:
@@ -150,10 +157,32 @@ class TaskSpec:
         else:
             self.priority = Priority.parse(self.priority)
         self.state = TaskState.parse(self.state)
-        if not isinstance(self.progress, int) or self.progress < 0:
+        if (
+            isinstance(self.progress, bool)
+            or not isinstance(self.progress, int)
+            or self.progress < 0
+        ):
             raise ValueError("progress must be an int >= 0")
-        if not isinstance(self.steps_required, int) or self.steps_required < 1:
+        if (
+            isinstance(self.steps_required, bool)
+            or not isinstance(self.steps_required, int)
+            or self.steps_required < 1
+        ):
             raise ValueError("steps_required must be an int >= 1")
+        if self.pending_since is not None:
+            if isinstance(self.pending_since, bool) or not isinstance(
+                self.pending_since, (int, float)
+            ):
+                raise ValueError(
+                    "pending_since must be None or a finite float >= 0; "
+                    f"got {self.pending_since!r}"
+                )
+            if not math.isfinite(self.pending_since) or self.pending_since < 0.0:
+                raise ValueError(
+                    "pending_since must be None or a finite float >= 0; "
+                    f"got {self.pending_since!r}"
+                )
+            self.pending_since = float(self.pending_since)
 
     def to_dict(self) -> dict:
         """Serialize to a JSON-ready mapping (priority as its name)."""
@@ -183,10 +212,25 @@ class TaskSpec:
         return cls(**data)
 
 
-def _pending_seconds(task: TaskSpec, now: float) -> float:
-    """Seconds the task has spent in a non-terminal state (never negative)."""
+def stamp_pending_since(task: TaskSpec, now: float) -> None:
+    """Stamp the aging clock on first observation of a non-terminal task.
 
-    if task.state not in NON_TERMINAL:
+    Idempotent: an already-stamped task keeps its entry moment, so preemption
+    and repeated observation never reset the aging clock (INV-4).
+    """
+
+    if task.state in NON_TERMINAL and task.pending_since is None:
+        task.pending_since = float(now)
+
+
+def _pending_seconds(task: TaskSpec, now: float) -> float:
+    """Seconds the task has spent in a non-terminal state (never negative).
+
+    An unstamped task has been pending for ``0.0`` seconds: it entered *now*,
+    so it must not inherit the age of the clock's epoch.
+    """
+
+    if task.state not in NON_TERMINAL or task.pending_since is None:
         return 0.0
     return max(0.0, now - task.pending_since)
 
@@ -232,8 +276,7 @@ class TaskCurriculum:
     def __post_init__(self) -> None:
         now = self.clock()
         for task in self.specs:
-            if task.state in NON_TERMINAL and task.pending_since == 0.0:
-                task.pending_since = now
+            stamp_pending_since(task, now)
 
     @property
     def cycle(self) -> int:
@@ -264,6 +307,8 @@ class TaskCurriculum:
         ]
         if not candidates:
             return None
+        for _, task in candidates:
+            stamp_pending_since(task, now)
 
         def rank(item: tuple[int, TaskSpec]) -> tuple[int, int, int]:
             index, task = item
@@ -290,9 +335,9 @@ class TaskCurriculum:
         new_state = TaskState.parse(state)
         moment = self.clock() if now is None else now
         if new_state in NON_TERMINAL:
-            if task.state not in NON_TERMINAL or task.pending_since == 0.0:
-                task.pending_since = moment
+            if task.state not in NON_TERMINAL or task.pending_since is None:
+                task.pending_since = float(moment)
         else:
-            task.pending_since = 0.0
+            task.pending_since = None
         task.state = new_state
         return task
