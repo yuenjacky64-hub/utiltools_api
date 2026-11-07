@@ -40,6 +40,8 @@ class TextServiceTest {
                 .isEqualTo(new TextTransformResponse("KEBAB", "hello-world", true, 11));
         assertThat(service.transform(new TextTransformRequest("Hello, World!", "SLUG")))
                 .isEqualTo(new TextTransformResponse("SLUG", "hello-world", true, 11));
+        assertThat(service.transform(new TextTransformRequest("Hello, World!", "SENTENCE_CASE")))
+                .isEqualTo(new TextTransformResponse("SENTENCE_CASE", "Hello, world!", true, 13));
 
         // case-insensitive operation, echoed back upper-case
         assertThat(service.transform(new TextTransformRequest("Hello, World!", " snake ")))
@@ -117,8 +119,40 @@ class TextServiceTest {
     void shouldRejectUnknownOperation() {
         assertThatThrownBy(() -> service.transform(new TextTransformRequest("secret body", "shout")))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("Unsupported operation 'shout'. Allowed values: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG")
+                .hasMessage("Unsupported operation 'shout'. Allowed values: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE")
                 .hasMessageNotContaining("secret body");
+    }
+
+    @Test
+    @DisplayName("SENTENCE_CASE upper-cases each sentence's first letter and preserves punctuation")
+    void shouldSentenceCasePreservingPunctuation() {
+        assertThat(service.transform(new TextTransformRequest("hello WORLD. bye world! third ONE?", "SENTENCE_CASE")))
+                .isEqualTo(new TextTransformResponse("SENTENCE_CASE", "Hello world. Bye world! Third one?", true, 34));
+    }
+
+    @Test
+    @DisplayName("SENTENCE_CASE is idempotent: canonical text and its own result are unchanged")
+    void shouldSentenceCaseLeaveCanonicalTextUnchanged() {
+        TextTransformResponse first = service.transform(
+                new TextTransformRequest("Hello world. Another one!", "SENTENCE_CASE"));
+        assertThat(first.result()).isEqualTo("Hello world. Another one!");
+        assertThat(first.changed()).isFalse();
+
+        TextTransformResponse second = service.transform(
+                new TextTransformRequest(first.result(), "SENTENCE_CASE"));
+        assertThat(second.result()).isEqualTo(first.result());
+        assertThat(second.changed()).isFalse();
+    }
+
+    @Test
+    @DisplayName("SENTENCE_CASE maps Unicode under Locale.ROOT and treats [.!?] runs as boundaries")
+    void shouldSentenceCaseUnicodeAndSeparators() {
+        assertThat(service.transform(new TextTransformRequest("ça va. ÉTÉ! \"quoted start", "SENTENCE_CASE")).result())
+                .isEqualTo("Ça va. Été! \"Quoted start");
+        assertThat(service.transform(new TextTransformRequest("hello...world", "SENTENCE_CASE")).result())
+                .isEqualTo("Hello...World");
+        assertThat(service.transform(new TextTransformRequest("hello\nworld", "SENTENCE_CASE")).result())
+                .isEqualTo("Hello\nworld");
     }
 
     @Test

@@ -3,6 +3,7 @@ package com.example.utiltools.audit.service;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.OperationType;
 import com.example.utiltools.common.RequestContext;
+import com.example.utiltools.common.ReplayConflictException;
 import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
@@ -23,6 +24,8 @@ import com.example.utiltools.json.dto.JsonFlattenRequest;
 import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
+import com.example.utiltools.json.dto.JsonMergePatchRequest;
+import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonUnflattenRequest;
 import com.example.utiltools.json.dto.JsonUnflattenResponse;
@@ -134,6 +137,10 @@ public class AuditedOperations {
         return record(OperationType.JSON_UNFLATTEN, request, () -> jsonService.unflatten(request));
     }
 
+    public JsonMergePatchResponse mergePatch(JsonMergePatchRequest request) {
+        return record(OperationType.JSON_MERGE_PATCH, request, () -> jsonService.mergePatch(request));
+    }
+
     public TextTransformResponse transform(TextTransformRequest request) {
         return record(OperationType.TEXT_TRANSFORM, request, () -> textService.transform(request));
     }
@@ -165,9 +172,15 @@ public class AuditedOperations {
             case JSON_QUERY -> jsonService.query((JsonQueryRequest) request);
             case JSON_FLATTEN -> jsonService.flatten((JsonFlattenRequest) request);
             case JSON_UNFLATTEN -> jsonService.unflatten((JsonUnflattenRequest) request);
+            case JSON_MERGE_PATCH -> jsonService.mergePatch((JsonMergePatchRequest) request);
             case TEXT_TRANSFORM -> textService.transform((TextTransformRequest) request);
             case TEXT_STATS -> textService.stats((TextStatsRequest) request);
             case TEXT_REPLACE -> textService.replace((TextReplaceRequest) request);
+            // Asynchronous batch hashing is audit-only: a BATCH_HASH entry can never be replayed,
+            // because there is no servlet-bound payload to re-run and the operation is
+            // non-deterministic. Defence in depth: claimReplay refuses the same entries.
+            case BATCH_HASH -> throw new ReplayConflictException(null,
+                    "batch hashing runs asynchronously and is non-replayable");
         };
     }
 

@@ -44,7 +44,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, current global time |
 | **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), UUID v4 batch generation and time-ordered RFC 9562 UUID v7 generation (`version=V4|V7`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit |
-| **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
+| **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
 
 ---
 
@@ -146,7 +146,8 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/validate` | Check JSON syntax validity and report exact syntax error line/col |
 | `POST` | `/api/v1/utils/json/query` | Evaluate JSONPath queries and extract matching nodes |
 | `POST` | `/api/v1/utils/json/patch` | Apply an ordered RFC 6902-style patch atomically, with reverse-order rollback and audit |
-| `POST` | `/api/v1/utils/text/transform` | Apply a deterministic case/format operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`) to a string |
+| `POST` | `/api/v1/utils/json/merge-patch` | Apply an RFC 7396 merge-patch document (`null` deletes, objects merge recursively, arrays/scalars replace) as a journalled `JSON_MERGE_PATCH` |
+| `POST` | `/api/v1/utils/text/transform` | Apply a deterministic case/format operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`) to a string |
 | `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
 | `POST` | `/api/v1/utils/text/replace` | Replace every (or, with `all=false`, the first) occurrence of a literal or regex `pattern`, reporting `replacements`, `changed` and code-point `length` |
 | `POST` | `/api/v1/utils/jobs/hash` | Submit a bounded async batch-hash job; `202` with a job id, idempotent via `idempotencyKey` |
@@ -912,7 +913,48 @@ curl -X POST http://localhost:8080/api/v1/utils/json/patch \
 }
 ```
 
-#### E. Circuit breaker & probe lease recovery
+#### E. Declarative Merge Patch (RFC 7396)
+
+`POST /api/v1/utils/json/merge-patch` applies a *merge-patch document* instead of an ordered operation list:
+a `null` member removes that key, objects merge recursively, and arrays/scalars replace the target value
+wholesale. A non-object patch (`7`, `[1,2]`, `"x"`, `null`) replaces the whole target. The journalled operation
+is `json/merge-patch` (`JSON_MERGE_PATCH`), so the call appears in the audit journal and replays like the other
+JSON utilities.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/json/merge-patch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "json": "{\"a\":1,\"b\":{\"c\":2,\"d\":3}}",
+    "patch": "{\"b\":{\"c\":null,\"e\":4},\"f\":[1,2]}"
+  }'
+```
+
+**Response (200):**
+
+```json
+{
+  "success": true,
+  "message": "JSON merge patch applied successfully",
+  "data": {
+    "resultJson": { "a": 1, "b": { "d": 3, "e": 4 }, "f": [1, 2] },
+    "sizeBytes": 35,
+    "changed": true,
+    "removedKeys": 1
+  },
+  "timestamp": "2026-10-30T16:50:39.127057574Z"
+}
+```
+
+`removedKeys` counts the members deleted by a `null` in the patch, `sizeBytes` is the UTF-8 byte length of the
+compact `resultJson`, and `changed` is `false` when the patch leaves the document byte-identical. Both inputs are
+parsed and never mutated, so the same request is replay-stable.
+
+**Errors:** malformed `json` or `patch` returns **HTTP 400** `BAD_REQUEST` (`Invalid JSON content ...`); blank
+fields return **HTTP 400** `VALIDATION_ERROR`; a patch nested deeper than 64 object levels is rejected with
+**HTTP 400** instead of overflowing the stack.
+
+#### F. Circuit breaker & probe lease recovery
 
 The JSONPath query path runs behind a single `CLOSED` / `OPEN` / `HALF_OPEN` circuit breaker, exposed
 read-only by `GET /api/v1/utils/resilience` and driven by hand with `POST /api/v1/utils/resilience/probe`.
@@ -958,9 +1000,9 @@ ignored — and the next admitted caller claims a fresh generation. The schedule
 
 ## 🧾 Operation Journal & Replay Verification
 
-All fourteen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+All fifteen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
 `datetime/shift`, `crypto/hash`, `crypto/base64`, `crypto/url`, `crypto/uuid`, `json/format`, `json/validate`,
-`json/query`, `text/transform`, `text/stats`, `text/replace` — are recorded in a **bounded in-memory journal** so a failed
+`json/query`, `json/merge-patch`, `text/transform`, `text/stats`, `text/replace` — are recorded in a **bounded in-memory journal** so a failed
 hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
 can be verified against the original outcome without ever mutating the original entry.
 `GET /api/v1/utils/datetime/timezones` is read-only catalogue metadata and is not journalled.
@@ -1183,6 +1225,7 @@ punctuation and whitespace are separators. With tokenizer output `w1..wn`:
 | `SNAKE` | tokens lower-cased; joined with `_` | `hello_world` |
 | `KEBAB` | tokens lower-cased; joined with `-` | `hello-world` |
 | `SLUG` | tokens lower-cased, NFD-normalised with combining marks stripped, emptied tokens dropped; joined with `-` | `hello-world` |
+| `SENTENCE_CASE` | first letter of each `[.!?]`-delimited sentence upper-cased, remaining letters lower-cased, all other characters copied through in place | `Hello world. Bye.` |
 
 `operation` is case-insensitive on input and echoed back upper-case. Unknown operations answer
 `400 BAD_REQUEST` and list the allowed values; blank `text` answers `400 VALIDATION_ERROR`.
@@ -1532,6 +1575,7 @@ duplicate submission with the same key observes the `CANCELLED` snapshot until t
 | Cancelling a job that is `RUNNING`, `COMPLETED` or `FAILED` | `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Stop cancelling; poll `GET` for the terminal snapshot. A repeat `DELETE` on an already-`CANCELLED` job is `200`, not a conflict |
 | Retrying a `QUEUED`, `RUNNING`, `COMPLETED` or `CANCELLED` job, or a `FAILED` job at `maxAttempts` | `409 CONFLICT` | `JOB_RETRY_CONFLICT` | Only a `FAILED` job below `maxAttempts` can be retried. The job snapshot is unchanged by the rejection; resubmit if the attempt budget is spent |
 | Retry rejected because the bounded queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry `POST …/retry` again once capacity frees: the previous `FAILED` snapshot and its `attempt` are restored, so nothing is consumed |
+| The client already holds `utiltools.jobs.max-active-jobs-per-client` non-terminal jobs | `429 TOO_MANY_REQUESTS` | `JOB_QUOTA_EXCEEDED` | Retry once one of your **own** jobs finishes — the quota is per client identity, so other callers are unaffected. `details.limit` is the ceiling and `details.activeJobs` is your current count. Nothing is registered on a rejected submission (no job row, no `idempotencyKey` mapping, no consumed slot), and a rejected `POST …/retry` restores the previous `FAILED` snapshot with its `attempt` unchanged. A resubmission that repeats the same `idempotencyKey` **and** payload is a duplicate, not a new job: it returns the existing snapshot instead of a quota error |
 | Same `idempotencyKey` reused with a different `algorithm`, `items` or `secretKey` | `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | The first job is untouched and keeps running; the conflicting submission is discarded before registration (no job, no execution, no key residue). Pick a new `idempotencyKey` for a genuinely new payload |
 | Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit with a **new** `idempotencyKey` (or none). `POST …/retry` would re-run the same rejected algorithm and fail again; reusing the failed job's key replays its cached `FAILED` snapshot instead of re-executing |
 | Blank/empty `items` | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Send a non-empty list of non-blank strings (max 1000) |
@@ -1545,6 +1589,7 @@ utiltools.jobs.queue-capacity=100
 utiltools.jobs.retention-seconds=300
 utiltools.jobs.cleanup-interval-ms=60000
 utiltools.jobs.max-attempts=3
+utiltools.jobs.max-active-jobs-per-client=20
 ```
 
 | Property | Default | Meaning |
@@ -1554,6 +1599,7 @@ utiltools.jobs.max-attempts=3
 | `utiltools.jobs.retention-seconds` | `300` | How long a `COMPLETED`/`FAILED`/`CANCELLED` job (plus its idempotency key) is kept before eviction |
 | `utiltools.jobs.cleanup-interval-ms` | `60000` | Interval of the scheduled eviction pass (`@EnableScheduling`); `QUEUED`/`RUNNING` jobs are never evicted, and `CANCELLED` jobs are evicted on the same retention cutoff as `COMPLETED`/`FAILED` |
 | `utiltools.jobs.max-attempts` | `3` | Ceiling on execution attempts per job, where the first submission is attempt `1`; a `FAILED` job at this count answers `409 JOB_RETRY_CONFLICT`. Values below `1` are clamped to `1`. Global — it is not settable per request |
+| `utiltools.jobs.max-active-jobs-per-client` | `20` | Ceiling on one client's concurrent **non-terminal** jobs (`QUEUED` or `RUNNING`), keyed by the same identity the rate limiter resolves (see [G](#g-rate-limiting-interaction-explicit-decision)); one more submission answers `429 JOB_QUOTA_EXCEEDED` with `limit` and `activeJobs` in `details`. A slot is released as each job reaches `COMPLETED`, `FAILED` or `CANCELLED`. Values below `1` fail startup. Set it at or above `worker-count + queue-capacity` to restore pre-quota (unbounded per client) admission |
 
 #### G. Rate limiting interaction (explicit decision)
 
@@ -1568,9 +1614,12 @@ route either. Consequences:
 - A caller that submits a batch and then polls aggressively can exhaust its own budget and receive
   `429 RATE_LIMITED` (error `RATE_LIMITED`) *before* the job finishes. This is a client-throttling
   response, not a job failure: the job keeps running and is still retrievable once `Retry-After` elapses.
-- The two `429` classes are distinguishable by the `error` field: `RATE_LIMITED` (too many calls —
+- The three `429` classes are distinguishable by the `error` field: `RATE_LIMITED` (too many calls —
   honour `Retry-After`) vs `QUEUE_FULL` (executor saturated — retry the **same** `idempotencyKey`, or repeat the
-  same `POST …/retry`, since a rejected requeue leaves the job `FAILED` with its attempt count intact).
+  same `POST …/retry`, since a rejected requeue leaves the job `FAILED` with its attempt count intact) vs
+  `JOB_QUOTA_EXCEEDED` (you already hold `utiltools.jobs.max-active-jobs-per-client` non-terminal jobs — wait for
+  one of yours to reach `COMPLETED`, `FAILED` or `CANCELLED`; the exhausted gauge is in `details.limit` /
+  `details.activeJobs` and no job is registered by the rejected call).
 - Recommended polling: a batch completes in milliseconds to a few seconds on the default
   `worker-count=2`, so a small number of polls is enough — **poll no faster than the default rate-limit
   budget** of `utiltools.ratelimit.requests-per-window=60` per `utiltools.ratelimit.window-ms=60000`
@@ -1744,6 +1793,7 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | Batch job idempotency key reused with a different request payload |
 | `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Cancellation attempted on a batch job that is `RUNNING`, `COMPLETED` or `FAILED` |
 | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Batch job queue is saturated; retry after capacity frees |
+| `429 TOO_MANY_REQUESTS` | `JOB_QUOTA_EXCEEDED` | Client holds `utiltools.jobs.max-active-jobs-per-client` non-terminal batch jobs; `details` carries `limit` and `activeJobs` |
 | `429 TOO_MANY_REQUESTS` | `RATE_LIMITED` | Request budget for `/api/v1/utils/*` exhausted (see [Rate Limiting](#-rate-limiting)) |
 | `500 INTERNAL_SERVER_ERROR` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |
 
@@ -1813,8 +1863,8 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `crypto/url` encode/decode, 400 `BAD_REQUEST` vs `VALIDATION_ERROR`, and `CRYPTO_URL` journal/replay (`VERIFIED`), including `version=V4|V7` selection, compact UUIDv7, and the 400 unified envelope for an unknown `version`.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries, six-op patch success, rollback to byte-identical original, missing paths, malformed pointers, `-` append, dry runs, input-not-mutated.
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, and empty-`operations` validation rejection.
-- **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`), diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points; plus replace coverage: `$n` group expansion, literal metacharacters, `all=false` first-match-only, case-insensitive matching, no-match results, invalid-regex rejection, code-point `length`, every request constraint bound, and the 1000000-character result bound.
-- **`TextControllerTest`**: Text endpoints MockMvc suite, including the snake-case transform envelope, diacritic slugging, `400 BAD_REQUEST` for an unknown operation, `400 VALIDATION_ERROR` for blank text, and a `TEXT_TRANSFORM` entry listed by `/audit/entries` and replayed as `VERIFIED`; a replace envelope with `$n` groups, `400 BAD_REQUEST` for an invalid regex (journalled `TEXT_REPLACE`/`FAILED`), `400 VALIDATION_ERROR` for blank text, an absent `replacement` and an oversized `pattern`, and a `TEXT_REPLACE` entry listed by `/audit/entries` and replayed as `VERIFIED`.
+- **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`), sentence-case idempotence and `[.!?]`-run boundaries, diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points; plus replace coverage: `$n` group expansion, literal metacharacters, `all=false` first-match-only, case-insensitive matching, no-match results, invalid-regex rejection, code-point `length`, every request constraint bound, and the 1000000-character result bound.
+- **`TextControllerTest`**: Text endpoints MockMvc suite, including the snake-case and sentence-case transform envelopes, diacritic slugging, `400 BAD_REQUEST` for an unknown operation, `400 VALIDATION_ERROR` for blank text, and a `TEXT_TRANSFORM` entry listed by `/audit/entries` and replayed as `VERIFIED`; a replace envelope with `$n` groups, `400 BAD_REQUEST` for an invalid regex (journalled `TEXT_REPLACE`/`FAILED`), `400 VALIDATION_ERROR` for blank text, an absent `replacement` and an oversized `pattern`, and a `TEXT_REPLACE` entry listed by `/audit/entries` and replayed as `VERIFIED`.
 - **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, key/payload fingerprint conflict detection (changed items, reordered items, changed algorithm or `secretKey`), 8-thread different-payload races, identical-key/identical-payload retries that mint no second execution, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff. Retry coverage: transient failure then a successful retry (`attempt` 2, attempt-1 `FAILED` entry retained), `RUNNING`/`COMPLETED`/`CANCELLED` conflicts that leave the snapshot unchanged, attempt exhaustion at `maxAttempts`, stale-worker fencing (a superseded generation writes nothing after a retry), and queue-rejection rollback that leaves the job `FAILED` with an unconsumed attempt while a later retry succeeds.
 - **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202 submit/retry, 400, 404 `JOB_NOT_FOUND`, 409 `IDEMPOTENCY_CONFLICT`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND`, 409 `JOB_CANCELLATION_CONFLICT`, and `POST …/retry` 202 `QUEUED` vs 409 `JOB_RETRY_CONFLICT` with `jobId`/`status`/`attempt`/`maxAttempts` details).
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.

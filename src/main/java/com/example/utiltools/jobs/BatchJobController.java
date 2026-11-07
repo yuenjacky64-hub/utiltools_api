@@ -1,9 +1,13 @@
 package com.example.utiltools.jobs;
 
 import com.example.utiltools.common.ApiResponse;
+import com.example.utiltools.ratelimit.ClientKeyResolver;
+import com.example.utiltools.ratelimit.RateLimitProperties;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -23,17 +27,35 @@ import java.util.List;
 public class BatchJobController {
 
     private final BatchHashJobService jobService;
+    private final RateLimitProperties rateLimitProperties;
 
-    public BatchJobController(BatchHashJobService jobService) {
+    @Autowired
+    public BatchJobController(BatchHashJobService jobService, RateLimitProperties rateLimitProperties) {
         this.jobService = jobService;
+        this.rateLimitProperties = rateLimitProperties;
+    }
+
+    /**
+     * Compatibility constructor for callers that inject no rate-limit configuration: the quota key
+     * is resolved against {@link RateLimitProperties}'s defaults (client remote address, with an
+     * untrusted {@code X-Forwarded-For}), i.e. exactly the identity the rate limiter would use under
+     * that configuration. Only {@code BatchHashJobService.submit(request)} without a caller identity
+     * falls back to {@link ClientKeyResolver}'s documented {@code unknown} key.
+     */
+    public BatchJobController(BatchHashJobService jobService) {
+        this(jobService, new RateLimitProperties(true, 60, 60000, 30000, 10000, false));
     }
 
     @PostMapping("/hash")
     @Operation(summary = "Submit a batch hash job",
             description = "Accepts a batch and returns 202 with a job id; an optional idempotencyKey deduplicates submissions")
-    public ResponseEntity<ApiResponse<BatchHashJobResponse>> submit(@Valid @RequestBody BatchHashRequest request) {
+    public ResponseEntity<ApiResponse<BatchHashJobResponse>> submit(@Valid @RequestBody BatchHashRequest request,
+            HttpServletRequest httpServletRequest) {
+        // The per-client admission quota is charged to the identity the rate limiter resolves, so a
+        // caller can never be throttled under one identity and quota-charged under another.
+        String clientKey = ClientKeyResolver.resolve(httpServletRequest, rateLimitProperties);
         return ResponseEntity.status(HttpStatus.ACCEPTED)
-                .body(ApiResponse.success(jobService.submit(request), "Batch hash job accepted"));
+                .body(ApiResponse.success(jobService.submit(request, clientKey), "Batch hash job accepted"));
     }
 
     @GetMapping

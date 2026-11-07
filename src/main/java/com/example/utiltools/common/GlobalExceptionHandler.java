@@ -5,6 +5,7 @@ import com.example.utiltools.jobs.IdempotencyConflictException;
 import com.example.utiltools.jobs.JobCancellationConflictException;
 import com.example.utiltools.jobs.JobNotFoundException;
 import com.example.utiltools.jobs.JobQueueFullException;
+import com.example.utiltools.jobs.JobQuotaExceededException;
 import com.example.utiltools.jobs.JobRetryConflictException;
 import com.example.utiltools.resilience.CircuitBreakerOpenException;
 import org.springframework.http.HttpStatus;
@@ -86,6 +87,17 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleJobNotFound(JobNotFoundException ex) {
         ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "JOB_NOT_FOUND", null);
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
+    }
+
+    @ExceptionHandler(JobQuotaExceededException.class)
+    public ResponseEntity<ApiResponse<Void>> handleJobQuotaExceeded(JobQuotaExceededException ex) {
+        // Bounded integers only: no client key and no job id, so a 429 cannot reveal another
+        // client's activity.
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("limit", ex.limit());
+        details.put("activeJobs", ex.activeJobs());
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "JOB_QUOTA_EXCEEDED", details);
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(response);
     }
 
     @ExceptionHandler(IdempotencyConflictException.class)

@@ -1,25 +1,38 @@
 package com.example.utiltools.jobs;
 
 import com.example.utiltools.common.GlobalExceptionHandler;
+import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
+import com.example.utiltools.ratelimit.ClientKeyResolver;
+import com.example.utiltools.ratelimit.RateLimitProperties;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.scheduling.TaskScheduler;
+import org.springframework.scheduling.Trigger;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.Clock;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Delayed;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
@@ -30,7 +43,13 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+// The application class carries @EnableScheduling; in this slice the startup sweep of the
+// @Scheduled evictExpiredJobs()/reapExpiredExecutions() would run on a background thread and could
+// land between doReturn(...).when(spy) and the request, hijacking the recorded stubbing
+// (Mockito CannotStubVoidMethodWithReturnValue) and letting the real getJob answer 404.
+// A scheduler bean that never runs a task keeps this slice deterministic.
 @WebMvcTest(BatchJobController.class)
+@EnableConfigurationProperties(RateLimitProperties.class)
 @Import({BatchHashJobService.class, CryptoService.class, GlobalExceptionHandler.class,
         BatchJobControllerTest.ClockConfig.class})
 class BatchJobControllerTest {
@@ -41,6 +60,88 @@ class BatchJobControllerTest {
 
         @Bean
         Clock clock() {
+            return Clock.systemUTC();
+        }
+
+        /** Accepts every scheduled registration and never executes it (see class comment). */
+        @Bean
+        TaskScheduler noOpTaskScheduler() {
+            return new NoOpTaskScheduler();
+        }
+    }
+
+    static final class NoOpTaskScheduler implements TaskScheduler {
+
+        private static final ScheduledFuture<?> NEVER = new ScheduledFuture<>() {
+            @Override
+            public long getDelay(TimeUnit unit) {
+                return Long.MAX_VALUE;
+            }
+
+            @Override
+            public int compareTo(Delayed other) {
+                return 0;
+            }
+
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning) {
+                return true;
+            }
+
+            @Override
+            public boolean isCancelled() {
+                return false;
+            }
+
+            @Override
+            public boolean isDone() {
+                return false;
+            }
+
+            @Override
+            public Object get() {
+                throw new UnsupportedOperationException("no-op scheduler");
+            }
+
+            @Override
+            public Object get(long timeout, TimeUnit unit) {
+                throw new UnsupportedOperationException("no-op scheduler");
+            }
+        };
+
+        @Override
+        public ScheduledFuture<?> schedule(Runnable task, Trigger trigger) {
+            return NEVER;
+        }
+
+        @Override
+        public ScheduledFuture<?> schedule(Runnable task, Instant startTime) {
+            return NEVER;
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleAtFixedRate(Runnable task, Instant startTime, Duration period) {
+            return NEVER;
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleAtFixedRate(Runnable task, Duration period) {
+            return NEVER;
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleWithFixedDelay(Runnable task, Instant startTime, Duration delay) {
+            return NEVER;
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleWithFixedDelay(Runnable task, Duration delay) {
+            return NEVER;
+        }
+
+        @Override
+        @SuppressWarnings("deprecation")
+        public Clock getClock() {
             return Clock.systemUTC();
         }
     }
@@ -104,7 +205,7 @@ class BatchJobControllerTest {
     @DisplayName("POST /api/v1/utils/jobs/hash - should map a full queue to 429 QUEUE_FULL")
     void shouldReturn429WhenQueueFull() throws Exception {
         doThrow(new JobQueueFullException("Hash job queue is full (worker-count=2, queue-capacity=100); retry after capacity frees"))
-                .when(jobService).submit(any(BatchHashRequest.class));
+                .when(jobService).submit(any(BatchHashRequest.class), anyString());
 
         String body = """
                 {
@@ -296,6 +397,28 @@ class BatchJobControllerTest {
     }
 
     @Test
+    @DisplayName("GET /api/v1/utils/jobs/{jobId} - attempt history serializes without a journal bean (auditEntryId omitted)")
+    void shouldReturnAttemptHistoryWithoutJournalBean() throws Exception {
+        Instant createdAt = Instant.parse("2026-11-06T10:00:00Z");
+        Instant completedAt = Instant.parse("2026-11-06T10:00:01Z");
+        BatchHashJobResponse completed = new BatchHashJobResponse("job-completed-1", "controller-history-key",
+                JobStatus.COMPLETED, 1, List.of(new HashResponse("SHA-256", "abc123", false)), null,
+                createdAt, createdAt, completedAt, 1, 3,
+                List.of(new JobAttempt(1, JobStatus.COMPLETED, createdAt, completedAt, null)));
+        doReturn(completed).when(jobService).getJob("job-completed-1");
+
+        // The slice wires BatchHashJobService without an AuditJournalService bean, so
+        // attemptHistory entries carry a null auditEntryId and Jackson omits the field.
+        mockMvc.perform(get("/api/v1/utils/jobs/job-completed-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("COMPLETED"))
+                .andExpect(jsonPath("$.data.results[0].digest").value("abc123"))
+                .andExpect(jsonPath("$.data.attempts[0].attempt").value(1))
+                .andExpect(jsonPath("$.data.attempts[0].status").value("COMPLETED"))
+                .andExpect(jsonPath("$.data.attempts[0].auditEntryId").doesNotExist());
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/jobs/{jobId}/retry - the three retry failure modes answer 409, 429 and 404 in one run")
     void shouldReturn409Then429Then404ForRetryFailuresInOneRun() throws Exception {
         doThrow(new JobRetryConflictException("job-completed-1", JobStatus.COMPLETED, 3, 3))
@@ -382,5 +505,96 @@ class BatchJobControllerTest {
                 .andExpect(status().isTooManyRequests())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("QUEUE_FULL"));
+    }
+    /**
+     * DOD-13 / REQ-04: the quota refusal surfaces as 429 JOB_QUOTA_EXCEEDED with bounded
+     * {@code limit}/{@code activeJobs} details and no client identity.
+     */
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/hash - should map an exhausted quota to 429 JOB_QUOTA_EXCEEDED")
+    void shouldReturn429WhenQuotaExceeded() throws Exception {
+        doThrow(new JobQuotaExceededException(20, 20))
+                .when(jobService).submit(any(BatchHashRequest.class), anyString());
+
+        String body = """
+                {
+                    "algorithm": "SHA-256",
+                    "items": ["alpha"]
+                }
+                """;
+
+        MvcResult result = mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .with(request -> {
+                            request.setRemoteAddr("203.0.113.70");
+                            return request;
+                        })
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("JOB_QUOTA_EXCEEDED"))
+                .andExpect(jsonPath("$.details.limit").value(20))
+                .andExpect(jsonPath("$.details.activeJobs").value(20))
+                .andExpect(jsonPath("$.message")
+                        .value(org.hamcrest.Matchers.containsString("activeJobs=20")))
+                .andReturn();
+
+        assertThat(result.getResponse().getContentAsString()).doesNotContain("203.0.113.70");
+    }
+
+    /** DOD-13 / REQ-06: an exhausted quota on the retry endpoint is also 429 JOB_QUOTA_EXCEEDED. */
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/retry - should map an exhausted quota to 429")
+    void shouldReturn429WhenRetryQuotaExceeded() throws Exception {
+        doThrow(new JobQuotaExceededException(3, 3)).when(jobService).retry("job-failed");
+
+        mockMvc.perform(post("/api/v1/utils/jobs/job-failed/retry"))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("JOB_QUOTA_EXCEEDED"))
+                .andExpect(jsonPath("$.details.limit").value(3))
+                .andExpect(jsonPath("$.details.activeJobs").value(3));
+    }
+
+    /**
+     * DOD-13 / REQ-02: the quota key is the rate limiter's identity — the remote address, and not an
+     * untrusted {@code X-Forwarded-For} header while {@code trust-forwarded-header} is false.
+     */
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/hash - should charge quota to the resolved client key")
+    void shouldChargeQuotaToTheRateLimiterClientKey() throws Exception {
+        List<String> resolvedKeys = new ArrayList<>();
+        doAnswer(invocation -> {
+            resolvedKeys.add(invocation.getArgument(1));
+            return invocation.callRealMethod();
+        }).when(jobService).submit(any(BatchHashRequest.class), anyString());
+
+        String body = """
+                {
+                    "algorithm": "SHA-256",
+                    "items": ["alpha"]
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .with(request -> {
+                            request.setRemoteAddr("203.0.113.71");
+                            return request;
+                        })
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isAccepted());
+
+        mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .with(request -> {
+                            request.setRemoteAddr("198.51.100.6");
+                            return request;
+                        })
+                        .header(ClientKeyResolver.FORWARDED_HEADER, "203.0.113.99")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isAccepted());
+
+        assertThat(resolvedKeys).containsExactly("203.0.113.71", "198.51.100.6");
     }
 }
