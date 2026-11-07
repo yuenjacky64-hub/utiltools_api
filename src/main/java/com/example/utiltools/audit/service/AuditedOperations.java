@@ -26,6 +26,8 @@ import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.text.dto.TextReplaceRequest;
+import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
@@ -38,7 +40,7 @@ import java.util.Map;
 import java.util.function.Supplier;
 
 /**
- * Journalling facade over the ten existing utility operations.
+ * Journalling facade over the journalled utility operations.
  *
  * <p>Every journalled call begins a PENDING entry, invokes the underlying service once,
  * and records SUCCEEDED or FAILED before returning/rethrowing. The original exception is
@@ -128,6 +130,10 @@ public class AuditedOperations {
         return record(OperationType.TEXT_STATS, request, () -> textService.stats(request));
     }
 
+    public TextReplaceResponse replace(TextReplaceRequest request) {
+        return record(OperationType.TEXT_REPLACE, request, () -> textService.replace(request));
+    }
+
     /**
      * Re-runs a stored operation without journalling; the single entry point used by replay.
      */
@@ -147,6 +153,7 @@ public class AuditedOperations {
             case JSON_QUERY -> jsonService.query((JsonQueryRequest) request);
             case TEXT_TRANSFORM -> textService.transform((TextTransformRequest) request);
             case TEXT_STATS -> textService.stats((TextStatsRequest) request);
+            case TEXT_REPLACE -> textService.replace((TextReplaceRequest) request);
         };
     }
 

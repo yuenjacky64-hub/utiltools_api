@@ -2,6 +2,8 @@ package com.example.utiltools.text.controller;
 
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.ApiResponse;
+import com.example.utiltools.text.dto.TextReplaceRequest;
+import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
@@ -16,7 +18,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/v1/utils/text")
-@Tag(name = "Text Transformation & Statistics Utility", description = "Endpoints for deterministic case/format conversion and text statistics")
+@Tag(name = "Text Transformation & Statistics Utility", description = "Endpoints for deterministic case/format conversion, find-and-replace and text statistics")
 public class TextController {
 
     private final AuditedOperations auditedOperations;
@@ -33,6 +35,16 @@ public class TextController {
     public ApiResponse<TextTransformResponse> transform(@Valid @RequestBody TextTransformRequest request) {
         TextTransformResponse result = auditedOperations.transform(request);
         return ApiResponse.success(result, "Text transformed successfully");
+    }
+
+    @PostMapping("/replace")
+    @Operation(summary = "Replace text occurrences",
+            description = "Replaces every (or, with all=false, the first) occurrence of a literal or regular-expression pattern. "
+                    + "Literal mode quotes the pattern and the replacement; regex mode supports $n group references. "
+                    + "The response reports the result, the number of replacements, whether it changed and the code-point length. "
+                    + "Every call is journalled as TEXT_REPLACE and can be replayed.")
+    public ApiResponse<TextReplaceResponse> replace(@Valid @RequestBody TextReplaceRequest request) {
+        return ApiResponse.success(auditedOperations.replace(request), "Text replaced successfully");
     }
 
     @PostMapping("/stats")

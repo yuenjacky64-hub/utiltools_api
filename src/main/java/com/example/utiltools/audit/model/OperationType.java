@@ -15,7 +15,8 @@ public enum OperationType {
     JSON_VALIDATE(true),
     JSON_QUERY(true),
     TEXT_TRANSFORM(true),
-    TEXT_STATS(true);
+    TEXT_STATS(true),
+    TEXT_REPLACE(true);
 
     private final boolean deterministic;
 

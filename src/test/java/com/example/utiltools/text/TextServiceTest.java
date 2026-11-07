@@ -1,5 +1,7 @@
 package com.example.utiltools.text;
 
+import com.example.utiltools.text.dto.TextReplaceRequest;
+import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
@@ -134,5 +136,98 @@ class TextServiceTest {
         TextTransformResponse emoji = service.transform(new TextTransformRequest("😀 Hello", "SNAKE"));
         assertThat(emoji.result()).isEqualTo("hello");
         assertThat(emoji.length()).isEqualTo(5);
+    }
+
+    @Test
+    @DisplayName("regex mode expands $n group references for every match")
+    void shouldReplaceRegexWithGroupReferences() {
+        assertThat(service.replace(new TextReplaceRequest("a1 b2", "(\\w)(\\d)", "$2$1", null, null, null)))
+                .isEqualTo(new TextReplaceResponse("1a 2b", 2, true, 5));
+    }
+
+    @Test
+    @DisplayName("literal mode replaces regex metacharacters verbatim")
+    void shouldReplaceLiteralMetacharacters() {
+        assertThat(service.replace(new TextReplaceRequest("a.b", ".", "X", null, true, null)))
+                .isEqualTo(new TextReplaceResponse("aXb", 1, true, 3));
+    }
+
+    @Test
+    @DisplayName("all=false replaces only the first match")
+    void shouldReplaceFirstMatchOnlyWhenAllFalse() {
+        assertThat(service.replace(new TextReplaceRequest("aaa", "a", "b", false, null, null)))
+                .isEqualTo(new TextReplaceResponse("baa", 1, true, 3));
+    }
+
+    @Test
+    @DisplayName("caseInsensitive=true matches regardless of case")
+    void shouldReplaceCaseInsensitively() {
+        assertThat(service.replace(new TextReplaceRequest("Hello HELLO", "hello", "bye", null, null, true)))
+                .isEqualTo(new TextReplaceResponse("bye bye", 2, true, 7));
+    }
+
+    @Test
+    @DisplayName("a no-match request leaves the text unchanged")
+    void shouldReportNoMatchUnchanged() {
+        assertThat(service.replace(new TextReplaceRequest("xyz", "q", "b", null, null, null)))
+                .isEqualTo(new TextReplaceResponse("xyz", 0, false, 3));
+    }
+
+    @Test
+    @DisplayName("an invalid regex fails with a BAD_REQUEST-shaped message")
+    void shouldRejectInvalidRegex() {
+        assertThatThrownBy(() -> service.replace(new TextReplaceRequest("abc", "(", "x", null, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageStartingWith("Invalid regex pattern '('");
+    }
+
+    @Test
+    @DisplayName("length measures code points of the result")
+    void shouldMeasureCodePointLengthAfterReplace() {
+        assertThat(service.replace(new TextReplaceRequest("\uD83D\uDE00a\uD83D\uDE00", "\uD83D\uDE00", "", null, null, null)))
+                .isEqualTo(new TextReplaceResponse("a", 2, true, 1));
+    }
+
+    @Test
+    @DisplayName("TextReplaceRequest constraint violations fire on every bound")
+    void shouldValidateReplaceRequest() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+
+            assertThat(validator.validate(new TextReplaceRequest("   ", "a", "b", null, null, null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("text is required");
+
+            assertThat(validator.validate(new TextReplaceRequest("abc", " ", "b", null, null, null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("pattern is required");
+
+            assertThat(validator.validate(new TextReplaceRequest("abc", "a", null, null, null, null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("replacement is required");
+
+            assertThat(validator.validate(new TextReplaceRequest("a".repeat(100001), "a", "b", null, null, null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("text must be at most 100000 characters");
+
+            assertThat(validator.validate(new TextReplaceRequest("abc", "a".repeat(513), "b", null, null, null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("pattern must be at most 512 characters");
+
+            assertThat(validator.validate(new TextReplaceRequest("abc", "a", "b".repeat(100001), null, null, null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("replacement must be at most 100000 characters");
+
+            assertThat(validator.validate(new TextReplaceRequest("abc", "a", "b", null, null, null))).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("an oversized replacement result is rejected before it is materialised")
+    void shouldRejectOversizedReplacementResult() {
+        assertThatThrownBy(() -> service.replace(
+                new TextReplaceRequest("a".repeat(2000), "a", "b".repeat(2000), null, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("replacement result exceeds 1000000 characters");
     }
 }

@@ -1,5 +1,7 @@
 package com.example.utiltools.text.service;
 
+import com.example.utiltools.text.dto.TextReplaceRequest;
+import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
@@ -10,10 +12,12 @@ import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 /**
- * Deterministic text transformation and statistics.
+ * Deterministic text transformation, find-and-replace and statistics.
  *
  * <p>Every operation is a pure function of the request body: only {@link Locale#ROOT} case
  * mapping is used and no clock, locale or random source is read, so a journalled result always
@@ -26,6 +30,8 @@ public class TextService {
     private static final String ALLOWED_OPERATIONS = "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG";
 
     private static final Pattern SENTENCE_SEPARATORS = Pattern.compile("[.!?]+");
+
+    private static final int MAX_RESULT_CHARS = 1_000_000;
 
     private static final String UPPER = "UPPER";
     private static final String LOWER = "LOWER";
@@ -52,6 +58,47 @@ public class TextService {
         boolean changed = !result.equals(text);
         int length = result.codePointCount(0, result.length());
         return new TextTransformResponse(operation, result, changed, length);
+    }
+
+    public TextReplaceResponse replace(TextReplaceRequest request) {
+        String text = request.text();
+        boolean all = request.all() == null || request.all();
+        boolean literal = Boolean.TRUE.equals(request.literal());
+        boolean caseInsensitive = Boolean.TRUE.equals(request.caseInsensitive());
+        String source = literal ? Pattern.quote(request.pattern()) : request.pattern();
+        Pattern compiled;
+        try {
+            compiled = Pattern.compile(source, caseInsensitive ? Pattern.CASE_INSENSITIVE : 0);
+        } catch (PatternSyntaxException e) {
+            throw new IllegalArgumentException("Invalid regex pattern '" + request.pattern()
+                    + "': " + e.getDescription());
+        }
+        Matcher counter = compiled.matcher(text);
+        int matches = 0;
+        while (counter.find()) {
+            matches++;
+        }
+        int replacements = all ? matches : Math.min(matches, 1);
+        String replacement = literal
+                ? Matcher.quoteReplacement(request.replacement())
+                : request.replacement();
+        if ((long) text.length() + (long) matches * request.replacement().length() > MAX_RESULT_CHARS) {
+            throw new IllegalArgumentException("replacement result exceeds " + MAX_RESULT_CHARS + " characters");
+        }
+        String result;
+        try {
+            result = all
+                    ? compiled.matcher(text).replaceAll(replacement)
+                    : compiled.matcher(text).replaceFirst(replacement);
+        } catch (IndexOutOfBoundsException | IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid replacement '" + request.replacement()
+                    + "' for pattern '" + request.pattern() + "': " + e.getMessage());
+        }
+        if (result.length() > MAX_RESULT_CHARS) {
+            throw new IllegalArgumentException("replacement result exceeds " + MAX_RESULT_CHARS + " characters");
+        }
+        return new TextReplaceResponse(result, replacements, !result.equals(text),
+                result.codePointCount(0, result.length()));
     }
 
     public TextStatsResponse stats(TextStatsRequest request) {
