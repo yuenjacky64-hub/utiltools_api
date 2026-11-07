@@ -659,4 +659,104 @@ class BatchJobControllerTest {
 
         assertThat(resolvedKeys).containsExactly("203.0.113.71", "198.51.100.6");
     }
+
+    /** DOD-02 / REQ-01, REQ-03, REQ-04: a running job renews its lease with no request body. */
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/heartbeat - should return 200 with the renewed snapshot")
+    void shouldReturn200WhenHeartbeatRenewsLease() throws Exception {
+        Instant createdAt = Instant.parse("2026-11-06T10:00:00Z");
+        Instant renewedLease = Instant.parse("2026-11-06T10:01:00Z");
+        BatchHashJobResponse renewed = new BatchHashJobResponse("job-running-1", "controller-heartbeat-key",
+                JobStatus.RUNNING, 2, null, null, createdAt, createdAt, null, 1, 3,
+                List.of(new JobAttempt(1, JobStatus.RUNNING, createdAt, null, null)),
+                renewedLease, createdAt.plusSeconds(30));
+        doReturn(renewed).when(jobService).heartbeat("job-running-1");
+
+        // No content type and no body: the endpoint takes only the path variable (REQ-01).
+        mockMvc.perform(post("/api/v1/utils/jobs/job-running-1/heartbeat"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Execution lease renewed"))
+                .andExpect(jsonPath("$.data.jobId").value("job-running-1"))
+                .andExpect(jsonPath("$.data.status").value("RUNNING"))
+                .andExpect(jsonPath("$.data.attempt").value(1))
+                .andExpect(jsonPath("$.data.executionLeaseExpiresAt").value("2026-11-06T10:01:00Z"))
+                .andExpect(jsonPath("$.data.lastHeartbeatAt").value("2026-11-06T10:00:30Z"))
+                .andExpect(jsonPath("$.data.completedAt").doesNotExist())
+                .andExpect(jsonPath("$.data.results").doesNotExist());
+
+        verify(jobService).heartbeat("job-running-1");
+    }
+
+    /** DOD-02 / REQ-02: an unknown job id is 404 JOB_NOT_FOUND (real service, no stubbing). */
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/heartbeat - should return 404 JOB_NOT_FOUND for an unknown job id")
+    void shouldReturn404WhenHeartbeatOnUnknownJob() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/jobs/does-not-exist/heartbeat"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("JOB_NOT_FOUND"))
+                .andExpect(jsonPath("$.message", org.hamcrest.Matchers.containsString("does-not-exist")));
+    }
+
+    /** DOD-02 / REQ-02: a non-RUNNING job is 409 JOB_RETRY_CONFLICT. */
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/heartbeat - should map a non-RUNNING job to 409 JOB_RETRY_CONFLICT")
+    void shouldReturn409WhenHeartbeatOnNonRunningJob() throws Exception {
+        doThrow(new JobRetryConflictException("job-completed-1", JobStatus.COMPLETED, 1, 3))
+                .when(jobService).heartbeat("job-completed-1");
+
+        mockMvc.perform(post("/api/v1/utils/jobs/job-completed-1/heartbeat"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("JOB_RETRY_CONFLICT"))
+                .andExpect(jsonPath("$.details.jobId").value("job-completed-1"))
+                .andExpect(jsonPath("$.details.status").value("COMPLETED"));
+    }
+
+    /** DOD-02 / REQ-02: an already-expired lease is 400 BAD_REQUEST, not a silent renewal. */
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/heartbeat - should map an expired lease to 400 BAD_REQUEST")
+    void shouldReturn400WhenHeartbeatLeaseExpired() throws Exception {
+        doThrow(new IllegalArgumentException(
+                "Execution lease for job job-running-1 expired at 2026-11-06T10:00:10Z; the reaper owns it now"))
+                .when(jobService).heartbeat("job-running-1");
+
+        mockMvc.perform(post("/api/v1/utils/jobs/job-running-1/heartbeat"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message",
+                        org.hamcrest.Matchers.containsString("expired at 2026-11-06T10:00:10Z")));
+    }
+
+    /** DOD-02: the four heartbeat outcomes answer 200 / 404 / 409 / 400 on one route snapshot. */
+    @Test
+    @DisplayName("POST /api/v1/utils/jobs/{jobId}/heartbeat - 200, 404, 409 and 400 answer in one run")
+    void shouldReturn200Then404Then409Then400ForHeartbeats() throws Exception {
+        Instant createdAt = Instant.parse("2026-11-06T10:00:00Z");
+        doReturn(new BatchHashJobResponse("job-running-2", null, JobStatus.RUNNING, 1, null, null,
+                createdAt, createdAt, null, 1, 3,
+                List.of(new JobAttempt(1, JobStatus.RUNNING, createdAt, null, null)),
+                createdAt.plusSeconds(60), createdAt.plusSeconds(20)))
+                .when(jobService).heartbeat("job-running-2");
+        doThrow(new JobRetryConflictException("job-queued-2", JobStatus.QUEUED, 1, 3))
+                .when(jobService).heartbeat("job-queued-2");
+        doThrow(new IllegalArgumentException("Execution lease for job job-running-3 expired at 2026-11-06T10:00:05Z"))
+                .when(jobService).heartbeat("job-running-3");
+
+        mockMvc.perform(post("/api/v1/utils/jobs/job-running-2/heartbeat"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("RUNNING"));
+        mockMvc.perform(post("/api/v1/utils/jobs/never-submitted/heartbeat"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error").value("JOB_NOT_FOUND"));
+        mockMvc.perform(post("/api/v1/utils/jobs/job-queued-2/heartbeat"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("JOB_RETRY_CONFLICT"))
+                .andExpect(jsonPath("$.details.status").value("QUEUED"));
+        mockMvc.perform(post("/api/v1/utils/jobs/job-running-3/heartbeat"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+    }
 }

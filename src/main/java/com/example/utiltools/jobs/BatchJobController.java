@@ -102,4 +102,14 @@ public class BatchJobController {
         return ResponseEntity.status(HttpStatus.ACCEPTED)
                 .body(ApiResponse.success(jobService.retry(jobId), "Job retried"));
     }
+
+    @PostMapping("/{jobId}/heartbeat")
+    @Operation(summary = "Renew a running job's execution lease",
+            description = "Extends executionLeaseExpiresAt by utiltools.jobs.execution-lease-seconds and stamps "
+                    + "lastHeartbeatAt; 404 JOB_NOT_FOUND for an unknown or evicted id, 409 JOB_RETRY_CONFLICT "
+                    + "unless the job is RUNNING, 400 BAD_REQUEST once the lease has already expired (the reaper "
+                    + "then fails the attempt and POST /api/v1/utils/jobs/{jobId}/retry starts attempt+1)")
+    public ApiResponse<BatchHashJobResponse> heartbeat(@PathVariable String jobId) {
+        return ApiResponse.success(jobService.heartbeat(jobId), "Execution lease renewed");
+    }
 }
