@@ -1190,7 +1190,7 @@ curl -X POST http://localhost:8080/api/v1/utils/text/replace \
 | `replacement` | string | yes | — | Replacement text, at most 100000 characters |
 | `all` | boolean | no | `true` | `true` replaces every match, `false` replaces only the first |
 | `literal` | boolean | no | `false` | `true` treats `pattern` and `replacement` verbatim, `false` treats `pattern` as a regex |
-| `caseInsensitive` | boolean | no | `false` | `true` matches regardless of case (ASCII/Unicode case folding via `CASE_INSENSITIVE`) |
+| `caseInsensitive` | boolean | no | `false` | `true` matches regardless of case, folding **ASCII letters only** (`Pattern.CASE_INSENSITIVE` without `UNICODE_CASE`) |
 
 | Response field | Definition |
 | :--- | :--- |
@@ -1211,14 +1211,21 @@ curl -X POST http://localhost:8080/api/v1/utils/text/replace \
 * `all=false` replaces only the first match: `{"text": "aaa", "pattern": "a", "replacement": "b", "all": false}`
   returns `"baa"` with `replacements: 1`.
 * `caseInsensitive=true`: `{"text": "Hello HELLO", "pattern": "hello", "replacement": "bye", "caseInsensitive": true}`
-  returns `"bye bye"` with `replacements: 2`.
+  returns `"bye bye"` with `replacements: 2`. Folding is ASCII-only — the pattern is compiled with
+  `Pattern.CASE_INSENSITIVE` and no `UNICODE_CASE`, so `É`/`é` do **not** match each other; spell both cases
+  in the pattern (e.g. `[Éé]`) when you need non-ASCII folding.
 
 **Errors and bounds.** Blank `text`/`pattern`, an absent `replacement` or an over-limit `text`/`pattern`/
 `replacement` answer `400 VALIDATION_ERROR` with the offending constraint messages. An invalid regex (or an
 out-of-range `$n` group reference) answers `400 BAD_REQUEST` with `Invalid regex pattern '<pattern>'`. Because a
 100000-character text with 100000 one-character matches and a 100000-character replacement would allocate 10^10
-characters, the result is bounded to **1000000 characters**; a request that would exceed it answers
-`400 BAD_REQUEST` with `replacement result exceeds 1000000 characters` instead of allocating. There is no regex
+characters, the result is bounded to **1000000 characters**. The bound is enforced *before* the result is
+materialised: `replace` accumulates the output match by match with `Matcher.appendReplacement` and checks each
+append against the exact expanded length of that match's replacement (so `$n`/`${name}` group references cannot
+smuggle an oversized expansion past the check), and the trailing unmatched text is checked too. A request that
+would exceed the bound answers `400 BAD_REQUEST` with `replacement result exceeds 1000000 characters` instead of
+allocating, and only the matches actually replaced count — `all=false` is bounded by its single replacement, not
+by every match. There is no regex
 timeout in this service, so keep untrusted patterns simple — the route sits behind the standard
 `/api/v1/utils/**` rate limit.
 
@@ -1226,8 +1233,12 @@ timeout in this service, so keep untrusted patterns simple — the route sits be
 
 All three endpoints call `AuditedOperations`, so every call is recorded as `TEXT_TRANSFORM`,
 `TEXT_STATS` or `TEXT_REPLACE` in `GET /api/v1/utils/audit/entries`, with the request (redacted like every other
-operation) and the response; a replace that fails validation or compilation is recorded as `TEXT_REPLACE` with
-`state = FAILED` and `errorCode = BAD_REQUEST`. All three are deterministic, so
+operation) and the response. A replace that compiles and reaches `TextService` but then fails — invalid regex,
+an out-of-range `$n` group reference, or the output bound — is recorded as `TEXT_REPLACE` with `state = FAILED`
+and `errorCode = BAD_REQUEST`. A *bean-validation* rejection (blank `text`/`pattern`, absent `replacement`,
+over-limit fields) is raised while Spring MVC resolves the `@Valid` argument, before the controller body runs, so
+— exactly like `/transform` and `/stats` — it answers `400 VALIDATION_ERROR` and is **not** journalled. All three
+are deterministic, so
 `POST /api/v1/utils/audit/entries/{id}/replay` re-runs the stored request and answers
 `replay.state = VERIFIED` with `detail = results match` without mutating the entry's original `state`, `result`
 or `completedAt`.

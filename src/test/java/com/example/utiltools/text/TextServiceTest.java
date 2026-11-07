@@ -230,4 +230,28 @@ class TextServiceTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("replacement result exceeds 1000000 characters");
     }
+
+    @Test
+    @DisplayName("a group reference that would expand past the bound is rejected without expanding")
+    void shouldRejectOversizedGroupReferenceExpansion() {
+        String text = "a".repeat(100000);
+        String pattern = "(a{100000})";
+        String replacement = "$1".repeat(50000);
+
+        assertThatThrownBy(() -> service.replace(new TextReplaceRequest(text, pattern, replacement, null, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("replacement result exceeds 1000000 characters");
+    }
+
+    @Test
+    @DisplayName("all=false is bounded by the first match, not by every match")
+    void shouldAcceptFirstMatchOnlyWithLargeReplacement() {
+        TextReplaceResponse response = service.replace(
+                new TextReplaceRequest("a".repeat(100000), "a", "b".repeat(11), false, null, null));
+
+        assertThat(response.replacements()).isEqualTo(1);
+        assertThat(response.changed()).isTrue();
+        assertThat(response.result()).startsWith("b".repeat(11) + "a");
+        assertThat(response.length()).isEqualTo(100010);
+    }
 }
