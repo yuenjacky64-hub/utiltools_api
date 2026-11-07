@@ -2237,6 +2237,8 @@ class BatchHashJobServiceTest {
         BatchHashJobResponse accepted = awaitStatus(service.submit(
                 new BatchHashRequest("SHA-256", List.of("alpha"), null, null)).jobId(), JobStatus.COMPLETED);
         assertThat(accepted.status()).isEqualTo(JobStatus.COMPLETED);
+        // The quota counter is released just after the job turns COMPLETED, so drain it deterministically.
+        awaitActiveJobs(ClientKeyResolver.UNKNOWN_CLIENT, 0);
         assertThat(service.activeJobsForClient(ClientKeyResolver.UNKNOWN_CLIENT)).isZero();
     }
 

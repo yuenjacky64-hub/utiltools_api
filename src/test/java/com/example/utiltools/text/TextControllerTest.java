@@ -107,7 +107,25 @@ class TextControllerTest {
                 .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
                 .andExpect(jsonPath("$.message").value(containsString("Unsupported operation 'shout'")))
                 .andExpect(jsonPath("$.message").value(containsString(
-                        "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG")));
+                        "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/transform - sentence-cases text and echoes the normalised operation")
+    void shouldSentenceCaseAndEchoOperation() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/transform")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                    "text": "the API is FAST. try it.",
+                                    "operation": " sentence_case "
+                                }
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("SENTENCE_CASE"))
+                .andExpect(jsonPath("$.data.result").value("The api is fast. Try it."))
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.length").value(24));
     }
 
     @Test
