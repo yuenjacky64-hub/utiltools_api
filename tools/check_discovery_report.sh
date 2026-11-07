@@ -16,8 +16,9 @@
 #                     directory, each citing a `- path:` that exists on disk.
 #   --sections        DOD-03: the seven literal H2 headings of plan §4.1 exist in order, the
 #                     report carries no scaffold placeholder and no bare backlog marker.
-#   --paths           DOD-04: at least 25 distinct `- path:` citations (duplicates collapse); each failure prints
-#                     `MISSING: <path>` and the run ends with a `FAIL:` line.
+#   --paths           DOD-04: at least 25 distinct `- path:` citations (duplicates collapse, canonicalized with
+#                     realpath so `./x`, `x` and `a/../x` count once); each failure prints `MISSING: <path>` and
+#                     the run ends with a `FAIL:` line.
 #   --evidence        DOD-05: at least five `### GAP-` blocks, each with `- evidence:`,
 #                     `- exit:` (integer) and `- output:`.
 #   --gaps            DOD-06: every GAP block declares all three filters (F1/F2/F3), a tier in
@@ -80,6 +81,26 @@ case "$REPORT_ABS" in /*) ;; *) REPORT_ABS="$TOP/$REPORT" ;; esac
 [ -f "$REPORT_ABS" ] || fail "report missing: $REPORT"
 BYTES=$(wc -c < "$REPORT_ABS" | tr -d ' ')
 [ "$BYTES" -ge "$MIN_BYTES" ] || fail "report too thin for a real discovery report: $BYTES bytes < $MIN_BYTES"
+
+# Absolute, lexically normalized form of a citation: repo-relative paths are anchored at $TOP so
+# `./x`, `x` and `a/../x` compare equal (realpath -m when available, a bash fallback otherwise).
+absolute_path() {
+  case "$1" in /*) ;; *) set -- "$TOP/$1" ;; esac
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m -- "$1"
+    return 0
+  fi
+  local seg out=""
+  local IFS=/
+  for seg in $1; do
+    case "$seg" in
+      ''|.) ;;
+      ..) out="${out%/*}" ;;
+      *) out="$out/$seg" ;;
+    esac
+  done
+  printf '%s\n' "${out:-/}"
+}
 
 # Lines of a `### `-headed block, heading included, up to the next `### ` heading.
 block_of() {
@@ -149,13 +170,27 @@ fi
 # ---------------------------------------------------------------- DOD-03
 if [ "$RUN_PATHS" -eq 1 ]; then
   # Deduplicated: N copies of one `- path:` line prove the line count, not the coverage, so the
-  # threshold is applied to distinct values (see Open_Findings NIT on --paths).
+  # threshold is applied to distinct values (see Open_Findings NIT on --paths). Distinctness is
+  # decided after canonicalization, otherwise `./README.md`, `README.md` and `a/../README.md` pass
+  # as three citations of the same file.
   mapfile -t cited_paths < <(grep -E '^- path: ' "$REPORT_ABS" | sed -E 's/^- path: //' \
-    | awk '{print $1}' | sort -u)
+    | awk '{print $1}' \
+    | while IFS= read -r p; do absolute_path "$p"; done \
+    | while IFS= read -r abs; do
+        case "$abs" in
+          "$TOP"/*) printf '%s\n' "${abs#"$TOP"/}" ;;
+          *) printf '%s\n' "$abs" ;;
+        esac
+      done \
+    | sort -u)
   [ "${#cited_paths[@]}" -ge "$MIN_PATHS" ] || fail "only ${#cited_paths[@]} distinct '- path:' citations, need >= $MIN_PATHS"
   missing=0
   for p in "${cited_paths[@]}"; do
-    if [ ! -e "$TOP/$p" ]; then printf 'MISSING: %s\n' "$p"; missing=$((missing + 1)); fi
+    case "$p" in
+      /*) probe="$p" ;;
+      *) probe="$TOP/$p" ;;
+    esac
+    if [ ! -e "$probe" ]; then printf 'MISSING: %s\n' "$p"; missing=$((missing + 1)); fi
   done
   [ "$missing" -eq 0 ] || fail "$missing cited path(s) unresolved"
 fi
