@@ -11,13 +11,19 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.scheduling.TaskScheduler;
+import org.springframework.scheduling.Trigger;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.Clock;
 import java.util.List;
+import java.util.concurrent.Delayed;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -29,6 +35,11 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+// The application class carries @EnableScheduling; in this slice the startup sweep of the
+// @Scheduled evictExpiredJobs()/reapExpiredExecutions() would run on a background thread and could
+// land between doReturn(...).when(spy) and the request, hijacking the recorded stubbing
+// (Mockito CannotStubVoidMethodWithReturnValue) and letting the real getJob answer 404.
+// A scheduler bean that never runs a task keeps this slice deterministic.
 @WebMvcTest(BatchJobController.class)
 @Import({BatchHashJobService.class, CryptoService.class, GlobalExceptionHandler.class,
         BatchJobControllerTest.ClockConfig.class})
@@ -40,6 +51,88 @@ class BatchJobControllerTest {
 
         @Bean
         Clock clock() {
+            return Clock.systemUTC();
+        }
+
+        /** Accepts every scheduled registration and never executes it (see class comment). */
+        @Bean
+        TaskScheduler noOpTaskScheduler() {
+            return new NoOpTaskScheduler();
+        }
+    }
+
+    static final class NoOpTaskScheduler implements TaskScheduler {
+
+        private static final ScheduledFuture<?> NEVER = new ScheduledFuture<>() {
+            @Override
+            public long getDelay(TimeUnit unit) {
+                return Long.MAX_VALUE;
+            }
+
+            @Override
+            public int compareTo(Delayed other) {
+                return 0;
+            }
+
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning) {
+                return true;
+            }
+
+            @Override
+            public boolean isCancelled() {
+                return false;
+            }
+
+            @Override
+            public boolean isDone() {
+                return false;
+            }
+
+            @Override
+            public Object get() {
+                throw new UnsupportedOperationException("no-op scheduler");
+            }
+
+            @Override
+            public Object get(long timeout, TimeUnit unit) {
+                throw new UnsupportedOperationException("no-op scheduler");
+            }
+        };
+
+        @Override
+        public ScheduledFuture<?> schedule(Runnable task, Trigger trigger) {
+            return NEVER;
+        }
+
+        @Override
+        public ScheduledFuture<?> schedule(Runnable task, Instant startTime) {
+            return NEVER;
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleAtFixedRate(Runnable task, Instant startTime, Duration period) {
+            return NEVER;
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleAtFixedRate(Runnable task, Duration period) {
+            return NEVER;
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleWithFixedDelay(Runnable task, Instant startTime, Duration delay) {
+            return NEVER;
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleWithFixedDelay(Runnable task, Duration delay) {
+            return NEVER;
+        }
+
+        @Override
+        @SuppressWarnings("deprecation")
+        public Clock getClock() {
             return Clock.systemUTC();
         }
     }
