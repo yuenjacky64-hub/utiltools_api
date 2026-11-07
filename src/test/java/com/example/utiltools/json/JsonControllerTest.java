@@ -92,6 +92,64 @@ class JsonControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/utils/json/format - should sort keys recursively when sortKeys is true")
+    void shouldFormatJsonWithSortKeys() throws Exception {
+        String body = """
+                {
+                    "json": "{\\"z\\":1,\\"a\\":{\\"d\\":4,\\"b\\":2},\\"list\\":[{\\"y\\":1,\\"x\\":2}]}",
+                    "minify": true,
+                    "sortKeys": true
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/format")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("JSON formatted successfully"))
+                .andExpect(jsonPath("$.data.formattedJson")
+                        .value("{\"a\":{\"b\":2,\"d\":4},\"list\":[{\"x\":2,\"y\":1}],\"z\":1}"))
+                .andExpect(jsonPath("$.data.sizeBytes").isNumber());
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/format - should keep input order when sortKeys is omitted")
+    void shouldKeepInputOrderWithoutSortKeys() throws Exception {
+        String body = """
+                {
+                    "json": "{\\"z\\":1,\\"a\\":2}",
+                    "minify": true
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/format")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.formattedJson").value("{\"z\":1,\"a\":2}"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/format - should return 400 for malformed json when sortKeys is true")
+    void shouldReturnBadRequestForMalformedJsonWhenSortKeysRequested() throws Exception {
+        String body = """
+                {
+                    "json": "{\\"a\\":}",
+                    "sortKeys": true
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/format")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("Invalid JSON content")));
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/json/format - should reject blank json payload")
     void shouldRejectBlankJson() throws Exception {
         String body = """

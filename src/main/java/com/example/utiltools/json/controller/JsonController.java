@@ -33,7 +33,10 @@ public class JsonController {
     }
 
     @PostMapping("/format")
-    @Operation(summary = "Pretty print or minify JSON", description = "Formats JSON with indentation or minifies it into a compact single-line string")
+    @Operation(summary = "Pretty print or minify JSON", description = "Formats JSON with indentation or minifies it into a compact single-line string. "
+            + "sortKeys=true recursively orders object field names in ascending String order for both "
+            + "minified and pretty output; array element order and scalar values are preserved. "
+            + "sortKeys is optional and defaults to false.")
     public ApiResponse<JsonFormatResponse> format(@Valid @RequestBody JsonFormatRequest request) {
         JsonFormatResponse result = auditedOperations.format(request);
         return ApiResponse.success(result, "JSON formatted successfully");

@@ -682,6 +682,8 @@ without appending a second journal entry.
 #### A. Format / Pretty-Print or Minify JSON
 `indent` is optional: it must be an integer in **1-8**, defaults to **2** spaces per nesting level when omitted, and is ignored when `minify` is `true`. Values outside 1-8 are rejected with HTTP 400 and `error` `VALIDATION_ERROR`.
 
+`sortKeys` is optional and defaults to `false`. When `true`, every object's field names are recursively ordered in ascending `String.compareTo` order before serialisation, including nested objects and objects inside arrays. Array element order and all scalar values are preserved, and sorting applies to both pretty-printed and minified output, so `indent` still controls the layout. This is useful for diffing, snapshot tests and stable cache keys.
+
 ```bash
 curl -X POST http://localhost:8080/api/v1/utils/json/format \
   -H "Content-Type: application/json" \
@@ -700,6 +702,30 @@ curl -X POST http://localhost:8080/api/v1/utils/json/format \
   "data": {
     "formattedJson": "{\n    \"user\" : {\n        \"id\" : 101,\n        \"name\" : \"Alice\"\n    }\n}",
     "sizeBytes": 69
+  },
+  "timestamp": "2026-10-30T16:50:38.987061888Z"
+}
+```
+
+**Sorted output (`sortKeys: true`)** — `{"z":1,"a":{"d":4,"b":2},"list":[{"y":1,"x":2}]}` minifies to `{"a":{"b":2,"d":4},"list":[{"x":2,"y":1}],"z":1}`:
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/json/format \
+  -H "Content-Type: application/json" \
+  -d '{
+    "json": "{\"z\":1,\"a\":{\"d\":4,\"b\":2},\"list\":[{\"y\":1,\"x\":2}]}",
+    "minify": true,
+    "sortKeys": true
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "JSON formatted successfully",
+  "data": {
+    "formattedJson": "{\"a\":{\"b\":2,\"d\":4},\"list\":[{\"x\":2,\"y\":1}],\"z\":1}",
+    "sizeBytes": 45
   },
   "timestamp": "2026-10-30T16:50:38.987061888Z"
 }

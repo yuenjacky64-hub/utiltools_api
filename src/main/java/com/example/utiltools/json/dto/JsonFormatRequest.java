@@ -10,5 +10,6 @@ public record JsonFormatRequest(
         Boolean minify,
         @Min(value = 1, message = "indent must be between 1 and 8")
         @Max(value = 8, message = "indent must be between 1 and 8")
-        Integer indent
+        Integer indent,
+        Boolean sortKeys
 ) {}
