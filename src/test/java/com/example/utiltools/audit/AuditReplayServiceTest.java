@@ -27,6 +27,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -316,5 +317,27 @@ class AuditReplayServiceTest {
         assertThat(replayed.replay().state()).isEqualTo(ReplayState.VERIFIED);
         assertThat(replayed.replay().detail()).isEqualTo("results match");
         assertThat(replayed.state()).isEqualTo(JournalState.SUCCEEDED);
+    }
+
+    @Test
+    @DisplayName("a SUCCEEDED BATCH_HASH entry is not claimable: the journal refuses it as non-deterministic")
+    void shouldRejectReplayForBatchHashEntry() {
+        Map<String, Object> descriptor = Map.of("jobId", "job-batch-1", "attempt", 1,
+                "algorithm", "SHA-256", "itemCount", 2, "idempotencyKey", "batch-key");
+        AuditEntry pending = journal.begin(OperationType.BATCH_HASH, descriptor, "req-batch-01");
+        AuditEntry entry = journal.succeed(pending.id(), Map.of("outcome", "COMPLETED", "resultCount", 2));
+        assertThat(entry.state()).isEqualTo(JournalState.SUCCEEDED);
+
+        // Batch hashing is audit-only (OperationType.BATCH_HASH is non-replayable): the journal
+        // itself refuses the claim, so neither the direct claim nor the replay service re-executes it.
+        assertThatThrownBy(() -> journal.claimReplay(entry.id()))
+                .isInstanceOf(ReplayConflictException.class)
+                .hasMessageContaining("non-deterministic");
+        assertThatThrownBy(() -> replayService.replay(entry.id()))
+                .isInstanceOf(ReplayConflictException.class)
+                .hasMessageContaining("non-deterministic");
+
+        AuditEntry after = journal.find(entry.id()).orElseThrow();
+        assertThat(after.replay()).isNull();
     }
 }

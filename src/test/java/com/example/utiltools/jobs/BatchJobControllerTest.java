@@ -1,6 +1,7 @@
 package com.example.utiltools.jobs;
 
 import com.example.utiltools.common.GlobalExceptionHandler;
+import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -291,6 +292,28 @@ class BatchJobControllerTest {
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("JOB_NOT_FOUND"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/jobs/{jobId} - attempt history serializes without a journal bean (auditEntryId omitted)")
+    void shouldReturnAttemptHistoryWithoutJournalBean() throws Exception {
+        Instant createdAt = Instant.parse("2026-11-06T10:00:00Z");
+        Instant completedAt = Instant.parse("2026-11-06T10:00:01Z");
+        BatchHashJobResponse completed = new BatchHashJobResponse("job-completed-1", "controller-history-key",
+                JobStatus.COMPLETED, 1, List.of(new HashResponse("SHA-256", "abc123", false)), null,
+                createdAt, createdAt, completedAt, 1, 3,
+                List.of(new JobAttempt(1, JobStatus.COMPLETED, createdAt, completedAt, null)));
+        doReturn(completed).when(jobService).getJob("job-completed-1");
+
+        // The slice wires BatchHashJobService without an AuditJournalService bean, so
+        // attemptHistory entries carry a null auditEntryId and Jackson omits the field.
+        mockMvc.perform(get("/api/v1/utils/jobs/job-completed-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("COMPLETED"))
+                .andExpect(jsonPath("$.data.results[0].digest").value("abc123"))
+                .andExpect(jsonPath("$.data.attempts[0].attempt").value(1))
+                .andExpect(jsonPath("$.data.attempts[0].status").value("COMPLETED"))
+                .andExpect(jsonPath("$.data.attempts[0].auditEntryId").doesNotExist());
     }
 
     @Test
