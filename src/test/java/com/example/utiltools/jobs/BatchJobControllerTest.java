@@ -496,6 +496,35 @@ class BatchJobControllerTest {
     }
 
     @Test
+    @DisplayName("GET /api/v1/utils/jobs - an out-of-range limit is forwarded unchanged and still answers 200")
+    void shouldForwardExplicitLimit() throws Exception {
+        doReturn(List.of()).when(jobService).listJobs(null, 5000);
+
+        mockMvc.perform(get("/api/v1/utils/jobs").param("limit", "5000"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data").isArray())
+                .andExpect(jsonPath("$.data").isEmpty());
+
+        // The bounded window is the service's job (clamp to [1, 100]); the controller never rewrites it.
+        verify(jobService).listJobs(null, 5000);
+        verify(jobService, never()).listJobs(null, 100);
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/jobs - an empty registry answers 200 with an empty data array")
+    void shouldReturnJobListEmptyArray() throws Exception {
+        doReturn(List.of()).when(jobService).listJobs(null, 20);
+
+        mockMvc.perform(get("/api/v1/utils/jobs"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Job list retrieved"))
+                .andExpect(jsonPath("$.data").isArray())
+                .andExpect(jsonPath("$.data").isEmpty());
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/jobs/{jobId}/retry - should map a rejected requeue to 429 QUEUE_FULL")
     void shouldReturn429WhenRetryQueueFull() throws Exception {
         doThrow(new JobQueueFullException("Hash job queue is full (worker-count=2, queue-capacity=100); retry after capacity frees"))
