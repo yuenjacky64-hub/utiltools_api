@@ -1613,10 +1613,11 @@ stamps `lastHeartbeatAt` with that same instant and writes one closed `BATCH_HAS
 `HEARTBEAT` with the bounded detail `lease renewed via heartbeat`; nothing else in the snapshot changes —
 `status`, `results`, `error`, `completedAt`, `startedAt`, `checkpoint` and `attemptHistory` are untouched. Only
 the attempt that is currently `RUNNING` can renew: an unknown or already-evicted `jobId` is `404 JOB_NOT_FOUND`,
-a `QUEUED`, `COMPLETED` or `CANCELLED` job is `409 JOB_RETRY_CONFLICT`, and a lease that has **already expired**
-is `400 BAD_REQUEST` rather than being revived, so a late worker from a superseded attempt cannot buy its
-generation more time. A lease that is never renewed still lapses on schedule, `reapExpiredExecutions` marks the
-job `FAILED` exactly as before, and the retry path then starts `attempt + 1`.
+a `QUEUED`, `CANCELLING`, `COMPLETED` or `CANCELLED` job is `409 JOB_RETRY_CONFLICT`, and a lease that has
+**already expired** is `400 BAD_REQUEST` rather than being revived, so a late worker from a superseded attempt
+cannot buy its generation more time. A lease that is never renewed still lapses on schedule,
+`reapExpiredExecutions` marks the job `FAILED` exactly as before, and the retry path then starts
+`attempt + 1`.
 
 Ineligible retries are rejected **without mutating state**: an unknown or already-evicted `jobId` is
 `404 JOB_NOT_FOUND`; a `QUEUED`, `RUNNING`, `CANCELLING`, `COMPLETED` or `CANCELLED` job is
@@ -1640,7 +1641,7 @@ duplicate submission with the same key observes the `CANCELLED` snapshot until t
 | :--- | :--- | :--- | :--- |
 | Bounded executor queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry with the **same** `idempotencyKey` once capacity frees. The rejected submission is rolled back atomically — its job row **and** its idempotency mapping are both removed, so it leaves no residue and the retry with that key starts a brand-new job |
 | Unknown or already-evicted `jobId` | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Resubmit the batch |
-| Cancelling a job that is `RUNNING`, `COMPLETED` or `FAILED` | `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Stop cancelling; poll `GET` for the terminal snapshot. A repeat `DELETE` on an already-`CANCELLED` job is `200`, not a conflict |
+| Cancelling a job that is `COMPLETED` or `FAILED` | `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Stop cancelling; poll `GET` for the terminal snapshot. A `QUEUED` or `RUNNING` job is cancelled instead: `DELETE` answers `200` with `CANCELLED` or `CANCELLING`, and a repeat `DELETE` on a `CANCELLING` or `CANCELLED` job is `200`, not a conflict |
 | Retrying a `QUEUED`, `RUNNING`, `CANCELLING`, `COMPLETED` or `CANCELLED` job, or a `FAILED` job at `maxAttempts` | `409 CONFLICT` | `JOB_RETRY_CONFLICT` | Only a `FAILED` job below `maxAttempts` can be retried. The job snapshot is unchanged by the rejection; resubmit if the attempt budget is spent |
 | Retry rejected because the bounded queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry `POST …/retry` again once capacity frees: the previous `FAILED` snapshot and its `attempt` are restored, so nothing is consumed |
 | The client already holds `utiltools.jobs.max-active-jobs-per-client` non-terminal jobs | `429 TOO_MANY_REQUESTS` | `JOB_QUOTA_EXCEEDED` | Retry once one of your **own** jobs finishes — the quota is per client identity, so other callers are unaffected. `details.limit` is the ceiling and `details.activeJobs` is your current count. Nothing is registered on a rejected submission (no job row, no `idempotencyKey` mapping, no consumed slot), and a rejected `POST …/retry` restores the previous `FAILED` snapshot with its `attempt` unchanged. A resubmission that repeats the same `idempotencyKey` **and** payload is a duplicate, not a new job: it returns the existing snapshot instead of a quota error |
