@@ -26,11 +26,14 @@ from typing import Any, Callable
 from ai_maintainer.config import MaintainerConfig
 from ai_maintainer.tasks.curriculum import (
     NON_TERMINAL,
+    STALE_ELIGIBLE,
     TaskCurriculum,
     TaskSpec,
     TaskState,
     effective_priority,
+    progress_age_sec,
     stamp_pending_since,
+    stamp_progress,
 )
 
 __all__ = [
@@ -165,6 +168,10 @@ class MaintainerEngine:
         with self._lock:
             self._cycles += 1
             cycle = self._cycles
+            # Poll-tick half of the stale-task state machine: refresh every
+            # active task's progress age and warn (``STALE_TASK``) on a
+            # breach. Recovery is the sweep thread's job, never the tick's.
+            self._evaluate_stale(self._clock())
 
         while steps < self._config.max_steps_per_cycle:
             with self._lock:
@@ -219,6 +226,9 @@ class MaintainerEngine:
                     steps += 1
                     continue
                 task.progress = max(task.progress, next_progress)
+                # INV-STALE-5: a committed step *is* a progress line, so the
+                # stale clock restarts here, before the outcome is recorded.
+                stamp_progress(task, self._clock())
                 if task.progress >= task.steps_required:
                     task.state = TaskState.COMPLETED
                     task.pending_since = None
@@ -276,6 +286,102 @@ class MaintainerEngine:
             ),
             "fingerprints": buckets,
         }
+
+    def sweep_stale_tasks(self, now: float | None = None) -> dict[str, Any]:
+        """Detect and recover stale tasks; safe from the tick and the sweeper.
+
+        Detection is :meth:`_evaluate_stale` (one ``STALE_TASK`` warning per
+        breach). Recovery fires only once the age also exceeds the grace
+        window, and it is the only writer of ``STALE_TASK_RECOVERED``:
+
+        ``{"event": "STALE_TASK_RECOVERED", "task", "cycle", "age_sec",
+        "timeout_sec", "grace_sec", "last_progress"}``
+
+        The nested ``last_progress`` mapping is the brief's "last known
+        progress line" citation, copied so later progress cannot rewrite it.
+        A recovered task is ``FAILED`` and terminal, exactly like the
+        exception path: this never retries and never touches the fingerprint
+        circuit registry.
+        """
+
+        moment = self._clock() if now is None else now
+        timeout = self._config.stale_timeout_sec
+        grace = self._config.stale_recovery_grace_sec
+        recovered = 0
+        with self._lock:
+            counts = self._evaluate_stale(moment)
+            for task in list(self._curriculum.specs):
+                if task.state not in STALE_ELIGIBLE:
+                    continue
+                age = progress_age_sec(task, moment)
+                if age <= timeout + grace:
+                    continue
+                citation = {
+                    "progress": task.progress,
+                    "steps_required": task.steps_required,
+                    "last_progress_at": task.last_progress_at,
+                    "age_sec": age,
+                }
+                task.state = TaskState.FAILED
+                task.pending_since = None
+                task.last_progress_age_sec = age
+                if self._monitored is task:
+                    # Re-validate under the lock, like the step-commit path.
+                    self._monitored = None
+                self._events.append(
+                    {
+                        "event": "STALE_TASK_RECOVERED",
+                        "task": task.name,
+                        "cycle": self._cycles,
+                        "age_sec": age,
+                        "timeout_sec": timeout,
+                        "grace_sec": grace,
+                        "last_progress": citation,
+                    }
+                )
+                recovered += 1
+        return {
+            "now": moment,
+            "scanned": counts["scanned"],
+            "stale": counts["stale"],
+            "recovered": recovered,
+        }
+
+    def _evaluate_stale(self, now: float) -> dict[str, int]:
+        """Called with ``_lock`` held: refresh ages, emit ``STALE_TASK`` once.
+
+        ``INV-STALE-1``: a task in ``STALE_ELIGIBLE`` must satisfy
+        ``progress_age_sec(task, now) <= stale_timeout_sec``; a violation is
+        logged as one ``STALE_TASK`` event. ``INV-STALE-2``: an unstamped task
+        is stamped with ``now`` (the ``pending_since`` sentinel idiom), so an
+        unobserved task never inherits the clock's epoch age.
+        """
+
+        timeout = self._config.stale_timeout_sec
+        scanned = stale = 0
+        for task in list(self._curriculum.specs):
+            if task.state not in STALE_ELIGIBLE:
+                continue
+            scanned += 1
+            if task.last_progress_at is None:
+                task.last_progress_at = float(now)
+            age = progress_age_sec(task, now)
+            task.last_progress_age_sec = age
+            if age <= timeout:
+                continue
+            if task.stale_since is None:
+                task.stale_since = float(now)
+                self._events.append(
+                    {
+                        "event": "STALE_TASK",
+                        "task": task.name,
+                        "cycle": self._cycles,
+                        "age_sec": age,
+                        "timeout_sec": timeout,
+                    }
+                )
+            stale += 1
+        return {"scanned": scanned, "stale": stale}
 
     def sweep_quarantine(self, now: float | None = None) -> dict[str, Any]:
         """Expire due quarantine timers, probe and close or re-arm each circuit."""
@@ -388,6 +494,7 @@ class MaintainerEngine:
         while not self._scheduler_stop.wait(interval):
             try:
                 self.sweep_quarantine()
+                self.sweep_stale_tasks()
             except Exception:  # pragma: no cover - defensive: never kill the thread
                 continue
 
@@ -587,3 +694,6 @@ class MaintainerEngine:
     def _adopt(self, incoming: TaskSpec) -> None:
         self._monitored = incoming
         incoming.state = TaskState.IN_PROGRESS
+        # A freshly adopted task starts fresh: it must not inherit the age of
+        # an observation from before the preemption (INV-STALE-5).
+        stamp_progress(incoming, self._clock())
