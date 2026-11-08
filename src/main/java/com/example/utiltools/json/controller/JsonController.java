@@ -2,6 +2,8 @@ package com.example.utiltools.json.controller;
 
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.ApiResponse;
+import com.example.utiltools.json.dto.JsonCsvRequest;
+import com.example.utiltools.json.dto.JsonCsvResponse;
 import com.example.utiltools.json.dto.JsonDiffRequest;
 import com.example.utiltools.json.dto.JsonDiffResponse;
 import com.example.utiltools.json.dto.JsonFlattenRequest;
@@ -133,6 +135,20 @@ public class JsonController {
                     + "more than 10000 rows or columns are rejected with 400 BAD_REQUEST.")
     public ApiResponse<JsonFromCsvResponse> fromCsv(@Valid @RequestBody JsonFromCsvRequest request) {
         JsonFromCsvResponse result = auditedOperations.fromCsv(request);
+        return ApiResponse.success(result, "CSV converted to JSON successfully");
+    }
+
+    @PostMapping("/csv-to-json")
+    @Operation(summary = "Convert CSV to a JSON array",
+            description = "Imports RFC 4180 CSV into a JSON array of string-valued objects. csvContent is the CSV text; "
+                    + "delimiter is optional and defaults to comma (a single character, '\\t' or a literal tab for TSV). "
+                    + "The first record is the header and supplies the object keys, blank header names map to columnN; "
+                    + "headerMapping optionally renames a header to a different JSON property name and must stay unique. "
+                    + "Quoted fields may carry the delimiter, LF, CRLF or CR, doubled quotes and a UTF-8 BOM are tolerated. "
+                    + "Duplicate header names, an unterminated quote, malformed text and more than 10000 rows or columns "
+                    + "are rejected with 400 BAD_REQUEST.")
+    public ApiResponse<JsonCsvResponse> csvToJson(@Valid @RequestBody JsonCsvRequest request) {
+        JsonCsvResponse result = auditedOperations.csvToJson(request);
         return ApiResponse.success(result, "CSV converted to JSON successfully");
     }
 

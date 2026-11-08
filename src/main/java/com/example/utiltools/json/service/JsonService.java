@@ -1,5 +1,7 @@
 package com.example.utiltools.json.service;
 
+import com.example.utiltools.json.dto.JsonCsvRequest;
+import com.example.utiltools.json.dto.JsonCsvResponse;
 import com.example.utiltools.json.dto.JsonDiffDetail;
 import com.example.utiltools.json.dto.JsonDiffRequest;
 import com.example.utiltools.json.dto.JsonDiffResponse;
@@ -559,6 +561,89 @@ public class JsonService {
             }
         }
         return new JsonFromCsvResponse(resultJson, rowCount, columnCount, List.copyOf(columns));
+    }
+
+    /**
+     * Imports RFC 4180 CSV into a JSON array of string-valued objects. The first record supplies the
+     * object keys (blank names map to columnN) and {@code headerMapping} optionally renames a header
+     * to a different JSON property name; values stay strings so the conversion is deterministic.
+     */
+    public JsonCsvResponse csvToJson(JsonCsvRequest request) {
+        if (request.csvContent() == null || request.csvContent().isBlank()) {
+            throw new IllegalArgumentException("csvContent is required");
+        }
+        char delimiter = normaliseDelimiter(request.delimiter());
+        List<List<String>> records = parseCsv(stripByteOrderMark(request.csvContent()), delimiter);
+        if (records.isEmpty()) {
+            throw new IllegalArgumentException("csvContent is required");
+        }
+        List<String> header = records.get(0);
+        List<String> headers = new ArrayList<>(header.size());
+        Set<String> seen = new LinkedHashSet<>();
+        for (int i = 0; i < header.size(); i++) {
+            String name = header.get(i);
+            if (name.isEmpty()) {
+                name = "column" + (i + 1);
+            }
+            if (!seen.add(name)) {
+                throw new IllegalArgumentException("duplicate header name: " + name);
+            }
+            headers.add(name);
+        }
+        applyHeaderMapping(headers, request.headerMapping());
+        int rowCount = records.size() - 1;
+        int columnCount = headers.size();
+        enforceCsvBounds(rowCount, columnCount);
+
+        ArrayNode resultJson = objectMapper.createArrayNode();
+        for (int r = 1; r < records.size(); r++) {
+            List<String> record = records.get(r);
+            if (record.size() > columnCount) {
+                throw new IllegalArgumentException("row " + (r + 1) + " has " + record.size()
+                        + " fields but the header has " + columnCount);
+            }
+            ObjectNode row = resultJson.addObject();
+            for (int i = 0; i < columnCount; i++) {
+                row.put(headers.get(i), i < record.size() ? record.get(i) : "");
+            }
+        }
+        return new JsonCsvResponse(resultJson, rowCount, columnCount, List.copyOf(headers));
+    }
+
+    /**
+     * Renames resolved header names in place. Every mapping key must name an existing header, every
+     * value must be non-blank and the renamed set must stay unique, so no column is ever lost.
+     */
+    private static void applyHeaderMapping(List<String> headers, Map<String, String> headerMapping) {
+        if (headerMapping == null || headerMapping.isEmpty()) {
+            return;
+        }
+        for (String key : headerMapping.keySet()) {
+            if (!headers.contains(key)) {
+                throw new IllegalArgumentException(
+                        "headerMapping key '" + key + "' does not match any header");
+            }
+        }
+        Map<String, String> sourceOf = new LinkedHashMap<>();
+        List<String> renamed = new ArrayList<>(headers.size());
+        for (String header : headers) {
+            boolean mapped = headerMapping.containsKey(header);
+            String value = headerMapping.get(header);
+            if (mapped && (value == null || value.isBlank())) {
+                throw new IllegalArgumentException(
+                        "headerMapping value for '" + header + "' must not be blank");
+            }
+            String name = mapped ? value : header;
+            String previous = sourceOf.putIfAbsent(name, header);
+            if (previous != null) {
+                String culprit = mapped ? header : previous;
+                throw new IllegalArgumentException(
+                        "headerMapping renames header '" + culprit + "' to duplicate key '" + name + "'");
+            }
+            renamed.add(name);
+        }
+        headers.clear();
+        headers.addAll(renamed);
     }
 
     /**
