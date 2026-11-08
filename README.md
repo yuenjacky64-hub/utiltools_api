@@ -152,6 +152,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/merge-patch` | Apply an RFC 7396 merge-patch document (`null` deletes, objects merge recursively, arrays/scalars replace) as a journalled `JSON_MERGE_PATCH` |
 | `POST` | `/api/v1/utils/json/to-ndjson` | Export a JSON array as NDJSON / JSON Lines: one compact value per line, `lineCount` and `sizeBytes`, journalled as `JSON_TO_NDJSON` |
 | `POST` | `/api/v1/utils/json/from-ndjson` | Import NDJSON / JSON Lines into a JSON array: blank lines and CRLF tolerated, errors name the 1-based line number, 10000-record bound, journalled as `JSON_FROM_NDJSON` |
+| `POST` | `/api/v1/utils/json/csv-to-json` | Import CSV into a JSON array of objects with an optional `delimiter` and optional `headerMapping` header renames; first record supplies the keys, malformed CSV returns 400; journalled as `JSON_CSV_TO_JSON` |
 | `POST` | `/api/v1/utils/json/diff` | Compare two JSON documents and report `added`, `removed` and `changed` paths (with old/new values and a pinned `summary`) at any nesting level, journalled as `JSON_DIFF` |
 | `POST` | `/api/v1/utils/text/transform` | Apply a deterministic case/format operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`) to a string |
 | `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
@@ -1056,7 +1057,49 @@ deterministic, so the same request is replay-stable.
 required` / `jsonB content is required`); a document nested deeper than 64 object levels is rejected with
 `jsonA depth must not exceed 64`, and more than 10000 changes is rejected as well - both **HTTP 400**.
 
-#### G. Circuit breaker & probe lease recovery
+#### G. CSV to JSON (header-driven import)
+
+`POST /api/v1/utils/json/csv-to-json` imports CSV text into a JSON array of objects. `csvContent` is the CSV text,
+`delimiter` is optional and defaults to comma (a single character, `\t` or a literal tab for TSV), and
+`headerMapping` optionally renames a header to a different JSON property name. The first record supplies the object
+keys (blank header names become `columnN`), values stay strings, and the journalled operation is `JSON_CSV_TO_JSON`.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/json/csv-to-json \
+  -H "Content-Type: application/json" \
+  -d '{"csvContent":"name,age\nAlice,30\nBob,25"}'
+```
+
+**Response (200):**
+
+```json
+{
+  "success": true,
+  "message": "CSV converted to JSON successfully",
+  "data": {
+    "resultJson": [
+      { "name": "Alice", "age": "30" },
+      { "name": "Bob",   "age": "25" }
+    ],
+    "rowCount": 2,
+    "columnCount": 2,
+    "headers": ["name", "age"]
+  },
+  "timestamp": "2026-11-08T22:51:42.003114Z"
+}
+```
+
+Quoted fields may carry the delimiter, LF, CRLF or CR, doubled quotes and a UTF-8 BOM are tolerated, and a short row
+is padded with empty cells. `headerMapping` must reference existing headers, its values must be non-blank, and no two
+columns may end up sharing a key.
+
+**Errors:** an unterminated quoted field, text after a closing quote, duplicate header names, an unresolvable
+`headerMapping` key or value, a row wider than the header, and more than 10000 rows or columns (or 1000000 cells)
+all return **HTTP 400** `BAD_REQUEST` with the parser message; blank `csvContent` returns **HTTP 400**
+`VALIDATION_ERROR` (`csvContent is required`) and a two-character delimiter returns
+`delimiter must be a single character`.
+
+#### H. Circuit breaker & probe lease recovery
 
 The JSONPath query path runs behind a single `CLOSED` / `OPEN` / `HALF_OPEN` circuit breaker, exposed
 read-only by `GET /api/v1/utils/resilience` and driven by hand with `POST /api/v1/utils/resilience/probe`.

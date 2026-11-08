@@ -917,6 +917,141 @@ class JsonControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/utils/json/csv-to-json - should convert CSV with delimiter and header mapping")
+    void shouldConvertCsvToJsonViaCsvToJsonEndpoint() throws Exception {
+        String response = mockMvc.perform(post("/api/v1/utils/json/csv-to-json")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("csvContent", "name,age\nAlice,30\nBob,25")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.rowCount").value(2))
+                .andExpect(jsonPath("$.data.columnCount").value(2))
+                .andExpect(jsonPath("$.data.headers[0]").value("name"))
+                .andExpect(jsonPath("$.data.headers[1]").value("age"))
+                .andExpect(jsonPath("$.data.resultJson[0].name").value("Alice"))
+                .andExpect(jsonPath("$.data.resultJson[0].age").value("30"))
+                .andExpect(jsonPath("$.data.resultJson[1].name").value("Bob"))
+                .andReturn().getResponse().getContentAsString();
+
+        JsonNode data = new ObjectMapper().readTree(response).path("data");
+        assertThat(data.path("resultJson").isArray()).isTrue();
+        assertThat(data.path("resultJson").get(1).path("age").asText()).isEqualTo("25");
+
+        // A non-comma delimiter and a literal tab are both honoured.
+        mockMvc.perform(post("/api/v1/utils/json/csv-to-json")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("csvContent", "a;b\r\n1;2", "delimiter", ";")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.headers[1]").value("b"))
+                .andExpect(jsonPath("$.data.resultJson[0].b").value("2"));
+
+        mockMvc.perform(post("/api/v1/utils/json/csv-to-json")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("csvContent", "a\tb\r\n1\t2", "delimiter", "\t")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.resultJson[0].b").value("2"));
+
+        // Quoted fields keep embedded delimiters and newlines, a BOM is tolerated and short rows
+        // are padded with empty cells.
+        String quoted = "\uFEFF\"a,b\",c\n1,\"say \"\"hi\"\"\"\n2,\"l1\nl2\"\n3";
+        String quotedResponse = mockMvc.perform(post("/api/v1/utils/json/csv-to-json")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("csvContent", quoted)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.rowCount").value(3))
+                .andExpect(jsonPath("$.data.columnCount").value(2))
+                .andExpect(jsonPath("$.data.headers[0]").value("a,b"))
+                .andExpect(jsonPath("$.data.headers[1]").value("c"))
+                .andExpect(jsonPath("$.data.resultJson[0].c").value("say \"hi\""))
+                .andExpect(jsonPath("$.data.resultJson[1].c").value("l1\nl2"))
+                .andExpect(jsonPath("$.data.resultJson[2].c").value(""))
+                .andReturn().getResponse().getContentAsString();
+        assertThat(new ObjectMapper().readTree(quotedResponse).path("data")
+                .path("resultJson").get(0).path("a,b").asText()).isEqualTo("1");
+
+        // headerMapping renames the header and every row key.
+        String mappingBody = "{\"csvContent\":\"name,age\\nAlice,30\","
+                + "\"headerMapping\":{\"name\":\"fullName\",\"age\":\"years\"}}";
+        mockMvc.perform(post("/api/v1/utils/json/csv-to-json")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(mappingBody))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.headers[0]").value("fullName"))
+                .andExpect(jsonPath("$.data.headers[1]").value("years"))
+                .andExpect(jsonPath("$.data.resultJson[0].fullName").value("Alice"))
+                .andExpect(jsonPath("$.data.resultJson[0].years").value("30"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/csv-to-json - should return 400 for malformed CSV")
+    void shouldRejectMalformedCsvWith400() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/csv-to-json")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("csvContent", "\"a,b")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value("unterminated quoted field"));
+
+        mockMvc.perform(post("/api/v1/utils/json/csv-to-json")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("csvContent", "a,\"b\"x,c")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value("unexpected character after closing quote"));
+
+        mockMvc.perform(post("/api/v1/utils/json/csv-to-json")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("csvContent", "a,b,a\r\n1,2,3")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value("duplicate header name: a"));
+
+        mockMvc.perform(post("/api/v1/utils/json/csv-to-json")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"csvContent\":\"a,b\\n1,2\",\"headerMapping\":{\"c\":\"x\"}}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value("headerMapping key 'c' does not match any header"));
+
+        mockMvc.perform(post("/api/v1/utils/json/csv-to-json")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("csvContent", " ")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]", containsString("csvContent is required")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/csv-to-json - journalled as JSON_CSV_TO_JSON and replay VERIFIED")
+    void shouldJournalCsvToJsonAndReplayVerified() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/csv-to-json")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("csvContent", "name,age\r\nAlice,30")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.resultJson[0].name").value("Alice"));
+
+        String entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[?(@.operation == 'JSON_CSV_TO_JSON')]").exists())
+                .andReturn().getResponse().getContentAsString();
+        String entryId = entryIdOf(entries, "JSON_CSV_TO_JSON");
+        int entryCount = new ObjectMapper().readTree(entries).path("data").size();
+
+        String replay = mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", entryId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andReturn().getResponse().getContentAsString();
+        assertThat(new ObjectMapper().readTree(replay).path("data").path("result")
+                .path("resultJson").get(0).path("age").asText()).isEqualTo("30");
+
+        String afterReplay = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        assertThat(new ObjectMapper().readTree(afterReplay).path("data").size()).isEqualTo(entryCount);
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/json/to-ndjson - should export an array as NDJSON")
     void shouldConvertJsonArrayToNdjson() throws Exception {
         String body = requestBody("json", "[{\"a\":1},{\"b\":2}]");

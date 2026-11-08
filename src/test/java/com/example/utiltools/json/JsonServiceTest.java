@@ -1,5 +1,7 @@
 package com.example.utiltools.json;
 
+import com.example.utiltools.json.dto.JsonCsvRequest;
+import com.example.utiltools.json.dto.JsonCsvResponse;
 import com.example.utiltools.json.dto.JsonDiffDetail;
 import com.example.utiltools.json.dto.JsonDiffRequest;
 import com.example.utiltools.json.dto.JsonDiffResponse;
@@ -1355,6 +1357,123 @@ class JsonServiceTest {
         assertThatThrownBy(() -> jsonService.fromCsv(new JsonFromCsvRequest(grid.toString(), ",", true)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("conversion exceeds " + MAX_CELLS + " cells");
+    }
+
+    @Test
+    @DisplayName("Should convert CSV to JSON with delimiters and header mapping")
+    void shouldConvertCsvToJsonWithDelimiterAndHeaderMapping() {
+        JsonCsvResponse defaults = jsonService.csvToJson(new JsonCsvRequest("name,age\r\nAlice,30\r\nBob,25", null, null));
+        assertThat(defaults.headers()).containsExactly("name", "age");
+        assertThat(defaults.rowCount()).isEqualTo(2);
+        assertThat(defaults.columnCount()).isEqualTo(2);
+        assertThat(defaults.resultJson().toString())
+                .isEqualTo("[{\"name\":\"Alice\",\"age\":\"30\"},{\"name\":\"Bob\",\"age\":\"25\"}]");
+
+        JsonCsvResponse semicolons = jsonService.csvToJson(new JsonCsvRequest("a;b\n1;2", ";", null));
+        assertThat(semicolons.headers()).containsExactly("a", "b");
+        assertThat(semicolons.resultJson().get(0).path("b").asText()).isEqualTo("2");
+
+        JsonCsvResponse tabs = jsonService.csvToJson(new JsonCsvRequest("a\tb\n1\t2", "\\t", null));
+        assertThat(tabs.headers()).containsExactly("a", "b");
+        assertThat(tabs.resultJson().get(0).path("b").asText()).isEqualTo("2");
+        assertThat(jsonService.csvToJson(new JsonCsvRequest("a\tb\n1\t2", "\t", null)).resultJson())
+                .isEqualTo(tabs.resultJson());
+
+        JsonCsvResponse mapped = jsonService.csvToJson(new JsonCsvRequest("name,age\nAlice,30",
+                null, java.util.Map.of("name", "fullName")));
+        assertThat(mapped.headers()).containsExactly("fullName", "age");
+        assertThat(mapped.resultJson().get(0).path("fullName").asText()).isEqualTo("Alice");
+        assertThat(mapped.resultJson().get(0).path("name").isMissingNode()).isTrue();
+
+        JsonCsvResponse blankHeader = jsonService.csvToJson(new JsonCsvRequest("h,,z\n1,2,3", null, null));
+        assertThat(blankHeader.headers()).containsExactly("h", "column2", "z");
+        assertThat(blankHeader.resultJson().get(0).path("column2").asText()).isEqualTo("2");
+
+        JsonCsvResponse shortRow = jsonService.csvToJson(new JsonCsvRequest("a,b\n1", null, null));
+        assertThat(shortRow.resultJson().get(0).path("b").asText()).isEmpty();
+
+        JsonCsvResponse bom = jsonService.csvToJson(new JsonCsvRequest("\uFEFFa,b\n1,2", null, null));
+        assertThat(bom.headers()).containsExactly("a", "b");
+
+        assertThatThrownBy(() -> jsonService.csvToJson(new JsonCsvRequest("a,b,a\n1,2,3", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("duplicate header name: a");
+        assertThatThrownBy(() -> jsonService.csvToJson(new JsonCsvRequest("a,b\n1,2,3", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("row 2 has 3 fields but the header has 2");
+        assertThatThrownBy(() -> jsonService.csvToJson(new JsonCsvRequest("a,b\n1,2",
+                null, java.util.Map.of("c", "x"))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("headerMapping key 'c' does not match any header");
+        assertThatThrownBy(() -> jsonService.csvToJson(new JsonCsvRequest("a,b\n1,2",
+                null, java.util.Map.of("a", " "))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("headerMapping value for 'a' must not be blank");
+        assertThatThrownBy(() -> jsonService.csvToJson(new JsonCsvRequest("a,b\n1,2",
+                null, java.util.Map.of("a", "b"))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("headerMapping renames header 'a' to duplicate key 'b'");
+
+        StringBuilder tall = new StringBuilder("h");
+        for (int i = 0; i <= MAX_KEYS; i++) {
+            tall.append("\r\nv");
+        }
+        assertThatThrownBy(() -> jsonService.csvToJson(new JsonCsvRequest(tall.toString(), null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("rows must not exceed " + MAX_KEYS);
+
+        StringBuilder wide = new StringBuilder("h0");
+        for (int i = 1; i <= MAX_KEYS; i++) {
+            wide.append(",h").append(i);
+        }
+        wide.append("\r\n");
+        assertThatThrownBy(() -> jsonService.csvToJson(new JsonCsvRequest(wide.toString(), null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("columns must not exceed " + MAX_KEYS);
+
+        StringBuilder grid = new StringBuilder("h0");
+        for (int i = 1; i <= 500; i++) {
+            grid.append(",h").append(i);
+        }
+        String dataRow = "x" + ",x".repeat(500);
+        for (int r = 0; r < 2000; r++) {
+            grid.append("\r\n").append(dataRow);
+        }
+        assertThatThrownBy(() -> jsonService.csvToJson(new JsonCsvRequest(grid.toString(), null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("conversion exceeds " + MAX_CELLS + " cells");
+    }
+
+    @Test
+    @DisplayName("Should validate and reject invalid CSV to JSON requests")
+    void shouldRejectInvalidCsvToJsonRequests() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+            assertThat(validator.validate(new JsonCsvRequest(" ", null, null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("csvContent is required");
+            assertThat(validator.validate(new JsonCsvRequest(null, null, null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("csvContent is required");
+            assertThat(validator.validate(new JsonCsvRequest("a".repeat(1_000_001), null, null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("csvContent must be at most 1000000 characters");
+            assertThat(validator.validate(new JsonCsvRequest("a,b\n1,2", ",,", null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("delimiter must be a single character");
+            assertThat(validator.validate(new JsonCsvRequest("a,b\n1,2", ";", java.util.Map.of("a", "x"))))
+                    .isEmpty();
+        }
+
+        assertThatThrownBy(() -> jsonService.csvToJson(new JsonCsvRequest("   ", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("csvContent is required");
+        assertThatThrownBy(() -> jsonService.csvToJson(new JsonCsvRequest("\"a,b", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("unterminated quoted field");
+        assertThatThrownBy(() -> jsonService.csvToJson(new JsonCsvRequest("a,\"b\"x,c", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("unexpected character after closing quote");
     }
 
     @Test
