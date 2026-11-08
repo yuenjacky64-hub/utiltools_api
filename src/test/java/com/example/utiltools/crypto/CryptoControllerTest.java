@@ -435,4 +435,106 @@ class CryptoControllerTest {
         assertThat(stored.result()).isEqualTo(entry.result());
         assertThat(stored.completedAt()).isEqualTo(entry.completedAt());
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/base32 - should encode and decode RFC 4648 Base32")
+    void shouldEncodeAndDecodeBase32() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/base32")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "content": "foobar"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.action").value("ENCODE"))
+                .andExpect(jsonPath("$.data.result").value("MZXW6YTBOI======"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/base32")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "DECODE", "content": "MZXW6YTBOI======"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.action").value("DECODE"))
+                .andExpect(jsonPath("$.data.result").value("foobar"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/base32 - should accept lowercase and unpadded decode input")
+    void shouldDecodeBase32Tolerantly() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/base32")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "decode", "content": "mzxw6ytboi"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.action").value("DECODE"))
+                .andExpect(jsonPath("$.data.result").value("foobar"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/base32 - should reject invalid input with the unified error envelope")
+    void shouldRejectInvalidBase32() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/base32")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "DECODE", "content": "MZXW6YTBOI=====!"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/base32")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "DECODE", "content": "MZXW6YTBO"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/base32")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ROT13", "content": "foobar"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/base32")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "content": "   "}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/base32 - should journal and replay a CRYPTO_BASE32 entry")
+    void shouldJournalAndReplayBase32Operation() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/base32")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "content": "foobar"}
+                                """))
+                .andExpect(status().isOk());
+
+        List<AuditEntry> entries = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_BASE32)
+                .toList();
+        assertThat(entries).isNotEmpty();
+        AuditEntry entry = entries.get(0);
+        assertThat(entry.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entry.replayable()).isTrue();
+        assertThat(entry.result().path("result").asText()).isEqualTo("MZXW6YTBOI======");
+
+        String replayBody = mockMvc.perform(post("/api/v1/utils/audit/entries/" + entry.id() + "/replay"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value(ReplayState.VERIFIED.name()))
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+
+        JsonNode replayed = objectMapper.readTree(replayBody).path("data");
+        assertThat(replayed.path("result").path("result").asText()).isEqualTo("MZXW6YTBOI======");
+    }
 }

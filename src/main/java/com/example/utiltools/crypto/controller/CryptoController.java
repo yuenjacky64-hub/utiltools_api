@@ -2,6 +2,8 @@ package com.example.utiltools.crypto.controller;
 
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.ApiResponse;
+import com.example.utiltools.crypto.dto.Base32Request;
+import com.example.utiltools.crypto.dto.Base32Response;
 import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
@@ -21,7 +23,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/v1/utils/crypto")
-@Tag(name = "Crypto & Encoding Utility", description = "Endpoints for cryptographic hashing, HMAC signatures, Base64 encoding/decoding, URL percent-encoding/decoding, and UUID generation")
+@Tag(name = "Crypto & Encoding Utility", description = "Endpoints for cryptographic hashing, HMAC signatures, Base32 encoding/decoding, Base64 encoding/decoding, URL percent-encoding/decoding, and UUID generation")
 public class CryptoController {
 
     private final AuditedOperations auditedOperations;
@@ -42,6 +44,13 @@ public class CryptoController {
     public ApiResponse<Base64Response> base64(@Valid @RequestBody Base64Request request) {
         Base64Response result = auditedOperations.base64(request);
         return ApiResponse.success(result, "Base64 operation completed successfully");
+    }
+
+    @PostMapping("/base32")
+    @Operation(summary = "Encode or decode Base32 strings", description = "Deterministic RFC 4648 Base32 (alphabet A-Z2-7) over UTF-8 bytes; encoding emits uppercase padded output, decoding accepts padded or unpadded input case-insensitively")
+    public ApiResponse<Base32Response> base32(@Valid @RequestBody Base32Request request) {
+        Base32Response result = auditedOperations.base32(request);
+        return ApiResponse.success(result, "Base32 operation completed successfully");
     }
 
     @PostMapping("/url")
