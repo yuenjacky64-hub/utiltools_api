@@ -24,12 +24,16 @@ import com.example.utiltools.json.dto.JsonFlattenRequest;
 import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
+import com.example.utiltools.json.dto.JsonFromCsvRequest;
+import com.example.utiltools.json.dto.JsonFromCsvResponse;
 import com.example.utiltools.json.dto.JsonMergePatchRequest;
 import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonUnflattenRequest;
 import com.example.utiltools.json.dto.JsonUnflattenResponse;
 import com.example.utiltools.json.dto.JsonQueryResponse;
+import com.example.utiltools.json.dto.JsonToCsvRequest;
+import com.example.utiltools.json.dto.JsonToCsvResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.service.JsonService;
@@ -141,6 +145,14 @@ public class AuditedOperations {
         return record(OperationType.JSON_MERGE_PATCH, request, () -> jsonService.mergePatch(request));
     }
 
+    public JsonToCsvResponse toCsv(JsonToCsvRequest request) {
+        return record(OperationType.JSON_TO_CSV, request, () -> jsonService.toCsv(request));
+    }
+
+    public JsonFromCsvResponse fromCsv(JsonFromCsvRequest request) {
+        return record(OperationType.JSON_FROM_CSV, request, () -> jsonService.fromCsv(request));
+    }
+
     public TextTransformResponse transform(TextTransformRequest request) {
         return record(OperationType.TEXT_TRANSFORM, request, () -> textService.transform(request));
     }
@@ -173,6 +185,8 @@ public class AuditedOperations {
             case JSON_FLATTEN -> jsonService.flatten((JsonFlattenRequest) request);
             case JSON_UNFLATTEN -> jsonService.unflatten((JsonUnflattenRequest) request);
             case JSON_MERGE_PATCH -> jsonService.mergePatch((JsonMergePatchRequest) request);
+            case JSON_TO_CSV -> jsonService.toCsv((JsonToCsvRequest) request);
+            case JSON_FROM_CSV -> jsonService.fromCsv((JsonFromCsvRequest) request);
             case TEXT_TRANSFORM -> textService.transform((TextTransformRequest) request);
             case TEXT_STATS -> textService.stats((TextStatsRequest) request);
             case TEXT_REPLACE -> textService.replace((TextReplaceRequest) request);

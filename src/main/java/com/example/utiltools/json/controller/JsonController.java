@@ -6,12 +6,16 @@ import com.example.utiltools.json.dto.JsonFlattenRequest;
 import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
+import com.example.utiltools.json.dto.JsonFromCsvRequest;
+import com.example.utiltools.json.dto.JsonFromCsvResponse;
 import com.example.utiltools.json.dto.JsonMergePatchRequest;
 import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonPatchRequest;
 import com.example.utiltools.json.dto.JsonPatchResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
+import com.example.utiltools.json.dto.JsonToCsvRequest;
+import com.example.utiltools.json.dto.JsonToCsvResponse;
 import com.example.utiltools.json.dto.JsonUnflattenRequest;
 import com.example.utiltools.json.dto.JsonUnflattenResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
@@ -27,7 +31,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/v1/utils/json")
-@Tag(name = "JSON & Data Processor Utility", description = "Endpoints for formatting, minifying, validating, querying, flattening, unflattening, and atomically patching JSON structures")
+@Tag(name = "JSON & Data Processor Utility", description = "Endpoints for formatting, minifying, validating, querying, flattening, unflattening, atomically patching JSON structures, and converting between JSON arrays and CSV/TSV tables")
 public class JsonController {
 
     private final AuditedOperations auditedOperations;
@@ -101,5 +105,28 @@ public class JsonController {
                 ? "JSON patch validated (dry run)"
                 : "JSON patch applied successfully";
         return ApiResponse.success(result, message);
+    }
+
+    @PostMapping("/to-csv")
+    @Operation(summary = "Convert a JSON array of flat objects to CSV/TSV",
+            description = "Exports a JSON array of flat objects as RFC 4180 text. The header is the union of keys in "
+                    + "first-seen order, records are separated by CRLF, and any field carrying the delimiter, a double quote, "
+                    + "CR or LF is quoted with doubled quotes. null or absent fields become empty cells; nested objects or "
+                    + "arrays, a non-array document and more than 10000 rows or columns are rejected with 400 BAD_REQUEST.")
+    public ApiResponse<JsonToCsvResponse> toCsv(@Valid @RequestBody JsonToCsvRequest request) {
+        JsonToCsvResponse result = auditedOperations.toCsv(request);
+        return ApiResponse.success(result, "JSON converted to CSV successfully");
+    }
+
+    @PostMapping("/from-csv")
+    @Operation(summary = "Convert CSV/TSV to a JSON array",
+            description = "Imports RFC 4180 CSV or TSV into a JSON array of string-valued objects. Quoted fields may carry "
+                    + "the delimiter, LF, CRLF or CR newlines and doubled quotes; a UTF-8 BOM is tolerated. hasHeader=true "
+                    + "(the default) uses the first record for property names, mapping blank names to columnN, while "
+                    + "hasHeader=false uses column1..N. Duplicate header names, an unterminated quote, malformed text and "
+                    + "more than 10000 rows or columns are rejected with 400 BAD_REQUEST.")
+    public ApiResponse<JsonFromCsvResponse> fromCsv(@Valid @RequestBody JsonFromCsvRequest request) {
+        JsonFromCsvResponse result = auditedOperations.fromCsv(request);
+        return ApiResponse.success(result, "CSV converted to JSON successfully");
     }
 }
