@@ -25,8 +25,11 @@ __all__ = [
     "TaskCurriculum",
     "TaskSpec",
     "TaskState",
+    "STALE_ELIGIBLE",
     "effective_priority",
+    "progress_age_sec",
     "stamp_pending_since",
+    "stamp_progress",
 ]
 
 PRIORITY_NAMES = "HIGH, NORMAL, LOW"
@@ -121,6 +124,12 @@ NON_TERMINAL = frozenset(
     {TaskState.PENDING, TaskState.IN_PROGRESS, TaskState.RUNNING}
 )
 
+# Only an *actively worked* task can go stale: ``PENDING`` (the state
+# ``_preempt`` leaves behind, and the only state a quarantine-skipped task can
+# hold) is deliberately excluded, so preemption and the fingerprint circuit
+# keep their semantics.
+STALE_ELIGIBLE = frozenset({TaskState.IN_PROGRESS, TaskState.RUNNING})
+
 BASE_PRIORITY_BY_DIFFICULTY = {
     Difficulty.COMPLEX: Priority.HIGH,
     Difficulty.HARD: Priority.NORMAL,
@@ -147,6 +156,15 @@ class TaskSpec:
     # then read as "pending since epoch" and age instantly).
     pending_since: float | None = None
     preempted_count: int = 0
+    # Stale-task bookkeeping. ``last_progress_at`` is the clock value of the
+    # last committed progress line (``None`` means "not observed yet", the same
+    # sentinel reasoning as ``pending_since``); ``last_progress_age_sec`` is the
+    # derived ``now - last_progress_at`` floored at ``0.0`` and refreshed on
+    # every poll tick; ``stale_since`` is the breach latch (set on the first
+    # violating evaluation, cleared by progress or by recovery).
+    last_progress_at: float | None = None
+    last_progress_age_sec: float = 0.0
+    stale_since: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -183,6 +201,31 @@ class TaskSpec:
                     f"got {self.pending_since!r}"
                 )
             self.pending_since = float(self.pending_since)
+        for label in ("last_progress_at", "stale_since"):
+            value = getattr(self, label)
+            if value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0.0
+            ):
+                raise ValueError(
+                    f"{label} must be None or a finite float >= 0; got {value!r}"
+                )
+            setattr(self, label, float(value))
+        if (
+            isinstance(self.last_progress_age_sec, bool)
+            or not isinstance(self.last_progress_age_sec, (int, float))
+            or not math.isfinite(self.last_progress_age_sec)
+            or self.last_progress_age_sec < 0.0
+        ):
+            raise ValueError(
+                "last_progress_age_sec must be a finite float >= 0; "
+                f"got {self.last_progress_age_sec!r}"
+            )
+        self.last_progress_age_sec = float(self.last_progress_age_sec)
 
     def to_dict(self) -> dict:
         """Serialize to a JSON-ready mapping (priority as its name)."""
@@ -197,6 +240,9 @@ class TaskSpec:
             "last_proposed_cycle": self.last_proposed_cycle,
             "pending_since": self.pending_since,
             "preempted_count": self.preempted_count,
+            "last_progress_at": self.last_progress_at,
+            "last_progress_age_sec": self.last_progress_age_sec,
+            "stale_since": self.stale_since,
         }
 
     @classmethod
@@ -221,6 +267,26 @@ def stamp_pending_since(task: TaskSpec, now: float) -> None:
 
     if task.state in NON_TERMINAL and task.pending_since is None:
         task.pending_since = float(now)
+
+
+def stamp_progress(task: TaskSpec, now: float) -> None:
+    """Record a committed progress line: age restarts at ``now``.
+
+    A fresh task and a task that just advanced share one representation, so
+    the stale clock can never be inherited across an adoption.
+    """
+
+    task.last_progress_at = float(now)
+    task.last_progress_age_sec = 0.0
+    task.stale_since = None
+
+
+def progress_age_sec(task: TaskSpec, now: float) -> float:
+    """Age of the last progress line; unstamped reads ``0.0``, never epoch age."""
+
+    if task.last_progress_at is None:
+        return 0.0
+    return max(0.0, float(now) - task.last_progress_at)
 
 
 def _pending_seconds(task: TaskSpec, now: float) -> float:
