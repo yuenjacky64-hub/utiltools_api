@@ -87,6 +87,12 @@ public class BatchHashJobService {
     /** Error recorded on a RUNNING attempt whose execution lease lapsed without a renewal. */
     public static final String EXECUTION_LEASE_EXPIRED = "EXECUTION_LEASE_EXPIRED";
 
+    /** Error recorded on a non-terminal job the {@code @PreDestroy} drain failed on the way down. */
+    public static final String JOB_SHUTDOWN = "JOB_SHUTDOWN";
+
+    /** Grace window the drain waits for in-flight work when the property is not configured. */
+    public static final long DEFAULT_SHUTDOWN_GRACE_SECONDS = 30L;
+
     /** Per-client ceiling on non-terminal jobs when the property is not configured. */
     static final int DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT = 20;
 
@@ -124,8 +130,15 @@ public class BatchHashJobService {
     private final int maxAttempts;
     private final long executionLeaseSeconds;
     private final long executionReaperIntervalMs;
+    private final long shutdownGraceSeconds;
     private final int maxActiveJobsPerClient;
     private final Clock clock;
+
+    /**
+     * Serializes concurrent drain callers only. Workers never take it, so it cannot deadlock with
+     * the pool, and it is always taken first (never while a job monitor is held).
+     */
+    private final Object shutdownMonitor = new Object();
 
     /** Null means auditing is disabled (test slices and direct construction). */
     private volatile AuditJournalService journal;
@@ -172,6 +185,10 @@ public class BatchHashJobService {
                 DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT, clock);
     }
 
+    /**
+     * The Spring-selected constructor: every knob is bound here, including the {@code @PreDestroy}
+     * drain's grace window.
+     */
     @Autowired
     public BatchHashJobService(CryptoService cryptoService,
             @Value("${utiltools.jobs.worker-count:2}") int workerCount,
@@ -180,6 +197,7 @@ public class BatchHashJobService {
             @Value("${utiltools.jobs.max-attempts:3}") int maxAttempts,
             @Value("${utiltools.jobs.execution-lease-seconds:30}") long executionLeaseSeconds,
             @Value("${utiltools.jobs.execution-reaper-interval-ms:5000}") long executionReaperIntervalMs,
+            @Value("${utiltools.jobs.shutdown-grace-seconds:30}") long shutdownGraceSeconds,
             @Value("${utiltools.jobs.max-active-jobs-per-client:20}") int maxActiveJobsPerClient,
             Clock clock) {
         this.cryptoService = cryptoService;
@@ -198,6 +216,12 @@ public class BatchHashJobService {
             throw new IllegalArgumentException("utiltools.jobs.execution-reaper-interval-ms must be positive, was "
                     + executionReaperIntervalMs);
         }
+        // Zero is legal and means "no grace": the drain forces immediately, which is what a test
+        // (and an operator who wants a hard stop) needs. Only a negative budget is rejected.
+        if (shutdownGraceSeconds < 0) {
+            throw new IllegalArgumentException(
+                    "utiltools.jobs.shutdown-grace-seconds must not be negative, was " + shutdownGraceSeconds);
+        }
         // A non-positive quota would refuse every submission, so it is rejected loudly at startup.
         if (maxActiveJobsPerClient <= 0) {
             throw new IllegalArgumentException(
@@ -205,10 +229,24 @@ public class BatchHashJobService {
         }
         this.executionLeaseSeconds = executionLeaseSeconds;
         this.executionReaperIntervalMs = executionReaperIntervalMs;
+        this.shutdownGraceSeconds = shutdownGraceSeconds;
         this.maxActiveJobsPerClient = maxActiveJobsPerClient;
         this.clock = clock == null ? Clock.systemUTC() : clock;
         this.executor = new ThreadPoolExecutor(workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(queueCapacity), new ThreadPoolExecutor.AbortPolicy());
+    }
+
+    /**
+     * Compatibility overload for callers (and tests) that predate the drain grace: the parameter
+     * list is unchanged and the configured default window applies. Unannotated on purpose — Spring
+     * must keep selecting the {@code @Autowired} constructor above.
+     */
+    public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
+            long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
+            long executionReaperIntervalMs, int maxActiveJobsPerClient, Clock clock) {
+        this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
+                executionLeaseSeconds, executionReaperIntervalMs, DEFAULT_SHUTDOWN_GRACE_SECONDS,
+                maxActiveJobsPerClient, clock);
     }
 
     /**
@@ -245,6 +283,20 @@ public class BatchHashJobService {
             AuditJournalService journal) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 executionLeaseSeconds, executionReaperIntervalMs, maxActiveJobsPerClient, clock);
+        this.journal = journal;
+    }
+
+    /**
+     * Test convenience: an explicit drain grace so a test can exercise the forced phase without
+     * sleeping. The journal stays last, so {@code null} still means "auditing disabled".
+     */
+    public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
+            long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
+            long executionReaperIntervalMs, long shutdownGraceSeconds, int maxActiveJobsPerClient,
+            Clock clock, AuditJournalService journal) {
+        this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
+                executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
+                maxActiveJobsPerClient, clock);
         this.journal = journal;
     }
 
@@ -743,9 +795,89 @@ public class BatchHashJobService {
         return reaped;
     }
 
+    /**
+     * Terminalizes the service: in-flight work gets a bounded grace window, everything still
+     * non-terminal afterwards is failed with {@link #JOB_SHUTDOWN}.
+     *
+     * <p>Two phases. Phase one calls {@link ThreadPoolExecutor#shutdown()}, so queued work still
+     * runs while {@link #submit} and {@link #retry} are refused through their existing
+     * {@link RejectedExecutionException} rollback, and waits up to the configured grace window for
+     * the pool to terminate. Phase two interrupts whatever is still running and sweeps the registry.
+     * The sweep fails only {@code QUEUED}/{@code RUNNING} jobs, keeps their attempt number and their
+     * checkpoint, and closes each open audit entry exactly once, so a worker that ignores
+     * interruption and returns later writes nothing: the existing status/attempt fence rejects it.
+     * </p>
+     *
+     * <p>Idempotent by construction rather than by flag: a second call re-runs no-op
+     * {@code shutdown()}/{@code shutdownNow()} and finds no non-terminal job, so it adds no attempt,
+     * no audit row and no quota release.</p>
+     */
     @PreDestroy
     public void shutdown() {
-        executor.shutdownNow();
+        synchronized (shutdownMonitor) {
+            executor.shutdown(); // phase 1: queued work still runs, new work is refused
+            boolean terminated = awaitTerminationBounded(shutdownGraceSeconds);
+            List<Runnable> discarded = executor.shutdownNow(); // phase 2: interrupt what is still running
+            int failed = failNonTerminalJobs(JOB_SHUTDOWN);
+            log.info("batch-hash drain: terminated={}, forced={}, failed={}", terminated, discarded.size(),
+                    failed);
+        }
+    }
+
+    /**
+     * Waits at most {@code graceSeconds} for the pool to terminate.
+     *
+     * @return {@code true} when every task finished, {@code false} on timeout or interruption
+     */
+    private boolean awaitTerminationBounded(long graceSeconds) {
+        if (graceSeconds <= 0) {
+            return executor.isTerminated();
+        }
+        try {
+            return executor.awaitTermination(graceSeconds, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            // Never swallow the caller's interrupt: the drain proceeds to the forced phase.
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /**
+     * Fails every non-terminal job with {@code error}, mirroring {@link #reapExpiredExecutions(Instant)}
+     * line for line: one job monitor at a time, terminal write + attempt upsert + audit close +
+     * reservation claim in that section, quota release outside it.
+     *
+     * @return the number of jobs failed by this pass
+     */
+    private int failNonTerminalJobs(String error) {
+        int failed = 0;
+        for (MutableJob job : jobs.values()) {
+            boolean released = false;
+            synchronized (job) {
+                if (job.status != JobStatus.QUEUED && job.status != JobStatus.RUNNING) {
+                    continue; // terminal jobs (including one that completed inside the grace) untouched
+                }
+                Instant now = Instant.now(clock);
+                job.status = JobStatus.FAILED; // the fence's status half now fails for a late worker
+                job.error = error;
+                job.completedAt = now;
+                job.results = null; // unpublished results are never published by a drain
+                job.executionLeaseExpiresAt = null;
+                job.lastHeartbeatAt = null;
+                // The checkpoint prefix is deliberately kept: it is the evidence a retry resumes from.
+                recordAttempt(job, job.attempt, JobStatus.FAILED, job.startedAt, now, error);
+                // Closes the entry this attempt opened and drops its id, so a late worker's own
+                // close finds nothing and a second drain cannot close the row again.
+                failQuietly(job, job.attempt, error);
+                // Claimed in the same section as the terminal write: the slot is released exactly once.
+                released = job.quotaReserved.compareAndSet(true, false);
+                failed++;
+            }
+            if (released) {
+                releaseQuota(job.clientKey); // after the monitor block (REQ-08)
+            }
+        }
+        return failed;
     }
 
     private MutableJob requireJob(String jobId) {
