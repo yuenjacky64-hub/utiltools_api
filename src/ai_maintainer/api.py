@@ -6,27 +6,77 @@ Stdlib only: the repo has no web framework, so the endpoint is mounted on a
 :meth:`ai_maintainer.engine.MaintainerEngine.fingerprint_state`. Nothing but
 counters and timestamps is exposed; the fingerprint is the exception *type*,
 never its message.
+
+Two routes are served: the fingerprint registry and
+``GET /api/v1/utils/consistency-check`` (REQ-01), a read-only cross-store
+report. :func:`serve` also runs the startup recovery job (REQ-02) once, before
+the scheduler and the request loop start, so drift left behind by a crashed
+role is repaired before anything can be adopted.
 """
 
 from __future__ import annotations
 
 import json
+import re
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
+from ai_maintainer.consistency import (
+    ConsistencyService,
+    UnknownTaskError,
+    run_startup_recovery,
+)
 from ai_maintainer.engine import MaintainerEngine
+from ai_maintainer.state_signal_impl import build_signal_gate
 
 __all__ = [
+    "CONSISTENCY_CHECK_PATH",
     "FINGERPRINT_STATE_PATH",
     "build_handler",
+    "default_consistency_service",
     "fingerprint_state_payload",
+    "run_startup_recovery",
     "serve",
+    "wire_signal_gate",
 ]
 
 FINGERPRINT_STATE_PATH = "/api/v1/maintainer/engine/fingerprint-state"
+CONSISTENCY_CHECK_PATH = "/api/v1/utils/consistency-check"
+
+#: Task ids are directory names; the route refuses anything that could escape
+#: the state root (``..``, ``/``, empty) with the same 404 as an unknown id.
+TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 CONTENT_TYPE = "application/json; charset=utf-8"
+
+#: Process-wide fallback service. Memoised on purpose: the report route, the
+#: startup job and the signal gate must share one instance, because the instance
+#: owns the lock, the audit journal handle and the ``findings[]`` buffer. A
+#: per-request instance would make ``findings[]`` structurally always empty and
+#: would give up the serialisation the repair path relies on.
+_DEFAULT_SERVICE: ConsistencyService | None = None
+_DEFAULT_SERVICE_LOCK = threading.Lock()
+
+
+def default_consistency_service() -> ConsistencyService:
+    """The shared service over the ambient configuration (built once)."""
+
+    global _DEFAULT_SERVICE
+    with _DEFAULT_SERVICE_LOCK:
+        if _DEFAULT_SERVICE is None:
+            _DEFAULT_SERVICE = ConsistencyService.from_environment()
+        return _DEFAULT_SERVICE
+
+
+def wire_signal_gate(
+    engine: MaintainerEngine, service: ConsistencyService
+) -> None:
+    """Install the REQ-03 admit-hook on ``engine`` unless one is already set."""
+
+    if engine.signal_gate is None:
+        engine.install_signal_gate(build_signal_gate(service))
 
 
 def fingerprint_state_payload(
@@ -39,8 +89,15 @@ def fingerprint_state_payload(
     return payload
 
 
-def build_handler(engine: MaintainerEngine) -> type[BaseHTTPRequestHandler]:
-    """Build a :class:`BaseHTTPRequestHandler` subclass bound to ``engine``."""
+def build_handler(
+    engine: MaintainerEngine, *, consistency: ConsistencyService | None = None
+) -> type[BaseHTTPRequestHandler]:
+    """Build a :class:`BaseHTTPRequestHandler` subclass bound to ``engine``.
+
+    ``consistency`` injects the service behind ``GET /api/v1/utils/consistency-check``
+    (tests bind it to a temporary state root); when omitted the route resolves
+    the stores from the ambient configuration, lazily, per request.
+    """
 
     class FingerprintStateHandler(BaseHTTPRequestHandler):
         server_version = "MaintainerEngine/1.0"
@@ -68,6 +125,9 @@ def build_handler(engine: MaintainerEngine) -> type[BaseHTTPRequestHandler]:
 
         def _handle(self) -> None:
             path = urlsplit(self.path).path
+            if path == CONSISTENCY_CHECK_PATH:
+                self._handle_consistency()
+                return
             if path != FINGERPRINT_STATE_PATH:
                 self._write_json(404, {"error": "not_found", "path": path})
                 return
@@ -80,6 +140,44 @@ def build_handler(engine: MaintainerEngine) -> type[BaseHTTPRequestHandler]:
                 return
             try:
                 payload = fingerprint_state_payload(engine)
+            except Exception:  # pragma: no cover - defensive: never echo errors
+                self._write_json(500, {"error": "internal_error"})
+                return
+            self._write_json(200, payload)
+
+        def _handle_consistency(self) -> None:
+            """Read-only cross-store report; never repairs (REQ-01)."""
+
+            # ``HEAD`` is answered like ``GET`` with the body suppressed by
+            # ``_write_json``: a GET route normally answers HEAD, so a 405 here
+            # would be a route-contract surprise (other methods stay 405).
+            if self.command not in ("GET", "HEAD"):
+                self._write_json(
+                    405,
+                    {"error": "method_not_allowed"},
+                    extra_headers={"Allow": "GET"},
+                )
+                return
+            split = urlsplit(self.path)
+            requested = parse_qs(split.query, keep_blank_values=True).get("task", [])
+            if len(requested) > 1:
+                self._write_json(404, {"error": "task_not_found"})
+                return
+            task = requested[0] if requested else None
+            if task is not None and not TASK_ID_PATTERN.match(task):
+                self._write_json(404, {"error": "task_not_found", "task": task})
+                return
+            try:
+                service = (
+                    consistency
+                    if consistency is not None
+                    else default_consistency_service()
+                )
+                payload: dict[str, Any] = {"path": CONSISTENCY_CHECK_PATH}
+                payload.update(service.report(task=task))
+            except UnknownTaskError:
+                self._write_json(404, {"error": "task_not_found", "task": task})
+                return
             except Exception:  # pragma: no cover - defensive: never echo errors
                 self._write_json(500, {"error": "internal_error"})
                 return
@@ -115,10 +213,34 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8000,
     sweep_interval_sec: float | None = None,
+    *,
+    consistency: ConsistencyService | None = None,
 ) -> ThreadingHTTPServer:
-    """Serve the endpoint (blocking) and run the quarantine sweep alongside it."""
+    """Serve the endpoints (blocking) and run the quarantine sweep alongside them.
 
-    server = ThreadingHTTPServer((host, port), build_handler(engine))
+    The startup consistency job runs first (REQ-02): it scans every known task
+    and repairs cross-store drift under the recovery journal. It never raises —
+    a failure is counted in the summary — so a broken store can never prevent
+    the server from starting.
+    """
+
+    service = consistency
+    try:
+        if service is None and engine.signal_gate is None:
+            # One shared service for the gate, the route and the startup job.
+            service = default_consistency_service()
+        if service is not None:
+            service.recover_all()
+        else:
+            run_startup_recovery()
+    except Exception:  # pragma: no cover - defensive: startup must not abort
+        pass
+    if service is not None:
+        # REQ-03 at runtime: the engine asks the gate before adopting a task, so
+        # a transition that would drift the stores is refused by the same
+        # validation the route and the startup job use.
+        wire_signal_gate(engine, service)
+    server = ThreadingHTTPServer((host, port), build_handler(engine, consistency=consistency))
     engine.start_scheduler(sweep_interval_sec)
     try:
         server.serve_forever()

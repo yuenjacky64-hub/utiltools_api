@@ -31,3 +31,9 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Orchestrator runtime audit journal (never source) - UTILTOOLS-62 REQ-02 / REQ-04 ###
+.parent/recovery_journal.jsonl
+.parent/recovery_journal.jsonl.tmp
+recovery_journal.jsonl
+recovery_journal.jsonl.tmp
