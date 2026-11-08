@@ -1618,7 +1618,9 @@ class BatchHashJobServiceTest {
         }
 
         // Exactly the cap survives, and the survivors are the newest rows: no surviving row is
-        // re-registered or mutated by the eviction pass.
+        // re-registered or mutated by the eviction pass. The last completion's cap pass runs after
+        // its job-monitor section, so await convergence rather than sampling mid-pass.
+        awaitRegistryKeys(jobIds.subList(2, cap + 2).toArray(new String[0]));
         assertThat(registryKeys("jobs")).containsExactlyInAnyOrderElementsOf(jobIds.subList(2, cap + 2));
         assertThatThrownBy(() -> service.getJob(jobIds.get(0))).isInstanceOf(JobNotFoundException.class);
         assertThatThrownBy(() -> service.getJob(jobIds.get(1))).isInstanceOf(JobNotFoundException.class);
@@ -1649,7 +1651,7 @@ class BatchHashJobServiceTest {
             clock.advanceSeconds(1);
         }
 
-        assertThat(registryKeys("jobs")).contains(held.jobId()).hasSize(cap + 1);
+        assertThat(awaitRegistrySize(cap + 1)).contains(held.jobId());
         assertThat(service.getJob(held.jobId()).status()).isEqualTo(JobStatus.RUNNING);
 
         // A time-based pass past retention-seconds still removes every eligible terminal row...
@@ -1680,6 +1682,7 @@ class BatchHashJobServiceTest {
                 new BatchHashRequest("SHA-256", List.of("other"), null, null));
         awaitStatus(second.jobId(), JobStatus.COMPLETED);
 
+        awaitRegistryKeys(second.jobId()); // the cap pass for the keyed row runs after its completion
         assertThatThrownBy(() -> service.getJob(first.jobId())).isInstanceOf(JobNotFoundException.class);
         assertThat(registryKeys("jobs")).containsExactly(second.jobId());
         assertThat(registryKeys("idempotencyIndex")).isEmpty(); // the mapping went with the row
@@ -1688,7 +1691,7 @@ class BatchHashJobServiceTest {
         BatchHashJobResponse fresh = service.submit(keyed);
         assertThat(fresh.jobId()).isNotEqualTo(first.jobId());
         awaitStatus(fresh.jobId(), JobStatus.COMPLETED); // the new row ages out second, not first
-        assertThat(registryKeys("jobs")).containsExactly(fresh.jobId());
+        awaitRegistryKeys(fresh.jobId());
         assertThat(idempotencyIndexView()).containsOnlyKeys("reuse-key");
         assertThat(idempotencyIndexView()).containsEntry("reuse-key", fresh.jobId());
         // ...and the duplicate path now answers with the new row, not the evicted one.
@@ -1926,6 +1929,7 @@ class BatchHashJobServiceTest {
                 new BatchHashRequest("SHA-256", List.of("pressure"), null, null), "198.51.100.12");
         awaitStatus(pressure.jobId(), JobStatus.COMPLETED);
 
+        awaitRegistryKeys(survivor.jobId(), pressure.jobId());
         assertThatThrownBy(() -> service.getJob(victim.jobId())).isInstanceOf(JobNotFoundException.class);
         assertThat(registryKeys("jobs")).containsExactlyInAnyOrder(survivor.jobId(), pressure.jobId());
 
@@ -2057,6 +2061,57 @@ class BatchHashJobServiceTest {
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Cannot read BatchHashJobService." + fieldName, e);
         }
+    }
+
+    /**
+     * Waits until the {@code jobs} registry converges on exactly {@code expectedIds}, then returns the
+     * observed set.
+     *
+     * <p>A terminal transition publishes its status under the job monitor and only then runs the cap
+     * pass, which must take {@code registryLock} <em>after</em> leaving that monitor
+     * ({@code registryLock -> job monitor} is the only legal order). A row that has just become
+     * terminal is therefore still registered for the few microseconds the completing worker needs to
+     * re-acquire the registry lock, so these tests await convergence instead of sampling the registry
+     * in the middle of an enforcement pass.</p>
+     */
+    private Set<String> awaitRegistryKeys(String... expectedIds) {
+        Set<String> expected = Set.of(expectedIds);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        Set<String> observed = Set.of();
+        while (System.nanoTime() < deadline) {
+            observed = registryKeys("jobs");
+            if (observed.equals(expected)) {
+                return observed;
+            }
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while awaiting the jobs registry", e);
+            }
+        }
+        throw new AssertionError("jobs registry did not converge on " + expected
+                + "; last observed " + observed);
+    }
+
+    /** Waits until the {@code jobs} registry holds exactly {@code expectedSize} rows (see above). */
+    private Set<String> awaitRegistrySize(int expectedSize) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        Set<String> observed = Set.of();
+        while (System.nanoTime() < deadline) {
+            observed = registryKeys("jobs");
+            if (observed.size() == expectedSize) {
+                return observed;
+            }
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while awaiting the jobs registry", e);
+            }
+        }
+        throw new AssertionError("jobs registry did not converge on " + expectedSize
+                + " rows; last observed " + observed);
     }
 
     /** Runs {@code cancel} expecting a conflict and returns the exception for field-level assertions. */

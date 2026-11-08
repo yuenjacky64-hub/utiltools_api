@@ -419,6 +419,12 @@ public class BatchHashJobService {
                 }
             }
 
+            // Count enforcement runs here, still holding registryLock and before the new row is
+            // published (Plan §4.4 order: duplicate resolution, cap, quota, registration): the
+            // registry is trimmed to the cap on every submission, including one that is about to be
+            // refused, and the QUEUED row created below can never be selected as its own victim.
+            enforceRetainedJobCapLocked();
+
             // Read-only: a refusal below leaves the job and idempotency registries untouched.
             int active = activeJobsByClient.getOrDefault(quotaKey, 0);
             if (active >= maxActiveJobsPerClient) {
@@ -442,11 +448,6 @@ public class BatchHashJobService {
             // and finishes immediately. A duplicate submission (fast path above) instead returns the
             // current live snapshot of the already-registered job, which may already be COMPLETED.
             BatchHashJobResponse accepted = snapshot(job);
-
-            // Count enforcement runs here, still holding registryLock and before the new job is
-            // published to the pool: the registry can never be observed above the cap by a later
-            // submit, and the fresh QUEUED row is skipped by the terminal-only selection.
-            enforceRetainedJobCapLocked();
 
             // Correlation is recorded before the handoff, so the worker can install the *submitter's*
             // id rather than whatever the reused pool thread happened to carry.
