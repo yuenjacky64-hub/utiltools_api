@@ -607,6 +607,9 @@ class BatchHashJobServiceTest {
         assertThat(third.jobId()).isEqualTo(cancelled.jobId());
         assertThat(third.completedAt()).isEqualTo(cancelled.completedAt());
         assertThat(third).isEqualTo(cancelled);
+        // REQ-08: the worker releases the quota after the monitor block that wrote CANCELLED, so the
+        // counter may still read 1 when awaitStatus returns - wait for the release, then assert it.
+        awaitActiveJobs(client, 0);
         assertThat(service.activeJobsForClient(client)).isZero(); // exactly one release
 
         // The repeats added no attempt and no second audit close.
