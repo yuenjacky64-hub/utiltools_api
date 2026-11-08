@@ -489,9 +489,25 @@ public class BatchHashJobService {
     /**
      * The bound this submission is charged against: the per-request value when present, otherwise the
      * configured server default. {@code 0} means "no bound", which is exactly today's behaviour.
+     *
+     * <p>The per-request range is re-checked here rather than only on the record: bean validation
+     * guards the HTTP route, but a direct caller (a test, an internal scheduler) never passes through
+     * it, and a value of {@code 0} would otherwise short-circuit this method into "unbounded" instead
+     * of failing. Rejecting it loudly keeps one meaning for {@code 0} - the configured default - and
+     * never turns a malformed request into a silently immortal job.</p>
+     *
+     * @throws IllegalArgumentException when the request value is outside {@code 1..3600}
      */
     private long resolveEffectiveDeadline(Integer requestDeadlineSeconds) {
-        return requestDeadlineSeconds != null ? requestDeadlineSeconds.longValue() : defaultDeadlineSeconds;
+        if (requestDeadlineSeconds == null) {
+            return defaultDeadlineSeconds;
+        }
+        long requested = requestDeadlineSeconds.longValue();
+        if (requested < 1 || requested > MAX_DEADLINE_SECONDS) {
+            throw new IllegalArgumentException(
+                    "deadlineSeconds must be between 1 and 3600, was " + requested);
+        }
+        return requested;
     }
 
     /** Decrements (and removes at zero) a client's counter entry. Caller must hold {@code registryLock}. */
@@ -818,6 +834,12 @@ public class BatchHashJobService {
      *         after leaving the monitor section
      */
     private boolean failDeadlineLocked(MutableJob job, int generation, Instant now) {
+        // A QUEUED generation was never admitted, so no worker is carrying its request id any more:
+        // drop the mapping here so a job that expired in the queue retains no correlation ids of
+        // generations that can never run (a RUNNING generation is cleaned by its own worker exit).
+        if (job.status == JobStatus.QUEUED) {
+            job.attemptRequestIds.remove(generation);
+        }
         job.status = JobStatus.FAILED;
         job.error = JOB_DEADLINE_EXCEEDED;
         job.completedAt = now;
