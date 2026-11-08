@@ -39,6 +39,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
@@ -389,5 +390,112 @@ class AuditControllerTest {
             boolean hasSkipReason = row.containsKey("skipReason");
             assertThat(hasOutcome ^ hasSkipReason).as("exactly one of outcome/skipReason").isTrue();
         });
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/audit/reaps - a fresh journal returns an empty tombstone log")
+    @DirtiesContext(methodMode = DirtiesContext.MethodMode.BEFORE_METHOD)
+    void shouldReturnEmptyReapLog() throws Exception {
+        mockMvc.perform(get("/api/v1/utils/audit/reaps"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Reap tombstones retrieved successfully"))
+                .andExpect(jsonPath("$.data").isArray())
+                .andExpect(jsonPath("$.data.length()").value(0));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/audit/reaps - tombstones are returned newest first and never carry payloads")
+    @DirtiesContext(methodMode = DirtiesContext.MethodMode.BEFORE_METHOD)
+    void shouldListReapLogNewestFirst() throws Exception {
+        AuditEntry stale = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "audit-reaps0001");
+        journal.reapStalePending(Instant.now().plusSeconds(3600));
+
+        AuditEntry manual = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "audit-reaps0002");
+        assertThat(journal.requestManualReap(manual.id())).isTrue();
+        assertThat(journal.reap()).isEqualTo(1);
+
+        MvcResult result = mockMvc.perform(get("/api/v1/utils/audit/reaps").param("limit", "10"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Reap tombstones retrieved successfully"))
+                .andExpect(jsonPath("$.data.length()").value(2))
+                .andExpect(jsonPath("$.data[0].status").value("REAPED"))
+                .andExpect(jsonPath("$.data[0].entryId").value(manual.id()))
+                .andExpect(jsonPath("$.data[0].reason").value("MANUALLY_REAPED"))
+                .andExpect(jsonPath("$.data[1].status").value("REAPED"))
+                .andExpect(jsonPath("$.data[1].entryId").value(stale.id()))
+                .andExpect(jsonPath("$.data[1].reason").value("STALE_PENDING"))
+                .andReturn();
+
+        String body = result.getResponse().getContentAsString();
+        assertThat(body).doesNotContain("Hello World").doesNotContain("super-secret-key");
+        assertThat(body).doesNotContain("\"request\"").doesNotContain("\"result\"");
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/audit/reaps?reason=STALE_PENDING - only matching tombstones are returned")
+    @DirtiesContext(methodMode = DirtiesContext.MethodMode.BEFORE_METHOD)
+    void shouldFilterReapLogByReason() throws Exception {
+        AuditEntry stale = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "audit-reaps0003");
+        journal.reapStalePending(Instant.now().plusSeconds(3600));
+
+        AuditEntry manual = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "audit-reaps0004");
+        assertThat(journal.requestManualReap(manual.id())).isTrue();
+        assertThat(journal.reap()).isEqualTo(1);
+
+        MvcResult result = mockMvc.perform(get("/api/v1/utils/audit/reaps")
+                        .param("reason", "STALE_PENDING"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.length()").value(1))
+                .andExpect(jsonPath("$.data[0].entryId").value(stale.id()))
+                .andExpect(jsonPath("$.data[0].reason").value("STALE_PENDING"))
+                .andReturn();
+
+        assertThat(result.getResponse().getContentAsString()).doesNotContain(manual.id());
+
+        mockMvc.perform(get("/api/v1/utils/audit/reaps").param("reason", "OVERSIZE_PAYLOAD"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.length()").value(0));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/audit/reaps?reason=BANANA - invalid enum value returns 400 BAD_REQUEST")
+    void shouldRejectUnknownReapReason() throws Exception {
+        mockMvc.perform(get("/api/v1/utils/audit/reaps").param("reason", "BANANA")
+                        .header("X-Request-Id", "audit-badreap1"))
+                .andExpect(status().isBadRequest())
+                .andExpect(header().string("X-Request-Id", "audit-badreap1"))
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(
+                        "Invalid value 'BANANA' for parameter 'reason'"))
+                .andExpect(jsonPath("$.requestId").value("audit-badreap1"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/audit/reaps?limit=abc - non-numeric limit returns 400 BAD_REQUEST")
+    void shouldRejectNonNumericReapLimit() throws Exception {
+        mockMvc.perform(get("/api/v1/utils/audit/reaps").param("limit", "abc"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(
+                        "Invalid value 'abc' for parameter 'limit'"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/audit/reaps - limit is clamped, never rejected")
+    void shouldClampReapLogLimit() throws Exception {
+        for (String limit : List.of("0", "-7", "100000")) {
+            mockMvc.perform(get("/api/v1/utils/audit/reaps").param("limit", limit))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.success").value(true))
+                    .andExpect(jsonPath("$.data").isArray());
+        }
+    }
+
+    private static HashRequest hashRequest() {
+        return new HashRequest("SHA-256", "Hello World", "super-secret-key");
     }
 }
