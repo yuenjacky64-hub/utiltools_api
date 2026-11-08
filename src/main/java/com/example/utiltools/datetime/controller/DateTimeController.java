@@ -7,6 +7,8 @@ import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
+import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
+import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.dto.TimeZoneListResponse;
@@ -53,6 +55,14 @@ public class DateTimeController {
     public ApiResponse<DateTimeShiftResponse> shift(@Valid @RequestBody DateTimeShiftRequest request) {
         DateTimeShiftResponse result = auditedOperations.shift(request);
         return ApiResponse.success(result, "DateTime shifted successfully");
+    }
+
+    @PostMapping("/duration")
+    @Operation(summary = "Parse or format ISO-8601 durations",
+            description = "Parses week/day/hour/minute/second ISO-8601 durations such as P1DT2H30M into components and total seconds, or formats signed seconds and nanos back into canonical ISO-8601 text")
+    public ApiResponse<DateTimeDurationResponse> duration(@Valid @RequestBody DateTimeDurationRequest request) {
+        DateTimeDurationResponse result = auditedOperations.duration(request);
+        return ApiResponse.success(result, "DateTime duration processed successfully");
     }
 
     @GetMapping("/current")
