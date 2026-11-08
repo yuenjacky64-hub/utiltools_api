@@ -499,7 +499,7 @@ class BatchHashJobServiceTest {
      */
     @Test
     @DisplayName("cancel - a RUNNING job turns CANCELLING and its worker finalizes CANCELLED at the checkpoint")
-    void shouldMarkRunningJobCancellingAndFinalizeCancelledAtCheckpoint() throws Exception {
+    void shouldMoveRunningJobToCancellingThenCancelled() throws Exception {
         AuditJournalService journal = newJournal();
         MutableJobClock clock = new MutableJobClock(LEASE_START);
         CountDownLatch enteredHash = new CountDownLatch(1);
@@ -567,13 +567,64 @@ class BatchHashJobServiceTest {
     }
 
     /**
+     * DOD-03 / REQ-02: a repeated DELETE on a CANCELLING job returns the current snapshot and writes
+     * nothing - the second request neither bumps an attempt nor closes the audit entry - and once the
+     * worker terminalizes the job a third DELETE returns that CANCELLED snapshot unchanged.
+     */
+    @Test
+    @DisplayName("cancel - repeated DELETE on a CANCELLING job is idempotent and writes nothing")
+    void shouldRepeatCancelOnCancellingIdempotently() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        CountDownLatch enteredHash = new CountDownLatch(1);
+        CountDownLatch releaseHash = new CountDownLatch(1);
+        CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
+        String client = "198.51.100.35";
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 1, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("blocked", "later"), null, null), client);
+        assertThat(enteredHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+        assertThat(awaitRunningAttempt(accepted.jobId(), 1).status()).isEqualTo(JobStatus.RUNNING);
+
+        BatchHashJobResponse first = service.cancel(accepted.jobId());
+        BatchHashJobResponse second = service.cancel(accepted.jobId());
+        assertThat(first.status()).isEqualTo(JobStatus.CANCELLING);
+        assertThat(second.status()).isEqualTo(JobStatus.CANCELLING);
+        assertThat(second.jobId()).isEqualTo(first.jobId());
+        assertThat(second.completedAt()).isNull();
+        assertThat(second).isEqualTo(first); // identical snapshot, nothing written
+        assertThat(service.getJob(accepted.jobId())).isEqualTo(first);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1); // the slot is still claimed
+        assertThat(batchHashEntries(journal, accepted.jobId())).hasSize(1);
+        assertThat(batchHashEntries(journal, accepted.jobId()).get(0).state())
+                .isEqualTo(JournalState.PENDING);
+
+        releaseHash.countDown();
+        BatchHashJobResponse cancelled = awaitStatus(accepted.jobId(), JobStatus.CANCELLED);
+        BatchHashJobResponse third = service.cancel(accepted.jobId());
+        assertThat(third.status()).isEqualTo(JobStatus.CANCELLED);
+        assertThat(third.jobId()).isEqualTo(cancelled.jobId());
+        assertThat(third.completedAt()).isEqualTo(cancelled.completedAt());
+        assertThat(third).isEqualTo(cancelled);
+        assertThat(service.activeJobsForClient(client)).isZero(); // exactly one release
+
+        // The repeats added no attempt and no second audit close.
+        assertThat(service.getJob(accepted.jobId()).attempts()).hasSize(1);
+        List<AuditEntry> entries = batchHashEntries(journal, accepted.jobId());
+        assertThat(entries).hasSize(1);
+        assertThat(entries.get(0).state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entries.get(0).result().path("outcome").asText()).isEqualTo("CANCELLED");
+    }
+
+    /**
      * DOD-02 / REQ-03 / REQ-04: a CANCELLING job whose execution lease lapses is terminalized
      * CANCELLED by the reaper - once, with one attempt-history entry, one audit close and one quota
      * release - and the worker that ignored the lapse writes nothing when it finally returns.
      */
     @Test
     @DisplayName("reap - a CANCELLING job with a lapsed lease is finalized CANCELLED once and ignores the late worker")
-    void shouldReapCancellingJobAsCancelled() throws Exception {
+    void shouldReapCancellingJobWithLapsedLease() throws Exception {
         AuditJournalService journal = newJournal();
         MutableJobClock clock = new MutableJobClock(LEASE_START);
         LeaseCryptoService crypto = new LeaseCryptoService("stall");
@@ -628,7 +679,7 @@ class BatchHashJobServiceTest {
      */
     @Test
     @DisplayName("cancelling - heartbeat and retry are refused with the CANCELLING status and write nothing")
-    void shouldRejectHeartbeatAndRetryWhileCancelling() throws Exception {
+    void shouldRejectHeartbeatAndRetryOnCancellingJob() throws Exception {
         AuditJournalService journal = newJournal();
         MutableJobClock clock = new MutableJobClock(LEASE_START);
         LeaseCryptoService crypto = new LeaseCryptoService("stall");
@@ -667,7 +718,7 @@ class BatchHashJobServiceTest {
      */
     @Test
     @DisplayName("drain - a CANCELLING job is settled CANCELLED while QUEUED and RUNNING keep JOB_SHUTDOWN")
-    void shouldSettleCancellingJobAsCancelledDuringDrain() {
+    void shouldCancelCancellingJobDuringShutdownDrain() {
         AuditJournalService journal = newJournal();
         StallingCryptoService crypto = new StallingCryptoService("stuck", "busy");
         MutableJobClock clock = new MutableJobClock(LEASE_START);
@@ -728,6 +779,44 @@ class BatchHashJobServiceTest {
         } finally {
             crypto.releaseAll();
         }
+    }
+
+    /**
+     * DOD-08 / REQ-01: a CANCELLING job holds a live checkpoint prefix (item 1 of four is committed
+     * while the worker blocks on item 2), yet the projection exposes neither that prefix nor any
+     * results, eviction skips it because it is non-terminal, and it never reaches COMPLETED.
+     */
+    @Test
+    @DisplayName("cancelling - no partial digest is exposed, eviction skips it and it never completes")
+    void shouldNotExposeCheckpointForCancellingJob() throws Exception {
+        CheckpointCryptoService crypto = new CheckpointCryptoService(Map.of(), "bravo");
+        String client = "198.51.100.36";
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000,
+                Clock.systemUTC());
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", CHECKPOINT_ITEMS, null, null), client);
+        assertThat(crypto.awaitGate()).isTrue(); // item 1 committed, item 2 is inside hash()
+
+        BatchHashJobResponse cancelling = service.cancel(accepted.jobId());
+        assertThat(cancelling.status()).isEqualTo(JobStatus.CANCELLING);
+        assertThat(cancelling.completedItems()).isZero(); // the durable prefix is hidden
+        assertThat(cancelling.results()).isNull();
+        assertThat(cancelling.completedAt()).isNull();
+        assertThat(service.getJob(accepted.jobId())).isEqualTo(cancelling);
+        // Eviction requires a terminal status with a completedAt, so CANCELLING is never evicted.
+        assertThat(service.evictExpiredJobs(Instant.now().plusSeconds(86_400L * 365))).isZero();
+        assertThat(service.getJob(accepted.jobId()).status()).isEqualTo(JobStatus.CANCELLING);
+
+        crypto.releaseGate();
+        BatchHashJobResponse cancelled = awaitStatus(accepted.jobId(), JobStatus.CANCELLED);
+        assertThat(cancelled.status()).isNotEqualTo(JobStatus.COMPLETED);
+        assertThat(cancelled.completedItems()).isZero(); // the prefix was discarded
+        assertThat(cancelled.results()).isNull();
+        assertThat(crypto.count("alpha")).isEqualTo(1);
+        assertThat(crypto.count("charlie")).isZero(); // nothing past the checkpoint was hashed
+        assertThat(crypto.count("delta")).isZero();
+        awaitActiveJobs(client, 0);
     }
 
     @Test
