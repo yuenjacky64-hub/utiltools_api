@@ -157,3 +157,58 @@ def test_config_json_rejects_unknown_key(tmp_path: Path, empty_must_config: None
     with pytest.raises(ValueError) as excinfo:
         MaintainerConfig.load(maintainer_root=tmp_path, env={})
     assert "config.json must contain a JSON object" in str(excinfo.value)
+
+
+def test_fingerprint_config_defaults_and_validation(
+    tmp_path: Path, empty_must_config: None
+) -> None:
+    """DOD-11 / REQ-01: new knobs have safe defaults, are coerced and validated."""
+
+    defaults = MaintainerConfig()
+    assert defaults.fingerprint_quarantine_threshold == 3
+    assert defaults.fingerprint_quarantine_sec == 60.0
+    assert defaults.quarantine_sweep_interval_sec == 5.0
+    assert defaults.blocked_backoff_base_sec == 0.1
+    assert defaults.blocked_backoff_max_sec == 30.0
+    assert defaults.max_fingerprint_buckets == 64
+
+    # Env layer coerces the string forms to the declared numeric types.
+    env = {
+        "MAINTAINER_FINGERPRINT_QUARANTINE_SEC": "60",
+        "MAINTAINER_QUARANTINE_SWEEP_INTERVAL_SEC": "2.5",
+        "MAINTAINER_BLOCKED_BACKOFF_BASE_SEC": "1",
+        "MAINTAINER_BLOCKED_BACKOFF_MAX_SEC": "7",
+        "MAINTAINER_FINGERPRINT_QUARANTINE_THRESHOLD": "5",
+        "MAINTAINER_MAX_FINGERPRINT_BUCKETS": "16",
+    }
+    config = MaintainerConfig.load(maintainer_root=tmp_path, env=env)
+    assert config.fingerprint_quarantine_sec == 60.0
+    assert isinstance(config.fingerprint_quarantine_sec, float)
+    assert config.quarantine_sweep_interval_sec == 2.5
+    assert config.blocked_backoff_base_sec == 1.0
+    assert config.blocked_backoff_max_sec == 7.0
+    assert config.fingerprint_quarantine_threshold == 5
+    assert config.max_fingerprint_buckets == 16
+
+    with pytest.raises(ValueError, match="fingerprint_quarantine_threshold must be >= 1"):
+        MaintainerConfig(fingerprint_quarantine_threshold=0)
+    with pytest.raises(ValueError, match="must be > 0"):
+        MaintainerConfig(fingerprint_quarantine_sec=0.0)
+    with pytest.raises(ValueError, match="must be > 0"):
+        MaintainerConfig(quarantine_sweep_interval_sec=-1.0)
+    with pytest.raises(ValueError, match="blocked_backoff_base_sec must be >= 0"):
+        MaintainerConfig(blocked_backoff_base_sec=-0.5)
+    with pytest.raises(ValueError, match="blocked_backoff_max_sec"):
+        MaintainerConfig(blocked_backoff_base_sec=2.0, blocked_backoff_max_sec=1.0)
+    with pytest.raises(ValueError, match="max_fingerprint_buckets must be >= 1"):
+        MaintainerConfig(max_fingerprint_buckets=0)
+    with pytest.raises(ValueError, match="must be an integer"):
+        MaintainerConfig.load(
+            maintainer_root=tmp_path,
+            env={"MAINTAINER_FINGERPRINT_QUARANTINE_THRESHOLD": "three"},
+        )
+    with pytest.raises(ValueError, match="must be a number"):
+        MaintainerConfig.load(
+            maintainer_root=tmp_path,
+            env={"MAINTAINER_FINGERPRINT_QUARANTINE_SEC": "soon"},
+        )

@@ -26,6 +26,13 @@ DEFAULT_AGING_INTERVAL_MS = 300_000
 DEFAULT_RECENCY_BOOST_CYCLES = 3
 DEFAULT_MAX_STEPS_PER_CYCLE = 8
 
+DEFAULT_FINGERPRINT_QUARANTINE_THRESHOLD = 3
+DEFAULT_FINGERPRINT_QUARANTINE_SEC = 60.0
+DEFAULT_QUARANTINE_SWEEP_INTERVAL_SEC = 5.0
+DEFAULT_BLOCKED_BACKOFF_BASE_SEC = 0.1
+DEFAULT_BLOCKED_BACKOFF_MAX_SEC = 30.0
+DEFAULT_MAX_FINGERPRINT_BUCKETS = 64
+
 DEFAULT_PRIMARY_CLI: str | None = None
 DEFAULT_PRIMARY_MODEL: str | None = None
 DEFAULT_SECONDARY_CLI: str | None = None
@@ -111,13 +118,31 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
 
     coerced: dict[str, Any] = {}
     for key, value in raw.items():
-        if key in ("prioritization_aging_interval_ms", "recency_boost_cycles", "max_steps_per_cycle"):
+        if key in (
+            "prioritization_aging_interval_ms",
+            "recency_boost_cycles",
+            "max_steps_per_cycle",
+            "fingerprint_quarantine_threshold",
+            "max_fingerprint_buckets",
+        ):
             if isinstance(value, bool):
                 raise ValueError(f"{key} must be an integer")
             try:
                 coerced[key] = int(value)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"{key} must be an integer") from exc
+        elif key in (
+            "fingerprint_quarantine_sec",
+            "quarantine_sweep_interval_sec",
+            "blocked_backoff_base_sec",
+            "blocked_backoff_max_sec",
+        ):
+            if isinstance(value, bool):
+                raise ValueError(f"{key} must be a number")
+            try:
+                coerced[key] = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{key} must be a number") from exc
         elif key == "priority_preemption_enabled":
             coerced[key] = _coerce_bool(key, value)
         else:
@@ -160,6 +185,12 @@ class MaintainerConfig:
     primary_model: str | None = DEFAULT_PRIMARY_MODEL
     secondary_cli: str | None = DEFAULT_SECONDARY_CLI
     secondary_model: str | None = DEFAULT_SECONDARY_MODEL
+    fingerprint_quarantine_threshold: int = DEFAULT_FINGERPRINT_QUARANTINE_THRESHOLD
+    fingerprint_quarantine_sec: float = DEFAULT_FINGERPRINT_QUARANTINE_SEC
+    quarantine_sweep_interval_sec: float = DEFAULT_QUARANTINE_SWEEP_INTERVAL_SEC
+    blocked_backoff_base_sec: float = DEFAULT_BLOCKED_BACKOFF_BASE_SEC
+    blocked_backoff_max_sec: float = DEFAULT_BLOCKED_BACKOFF_MAX_SEC
+    max_fingerprint_buckets: int = DEFAULT_MAX_FINGERPRINT_BUCKETS
 
     def __post_init__(self) -> None:
         interval = self.prioritization_aging_interval_ms
@@ -179,6 +210,34 @@ class MaintainerConfig:
             value = getattr(self, name)
             if value is not None and not is_free_model(value):
                 raise ValueError(f"{name} is not a free model: {value}")
+        threshold = self.fingerprint_quarantine_threshold
+        if (
+            not isinstance(threshold, int)
+            or isinstance(threshold, bool)
+            or threshold < 1
+        ):
+            raise ValueError("fingerprint_quarantine_threshold must be >= 1")
+        for name in ("fingerprint_quarantine_sec", "quarantine_sweep_interval_sec"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ValueError(f"{name} must be > 0")
+        base_backoff = self.blocked_backoff_base_sec
+        if (
+            isinstance(base_backoff, bool)
+            or not isinstance(base_backoff, (int, float))
+            or base_backoff < 0
+        ):
+            raise ValueError("blocked_backoff_base_sec must be >= 0")
+        max_backoff = self.blocked_backoff_max_sec
+        if (
+            isinstance(max_backoff, bool)
+            or not isinstance(max_backoff, (int, float))
+            or max_backoff < base_backoff
+        ):
+            raise ValueError("blocked_backoff_max_sec must be >= blocked_backoff_base_sec")
+        buckets = self.max_fingerprint_buckets
+        if not isinstance(buckets, int) or isinstance(buckets, bool) or buckets < 1:
+            raise ValueError("max_fingerprint_buckets must be >= 1")
 
     @property
     def aging_threshold_seconds(self) -> float:

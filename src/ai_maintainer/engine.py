@@ -5,6 +5,13 @@ task priority bookkeeping and the event deque. Monitor step bodies run outside
 that lock and their result is committed only after re-validating that the
 stepped task is still the monitored one, so a concurrent preemption can never
 double-count progress.
+
+The same lock also guards the per-fingerprint circuit registry: every blocked
+cycle is tallied against its *error fingerprint* (the exception type, never the
+message), a fingerprint that reaches ``fingerprint_quarantine_threshold``
+consecutive blocks is quarantined for ``fingerprint_quarantine_sec``, and a
+background sweep pass probes the fingerprint after the window elapses. Probe
+bodies run outside the lock, exactly like the monitor step body.
 """
 
 from __future__ import annotations
@@ -13,6 +20,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable
 
 from ai_maintainer.config import MaintainerConfig
@@ -25,9 +33,70 @@ from ai_maintainer.tasks.curriculum import (
     stamp_pending_since,
 )
 
-__all__ = ["CycleResult", "MaintainerEngine"]
+__all__ = [
+    "CycleResult",
+    "FingerprintBucket",
+    "FingerprintCircuitState",
+    "MaintainerEngine",
+    "error_fingerprint",
+]
 
 EVENT_LOG_MAXLEN = 100
+
+
+class FingerprintCircuitState(Enum):
+    """Circuit state of one error fingerprint."""
+
+    CLOSED = "CLOSED"  # normal operation, no quarantine
+    OPEN = "OPEN"  # quarantined until ``quarantine_until``
+    HALF_OPEN = "HALF_OPEN"  # quarantine expired, a single probe is in flight
+
+
+def error_fingerprint(exc: BaseException) -> str:
+    """Return the error-type key of ``exc`` (never ``str(exc)``)."""
+
+    error_type = type(exc)
+    return f"{error_type.__module__}.{error_type.__qualname__}"
+
+
+@dataclass
+class FingerprintBucket:
+    """Consecutive-blocked counter and quarantine window of one fingerprint."""
+
+    fingerprint: str
+    consecutive_blocked: int = 0
+    quarantine_until: float | None = None
+    circuit_state: FingerprintCircuitState = FingerprintCircuitState.CLOSED
+    last_cycle: int = 0
+    last_seen: float = 0.0
+    probe_epoch: int = 0
+
+    def is_quarantined(self, now: float) -> bool:
+        """Single coherence rule shared by the skip rule and the endpoint."""
+
+        return (
+            self.circuit_state is not FingerprintCircuitState.CLOSED
+            and self.quarantine_until is not None
+            and now < self.quarantine_until
+        )
+
+    def remaining_sec(self, now: float) -> float:
+        """Remaining quarantine time, derived (never a mutable countdown)."""
+
+        if self.quarantine_until is None:
+            return 0.0
+        return max(0.0, self.quarantine_until - now)
+
+    def to_dict(self, *, now: float) -> dict[str, Any]:
+        return {
+            "fingerprint": self.fingerprint,
+            "circuit_state": self.circuit_state.value,
+            "consecutive_blocked": self.consecutive_blocked,
+            "quarantine_active": self.is_quarantined(now),
+            "quarantine_until": self.quarantine_until,
+            "remaining_sec": self.remaining_sec(now),
+            "last_cycle": self.last_cycle,
+        }
 
 
 @dataclass
@@ -58,6 +127,7 @@ class MaintainerEngine:
         curriculum: TaskCurriculum,
         config: MaintainerConfig | None = None,
         clock: Callable[[], float] = time.monotonic,
+        probe: Callable[[str], bool] | None = None,
     ) -> None:
         self._curriculum = curriculum
         self._config = config if config is not None else curriculum.config
@@ -66,6 +136,11 @@ class MaintainerEngine:
         self._monitored: TaskSpec | None = None
         self._events: deque[dict[str, Any]] = deque(maxlen=EVENT_LOG_MAXLEN)
         self._cycles = 0
+        self._buckets: dict[str, FingerprintBucket] = {}
+        self._task_fingerprint: dict[str, str] = {}
+        self._probe = probe
+        self._scheduler_thread: threading.Thread | None = None
+        self._scheduler_stop = threading.Event()
 
     # ------------------------------------------------------------------ public
 
@@ -85,6 +160,7 @@ class MaintainerEngine:
         preempted_name: str | None = None
         monitored_name: str | None = None
         priority_name: str | None = None
+        reported_skips: set[str] = set()
 
         with self._lock:
             self._cycles += 1
@@ -97,7 +173,7 @@ class MaintainerEngine:
                     self._monitored.state not in NON_TERMINAL
                 ):
                     self._monitored = None
-                incoming = self._select_next_task(now)
+                incoming = self._select_next_task(now, reported_skips)
                 if self._monitored is None:
                     if incoming is None:
                         break
@@ -137,8 +213,8 @@ class MaintainerEngine:
                     task.state = TaskState.FAILED
                     task.pending_since = None
                     self._monitored = None
-                    self._events.append(
-                        {"event": "FAILED", "task": task.name, "cycle": cycle}
+                    self._record_cycle_outcome(
+                        "BLOCKED", task, cycle=cycle, error=error
                     )
                     steps += 1
                     continue
@@ -147,9 +223,9 @@ class MaintainerEngine:
                     task.state = TaskState.COMPLETED
                     task.pending_since = None
                     self._monitored = None
-                    self._events.append(
-                        {"event": "COMPLETED", "task": task.name, "cycle": cycle}
-                    )
+                    self._record_cycle_outcome("COMPLETED", task, cycle=cycle)
+                else:
+                    self._record_cycle_outcome("PROGRESS", task, cycle=cycle)
             steps += 1
 
         return CycleResult(
@@ -181,6 +257,126 @@ class MaintainerEngine:
                 "pending": pending,
             }
 
+    def fingerprint_state(self, now: float | None = None) -> dict[str, Any]:
+        """Lock-protected copy of the per-fingerprint circuit registry."""
+
+        with self._lock:
+            moment = self._clock() if now is None else now
+            cycle = self._cycles
+            buckets = [
+                bucket.to_dict(now=moment) for bucket in self._buckets.values()
+            ]
+        # Quarantined first, then ascending fingerprint: stable for assertions.
+        buckets.sort(key=lambda item: (not item["quarantine_active"], item["fingerprint"]))
+        return {
+            "cycle": cycle,
+            "now": moment,
+            "quarantined_count": sum(
+                1 for item in buckets if item["quarantine_active"]
+            ),
+            "fingerprints": buckets,
+        }
+
+    def sweep_quarantine(self, now: float | None = None) -> dict[str, Any]:
+        """Expire due quarantine timers, probe and close or re-arm each circuit."""
+
+        moment = self._clock() if now is None else now
+        candidates: list[tuple[str, int]] = []
+        with self._lock:
+            for fingerprint, bucket in self._buckets.items():
+                if bucket.circuit_state is not FingerprintCircuitState.OPEN:
+                    continue
+                if bucket.quarantine_until is None or moment < bucket.quarantine_until:
+                    continue
+                bucket.circuit_state = FingerprintCircuitState.HALF_OPEN
+                bucket.probe_epoch += 1
+                bucket.last_seen = moment
+                candidates.append((fingerprint, bucket.probe_epoch))
+
+        probed = closed = reopened = 0
+        for fingerprint, epoch in candidates:
+            probed += 1
+            try:
+                ok = True if self._probe is None else bool(self._probe(fingerprint))
+            except Exception:  # a raising probe is a failed probe
+                ok = False
+            with self._lock:
+                bucket = self._buckets.get(fingerprint)
+                if (
+                    bucket is None
+                    or bucket.circuit_state is not FingerprintCircuitState.HALF_OPEN
+                    or bucket.probe_epoch != epoch
+                ):
+                    continue
+                bucket.last_seen = moment
+                if ok:
+                    closed += 1
+                    bucket.circuit_state = FingerprintCircuitState.CLOSED
+                    bucket.consecutive_blocked = 0
+                    bucket.quarantine_until = None
+                    self._events.append(
+                        {
+                            "event": "FINGERPRINT_CLOSED",
+                            "fingerprint": fingerprint,
+                            "cycle": self._cycles,
+                        }
+                    )
+                else:
+                    reopened += 1
+                    bucket.consecutive_blocked += 1
+                    bucket.probe_epoch += 1
+                    bucket.circuit_state = FingerprintCircuitState.OPEN
+                    bucket.quarantine_until = (
+                        moment + self._config.fingerprint_quarantine_sec
+                    )
+                    self._events.append(
+                        {
+                            "event": "FINGERPRINT_REOPENED",
+                            "fingerprint": fingerprint,
+                            "cycle": self._cycles,
+                        }
+                    )
+        return {
+            "now": moment,
+            "probed": probed,
+            "closed": closed,
+            "reopened": reopened,
+        }
+
+    def start_scheduler(self, interval_sec: float | None = None) -> threading.Thread:
+        """Start the daemon quarantine sweep thread (idempotent)."""
+
+        with self._lock:
+            existing = self._scheduler_thread
+            if existing is not None and existing.is_alive():
+                return existing
+            interval = (
+                self._config.quarantine_sweep_interval_sec
+                if interval_sec is None
+                else float(interval_sec)
+            )
+            self._scheduler_stop.clear()
+            thread = threading.Thread(
+                target=self._scheduler_loop,
+                args=(interval,),
+                name="maintainer-quarantine-sweep",
+                daemon=True,
+            )
+            self._scheduler_thread = thread
+        thread.start()
+        return thread
+
+    def stop_scheduler(self) -> None:
+        """Stop the sweep thread and wait for it (idempotent)."""
+
+        thread = self._scheduler_thread
+        self._scheduler_stop.set()
+        if thread is not None:
+            thread.join(timeout=5.0)
+        with self._lock:
+            self._scheduler_thread = None
+        self._scheduler_stop.clear()
+
     # ----------------------------------------------------------------- private
 
     def _monitor_step(self, task: TaskSpec) -> None:
@@ -188,13 +384,167 @@ class MaintainerEngine:
 
         return None
 
-    def _select_next_task(self, now: float) -> TaskSpec | None:
-        """Highest effective priority wins; ties break FIFO by insertion order."""
+    def _scheduler_loop(self, interval: float) -> None:
+        while not self._scheduler_stop.wait(interval):
+            try:
+                self.sweep_quarantine()
+            except Exception:  # pragma: no cover - defensive: never kill the thread
+                continue
+
+    def _record_cycle_outcome(
+        self,
+        outcome: str,
+        task: TaskSpec,
+        *,
+        cycle: int,
+        error: BaseException | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Tally one cycle outcome against the task's error fingerprint.
+
+        Called with ``_lock`` held. ``outcome`` is ``BLOCKED`` (monitor step
+        raised), ``COMPLETED`` or ``PROGRESS`` (a committed step clears the
+        streak of that task's fingerprint).
+        """
+
+        moment = self._clock() if now is None else now
+        if outcome == "BLOCKED":
+            fingerprint = self._task_fingerprint.get(task.name)
+            if error is not None:
+                fingerprint = error_fingerprint(error)
+                self._task_fingerprint[task.name] = fingerprint
+            bucket = (
+                None if fingerprint is None else self._bucket_for(fingerprint, moment)
+            )
+            self._events.append(
+                {"event": "FAILED", "task": task.name, "cycle": cycle}
+            )
+            if bucket is None:
+                return
+            bucket.consecutive_blocked += 1
+            bucket.last_cycle = cycle
+            bucket.last_seen = moment
+            if (
+                bucket.consecutive_blocked
+                >= self._config.fingerprint_quarantine_threshold
+                and bucket.circuit_state is not FingerprintCircuitState.OPEN
+            ):
+                self._open_quarantine(bucket, now=moment, cycle=cycle)
+            return
+
+        fingerprint = self._task_fingerprint.pop(task.name, None)
+        if fingerprint is not None:
+            bucket = self._buckets.get(fingerprint)
+            if bucket is not None and not bucket.is_quarantined(moment):
+                bucket.consecutive_blocked = 0
+                bucket.quarantine_until = None
+                bucket.circuit_state = FingerprintCircuitState.CLOSED
+                bucket.last_seen = moment
+        if outcome == "COMPLETED":
+            self._events.append(
+                {"event": "COMPLETED", "task": task.name, "cycle": cycle}
+            )
+
+    def _open_quarantine(
+        self, bucket: FingerprintBucket, *, now: float, cycle: int
+    ) -> None:
+        bucket.circuit_state = FingerprintCircuitState.OPEN
+        bucket.quarantine_until = now + self._config.fingerprint_quarantine_sec
+        bucket.probe_epoch += 1
+        bucket.last_seen = now
+        self._events.append(
+            {
+                "event": "FINGERPRINT_QUARANTINED",
+                "fingerprint": bucket.fingerprint,
+                "cycle": cycle,
+            }
+        )
+
+    def _bucket_for(self, fingerprint: str, now: float) -> FingerprintBucket:
+        """Return (creating if needed) the bucket of ``fingerprint``."""
+
+        bucket = self._buckets.get(fingerprint)
+        if bucket is None:
+            bucket = FingerprintBucket(fingerprint=fingerprint, last_seen=now)
+            self._buckets[fingerprint] = bucket
+            self._enforce_bucket_cap()
+        return bucket
+
+    def _enforce_bucket_cap(self) -> None:
+        """Bound the registry; ``OPEN``/``HALF_OPEN`` buckets are never evicted."""
+
+        cap = self._config.max_fingerprint_buckets
+        if len(self._buckets) <= cap:
+            return
+        evictable = sorted(
+            (
+                bucket
+                for bucket in self._buckets.values()
+                if bucket.circuit_state is FingerprintCircuitState.CLOSED
+            ),
+            key=lambda bucket: (bucket.last_seen, bucket.fingerprint),
+        )
+        for victim in evictable:
+            if len(self._buckets) <= cap:
+                break
+            self._buckets.pop(victim.fingerprint, None)
+            for name in [
+                name
+                for name, fingerprint in self._task_fingerprint.items()
+                if fingerprint == victim.fingerprint
+            ]:
+                self._task_fingerprint.pop(name, None)
+
+    def _blocked_backoff_sec(self, fingerprint: str) -> float:
+        """Exponential backoff of one fingerprint's current streak, clamped."""
+
+        bucket = self._buckets.get(fingerprint)
+        if bucket is None:
+            return 0.0
+        streak = bucket.consecutive_blocked
+        if streak == 0 or bucket.is_quarantined(self._clock()):
+            # A quarantined fingerprint is skipped, not delayed.
+            return 0.0
+        return float(
+            min(
+                self._config.blocked_backoff_base_sec * (2 ** (streak - 1)),
+                self._config.blocked_backoff_max_sec,
+            )
+        )
+
+    def _is_fingerprint_quarantined(self, task: TaskSpec, now: float) -> bool:
+        fingerprint = self._task_fingerprint.get(task.name)
+        if fingerprint is None:
+            return False
+        bucket = self._buckets.get(fingerprint)
+        return bucket is not None and bucket.is_quarantined(now)
+
+    def _select_next_task(
+        self, now: float, reported_skips: set[str] | None = None
+    ) -> TaskSpec | None:
+        """Highest effective priority wins; ties break FIFO by insertion order.
+
+        A task whose fingerprint is quarantined is neither adopted nor stepped;
+        its ``FINGERPRINT_SKIPPED`` event is appended at most once per cycle.
+        """
 
         best: TaskSpec | None = None
         best_key: tuple[int, int] | None = None
         for index, task in enumerate(self._curriculum.specs):
             if task.state not in NON_TERMINAL:
+                continue
+            if self._is_fingerprint_quarantined(task, now):
+                fingerprint = self._task_fingerprint[task.name]
+                if reported_skips is not None and fingerprint not in reported_skips:
+                    reported_skips.add(fingerprint)
+                    self._events.append(
+                        {
+                            "event": "FINGERPRINT_SKIPPED",
+                            "task": task.name,
+                            "fingerprint": fingerprint,
+                            "cycle": self._cycles,
+                        }
+                    )
                 continue
             stamp_pending_since(task, now)
             level = effective_priority(
