@@ -36,6 +36,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -325,17 +326,56 @@ class BatchJobControllerTest {
     }
 
     @Test
-    @DisplayName("DELETE /api/v1/utils/jobs/{jobId} - should map a late cancellation to 409 JOB_CANCELLATION_CONFLICT")
-    void shouldReturn409WhenCancellationConflicts() throws Exception {
-        doThrow(new JobCancellationConflictException("job-running-1", JobStatus.RUNNING))
-                .when(jobService).cancel("job-running-1");
+    @DisplayName("DELETE /api/v1/utils/jobs/{jobId} - should return 200 CANCELLING when cancelling a RUNNING job")
+    void shouldReturn200WithCancellingWhenCancellingRunningJob() throws Exception {
+        Instant createdAt = Instant.parse("2026-11-06T10:00:00Z");
+        Instant startedAt = Instant.parse("2026-11-06T10:00:01Z");
+        Instant completedAt = Instant.parse("2026-11-06T10:00:05Z");
+        BatchHashJobResponse cancelling = new BatchHashJobResponse("job-running-2", "controller-cancel-key",
+                JobStatus.CANCELLING, 2, null, null, createdAt, startedAt, null, 1, 3,
+                List.of(new JobAttempt(1, JobStatus.CANCELLING, startedAt, null, null)));
+        BatchHashJobResponse cancelled = new BatchHashJobResponse("job-running-2", "controller-cancel-key",
+                JobStatus.CANCELLED, 2, null, null, createdAt, startedAt, completedAt, 1, 3,
+                List.of(new JobAttempt(1, JobStatus.CANCELLED, startedAt, completedAt, null)));
+        doReturn(cancelling).when(jobService).cancel("job-running-2");
+        doReturn(cancelled).when(jobService).getJob("job-running-2");
 
-        mockMvc.perform(delete("/api/v1/utils/jobs/job-running-1"))
+        mockMvc.perform(delete("/api/v1/utils/jobs/job-running-2"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Job cancelled"))
+                .andExpect(jsonPath("$.data.jobId").value("job-running-2"))
+                .andExpect(jsonPath("$.data.status").value("CANCELLING"))
+                .andExpect(jsonPath("$.data.completedAt").doesNotExist())
+                .andExpect(jsonPath("$.data.completedItems").value(0))
+                .andExpect(jsonPath("$.data.results").doesNotExist());
+        // A repeated DELETE is idempotent: same snapshot, same 200.
+        mockMvc.perform(delete("/api/v1/utils/jobs/job-running-2"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("CANCELLING"));
+
+        // Once the worker hits its checkpoint the poll projects the terminal CANCELLED snapshot.
+        mockMvc.perform(get("/api/v1/utils/jobs/job-running-2"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("CANCELLED"))
+                .andExpect(jsonPath("$.data.completedAt").value("2026-11-06T10:00:05Z"))
+                .andExpect(jsonPath("$.data.completedItems").value(0))
+                .andExpect(jsonPath("$.data.results").doesNotExist());
+        verify(jobService, times(2)).cancel("job-running-2");
+    }
+
+    @Test
+    @DisplayName("DELETE /api/v1/utils/jobs/{jobId} - should map cancelling a COMPLETED job to 409 JOB_CANCELLATION_CONFLICT")
+    void shouldReturn409WhenCancellationConflicts() throws Exception {
+        doThrow(new JobCancellationConflictException("job-completed-9", JobStatus.COMPLETED))
+                .when(jobService).cancel("job-completed-9");
+
+        mockMvc.perform(delete("/api/v1/utils/jobs/job-completed-9"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("JOB_CANCELLATION_CONFLICT"))
-                .andExpect(jsonPath("$.details.jobId").value("job-running-1"))
-                .andExpect(jsonPath("$.details.status").value("RUNNING"));
+                .andExpect(jsonPath("$.details.jobId").value("job-completed-9"))
+                .andExpect(jsonPath("$.details.status").value("COMPLETED"));
     }
 
     @Test

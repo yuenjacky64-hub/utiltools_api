@@ -169,7 +169,7 @@ public class BatchHashJobService {
     private static int completedItems(MutableJob job) {
         return switch (job.status) {
             case COMPLETED -> job.items.size();
-            case CANCELLED -> 0;
+            case CANCELLING, CANCELLED -> 0; // a cancelled job never exposes a prefix
             default -> job.checkpoint.size();
         };
     }
@@ -621,22 +621,37 @@ public class BatchHashJobService {
     }
 
     /**
-     * Withdraws a job that is still QUEUED. The QUEUED -> CANCELLED transition happens exactly once,
-     * under the job's own monitor, so it cannot interleave with the worker's admission check: either
-     * the worker has not started (and will see CANCELLED and return without hashing) or the job is
-     * already RUNNING and this call reports a conflict. A repeated call on a CANCELLED job returns the
-     * same snapshot, because CANCELLED is terminal and no field is written again.
+     * Requests cancellation of a job: {@code QUEUED -> CANCELLED} withdraws it outright, while
+     * {@code RUNNING -> CANCELLING} only records the request and lets the worker honour it at its next
+     * checkpoint.
+     *
+     * <p>Both transitions happen under the job's own monitor, so they cannot interleave with the
+     * worker's admission check: either the worker has not started (and will see CANCELLED and return
+     * without hashing), or it is already RUNNING and turns CANCELLING — the writer that observes
+     * CANCELLING is the one that terminalizes CANCELLED exactly once ({@code INV-CAN-2}). A
+     * cancellation request deliberately releases nothing: the per-client quota slot and the execution
+     * lease stay with the in-flight worker, because the job is still non-terminal and still hashing.</p>
+     *
+     * <p>Calling this again on a CANCELLING or CANCELLED job returns the current snapshot and writes
+     * nothing ({@code INV-CAN-3}); COMPLETED and FAILED remain a conflict and leave the snapshot
+     * untouched.</p>
      *
      * @throws JobNotFoundException              when the id is unknown or was already evicted
-     * @throws JobCancellationConflictException  when the job is RUNNING, COMPLETED or FAILED
+     * @throws JobCancellationConflictException  when the job is COMPLETED or FAILED
      */
     public BatchHashJobResponse cancel(String jobId) {
         MutableJob job = requireJob(jobId);
         boolean released = false;
         BatchHashJobResponse cancelled;
         synchronized (job) {
-            if (job.status == JobStatus.CANCELLED) {
+            if (job.status == JobStatus.CANCELLING || job.status == JobStatus.CANCELLED) {
                 return snapshot(job); // idempotent: nothing is written
+            }
+            if (job.status == JobStatus.RUNNING) {
+                // Records the request only: the worker (or the reaper / drain, if it stalls) still has
+                // to write the terminal CANCELLED, so the reservation and the lease stay untouched.
+                job.status = JobStatus.CANCELLING;
+                return snapshot(job);
             }
             if (job.status != JobStatus.QUEUED) {
                 throw new JobCancellationConflictException(job.jobId, job.status);
@@ -657,6 +672,54 @@ public class BatchHashJobService {
             releaseQuota(job.clientKey);
         }
         return cancelled;
+    }
+
+    /**
+     * Writes the single {@code CANCELLING -> CANCELLED} transition. The caller must already hold the
+     * job monitor and must have re-checked that this generation still owns a CANCELLING job, so the
+     * terminal write, the attempt upsert, the audit close and the reservation claim can never be split
+     * by a concurrent writer ({@code INV-CAN-2}).
+     *
+     * <p>Clearing the checkpoint on the way out is what makes cancellation a withdrawal rather than a
+     * failure: a retry resumes an empty prefix, exactly as {@code QUEUED -> CANCELLED} does, and no
+     * partial digest survives in memory.</p>
+     *
+     * @return {@code true} when this call claimed the quota reservation; the caller releases the slot
+     *         after leaving the monitor section
+     */
+    private boolean finalizeCancelledLocked(MutableJob job, int generation) {
+        job.status = JobStatus.CANCELLED;
+        job.completedAt = Instant.now(clock);
+        job.results = null; // explicit: a cancelled batch never publishes results
+        job.checkpoint.clear(); // a cancelled job retains no partial digests
+        job.error = null;
+        job.lastHeartbeatAt = null;
+        job.executionLeaseExpiresAt = null;
+        recordAttempt(job, generation, JobStatus.CANCELLED, job.startedAt, job.completedAt, null);
+        // Closes the entry the attempt opened and drops its id, so the worker's own outcome and every
+        // recovery path find nothing left to close and the row is journalled exactly once.
+        succeedQuietly(job, generation, "CANCELLED");
+        return job.quotaReserved.compareAndSet(true, false);
+    }
+
+    /**
+     * Terminalizes a CANCELLING job outside the monitor, releasing the quota slot after the section.
+     *
+     * @return {@code true} when this call wrote the terminal status, {@code false} when another writer
+     *         had already terminalized the attempt
+     */
+    private boolean finalizeCancelled(MutableJob job, int generation) {
+        boolean released;
+        synchronized (job) {
+            if (job.status != JobStatus.CANCELLING) {
+                return false; // a concurrent reaper or drain already settled this attempt
+            }
+            released = finalizeCancelledLocked(job, generation);
+        }
+        if (released) {
+            releaseQuota(job.clientKey); // after the monitor block (REQ-08)
+        }
+        return true;
     }
 
     /**
@@ -766,27 +829,33 @@ public class BatchHashJobService {
         for (MutableJob job : jobs.values()) {
             boolean released = false;
             synchronized (job) {
-                if (job.status != JobStatus.RUNNING || job.executionLeaseExpiresAt == null) {
-                    continue; // QUEUED, terminal, or (defensively) a RUNNING job with no lease
+                if (job.executionLeaseExpiresAt == null || job.executionLeaseExpiresAt.isAfter(now)) {
+                    continue; // no lease at all, or the lease is still live
                 }
-                if (job.executionLeaseExpiresAt.isAfter(now)) {
-                    continue; // lease still live
+                if (job.status == JobStatus.CANCELLING) {
+                    // A pending cancellation whose worker stalled: honour the request rather than
+                    // overwriting it with FAILED, so the caller-visible outcome stays CANCELLED.
+                    released = finalizeCancelledLocked(job, job.attempt);
+                    reaped++;
+                } else if (job.status == JobStatus.RUNNING) {
+                    job.status = JobStatus.FAILED;
+                    job.error = EXECUTION_LEASE_EXPIRED;
+                    job.completedAt = now;
+                    job.results = null;
+                    job.executionLeaseExpiresAt = null;
+                    job.lastHeartbeatAt = null;
+                    recordAttempt(job, job.attempt, JobStatus.FAILED, job.startedAt, now,
+                            EXECUTION_LEASE_EXPIRED);
+                    // Close the audit entry the stalled worker opened: the fence keeps that worker from
+                    // writing its own (late) outcome, so this is the only terminal write for the attempt.
+                    failQuietly(job, job.attempt, EXECUTION_LEASE_EXPIRED);
+                    // Claimed in the same section as the terminal write; a late worker fenced by this
+                    // reap never reaches its own claim, so the slot is released exactly once.
+                    released = job.quotaReserved.compareAndSet(true, false);
+                    reaped++;
+                } else {
+                    continue; // QUEUED holds no lease; terminal jobs are already settled
                 }
-                job.status = JobStatus.FAILED;
-                job.error = EXECUTION_LEASE_EXPIRED;
-                job.completedAt = now;
-                job.results = null;
-                job.executionLeaseExpiresAt = null;
-                job.lastHeartbeatAt = null;
-                recordAttempt(job, job.attempt, JobStatus.FAILED, job.startedAt, now,
-                        EXECUTION_LEASE_EXPIRED);
-                // Close the audit entry the stalled worker opened: the fence keeps that worker from
-                // writing its own (late) outcome, so this is the only terminal write for the attempt.
-                failQuietly(job, job.attempt, EXECUTION_LEASE_EXPIRED);
-                // Claimed in the same section as the terminal write; a late worker fenced by this
-                // reap never reaches its own claim, so the slot is released exactly once.
-                released = job.quotaReserved.compareAndSet(true, false);
-                reaped++;
             }
             if (released) {
                 releaseQuota(job.clientKey); // after the monitor block (REQ-08)
@@ -854,24 +923,30 @@ public class BatchHashJobService {
         for (MutableJob job : jobs.values()) {
             boolean released = false;
             synchronized (job) {
-                if (job.status != JobStatus.QUEUED && job.status != JobStatus.RUNNING) {
+                if (job.status == JobStatus.CANCELLING) {
+                    // The caller already asked for CANCELLED: a drain settles the request instead of
+                    // turning it into a JOB_SHUTDOWN failure the caller never asked for.
+                    released = finalizeCancelledLocked(job, job.attempt);
+                    failed++;
+                } else if (job.status == JobStatus.QUEUED || job.status == JobStatus.RUNNING) {
+                    Instant now = Instant.now(clock);
+                    job.status = JobStatus.FAILED; // the fence's status half now fails for a late worker
+                    job.error = error;
+                    job.completedAt = now;
+                    job.results = null; // unpublished results are never published by a drain
+                    job.executionLeaseExpiresAt = null;
+                    job.lastHeartbeatAt = null;
+                    // The checkpoint prefix is deliberately kept: it is the evidence a retry resumes from.
+                    recordAttempt(job, job.attempt, JobStatus.FAILED, job.startedAt, now, error);
+                    // Closes the entry this attempt opened and drops its id, so a late worker's own
+                    // close finds nothing and a second drain cannot close the row again.
+                    failQuietly(job, job.attempt, error);
+                    // Claimed in the same section as the terminal write: the slot is released exactly once.
+                    released = job.quotaReserved.compareAndSet(true, false);
+                    failed++;
+                } else {
                     continue; // terminal jobs (including one that completed inside the grace) untouched
                 }
-                Instant now = Instant.now(clock);
-                job.status = JobStatus.FAILED; // the fence's status half now fails for a late worker
-                job.error = error;
-                job.completedAt = now;
-                job.results = null; // unpublished results are never published by a drain
-                job.executionLeaseExpiresAt = null;
-                job.lastHeartbeatAt = null;
-                // The checkpoint prefix is deliberately kept: it is the evidence a retry resumes from.
-                recordAttempt(job, job.attempt, JobStatus.FAILED, job.startedAt, now, error);
-                // Closes the entry this attempt opened and drops its id, so a late worker's own
-                // close finds nothing and a second drain cannot close the row again.
-                failQuietly(job, job.attempt, error);
-                // Claimed in the same section as the terminal write: the slot is released exactly once.
-                released = job.quotaReserved.compareAndSet(true, false);
-                failed++;
             }
             if (released) {
                 releaseQuota(job.clientKey); // after the monitor block (REQ-08)
@@ -897,7 +972,7 @@ public class BatchHashJobService {
             // the reap / retry / cancel edges.
             int completedItems = switch (job.status) {
                 case COMPLETED -> job.items.size(); // the prefix was cleared when results were published
-                case CANCELLED -> 0; // never expose a withdrawn job's prefix
+                case CANCELLING, CANCELLED -> 0; // never expose a cancelled job's prefix
                 default -> job.checkpoint.size(); // QUEUED / RUNNING / FAILED
             };
             return new BatchHashJobResponse(job.jobId, job.idempotencyKey, job.status, job.items.size(),
@@ -959,31 +1034,41 @@ public class BatchHashJobService {
                 }
                 boolean released;
                 synchronized (job) {
-                    if (job.attempt != generation || job.status != JobStatus.RUNNING) {
-                        // Load-bearing: a reaped attempt keeps its attempt number but is FAILED, so the
-                        // status half of this fence is what stops a late COMPLETED write; the generation
-                        // half covers an attempt superseded by retry.
-                        return; // fenced: the attempt was requeued or reaped while hashing
+                    if (job.attempt != generation) {
+                        // The generation half covers an attempt superseded by retry.
+                        return; // fenced: the attempt was requeued while hashing
                     }
-                    if (job.checkpoint.size() != job.items.size()) {
-                        // Unreachable through input; surfaces as an ordinary FAILED job rather than
-                        // publishing a short result list.
-                        throw new IllegalStateException("checkpoint prefix does not cover the batch");
+                    if (job.status == JobStatus.CANCELLING) {
+                        // The caller cancelled while the last item was hashing: its CANCELLED wins over
+                        // this COMPLETED, so the results just computed are discarded with the prefix.
+                        released = finalizeCancelledLocked(job, generation);
+                    } else {
+                        if (job.status != JobStatus.RUNNING) {
+                            // Load-bearing: a reaped attempt keeps its attempt number but is FAILED, so
+                            // the status half of this fence is what stops a late COMPLETED write.
+                            return; // fenced: the attempt was reaped while hashing
+                        }
+                        if (job.checkpoint.size() != job.items.size()) {
+                            // Unreachable through input; surfaces as an ordinary FAILED job rather than
+                            // publishing a short result list.
+                            throw new IllegalStateException("checkpoint prefix does not cover the batch");
+                        }
+                        job.results = List.copyOf(job.checkpoint); // the full ordered prefix, input order
+                        job.checkpoint.clear(); // results now own the values; retained state stays bounded
+                        job.error = null;
+                        job.status = JobStatus.COMPLETED;
+                        job.completedAt = Instant.now(clock);
+                        job.lastHeartbeatAt = null;
+                        job.executionLeaseExpiresAt = null;
+                        recordAttempt(job, generation, JobStatus.COMPLETED, job.startedAt, job.completedAt,
+                                null);
+                        // Same section that wrote the terminal status: the audit outcome can never
+                        // disagree with the snapshot, and a journal fault cannot change it.
+                        succeedQuietly(job, generation, "COMPLETED");
+                        // Claimed in the same section as the terminal write: the slot covering this
+                        // attempt is released exactly once, by the writer that terminated it.
+                        released = job.quotaReserved.compareAndSet(true, false);
                     }
-                    job.results = List.copyOf(job.checkpoint); // the full ordered prefix, input order
-                    job.checkpoint.clear(); // results now own the values; retained state stays bounded
-                    job.error = null;
-                    job.status = JobStatus.COMPLETED;
-                    job.completedAt = Instant.now(clock);
-                    job.lastHeartbeatAt = null;
-                    job.executionLeaseExpiresAt = null;
-                    recordAttempt(job, generation, JobStatus.COMPLETED, job.startedAt, job.completedAt, null);
-                    // Same section that wrote the terminal status: the audit outcome can never
-                    // disagree with the snapshot, and a journal fault cannot change it.
-                    succeedQuietly(job, generation, "COMPLETED");
-                    // Claimed in the same section as the terminal write: the slot covering this
-                    // attempt is released exactly once, by the writer that terminated it.
-                    released = job.quotaReserved.compareAndSet(true, false);
                 }
                 if (released) {
                     releaseQuota(job.clientKey); // after the monitor block (REQ-08)
@@ -992,19 +1077,29 @@ public class BatchHashJobService {
                 // Intentional: an Error must not wedge the pool, later jobs still run.
                 boolean released = false;
                 synchronized (job) {
-                    if (job.attempt != generation || job.status != JobStatus.RUNNING) {
-                        // Load-bearing, same reasoning as the COMPLETED fence above: a stale failure must
-                        // not overwrite a reaped or retried attempt.
-                        return; // fenced: a superseded failure must not overwrite the retried attempt
+                    if (job.attempt != generation) {
+                        // A stale failure must not overwrite an attempt superseded by retry.
+                        return; // fenced: the attempt was requeued while hashing
                     }
-                    job.error = describe(t);
-                    job.status = JobStatus.FAILED;
-                    job.completedAt = Instant.now(clock);
-                    job.lastHeartbeatAt = null;
-                    job.executionLeaseExpiresAt = null;
-                    recordAttempt(job, generation, JobStatus.FAILED, job.startedAt, job.completedAt, job.error);
-                    failQuietly(job, generation, job.error);
-                    released = job.quotaReserved.compareAndSet(true, false);
+                    if (job.status == JobStatus.CANCELLING) {
+                        // Cancellation beats a concurrent fault: the caller asked to stop, so the job
+                        // ends CANCELLED with no error rather than FAILED.
+                        released = finalizeCancelledLocked(job, generation);
+                    } else if (job.status == JobStatus.RUNNING) {
+                        job.error = describe(t);
+                        job.status = JobStatus.FAILED;
+                        job.completedAt = Instant.now(clock);
+                        job.lastHeartbeatAt = null;
+                        job.executionLeaseExpiresAt = null;
+                        recordAttempt(job, generation, JobStatus.FAILED, job.startedAt, job.completedAt,
+                                job.error);
+                        failQuietly(job, generation, job.error);
+                        released = job.quotaReserved.compareAndSet(true, false);
+                    } else {
+                        // Load-bearing, same reasoning as the COMPLETED fence above: a stale failure
+                        // must not overwrite a reaped attempt.
+                        return; // fenced: a superseded failure must not overwrite the reaped attempt
+                    }
                 }
                 if (released) {
                     releaseQuota(job.clientKey); // after the monitor block (REQ-08)
@@ -1024,17 +1119,32 @@ public class BatchHashJobService {
      * cannot be revived, and the worker stops hashing instead of burning CPU for a job it can no
      * longer complete.</p>
      *
+     * <p>This is the cancellation checkpoint: a CANCELLING job is terminalized here, between two items,
+     * so the batch stops within one item of the {@code DELETE} and the worker never resumes a lease for
+     * a job the caller withdrew ({@code INV-CAN-2}).</p>
+     *
      * @return {@code true} when the lease was renewed, {@code false} when the attempt was fenced
      */
     private boolean renewLease(MutableJob job, int generation) {
+        boolean cancelPending = false;
         synchronized (job) {
-            if (job.attempt != generation || job.status != JobStatus.RUNNING) {
+            if (job.attempt != generation) {
                 return false;
             }
-            job.lastHeartbeatAt = Instant.now(clock);
-            job.executionLeaseExpiresAt = job.lastHeartbeatAt.plusSeconds(executionLeaseSeconds);
-            return true;
+            if (job.status == JobStatus.CANCELLING) {
+                cancelPending = true; // terminalized below, outside this monitor section
+            } else if (job.status != JobStatus.RUNNING) {
+                return false;
+            } else {
+                job.lastHeartbeatAt = Instant.now(clock);
+                job.executionLeaseExpiresAt = job.lastHeartbeatAt.plusSeconds(executionLeaseSeconds);
+                return true;
+            }
         }
+        if (cancelPending) {
+            finalizeCancelled(job, generation);
+        }
+        return false;
     }
 
     /**
@@ -1046,20 +1156,34 @@ public class BatchHashJobService {
      * generation's prefix. The {@code checkpoint.size() == index} guard additionally guarantees an
      * attempt can only continue the prefix, never append out of order.</p>
      *
+     * <p>A CANCELLING job is terminalized instead of appended to: the item just hashed is dropped with
+     * the rest of the prefix, so a cancelled job never reports progress it did not publish
+     * ({@code INV-CAN-2}).</p>
+     *
      * @return {@code true} when the item was committed, {@code false} when this generation no longer
      *         owns the job and nothing at all was written
      */
-    private static boolean commitCheckpoint(MutableJob job, int generation, int index, HashResponse hashed) {
+    private boolean commitCheckpoint(MutableJob job, int generation, int index, HashResponse hashed) {
+        boolean cancelPending = false;
         synchronized (job) {
-            if (job.attempt != generation || job.status != JobStatus.RUNNING) {
+            if (job.attempt != generation) {
                 return false; // fenced, cancelled, reaped or superseded
             }
-            if (job.checkpoint.size() != index) {
+            if (job.status == JobStatus.CANCELLING) {
+                cancelPending = true; // terminalized below, outside this monitor section
+            } else if (job.status != JobStatus.RUNNING) {
+                return false; // fenced, reaped or superseded
+            } else if (job.checkpoint.size() != index) {
                 return false; // drifted prefix: never append at the wrong index
+            } else {
+                job.checkpoint.add(hashed);
+                return true;
             }
-            job.checkpoint.add(hashed);
-            return true;
         }
+        if (cancelPending) {
+            finalizeCancelled(job, generation);
+        }
+        return false;
     }
 
     /**

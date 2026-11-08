@@ -151,8 +151,8 @@ utiltools_api/
 | `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
 | `POST` | `/api/v1/utils/text/replace` | Replace every (or, with `all=false`, the first) occurrence of a literal or regex `pattern`, reporting `replacements`, `changed` and code-point `length` |
 | `POST` | `/api/v1/utils/jobs/hash` | Submit a bounded async batch-hash job; `202` with a job id, idempotent via `idempotencyKey` |
-| `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `COMPLETED` / `FAILED` / `CANCELLED` |
-| `DELETE` | `/api/v1/utils/jobs/{jobId}` | Cancel a `QUEUED` job (`200`, idempotent); `409` `JOB_CANCELLATION_CONFLICT` once it is `RUNNING`/`COMPLETED`/`FAILED` |
+| `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `CANCELLING` / `COMPLETED` / `FAILED` / `CANCELLED` |
+| `DELETE` | `/api/v1/utils/jobs/{jobId}` | Cancel a job: `QUEUED` → `CANCELLED` immediately, `RUNNING` → `CANCELLING` (`200`, idempotent, the worker stops at its next checkpoint); `409` `JOB_CANCELLATION_CONFLICT` for `COMPLETED`/`FAILED` |
 | `POST` | `/api/v1/utils/jobs/{jobId}/retry` | Requeue a `FAILED` job (`202`); `409` `JOB_RETRY_CONFLICT` for any other status or once `attempt` reaches `maxAttempts` |
 | `POST` | `/api/v1/utils/jobs/{jobId}/heartbeat` | Renew a `RUNNING` job's execution lease (`200`); `404` `JOB_NOT_FOUND`, `409` `JOB_RETRY_CONFLICT` unless `RUNNING`, `400` `BAD_REQUEST` once the lease has expired |
 | `GET` | `/api/v1/utils/jobs` | List job snapshots newest first; optional `status` filter and `limit` (default `20`, clamped to `1..100`) |
@@ -1475,9 +1475,10 @@ curl http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c
 }
 ```
 
-The state machine is `QUEUED → RUNNING → COMPLETED | FAILED` plus `QUEUED → CANCELLED` and the bounded
+The state machine is `QUEUED → RUNNING → COMPLETED | FAILED` plus `QUEUED → CANCELLED`, the in-flight
+`RUNNING → CANCELLING → CANCELLED` cancellation (see [C](#c-cancel-a-job-200-ok-idempotent)) and the bounded
 `FAILED → QUEUED` retry transition (see [D](#d-retry-a-failed-job-202-accepted)); `COMPLETED`, `CANCELLED` and
-`FAILED`-at-`maxAttempts` are terminal. A `FAILED` job carries a non-null `error` and a `completedAt`, and never
+`FAILED`-at-`maxAttempts` are terminal, while `QUEUED`, `RUNNING` and `CANCELLING` are not. A `FAILED` job carries a non-null `error` and a `completedAt`, and never
 blocks later jobs.
 
 Every snapshot also carries the attempt bookkeeping: `attempt` (1-based, `1` for a first submission and
@@ -1490,22 +1491,37 @@ keep their names and meaning.
 Hashing is **checkpointed per item**. `completedItems` (additive, `0..itemCount`) reports how many leading items
 are durably hashed: it advances one item at a time as the worker commits each digest, so a `RUNNING` job shows
 real progress and a `FAILED` one shows how much survived. The prefix is private to the job — `results` stays
-absent until the job `COMPLETES`, and a `CANCELLED` job reports `completedItems: 0` — so a poller can watch
+absent until the job `COMPLETES`, and a `CANCELLING` or `CANCELLED` job reports `completedItems: 0` — so a poller can watch
 progress without ever seeing a partial digest. The checkpoint lives in memory with the rest of the job registry:
 eviction, expiry and restart discard it.
 
-#### C. Cancel a queued job (200 OK, idempotent)
+#### C. Cancel a job (200 OK, idempotent)
 
-`DELETE /api/v1/utils/jobs/{jobId}` withdraws a job that is still `QUEUED`. The job moves `QUEUED → CANCELLED`
-exactly once: it is either still waiting behind other work (cancellation wins and **nothing is hashed**) or a
-worker has already admitted it, in which case the call reports a conflict instead. `startedAt` and `results`
-stay absent, and `completedAt` is set to the instant the cancellation was accepted.
+`DELETE /api/v1/utils/jobs/{jobId}` cancels a job that is still `QUEUED` **or** already `RUNNING`.
+Cancellation is cooperative: the request is recorded immediately and honoured at the worker's next checkpoint,
+so a poll may briefly show `CANCELLING` before the job becomes `CANCELLED`.
+
+- A `QUEUED` job moves `QUEUED → CANCELLED` exactly once and **nothing is hashed**: `startedAt` and `results`
+  stay absent, and `completedAt` is set to the instant the cancellation was accepted.
+- A `RUNNING` job moves `RUNNING → CANCELLING` and answers `200` with `status: CANCELLING`. The per-client quota
+  slot stays held and the execution lease stays in place while the cancellation is in flight — the job is still
+  non-terminal, so it keeps occupying its slot and stays in listings. The worker notices `CANCELLING` at its next
+  checkpoint (before the next item, or as soon as a blocked `hash` for the current item returns), discards the
+  private checkpoint prefix, and writes `CANCELLED` exactly once; only that terminal write releases the quota.
+- If the worker never returns, the lease reaper terminalizes a `CANCELLING` job whose execution lease has lapsed
+  to `CANCELLED`, and the drain that runs when the application stops does the same, so a cancellation can never
+  leave a job non-terminal forever.
+
+A `CANCELLING` job reports `completedItems: 0` and no `results`, so a partial digest is never disclosed, and it
+is never evicted (it has no `completedAt` yet). A repeated `DELETE` on a `CANCELLING` (or `CANCELLED`) job is
+idempotent and returns the current snapshot; a `COMPLETED` or `FAILED` job answers
+`409 JOB_CANCELLATION_CONFLICT`, because there is nothing left to cancel.
 
 ```bash
 curl -i -X DELETE http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3
 ```
 
-**Response — `200 OK`, `CANCELLED`:**
+**Response — `200 OK`, `CANCELLED` (the job was still `QUEUED`):**
 ```json
 {
   "success": true,
@@ -1521,6 +1537,28 @@ curl -i -X DELETE http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d4
   "timestamp": "2026-10-31T19:12:04.502381Z"
 }
 ```
+
+**Response — `200 OK`, `CANCELLING` (the job was already `RUNNING`):**
+```json
+{
+  "success": true,
+  "message": "Job cancelled",
+  "data": {
+    "jobId": "3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c3",
+    "idempotencyKey": "batch-2026-10-31-001",
+    "status": "CANCELLING",
+    "itemCount": 3,
+    "completedItems": 0,
+    "createdAt": "2026-10-31T19:12:04.418273Z",
+    "startedAt": "2026-10-31T19:12:04.420118Z"
+  },
+  "timestamp": "2026-10-31T19:12:04.502381Z"
+}
+```
+
+`completedAt` is absent while the job is `CANCELLING` (the retention clock starts at the terminal write) and
+`results` is always absent until the job `COMPLETES`. Polling the same id afterwards shows `CANCELLED` with
+`completedAt` set, `results` absent and `completedItems: 0`.
 
 #### D. Retry a failed job (202 Accepted)
 
@@ -1575,21 +1613,24 @@ stamps `lastHeartbeatAt` with that same instant and writes one closed `BATCH_HAS
 `HEARTBEAT` with the bounded detail `lease renewed via heartbeat`; nothing else in the snapshot changes —
 `status`, `results`, `error`, `completedAt`, `startedAt`, `checkpoint` and `attemptHistory` are untouched. Only
 the attempt that is currently `RUNNING` can renew: an unknown or already-evicted `jobId` is `404 JOB_NOT_FOUND`,
-a `QUEUED`, `COMPLETED` or `CANCELLED` job is `409 JOB_RETRY_CONFLICT`, and a lease that has **already expired**
-is `400 BAD_REQUEST` rather than being revived, so a late worker from a superseded attempt cannot buy its
-generation more time. A lease that is never renewed still lapses on schedule, `reapExpiredExecutions` marks the
-job `FAILED` exactly as before, and the retry path then starts `attempt + 1`.
+a `QUEUED`, `CANCELLING`, `COMPLETED` or `CANCELLED` job is `409 JOB_RETRY_CONFLICT`, and a lease that has
+**already expired** is `400 BAD_REQUEST` rather than being revived, so a late worker from a superseded attempt
+cannot buy its generation more time. A lease that is never renewed still lapses on schedule,
+`reapExpiredExecutions` marks the job `FAILED` exactly as before, and the retry path then starts
+`attempt + 1`.
 
 Ineligible retries are rejected **without mutating state**: an unknown or already-evicted `jobId` is
-`404 JOB_NOT_FOUND`; a `QUEUED`, `RUNNING`, `COMPLETED` or `CANCELLED` job is `409 JOB_RETRY_CONFLICT`; and a
+`404 JOB_NOT_FOUND`; a `QUEUED`, `RUNNING`, `CANCELLING`, `COMPLETED` or `CANCELLED` job is
+`409 JOB_RETRY_CONFLICT`; and a
 `FAILED` job whose `attempt` already equals `maxAttempts` answers the same `409` with `attempt` and
 `maxAttempts` in `details`. If the queue is saturated the requeue is rolled back — the previous `FAILED`
 snapshot is restored, checkpoint and `completedItems` included, the attempt is **not** consumed, and the caller
 gets the same `429 QUEUE_FULL` as on submission, so the retry can simply be repeated once capacity frees.
 
 Cancellation is idempotent: repeating the same `DELETE` on an already-`CANCELLED` job returns **`200`** with the
-identical snapshot (`jobId`, `status`, `completedAt` unchanged) rather than a conflict. A `RUNNING`, `COMPLETED`
-or `FAILED` job returns `409 JOB_CANCELLATION_CONFLICT` (see [E](#e-failure-modes)), and an unknown or
+identical snapshot (`jobId`, `status`, `completedAt` unchanged) rather than a conflict, and repeating it on a
+`CANCELLING` job returns **`200`** with the same `CANCELLING` snapshot (the request is already recorded). A
+`COMPLETED` or `FAILED` job returns `409 JOB_CANCELLATION_CONFLICT` (see [E](#e-failure-modes)), and an unknown or
 already-evicted `jobId` returns `404 JOB_NOT_FOUND`. The cancelled snapshot — and its `idempotencyKey` mapping —
 stays pollable for `utiltools.jobs.retention-seconds` and is then evicted like any other terminal job, so a
 duplicate submission with the same key observes the `CANCELLED` snapshot until the retention cutoff elapses.
@@ -1600,8 +1641,8 @@ duplicate submission with the same key observes the `CANCELLED` snapshot until t
 | :--- | :--- | :--- | :--- |
 | Bounded executor queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry with the **same** `idempotencyKey` once capacity frees. The rejected submission is rolled back atomically — its job row **and** its idempotency mapping are both removed, so it leaves no residue and the retry with that key starts a brand-new job |
 | Unknown or already-evicted `jobId` | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Resubmit the batch |
-| Cancelling a job that is `RUNNING`, `COMPLETED` or `FAILED` | `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Stop cancelling; poll `GET` for the terminal snapshot. A repeat `DELETE` on an already-`CANCELLED` job is `200`, not a conflict |
-| Retrying a `QUEUED`, `RUNNING`, `COMPLETED` or `CANCELLED` job, or a `FAILED` job at `maxAttempts` | `409 CONFLICT` | `JOB_RETRY_CONFLICT` | Only a `FAILED` job below `maxAttempts` can be retried. The job snapshot is unchanged by the rejection; resubmit if the attempt budget is spent |
+| Cancelling a job that is `COMPLETED` or `FAILED` | `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Stop cancelling; poll `GET` for the terminal snapshot. A `QUEUED` or `RUNNING` job is cancelled instead: `DELETE` answers `200` with `CANCELLED` or `CANCELLING`, and a repeat `DELETE` on a `CANCELLING` or `CANCELLED` job is `200`, not a conflict |
+| Retrying a `QUEUED`, `RUNNING`, `CANCELLING`, `COMPLETED` or `CANCELLED` job, or a `FAILED` job at `maxAttempts` | `409 CONFLICT` | `JOB_RETRY_CONFLICT` | Only a `FAILED` job below `maxAttempts` can be retried. The job snapshot is unchanged by the rejection; resubmit if the attempt budget is spent |
 | Retry rejected because the bounded queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry `POST …/retry` again once capacity frees: the previous `FAILED` snapshot and its `attempt` are restored, so nothing is consumed |
 | The client already holds `utiltools.jobs.max-active-jobs-per-client` non-terminal jobs | `429 TOO_MANY_REQUESTS` | `JOB_QUOTA_EXCEEDED` | Retry once one of your **own** jobs finishes — the quota is per client identity, so other callers are unaffected. `details.limit` is the ceiling and `details.activeJobs` is your current count. Nothing is registered on a rejected submission (no job row, no `idempotencyKey` mapping, no consumed slot), and a rejected `POST …/retry` restores the previous `FAILED` snapshot with its `attempt` unchanged. A resubmission that repeats the same `idempotencyKey` **and** payload is a duplicate, not a new job: it returns the existing snapshot instead of a quota error |
 | Same `idempotencyKey` reused with a different `algorithm`, `items` or `secretKey` | `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | The first job is untouched and keeps running; the conflicting submission is discarded before registration (no job, no execution, no key residue). Pick a new `idempotencyKey` for a genuinely new payload |
@@ -1625,9 +1666,9 @@ utiltools.jobs.max-active-jobs-per-client=20
 | `utiltools.jobs.worker-count` | `2` | Worker threads hashing batches; bounds CPU-wide concurrency |
 | `utiltools.jobs.queue-capacity` | `100` | `ArrayBlockingQueue` slots for accepted-but-not-started jobs; full queue ⇒ `429 QUEUE_FULL` (`AbortPolicy`) |
 | `utiltools.jobs.retention-seconds` | `300` | How long a `COMPLETED`/`FAILED`/`CANCELLED` job (plus its idempotency key) is kept before eviction |
-| `utiltools.jobs.cleanup-interval-ms` | `60000` | Interval of the scheduled eviction pass (`@EnableScheduling`); `QUEUED`/`RUNNING` jobs are never evicted, and `CANCELLED` jobs are evicted on the same retention cutoff as `COMPLETED`/`FAILED` |
+| `utiltools.jobs.cleanup-interval-ms` | `60000` | Interval of the scheduled eviction pass (`@EnableScheduling`); `QUEUED`/`RUNNING`/`CANCELLING` jobs are never evicted, and `CANCELLED` jobs are evicted on the same retention cutoff as `COMPLETED`/`FAILED` |
 | `utiltools.jobs.max-attempts` | `3` | Ceiling on execution attempts per job, where the first submission is attempt `1`; a `FAILED` job at this count answers `409 JOB_RETRY_CONFLICT`. Values below `1` are clamped to `1`. Global — it is not settable per request |
-| `utiltools.jobs.max-active-jobs-per-client` | `20` | Ceiling on one client's concurrent **non-terminal** jobs (`QUEUED` or `RUNNING`), keyed by the same identity the rate limiter resolves (see [G](#g-rate-limiting-interaction-explicit-decision)); one more submission answers `429 JOB_QUOTA_EXCEEDED` with `limit` and `activeJobs` in `details`. A slot is released as each job reaches `COMPLETED`, `FAILED` or `CANCELLED`. Values below `1` fail startup. Set it at or above `worker-count + queue-capacity` to restore pre-quota (unbounded per client) admission |
+| `utiltools.jobs.max-active-jobs-per-client` | `20` | Ceiling on one client's concurrent **non-terminal** jobs (`QUEUED`, `RUNNING` or `CANCELLING`), keyed by the same identity the rate limiter resolves (see [G](#g-rate-limiting-interaction-explicit-decision)); one more submission answers `429 JOB_QUOTA_EXCEEDED` with `limit` and `activeJobs` in `details`. A slot is released as each job reaches `COMPLETED`, `FAILED` or `CANCELLED` — a `DELETE` on a `RUNNING` job records the cancellation without releasing the slot, which is released once by the terminal `CANCELLED` write. Values below `1` fail startup. Set it at or above `worker-count + queue-capacity` to restore pre-quota (unbounded per client) admission |
 
 #### G. Rate limiting interaction (explicit decision)
 
@@ -1669,7 +1710,7 @@ Two optional query parameters bound the response:
 
 | Parameter | Default | Bound | Behaviour |
 | :-------- | :------ | :---- | :-------- |
-| `status`  | *(none)* | `JobStatus` | Exact-match filter: `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED` or `CANCELLED`. Omitted ⇒ every status |
+| `status`  | *(none)* | `JobStatus` | Exact-match filter: `QUEUED`, `RUNNING`, `CANCELLING`, `COMPLETED`, `FAILED` or `CANCELLED`. Omitted ⇒ every status |
 | `limit`   | `20` | clamped to `1..100` | Maximum number of entries returned; `0`, negative or `>100` values are clamped rather than rejected |
 
 ```bash
@@ -1819,9 +1860,9 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Unknown or evicted batch job id |
 | `404 NOT_FOUND` | `NOT_FOUND` | Unknown audit journal entry id |
 | `409 CONFLICT` | `REPLAY_CONFLICT` | Replay of a FAILED, non-deterministic, oversized, or still-PENDING entry, or a replay of an entry whose claim is already `IN_PROGRESS` (live lease) or was lost to a lease takeover |
-| `409 CONFLICT` | `JOB_RETRY_CONFLICT` | Retry of a `QUEUED`/`RUNNING`/`COMPLETED`/`CANCELLED` batch job, or of a `FAILED` job whose `attempt` already equals `maxAttempts` |
+| `409 CONFLICT` | `JOB_RETRY_CONFLICT` | Retry of a `QUEUED`/`RUNNING`/`CANCELLING`/`COMPLETED`/`CANCELLED` batch job, or of a `FAILED` job whose `attempt` already equals `maxAttempts` |
 | `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | Batch job idempotency key reused with a different request payload |
-| `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Cancellation attempted on a batch job that is `RUNNING`, `COMPLETED` or `FAILED` |
+| `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Cancellation attempted on a batch job that is `COMPLETED` or `FAILED` (a `QUEUED` or `RUNNING` job is cancelled: `CANCELLED` or `CANCELLING`) |
 | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Batch job queue is saturated; retry after capacity frees |
 | `429 TOO_MANY_REQUESTS` | `JOB_QUOTA_EXCEEDED` | Client holds `utiltools.jobs.max-active-jobs-per-client` non-terminal batch jobs; `details` carries `limit` and `activeJobs` |
 | `429 TOO_MANY_REQUESTS` | `RATE_LIMITED` | Request budget for `/api/v1/utils/*` exhausted (see [Rate Limiting](#-rate-limiting)) |
@@ -1896,7 +1937,7 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`), sentence-case idempotence and `[.!?]`-run boundaries, diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points; plus replace coverage: `$n` group expansion, literal metacharacters, `all=false` first-match-only, case-insensitive matching, no-match results, invalid-regex rejection, code-point `length`, every request constraint bound, and the 1000000-character result bound.
 - **`TextControllerTest`**: Text endpoints MockMvc suite, including the snake-case and sentence-case transform envelopes, diacritic slugging, `400 BAD_REQUEST` for an unknown operation, `400 VALIDATION_ERROR` for blank text, and a `TEXT_TRANSFORM` entry listed by `/audit/entries` and replayed as `VERIFIED`; a replace envelope with `$n` groups, `400 BAD_REQUEST` for an invalid regex (journalled `TEXT_REPLACE`/`FAILED`), `400 VALIDATION_ERROR` for blank text, an absent `replacement` and an oversized `pattern`, and a `TEXT_REPLACE` entry listed by `/audit/entries` and replayed as `VERIFIED`.
 - **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, key/payload fingerprint conflict detection (changed items, reordered items, changed algorithm or `secretKey`), 8-thread different-payload races, identical-key/identical-payload retries that mint no second execution, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff. Retry coverage: transient failure then a successful retry (`attempt` 2, attempt-1 `FAILED` entry retained), `RUNNING`/`COMPLETED`/`CANCELLED` conflicts that leave the snapshot unchanged, attempt exhaustion at `maxAttempts`, stale-worker fencing (a superseded generation writes nothing after a retry), and queue-rejection rollback that leaves the job `FAILED` with an unconsumed attempt while a later retry succeeds. Checkpoint coverage: a transient failure at a chosen item reports `completedItems` equal to the hashes that succeeded, leaves `results` absent and does not reach later items; the retry rehashes only the suffix (per-item invocation counts) and publishes the full batch in input order with `resumedFrom` on the second attempt; a stale worker from a reaped or superseded generation cannot advance or overwrite the checkpoint (replaying `executeAttempt` leaves the snapshot identical); a `429 QUEUE_FULL` retry restores the exact pre-retry `FAILED` snapshot including attempt, `completedItems` and the checkpoint; the journal descriptor and outcome carry `resumedFrom`/`completedItems` but never items or `secretKey`; and a cancelled job exposes no checkpoint results.
-Heartbeat coverage: a `RUNNING` job with a live lease extends `executionLeaseExpiresAt` to `Instant.now(clock) + executionLeaseSeconds` and stamps `lastHeartbeatAt` with the same instant; an unknown `jobId` is `404 JOB_NOT_FOUND`, a `QUEUED`/`COMPLETED`/`CANCELLED` job is `409 JOB_RETRY_CONFLICT`, and an already-expired lease is `400 BAD_REQUEST` without reviving it; a heartbeat from a superseded attempt generation writes neither the lease nor a journal row; the success writes exactly one `HEARTBEAT` row with the bounded detail `lease renewed via heartbeat`; and the entry's `status`, `results`, `error`, `completedAt`, `startedAt`, `checkpoint` and `attemptHistory` are byte-identical afterwards.
+  Heartbeat coverage: a `RUNNING` job with a live lease extends `executionLeaseExpiresAt` to `Instant.now(clock) + executionLeaseSeconds` and stamps `lastHeartbeatAt` with the same instant; an unknown `jobId` is `404 JOB_NOT_FOUND`, a `QUEUED`/`CANCELLING`/`COMPLETED`/`CANCELLED` job is `409 JOB_RETRY_CONFLICT`, and an already-expired lease is `400 BAD_REQUEST` without reviving it; a heartbeat from a superseded attempt generation writes neither the lease nor a journal row; the success writes exactly one `HEARTBEAT` row with the bounded detail `lease renewed via heartbeat`; and the entry's `status`, `results`, `error`, `completedAt`, `startedAt`, `checkpoint` and `attemptHistory` are byte-identical afterwards.
 - **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202 submit/retry, 400, 404 `JOB_NOT_FOUND`, 409 `IDEMPOTENCY_CONFLICT`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND`, 409 `JOB_CANCELLATION_CONFLICT`, and `POST …/retry` 202 `QUEUED` vs 409 `JOB_RETRY_CONFLICT` with `jobId`/`status`/`attempt`/`maxAttempts` details, plus the additive `completedItems` on a `FAILED` snapshot beside every pre-existing field, and `POST …/heartbeat` returning the `200` success envelope with the renewed `executionLeaseExpiresAt`/`lastHeartbeatAt` beside `404 JOB_NOT_FOUND`, `409 JOB_RETRY_CONFLICT` and `400 BAD_REQUEST` error envelopes for each failure case).
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.
 - **`SlidingWindowRateLimiterTest`**: Exact-cap concurrent admission, deterministic window rollover on a mutable `Clock`, denials consuming no capacity, per-client isolation, idle eviction, and cap enforcement under many spoofed keys.
