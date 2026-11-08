@@ -4,6 +4,8 @@ import com.example.utiltools.json.dto.JsonFlattenRequest;
 import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
+import com.example.utiltools.json.dto.JsonFromCsvRequest;
+import com.example.utiltools.json.dto.JsonFromCsvResponse;
 import com.example.utiltools.json.dto.JsonMergePatchRequest;
 import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonPatchOperation;
@@ -11,6 +13,8 @@ import com.example.utiltools.json.dto.JsonPatchRequest;
 import com.example.utiltools.json.dto.JsonPatchResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
+import com.example.utiltools.json.dto.JsonToCsvRequest;
+import com.example.utiltools.json.dto.JsonToCsvResponse;
 import com.example.utiltools.json.dto.JsonUnflattenRequest;
 import com.example.utiltools.json.dto.JsonUnflattenResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
@@ -40,6 +44,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -57,6 +62,11 @@ public class JsonService {
     static final int MAX_DEPTH = 64;
     /** Most leaves a flatten response, or keys a flat document, may carry. */
     static final int MAX_KEYS = 10000;
+    /** Most cells (rows x columns) one CSV conversion may emit or import. */
+    static final int MAX_CELLS = 1000000;
+    private static final int CSV_UNQUOTED = 0;
+    private static final int CSV_QUOTED = 1;
+    private static final int CSV_QUOTE_IN_QUOTED = 2;
 
     private final ObjectMapper objectMapper;
     private final CircuitBreaker circuitBreaker;
@@ -435,6 +445,254 @@ public class JsonService {
             current.set(leaf, values.get(i));
         }
         return new JsonUnflattenResponse(nested, keyCount, maxDepth);
+    }
+
+    /**
+     * Exports a JSON array of flat objects as RFC 4180 CSV: header from the union of keys in
+     * first-seen order, CRLF record separators, quoting only where a field needs it.
+     */
+    public JsonToCsvResponse toCsv(JsonToCsvRequest request) {
+        char delimiter = normaliseDelimiter(request.delimiter());
+        JsonNode root = parseTree(request.json());
+        if (!root.isArray()) {
+            throw new IllegalArgumentException("json content must be an array of objects");
+        }
+        ArrayNode rows = (ArrayNode) root;
+        Set<String> header = new LinkedHashSet<>();
+        for (JsonNode element : rows) {
+            if (!element.isObject()) {
+                throw new IllegalArgumentException("json array must contain only objects");
+            }
+            Iterator<Map.Entry<String, JsonNode>> members = element.fields();
+            while (members.hasNext()) {
+                Map.Entry<String, JsonNode> member = members.next();
+                if (member.getValue().isContainerNode()) {
+                    throw new IllegalArgumentException("nested values are not supported in CSV export");
+                }
+                header.add(member.getKey());
+            }
+        }
+        int rowCount = rows.size();
+        int columnCount = header.size();
+        enforceCsvBounds(rowCount, columnCount);
+
+        List<String> headers = List.copyOf(header);
+        StringBuilder csv = new StringBuilder();
+        appendRecord(csv, headers, delimiter);
+        for (JsonNode element : rows) {
+            csv.append("\r\n");
+            List<String> cells = new ArrayList<>(columnCount);
+            for (String name : headers) {
+                JsonNode value = element.get(name);
+                cells.add(value == null || value.isNull() ? "" : value.asText());
+            }
+            appendRecord(csv, cells, delimiter);
+        }
+        String text = csv.toString();
+        return new JsonToCsvResponse(text, rowCount, columnCount, headers,
+                text.getBytes(StandardCharsets.UTF_8).length);
+    }
+
+    /**
+     * Imports RFC 4180 CSV/TSV into a JSON array of string-valued objects. A single-character
+     * delimiter keeps the CSV module stateless; values stay strings so the result is deterministic.
+     */
+    public JsonFromCsvResponse fromCsv(JsonFromCsvRequest request) {
+        char delimiter = normaliseDelimiter(request.delimiter());
+        List<List<String>> records = parseCsv(stripByteOrderMark(request.csv()), delimiter);
+        if (records.isEmpty()) {
+            throw new IllegalArgumentException("csv content is required");
+        }
+        boolean hasHeader = !Boolean.FALSE.equals(request.hasHeader());
+        int dataStart;
+        List<String> columns;
+        if (hasHeader) {
+            List<String> header = records.get(0);
+            columns = new ArrayList<>(header.size());
+            Set<String> seen = new LinkedHashSet<>();
+            for (int i = 0; i < header.size(); i++) {
+                String name = header.get(i);
+                if (name.isEmpty()) {
+                    name = "column" + (i + 1);
+                }
+                if (!seen.add(name)) {
+                    throw new IllegalArgumentException("duplicate header name: " + name);
+                }
+                columns.add(name);
+            }
+            dataStart = 1;
+        } else {
+            int width = records.get(0).size();
+            columns = new ArrayList<>(width);
+            for (int i = 0; i < width; i++) {
+                columns.add("column" + (i + 1));
+            }
+            dataStart = 0;
+        }
+        int rowCount = records.size() - dataStart;
+        int columnCount = columns.size();
+        enforceCsvBounds(rowCount, columnCount);
+
+        ArrayNode resultJson = objectMapper.createArrayNode();
+        for (int r = dataStart; r < records.size(); r++) {
+            List<String> record = records.get(r);
+            if (record.size() > columnCount) {
+                throw new IllegalArgumentException("row " + (r + 1) + " has " + record.size()
+                        + " fields but the header has " + columnCount);
+            }
+            ObjectNode row = resultJson.addObject();
+            for (int i = 0; i < columnCount; i++) {
+                row.put(columns.get(i), i < record.size() ? record.get(i) : "");
+            }
+        }
+        return new JsonFromCsvResponse(resultJson, rowCount, columnCount, List.copyOf(columns));
+    }
+
+    /**
+     * Accepts the two-character escape {@code \t}, a literal tab, or any other single character;
+     * null or blank means comma.
+     */
+    private static char normaliseDelimiter(String delimiter) {
+        if (delimiter == null || delimiter.isEmpty()) {
+            return ',';
+        }
+        if ("\\t".equals(delimiter) || "\t".equals(delimiter)) {
+            return '\t';
+        }
+        if (delimiter.isBlank()) {
+            return ',';
+        }
+        if (delimiter.length() != 1) {
+            throw new IllegalArgumentException("delimiter must be a single character");
+        }
+        char delimiterChar = delimiter.charAt(0);
+        if (delimiterChar == '"' || delimiterChar == '\r' || delimiterChar == '\n') {
+            throw new IllegalArgumentException("delimiter must not be a quote or a line break");
+        }
+        return delimiterChar;
+    }
+
+    private static String stripByteOrderMark(String csv) {
+        return csv != null && !csv.isEmpty() && csv.charAt(0) == '\uFEFF' ? csv.substring(1) : csv;
+    }
+
+    /** Rows, columns and their product are bounded so no request materialises a huge response. */
+    private static void enforceCsvBounds(int rowCount, int columnCount) {
+        if (rowCount > MAX_KEYS) {
+            throw new IllegalArgumentException("rows must not exceed " + MAX_KEYS);
+        }
+        if (columnCount > MAX_KEYS) {
+            throw new IllegalArgumentException("columns must not exceed " + MAX_KEYS);
+        }
+        if ((long) rowCount * columnCount > MAX_CELLS) {
+            throw new IllegalArgumentException("conversion exceeds " + MAX_CELLS + " cells");
+        }
+    }
+
+    private static void appendRecord(StringBuilder csv, List<String> cells, char delimiter) {
+        for (int i = 0; i < cells.size(); i++) {
+            if (i > 0) {
+                csv.append(delimiter);
+            }
+            appendField(csv, cells.get(i), delimiter);
+        }
+    }
+
+    /** RFC 4180: quote when the field carries the delimiter, a double quote, CR or LF. */
+    private static void appendField(StringBuilder csv, String value, char delimiter) {
+        if (value.indexOf(delimiter) < 0 && value.indexOf('"') < 0
+                && value.indexOf('\r') < 0 && value.indexOf('\n') < 0) {
+            csv.append(value);
+            return;
+        }
+        csv.append('"');
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '"') {
+                csv.append('"');
+            }
+            csv.append(c);
+        }
+        csv.append('"');
+    }
+
+    /**
+     * Splits RFC 4180 text into records: quoted fields keep embedded delimiters, newlines and
+     * doubled quotes; LF, CRLF and CR all terminate a record; a trailing newline adds no record.
+     */
+    private static List<List<String>> parseCsv(String csv, char delimiter) {
+        List<List<String>> records = new ArrayList<>();
+        List<String> record = new ArrayList<>();
+        StringBuilder cell = new StringBuilder();
+        int state = CSV_UNQUOTED;
+        int index = 0;
+        int length = csv.length();
+        while (index < length) {
+            char c = csv.charAt(index);
+            if (state == CSV_QUOTED) {
+                if (c == '"') {
+                    state = CSV_QUOTE_IN_QUOTED;
+                } else {
+                    cell.append(c);
+                }
+                index++;
+                continue;
+            }
+            if (state == CSV_QUOTE_IN_QUOTED) {
+                if (c == '"') {
+                    cell.append('"');
+                    state = CSV_QUOTED;
+                    index++;
+                    continue;
+                }
+                if (c == delimiter) {
+                    record.add(cell.toString());
+                    cell.setLength(0);
+                    state = CSV_UNQUOTED;
+                    index++;
+                    continue;
+                }
+                if (c == '\r' || c == '\n') {
+                    record.add(cell.toString());
+                    cell.setLength(0);
+                    records.add(record);
+                    record = new ArrayList<>();
+                    state = CSV_UNQUOTED;
+                    index += c == '\r' && index + 1 < length && csv.charAt(index + 1) == '\n' ? 2 : 1;
+                    continue;
+                }
+                throw new IllegalArgumentException("unexpected character after closing quote");
+            }
+            if (c == delimiter) {
+                record.add(cell.toString());
+                cell.setLength(0);
+                index++;
+                continue;
+            }
+            if (c == '\r' || c == '\n') {
+                record.add(cell.toString());
+                cell.setLength(0);
+                records.add(record);
+                record = new ArrayList<>();
+                index += c == '\r' && index + 1 < length && csv.charAt(index + 1) == '\n' ? 2 : 1;
+                continue;
+            }
+            if (c == '"' && cell.length() == 0) {
+                state = CSV_QUOTED;
+                index++;
+                continue;
+            }
+            cell.append(c);
+            index++;
+        }
+        if (state == CSV_QUOTED) {
+            throw new IllegalArgumentException("unterminated quoted field");
+        }
+        if (state == CSV_QUOTE_IN_QUOTED || cell.length() > 0) {
+            record.add(cell.toString());
+            records.add(record);
+        }
+        return records;
     }
 
     private static String normaliseSeparator(String separator) {

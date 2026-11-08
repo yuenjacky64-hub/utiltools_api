@@ -17,6 +17,8 @@ public enum OperationType {
     JSON_FLATTEN(true),
     JSON_UNFLATTEN(true),
     JSON_MERGE_PATCH(true),
+    JSON_TO_CSV(true),
+    JSON_FROM_CSV(true),
     TEXT_TRANSFORM(true),
     TEXT_STATS(true),
     TEXT_REPLACE(true),
