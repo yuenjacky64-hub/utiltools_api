@@ -8,6 +8,8 @@ import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
 import com.example.utiltools.json.dto.JsonFromCsvRequest;
 import com.example.utiltools.json.dto.JsonFromCsvResponse;
+import com.example.utiltools.json.dto.JsonFromNdjsonRequest;
+import com.example.utiltools.json.dto.JsonFromNdjsonResponse;
 import com.example.utiltools.json.dto.JsonMergePatchRequest;
 import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonPatchRequest;
@@ -16,6 +18,8 @@ import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonToCsvRequest;
 import com.example.utiltools.json.dto.JsonToCsvResponse;
+import com.example.utiltools.json.dto.JsonToNdjsonRequest;
+import com.example.utiltools.json.dto.JsonToNdjsonResponse;
 import com.example.utiltools.json.dto.JsonUnflattenRequest;
 import com.example.utiltools.json.dto.JsonUnflattenResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
@@ -31,7 +35,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/v1/utils/json")
-@Tag(name = "JSON & Data Processor Utility", description = "Endpoints for formatting, minifying, validating, querying, flattening, unflattening, atomically patching JSON structures, and converting between JSON arrays and CSV/TSV tables")
+@Tag(name = "JSON & Data Processor Utility", description = "Endpoints for formatting, minifying, validating, querying, flattening, unflattening, atomically patching JSON structures, converting between JSON arrays and CSV/TSV tables, and converting between JSON arrays and NDJSON / JSON Lines")
 public class JsonController {
 
     private final AuditedOperations auditedOperations;
@@ -128,5 +132,27 @@ public class JsonController {
     public ApiResponse<JsonFromCsvResponse> fromCsv(@Valid @RequestBody JsonFromCsvRequest request) {
         JsonFromCsvResponse result = auditedOperations.fromCsv(request);
         return ApiResponse.success(result, "CSV converted to JSON successfully");
+    }
+
+    @PostMapping("/to-ndjson")
+    @Operation(summary = "Convert a JSON array to NDJSON / JSON Lines",
+            description = "Exports a JSON array as Newline Delimited JSON: one compact JSON value per line, joined by "
+                    + "a single newline with no trailing newline. lineCount reports the record count and sizeBytes the "
+                    + "UTF-8 byte size. An empty array returns an empty string with lineCount 0; malformed JSON or a "
+                    + "non-array document is rejected with 400 BAD_REQUEST.")
+    public ApiResponse<JsonToNdjsonResponse> toNdjson(@Valid @RequestBody JsonToNdjsonRequest request) {
+        JsonToNdjsonResponse result = auditedOperations.toNdjson(request);
+        return ApiResponse.success(result, "JSON converted to NDJSON successfully");
+    }
+
+    @PostMapping("/from-ndjson")
+    @Operation(summary = "Convert NDJSON / JSON Lines to a JSON array",
+            description = "Imports Newline Delimited JSON: each non-blank physical line is parsed as one independent "
+                    + "JSON value (objects, arrays or scalars) in input order; blank lines and CRLF line endings are "
+                    + "tolerated. An empty document yields an empty array, a malformed line is rejected with 400 "
+                    + "BAD_REQUEST naming its 1-based physical line number, and more than 10000 records is rejected.")
+    public ApiResponse<JsonFromNdjsonResponse> fromNdjson(@Valid @RequestBody JsonFromNdjsonRequest request) {
+        JsonFromNdjsonResponse result = auditedOperations.fromNdjson(request);
+        return ApiResponse.success(result, "NDJSON converted to JSON successfully");
     }
 }

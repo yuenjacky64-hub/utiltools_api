@@ -105,6 +105,10 @@ public class BatchHashJobService {
 
     /** Upper bound on the configured default deadline, mirroring the request's 1..3600 range. */
     private static final long MAX_DEADLINE_SECONDS = 3600;
+
+    /** Hard ceiling on retained terminal job rows when the property is not configured. */
+    static final int DEFAULT_MAX_RETAINED_JOBS = 1000;
+
     private static final long DEFAULT_EXECUTION_LEASE_SECONDS = 30;
     private static final long DEFAULT_EXECUTION_REAPER_INTERVAL_MS = 5000;
     private static final String BATCH_HASH_FAILED = "BATCH_HASH_FAILED";
@@ -131,6 +135,16 @@ public class BatchHashJobService {
     /** Exact inverse of LIST_ORDER (tie-break included); used only as the bounded-heap eviction order. */
     private static final Comparator<MutableJob> LIST_ORDER_INVERSE = LIST_ORDER.reversed();
 
+    /**
+     * Oldest {@code completedAt} first, {@code jobId} ascending as the deterministic tie-break, so
+     * repeated passes over the same registry pick the same victims in the same order. Only terminal
+     * rows that carry a {@code completedAt} become candidates (Plan §4.2), so no row passed to this
+     * comparator is ever null there.
+     */
+    private static final Comparator<MutableJob> EVICTION_ORDER =
+            Comparator.comparing((MutableJob job) -> job.completedAt)
+                    .thenComparing(job -> job.jobId);
+
     private final CryptoService cryptoService;
     private final ThreadPoolExecutor executor;
     private final int workerCount;
@@ -143,6 +157,9 @@ public class BatchHashJobService {
     private final int maxActiveJobsPerClient;
     /** Server-side default bound applied when a request omits {@code deadlineSeconds}; 0 disables it. */
     private final long defaultDeadlineSeconds;
+
+    private final int maxRetainedJobs;
+
     private final Clock clock;
 
     /**
@@ -211,6 +228,7 @@ public class BatchHashJobService {
             @Value("${utiltools.jobs.shutdown-grace-seconds:30}") long shutdownGraceSeconds,
             @Value("${utiltools.jobs.max-active-jobs-per-client:20}") int maxActiveJobsPerClient,
             @Value("${utiltools.jobs.default-deadline-seconds:0}") long defaultDeadlineSeconds,
+            @Value("${utiltools.jobs.max-retained-jobs:1000}") int maxRetainedJobs,
             Clock clock) {
         this.cryptoService = cryptoService;
         this.workerCount = workerCount;
@@ -246,20 +264,27 @@ public class BatchHashJobService {
                     "utiltools.jobs.default-deadline-seconds must be between 0 and 3600, was "
                             + defaultDeadlineSeconds);
         }
+        // A non-positive cap would either evict every terminal row or disable retention entirely.
+        if (maxRetainedJobs <= 0) {
+            throw new IllegalArgumentException(
+                    "utiltools.jobs.max-retained-jobs must be positive, was " + maxRetainedJobs);
+        }
         this.executionLeaseSeconds = executionLeaseSeconds;
         this.executionReaperIntervalMs = executionReaperIntervalMs;
         this.defaultDeadlineSeconds = defaultDeadlineSeconds;
         this.shutdownGraceSeconds = shutdownGraceSeconds;
         this.maxActiveJobsPerClient = maxActiveJobsPerClient;
+        this.maxRetainedJobs = maxRetainedJobs;
         this.clock = clock == null ? Clock.systemUTC() : clock;
         this.executor = new ThreadPoolExecutor(workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(queueCapacity), new ThreadPoolExecutor.AbortPolicy());
     }
 
     /**
-     * Compatibility overload for callers (and tests) that predate the configurable default deadline:
-     * the parameter list is unchanged and deadlines are disabled ({@code 0}). Unannotated on purpose
-     * — Spring must keep selecting the {@code @Autowired} constructor above.
+     * Test/compatibility overload: an explicit drain grace with auditing disabled. The parameter
+     * list is unchanged from before the retained-row cap and the configurable default deadline
+     * existed, so the cap keeps its default and deadlines are disabled ({@code 0}). Unannotated on
+     * purpose — Spring must keep selecting the {@code @Autowired} constructor above.
      */
     public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
             long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
@@ -267,7 +292,7 @@ public class BatchHashJobService {
             Clock clock) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
-                maxActiveJobsPerClient, 0L, clock);
+                maxActiveJobsPerClient, 0L, DEFAULT_MAX_RETAINED_JOBS, clock);
     }
 
     /**
@@ -330,7 +355,21 @@ public class BatchHashJobService {
             Clock clock, AuditJournalService journal) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
-                maxActiveJobsPerClient, clock);
+                maxActiveJobsPerClient, 0L, DEFAULT_MAX_RETAINED_JOBS, clock);
+        this.journal = journal;
+    }
+
+    /**
+     * Test convenience: an explicit retained-row cap so a test can force count pressure with a
+     * handful of jobs. The journal stays last, so {@code null} still means "auditing disabled".
+     */
+    public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
+            long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
+            long executionReaperIntervalMs, long shutdownGraceSeconds, int maxActiveJobsPerClient,
+            int maxRetainedJobs, Clock clock, AuditJournalService journal) {
+        this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
+                executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
+                maxActiveJobsPerClient, 0L, maxRetainedJobs, clock);
         this.journal = journal;
     }
 
@@ -345,7 +384,7 @@ public class BatchHashJobService {
             long defaultDeadlineSeconds, Clock clock, AuditJournalService journal) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
-                maxActiveJobsPerClient, defaultDeadlineSeconds, clock);
+                maxActiveJobsPerClient, defaultDeadlineSeconds, DEFAULT_MAX_RETAINED_JOBS, clock);
         this.journal = journal;
     }
 
@@ -416,8 +455,19 @@ public class BatchHashJobService {
                         }
                         return snapshot(existing); // duplicate submission: same jobId, no second execution
                     }
+                    // The mapping is dangling: every removal of a job is paired with a conditional
+                    // removal of its mapping, but a mapping can still outlive its row (a rollout, a
+                    // legacy row). Drop it so this key starts exactly one new job instead of
+                    // answering a 404-id snapshot forever.
+                    idempotencyIndex.remove(key, existingJobId);
                 }
             }
+
+            // Count enforcement runs here, still holding registryLock and before the new row is
+            // published (Plan §4.4 order: duplicate resolution, cap, quota, registration): the
+            // registry is trimmed to the cap on every submission, including one that is about to be
+            // refused, and the QUEUED row created below can never be selected as its own victim.
+            enforceRetainedJobCapLocked();
 
             // Read-only: a refusal below leaves the job and idempotency registries untouched.
             int active = activeJobsByClient.getOrDefault(quotaKey, 0);
@@ -752,6 +802,9 @@ public class BatchHashJobService {
         }
         if (released) {
             releaseQuota(job.clientKey);
+            // Bounded retention on the terminal write itself: a fast submit/complete churn would
+            // otherwise let terminal rows pile up between two scheduled cleanup passes.
+            enforceRetainedJobCap();
         }
         return cancelled;
     }
@@ -800,6 +853,7 @@ public class BatchHashJobService {
         }
         if (released) {
             releaseQuota(job.clientKey); // after the monitor block (REQ-08)
+            enforceRetainedJobCap(); // outside the monitor: registryLock -> job monitor, never reverse
         }
         return true;
     }
@@ -926,34 +980,116 @@ public class BatchHashJobService {
      * {@code cutoff}, together with their idempotency entries. QUEUED and RUNNING jobs are never
      * evicted. Public and clock-free so tests can advance the cutoff instead of waiting.
      *
-     * @return the number of evicted jobs
+     * <p>The whole pass holds {@code registryLock}, so a removal and the idempotency-index update
+     * that mirrors it are one atomic step for {@link #submit}. The scheduled pass therefore enforces
+     * time-based retention and then count-based retention ({@link #enforceRetainedJobCapLocked()}) in
+     * the same section.</p>
+     *
+     * @return the total number of rows this pass removed: the time-based evictions plus the terminal
+     *         rows removed because the retained-row cap was exceeded (Plan §4.5)
      */
     public int evictExpiredJobs(Instant cutoff) {
         int evicted = 0;
-        for (MutableJob job : jobs.values()) {
-            synchronized (job) {
-                // Terminality and removal share one monitor section with retry's FAILED -> QUEUED
-                // transition, so a retry can neither slip between the check and the remove nor
-                // target a job this pass has unregistered: either the retry wins (the job is
-                // QUEUED here and is not evicted) or this pass wins (retry re-checks the registry
-                // under the same monitor and answers 404).
-                boolean evictable = (job.status == JobStatus.COMPLETED
-                        || job.status == JobStatus.FAILED
-                        || job.status == JobStatus.CANCELLED)
-                        && job.completedAt != null
-                        && job.completedAt.isBefore(cutoff);
-                if (evictable && jobs.remove(job.jobId, job)) {
-                    evicted++;
-                    if (job.idempotencyKey != null) {
-                        idempotencyIndex.remove(job.idempotencyKey, job.jobId);
+        synchronized (registryLock) {
+            for (MutableJob job : jobs.values()) {
+                synchronized (job) {
+                    // Terminality and removal share one monitor section with retry's FAILED -> QUEUED
+                    // transition, so a retry can neither slip between the check and the remove nor
+                    // target a job this pass has unregistered: either the retry wins (the job is
+                    // QUEUED here and is not evicted) or this pass wins (retry re-checks the registry
+                    // under the same monitor and answers 404).
+                    boolean evictable = isTerminal(job.status)
+                            && job.completedAt != null
+                            && job.completedAt.isBefore(cutoff);
+                    if (evictable && jobs.remove(job.jobId, job)) {
+                        evicted++;
+                        if (job.idempotencyKey != null) {
+                            idempotencyIndex.remove(job.idempotencyKey, job.jobId);
+                        }
+                        // No quota release here on purpose: every terminal status above was written
+                        // together with the reservation claim, so a terminal job holds no slot.
+                        // Releasing on eviction would under-count and over-admit this client later.
                     }
-                    // No quota release here on purpose: every terminal status above was written
-                    // together with the reservation claim, so a terminal job holds no slot. Releasing
-                    // on eviction would under-count and over-admit this client later.
+                }
+            }
+            // Count-based retention rides the same pass, under the same lock: an idle registry still
+            // converges on the cap even if no terminal transition happens to run enforcement.
+            int enforced = enforceRetainedJobCapLocked();
+            return evicted + enforced;
+        }
+    }
+
+    /**
+     * Enforces the retained-row cap for a caller that holds no monitor yet: a terminal transition
+     * calls this after it has left every job monitor, so the {@code registryLock} it takes here can
+     * never be acquired in the reverse order.
+     */
+    private void enforceRetainedJobCap() {
+        synchronized (registryLock) {
+            enforceRetainedJobCapLocked();
+        }
+    }
+
+    /**
+     * Enforces the retained-row cap; the caller must already hold {@code registryLock}.
+     *
+     * <p>At most {@code maxRetainedJobs} terminal rows survive: {@code QUEUED}, {@code RUNNING} and
+     * {@code CANCELLING} rows are never candidates, so a registry full of live work stays above the
+     * cap instead of losing a job a client is still polling.</p>
+     *
+     * @return the number of terminal rows evicted by this pass
+     */
+    private int enforceRetainedJobCapLocked() {
+        if (jobs.size() <= maxRetainedJobs) {
+            return 0; // fast path: fewer rows than the cap cannot violate it, so no scan at all
+        }
+        List<MutableJob> candidates = new ArrayList<>();
+        for (MutableJob job : jobs.values()) {
+            synchronized (job) { // registryLock -> job monitor is the only legal order
+                if (isTerminal(job.status) && job.completedAt != null) {
+                    candidates.add(job);
                 }
             }
         }
+        int excess = candidates.size() - maxRetainedJobs;
+        if (excess <= 0) {
+            return 0; // the common case: non-terminal rows are what push the registry over the cap
+        }
+        candidates.sort(EVICTION_ORDER); // oldest completedAt first, jobId ascending on ties
+        int evicted = 0;
+        // Every candidate is walked, not just the first `excess` slots: a victim skipped below (a
+        // concurrent retry flipped it back to QUEUED, or another writer already removed it) is
+        // replaced by the next-oldest candidate, so one skip cannot leave the registry above the cap
+        // until the following pass.
+        for (MutableJob victim : candidates) {
+            if (evicted >= excess) {
+                break;
+            }
+            synchronized (victim) {
+                // Re-checked under the monitor: a victim is only removed while it is still terminal
+                // and still the row this pass selected, so a concurrent retry cannot be unmapped.
+                if (!isTerminal(victim.status) || !jobs.remove(victim.jobId, victim)) {
+                    continue;
+                }
+                if (victim.idempotencyKey != null) {
+                    // Conditional on purpose: a same-key resubmission may already have repointed the
+                    // index at a newer job, and eviction must never drop that newer mapping.
+                    idempotencyIndex.remove(victim.idempotencyKey, victim.jobId);
+                }
+                // No quota release, no surviving-job mutation: a terminal row holds no slot and the
+                // snapshots, attempt histories, checkpoints and audit entries of other rows stay put.
+            }
+            evicted++;
+        }
+        if (evicted > 0) {
+            log.debug("batch-hash retention: evicted={} terminal jobs beyond the cap of {}", evicted,
+                    maxRetainedJobs);
+        }
         return evicted;
+    }
+
+    private static boolean isTerminal(JobStatus status) {
+        return status == JobStatus.COMPLETED || status == JobStatus.FAILED || status == JobStatus.CANCELLED;
     }
 
     @Scheduled(fixedDelayString = "${utiltools.jobs.execution-reaper-interval-ms:5000}")
@@ -1038,6 +1174,12 @@ public class BatchHashJobService {
             if (released) {
                 releaseQuota(job.clientKey); // after the monitor block (REQ-08)
             }
+            // REQ-02, enforcement site #4 (Plan §4.3): this pass just published a terminal row (reaped
+            // FAILED, or a finalised CANCELLED) — the two `continue` branches above are the only way
+            // to skip this line. It runs after the monitor block, so the order stays
+            // registryLock -> job monitor, and it is not gated on `released`: a quota claim already
+            // spent by another writer must not leave the terminal row in place until the next pass.
+            enforceRetainedJobCap();
         }
         return reaped;
     }
@@ -1129,6 +1271,11 @@ public class BatchHashJobService {
             if (released) {
                 releaseQuota(job.clientKey); // after the monitor block (REQ-08)
             }
+            // REQ-02, enforcement site #6 (Plan §4.3): the drain sweep publishes FAILED (JOB_SHUTDOWN)
+            // rows in bulk, and the `continue` above is the only path that settles no row. Enforced
+            // after the monitor block and after releaseQuota, so the order stays
+            // registryLock -> job monitor and a drain sweep cannot push the registry past the cap.
+            enforceRetainedJobCap();
         }
         return failed;
     }
@@ -1276,6 +1423,7 @@ public class BatchHashJobService {
                 }
                 if (released) {
                     releaseQuota(job.clientKey); // after the monitor block (REQ-08)
+                    enforceRetainedJobCap(); // outside the monitor: registryLock -> job monitor
                 }
             } catch (Throwable t) {
                 // Intentional: an Error must not wedge the pool, later jobs still run.
@@ -1307,6 +1455,7 @@ public class BatchHashJobService {
                 }
                 if (released) {
                     releaseQuota(job.clientKey); // after the monitor block (REQ-08)
+                    enforceRetainedJobCap(); // outside the monitor: registryLock -> job monitor
                 }
             }
         } finally {

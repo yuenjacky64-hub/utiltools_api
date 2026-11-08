@@ -4,6 +4,8 @@ import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.OperationType;
 import com.example.utiltools.common.RequestContext;
 import com.example.utiltools.common.ReplayConflictException;
+import com.example.utiltools.crypto.dto.Base32Request;
+import com.example.utiltools.crypto.dto.Base32Response;
 import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
@@ -28,6 +30,8 @@ import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
 import com.example.utiltools.json.dto.JsonFromCsvRequest;
 import com.example.utiltools.json.dto.JsonFromCsvResponse;
+import com.example.utiltools.json.dto.JsonFromNdjsonRequest;
+import com.example.utiltools.json.dto.JsonFromNdjsonResponse;
 import com.example.utiltools.json.dto.JsonMergePatchRequest;
 import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
@@ -36,6 +40,8 @@ import com.example.utiltools.json.dto.JsonUnflattenResponse;
 import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonToCsvRequest;
 import com.example.utiltools.json.dto.JsonToCsvResponse;
+import com.example.utiltools.json.dto.JsonToNdjsonRequest;
+import com.example.utiltools.json.dto.JsonToNdjsonResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.service.JsonService;
@@ -114,6 +120,10 @@ public class AuditedOperations {
         return record(OperationType.CRYPTO_BASE64, request, () -> cryptoService.base64(request));
     }
 
+    public Base32Response base32(Base32Request request) {
+        return record(OperationType.CRYPTO_BASE32, request, () -> cryptoService.base32(request));
+    }
+
     public UrlResponse url(UrlRequest request) {
         return record(OperationType.CRYPTO_URL, request, () -> cryptoService.url(request));
     }
@@ -159,6 +169,14 @@ public class AuditedOperations {
         return record(OperationType.JSON_FROM_CSV, request, () -> jsonService.fromCsv(request));
     }
 
+    public JsonToNdjsonResponse toNdjson(JsonToNdjsonRequest request) {
+        return record(OperationType.JSON_TO_NDJSON, request, () -> jsonService.toNdjson(request));
+    }
+
+    public JsonFromNdjsonResponse fromNdjson(JsonFromNdjsonRequest request) {
+        return record(OperationType.JSON_FROM_NDJSON, request, () -> jsonService.fromNdjson(request));
+    }
+
     public TextTransformResponse transform(TextTransformRequest request) {
         return record(OperationType.TEXT_TRANSFORM, request, () -> textService.transform(request));
     }
@@ -183,6 +201,7 @@ public class AuditedOperations {
             case DATETIME_CURRENT -> dateTimeService.getCurrentTime(timeZoneOf(request));
             case CRYPTO_HASH -> cryptoService.hash((HashRequest) request);
             case CRYPTO_BASE64 -> cryptoService.base64((Base64Request) request);
+            case CRYPTO_BASE32 -> cryptoService.base32((Base32Request) request);
             case CRYPTO_URL -> cryptoService.url((UrlRequest) request);
             case CRYPTO_UUID -> cryptoService.generateUuids(intOf(request, "count"), booleanOf(request, "compact"),
                     stringOf(request, "version"));
@@ -194,6 +213,8 @@ public class AuditedOperations {
             case JSON_MERGE_PATCH -> jsonService.mergePatch((JsonMergePatchRequest) request);
             case JSON_TO_CSV -> jsonService.toCsv((JsonToCsvRequest) request);
             case JSON_FROM_CSV -> jsonService.fromCsv((JsonFromCsvRequest) request);
+            case JSON_TO_NDJSON -> jsonService.toNdjson((JsonToNdjsonRequest) request);
+            case JSON_FROM_NDJSON -> jsonService.fromNdjson((JsonFromNdjsonRequest) request);
             case TEXT_TRANSFORM -> textService.transform((TextTransformRequest) request);
             case TEXT_STATS -> textService.stats((TextStatsRequest) request);
             case TEXT_REPLACE -> textService.replace((TextReplaceRequest) request);

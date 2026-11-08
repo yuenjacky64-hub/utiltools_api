@@ -43,7 +43,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | :--- | :--- | :--- |
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, current global time |
 | **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), UUID v4 batch generation and time-ordered RFC 9562 UUID v7 generation (`version=V4|V7`) |
-| **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit |
+| **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit, and NDJSON / JSON Lines conversion (array <-> line-delimited records) |
 | **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
 
 ---
@@ -148,6 +148,8 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/query` | Evaluate JSONPath queries and extract matching nodes |
 | `POST` | `/api/v1/utils/json/patch` | Apply an ordered RFC 6902-style patch atomically, with reverse-order rollback and audit |
 | `POST` | `/api/v1/utils/json/merge-patch` | Apply an RFC 7396 merge-patch document (`null` deletes, objects merge recursively, arrays/scalars replace) as a journalled `JSON_MERGE_PATCH` |
+| `POST` | `/api/v1/utils/json/to-ndjson` | Export a JSON array as NDJSON / JSON Lines: one compact value per line, `lineCount` and `sizeBytes`, journalled as `JSON_TO_NDJSON` |
+| `POST` | `/api/v1/utils/json/from-ndjson` | Import NDJSON / JSON Lines into a JSON array: blank lines and CRLF tolerated, errors name the 1-based line number, 10000-record bound, journalled as `JSON_FROM_NDJSON` |
 | `POST` | `/api/v1/utils/text/transform` | Apply a deterministic case/format operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`) to a string |
 | `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
 | `POST` | `/api/v1/utils/text/replace` | Replace every (or, with `all=false`, the first) occurrence of a literal or regex `pattern`, reporting `replacements`, `changed` and code-point `length` |
@@ -724,6 +726,9 @@ without appending a second journal entry.
 ---
 
 ### 3. JSON & Data Processor Utility
+
+Covers formatting and minification, syntax validation, JSONPath querying, atomic RFC 6902-style patching,
+declarative RFC 7396 merge-patch, and NDJSON / JSON Lines conversion (array <-> line-delimited records).
 
 #### A. Format / Pretty-Print or Minify JSON
 `indent` is optional: it must be an integer in **1-8**, defaults to **2** spaces per nesting level when omitted, and is ignored when `minify` is `true`. Values outside 1-8 are rejected with HTTP 400 and `error` `VALIDATION_ERROR`.
@@ -1736,6 +1741,7 @@ utiltools.jobs.cleanup-interval-ms=60000
 utiltools.jobs.max-attempts=3
 utiltools.jobs.max-active-jobs-per-client=20
 utiltools.jobs.default-deadline-seconds=0
+utiltools.jobs.max-retained-jobs=1000
 ```
 
 | Property | Default | Meaning |
@@ -1747,6 +1753,7 @@ utiltools.jobs.default-deadline-seconds=0
 | `utiltools.jobs.max-attempts` | `3` | Ceiling on execution attempts per job, where the first submission is attempt `1`; a `FAILED` job at this count answers `409 JOB_RETRY_CONFLICT`. Values below `1` are clamped to `1`. Global — it is not settable per request |
 | `utiltools.jobs.default-deadline-seconds` | `0` | Server default total-life bound (seconds) applied when a request omits `deadlineSeconds`; it covers **queue wait plus execution** and, once `deadlineAt` passes, moves the job to `FAILED` with `JOB_DEADLINE_EXCEEDED` while keeping the checkpoint prefix for a retry. `0` disables the default, so a deploy that never sets it behaves exactly as before. Anything outside `0..3600` fails startup |
 | `utiltools.jobs.max-active-jobs-per-client` | `20` | Ceiling on one client's concurrent **non-terminal** jobs (`QUEUED`, `RUNNING` or `CANCELLING`), keyed by the same identity the rate limiter resolves (see [G](#g-rate-limiting-interaction-explicit-decision)); one more submission answers `429 JOB_QUOTA_EXCEEDED` with `limit` and `activeJobs` in `details`. A slot is released as each job reaches `COMPLETED`, `FAILED` or `CANCELLED` — a `DELETE` on a `RUNNING` job records the cancellation without releasing the slot, which is released once by the terminal `CANCELLED` write. Values below `1` fail startup. Set it at or above `worker-count + queue-capacity` to restore pre-quota (unbounded per client) admission |
+| `utiltools.jobs.max-retained-jobs` | `1000` | Hard cap on retained **terminal** rows (`COMPLETED`, `FAILED`, `CANCELLED`) in the in-memory registry, enforced together with `retention-seconds`: once the cap is exceeded the oldest terminal job by `completedAt` is unregistered (with its idempotency key) so a fast submit/complete churn cannot grow the registry without bound. `QUEUED`, `RUNNING` and `CANCELLING` rows are never evicted, so the registry stays at or below `max-retained-jobs + worker-count + queue-capacity` rows. Values below `1` fail startup |
 
 #### G. Rate limiting interaction (explicit decision)
 

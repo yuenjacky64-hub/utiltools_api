@@ -1,5 +1,7 @@
 package com.example.utiltools.crypto;
 
+import com.example.utiltools.crypto.dto.Base32Request;
+import com.example.utiltools.crypto.dto.Base32Response;
 import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
@@ -356,5 +358,73 @@ class CryptoServiceTest {
         public Instant instant() {
             return instant;
         }
+    }
+
+    @Test
+    @DisplayName("base32 - should encode UTF-8 bytes to canonical uppercase padded RFC 4648 output")
+    void shouldEncodeBase32() {
+        assertThat(cryptoService.base32(new Base32Request("ENCODE", "foobar")).result())
+                .isEqualTo("MZXW6YTBOI======");
+        assertThat(cryptoService.base32(new Base32Request("encode", "Hello World")).result())
+                .isEqualTo("JBSWY3DPEBLW64TMMQ======");
+        assertThat(cryptoService.base32(new Base32Request("ENCODE", "a")).result())
+                .isEqualTo("ME======");
+        assertThat(cryptoService.base32(new Base32Request("ENCODE", "\u00e9")).result())
+                .isEqualTo("YOUQ====");
+    }
+
+    @Test
+    @DisplayName("base32 - should decode padded, unpadded and lowercase input")
+    void shouldDecodeBase32Tolerantly() {
+        assertThat(cryptoService.base32(new Base32Request("DECODE", "MZXW6YTBOI======")))
+                .isEqualTo(new Base32Response("DECODE", "foobar"));
+        assertThat(cryptoService.base32(new Base32Request("DECODE", "MZXW6YTBOI")).result())
+                .isEqualTo("foobar");
+        assertThat(cryptoService.base32(new Base32Request("DECODE", "mzxw6ytboi")).result())
+                .isEqualTo("foobar");
+        assertThat(cryptoService.base32(new Base32Request("DECODE", "JBSWY3DPEBLW64TMMQ======")).result())
+                .isEqualTo("Hello World");
+    }
+
+    @Test
+    @DisplayName("base32 - should round-trip arbitrary UTF-8 text")
+    void shouldRoundTripBase32() {
+        for (String sample : List.of("f", "fo", "foo", "foob", "fooba", "foobar", "Gr\u00fc\u00dfe \u2603")) {
+            String encoded = cryptoService.base32(new Base32Request("ENCODE", sample)).result();
+            assertThat(encoded).matches("^[A-Z2-7]*=*$");
+            assertThat(encoded.length() % 8).isZero();
+            assertThat(cryptoService.base32(new Base32Request("DECODE", encoded)).result()).isEqualTo(sample);
+        }
+    }
+
+    @Test
+    @DisplayName("base32 - should reject invalid characters, impossible lengths and non-zero trailing bits")
+    void shouldRejectInvalidBase32() {
+        assertThatThrownBy(() -> cryptoService.base32(new Base32Request("DECODE", "MZXW6YTBOI=====!")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("unexpected character '!'");
+        assertThatThrownBy(() -> cryptoService.base32(new Base32Request("DECODE", "MZXW6YTBO0")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("unexpected character '0'");
+        assertThatThrownBy(() -> cryptoService.base32(new Base32Request("DECODE", "MZXW6YTBO")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("invalid length");
+        assertThatThrownBy(() -> cryptoService.base32(new Base32Request("DECODE", "MZXW6YTBOJ")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-zero trailing bits");
+        assertThatThrownBy(() -> cryptoService.base32(new Base32Request("DECODE", "MZXW6=YTB")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("misplaced padding");
+        assertThatThrownBy(() -> cryptoService.base32(new Base32Request("DECODE", "MZXW6YTBOI==")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("incorrect padding");
+    }
+
+    @Test
+    @DisplayName("base32 - should reject an unknown action")
+    void shouldRejectUnknownBase32Action() {
+        assertThatThrownBy(() -> cryptoService.base32(new Base32Request("ROT13", "foobar")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid action");
     }
 }

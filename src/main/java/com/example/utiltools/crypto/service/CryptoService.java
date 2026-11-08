@@ -1,5 +1,7 @@
 package com.example.utiltools.crypto.service;
 
+import com.example.utiltools.crypto.dto.Base32Request;
+import com.example.utiltools.crypto.dto.Base32Response;
 import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
@@ -21,6 +23,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.List;
@@ -34,6 +37,19 @@ public class CryptoService {
 
     private static final HexFormat HEX_FORMAT = HexFormat.of();
     private static final char[] HEX_DIGITS = "0123456789ABCDEF".toCharArray();
+
+    private static final char[] BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".toCharArray();
+    private static final int BASE32_BLOCK_CHARS = 8;
+    private static final int[] BASE32_SPARE_BITS = {0, 0, 2, 0, 4, 1, 0, 3};
+    private static final int[] BASE32_DECODE_TABLE = new int[128];
+
+    static {
+        Arrays.fill(BASE32_DECODE_TABLE, -1);
+        for (int i = 0; i < BASE32_ALPHABET.length; i++) {
+            BASE32_DECODE_TABLE[BASE32_ALPHABET[i]] = i;
+            BASE32_DECODE_TABLE[Character.toLowerCase(BASE32_ALPHABET[i])] = i;
+        }
+    }
 
     private static final String UUID_VERSION_V4 = "V4";
     private static final String UUID_VERSION_V7 = "V7";
@@ -105,6 +121,134 @@ public class CryptoService {
         } else {
             throw new IllegalArgumentException("Invalid action: " + request.action() + ". Expected ENCODE or DECODE.");
         }
+    }
+
+    public Base32Response base32(Base32Request request) {
+        String action = request.action().trim().toUpperCase(Locale.ROOT);
+
+        if ("ENCODE".equals(action)) {
+            byte[] bytes = request.content().getBytes(StandardCharsets.UTF_8);
+            return new Base32Response("ENCODE", encodeBase32(bytes));
+        } else if ("DECODE".equals(action)) {
+            return new Base32Response("DECODE", decodeBase32(request.content()));
+        } else {
+            throw new IllegalArgumentException("Invalid action: " + request.action() + ". Expected ENCODE or DECODE.");
+        }
+    }
+
+    /**
+     * Canonical RFC 4648 Base32: uppercase alphabet A-Z2-7, '=' padding to a multiple of 8 characters.
+     */
+    private String encodeBase32(byte[] bytes) {
+        if (bytes.length == 0) {
+            return "";
+        }
+        StringBuilder encoded = new StringBuilder((bytes.length * 8 + 4) / 5);
+        int buffer = 0;
+        int bits = 0;
+        for (byte raw : bytes) {
+            buffer = (buffer << 8) | (raw & 0xFF);
+            bits += 8;
+            while (bits >= 5) {
+                encoded.append(BASE32_ALPHABET[(buffer >>> (bits - 5)) & 0x1F]);
+                bits -= 5;
+            }
+        }
+        if (bits > 0) {
+            encoded.append(BASE32_ALPHABET[(buffer << (5 - bits)) & 0x1F]);
+        }
+        while (encoded.length() % BASE32_BLOCK_CHARS != 0) {
+            encoded.append('=');
+        }
+        return encoded.toString();
+    }
+
+    /**
+     * Tolerant on form (case, optional padding) but strict on validity: the alphabet, padding
+     * placement, group length, non-zero trailing bits and the decoded UTF-8 sequence are all gated.
+     */
+    private String decodeBase32(String content) {
+        String input = content.trim();
+        int end = input.length();
+        while (end > 0 && input.charAt(end - 1) == '=') {
+            end--;
+        }
+        String body = input.substring(0, end);
+
+        for (int i = 0; i < body.length(); i++) {
+            char ch = body.charAt(i);
+            if (ch == '=') {
+                // Deferred to the padding gate below so '=' is reported as misplaced padding,
+                // while 'MZXW6YTBOI=====!' still fails on the alphabet gate first.
+                continue;
+            }
+            if (ch >= 128 || BASE32_DECODE_TABLE[ch] < 0) {
+                throw new IllegalArgumentException(
+                        "Invalid Base32 content: unexpected character '" + ch + "' at index " + i);
+            }
+        }
+        if (body.indexOf('=') >= 0) {
+            throw new IllegalArgumentException(
+                    "Invalid Base32 content: misplaced padding '=' inside the encoded body");
+        }
+        if (!isLegalBase32Length(body.length())) {
+            throw new IllegalArgumentException("Invalid Base32 content: invalid length " + body.length()
+                    + "; Base32 data must be a multiple of 8 characters or end after 2, 4, 5 or 7 characters");
+        }
+        int padding = input.length() - end;
+        if (padding > 0 && padding != expectedBase32Padding(body.length())) {
+            throw new IllegalArgumentException("Invalid Base32 content: incorrect padding; expected "
+                    + expectedBase32Padding(body.length()) + " '=' characters but found " + padding);
+        }
+
+        int spareBits = BASE32_SPARE_BITS[body.length() % BASE32_BLOCK_CHARS];
+        if (!body.isEmpty() && spareBits > 0) {
+            int last = BASE32_DECODE_TABLE[body.charAt(body.length() - 1)];
+            if ((last & ((1 << spareBits) - 1)) != 0) {
+                throw new IllegalArgumentException("Invalid Base32 content: non-zero trailing bits "
+                        + "in the final character '" + body.charAt(body.length() - 1) + "'");
+            }
+        }
+
+        byte[] decoded = new byte[body.length() * 5 / 8];
+        int buffer = 0;
+        int bits = 0;
+        int written = 0;
+        for (int i = 0; i < body.length(); i++) {
+            buffer = (buffer << 5) | BASE32_DECODE_TABLE[body.charAt(i)];
+            bits += 5;
+            if (bits >= 8) {
+                decoded[written++] = (byte) ((buffer >>> (bits - 8)) & 0xFF);
+                bits -= 8;
+            }
+        }
+
+        CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT);
+        try {
+            return decoder.decode(ByteBuffer.wrap(decoded)).toString();
+        } catch (CharacterCodingException e) {
+            throw new IllegalArgumentException(
+                    "Invalid Base32 content: invalid UTF-8 sequence in decoded content: " + e.getMessage(), e);
+        }
+    }
+
+    private static int expectedBase32Padding(int length) {
+        return switch (length % BASE32_BLOCK_CHARS) {
+            case 0 -> 0;
+            case 2 -> 6;
+            case 4 -> 4;
+            case 5 -> 3;
+            default -> 1;
+        };
+    }
+
+    private static boolean isLegalBase32Length(int length) {
+        return switch (length % BASE32_BLOCK_CHARS) {
+            case 0, 2, 4, 5, 7 -> true;
+            default -> false;
+        };
     }
 
     public UrlResponse url(UrlRequest request) {
