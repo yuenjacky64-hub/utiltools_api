@@ -1,10 +1,12 @@
 package com.example.utiltools.datetime;
 
 import com.example.utiltools.audit.AuditTestSupport;
+import com.example.utiltools.audit.controller.AuditController;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
 import com.example.utiltools.audit.model.OperationType;
 import com.example.utiltools.audit.service.AuditJournalService;
+import com.example.utiltools.audit.service.AuditReplayService;
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.GlobalExceptionHandler;
 import com.example.utiltools.crypto.service.CryptoService;
@@ -13,6 +15,8 @@ import com.example.utiltools.json.service.JsonService;
 import com.example.utiltools.text.service.TextService;
 import com.example.utiltools.resilience.ResilienceConfig;
 import com.example.utiltools.datetime.controller.DateTimeController;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -21,6 +25,9 @@ import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
+
+import java.time.Instant;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.everyItem;
@@ -31,8 +38,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-@WebMvcTest(DateTimeController.class)
-@Import({AuditTestSupport.class, AuditJournalService.class, AuditedOperations.class, CryptoService.class, DateTimeService.class,
+@WebMvcTest({DateTimeController.class, AuditController.class})
+@Import({AuditTestSupport.class, AuditJournalService.class, AuditReplayService.class, AuditedOperations.class,
+        CryptoService.class, DateTimeService.class,
         JsonService.class, TextService.class, ResilienceConfig.class, GlobalExceptionHandler.class})
 @TestPropertySource(properties = {"utiltools.audit.max-entries=200", "utiltools.audit.max-replay-bytes=65536"})
 class DateTimeControllerTest {
@@ -42,6 +50,9 @@ class DateTimeControllerTest {
 
     @Autowired
     private AuditJournalService auditJournal;
+
+    @Autowired
+    private ObjectMapper objectMapper;
 
     @Test
     @DisplayName("POST /api/v1/utils/datetime/convert - should convert epoch millis to Tokyo time")
@@ -541,5 +552,172 @@ class DateTimeControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/duration - should parse components and total seconds")
+    void shouldParseDurationEndpointReturnsComponents() throws Exception {
+        String body = """
+                {
+                    "action": "PARSE",
+                    "input": "P1DT2H30M"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/duration")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.action").value("PARSE"))
+                .andExpect(jsonPath("$.data.input").value("P1DT2H30M"))
+                .andExpect(jsonPath("$.data.iso").value("P1DT2H30M"))
+                .andExpect(jsonPath("$.data.negative").value(false))
+                .andExpect(jsonPath("$.data.days").value(1))
+                .andExpect(jsonPath("$.data.hours").value(2))
+                .andExpect(jsonPath("$.data.minutes").value(30))
+                .andExpect(jsonPath("$.data.seconds").value(0))
+                .andExpect(jsonPath("$.data.nanos").value(0))
+                .andExpect(jsonPath("$.data.totalSeconds").value(95400));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/duration - should format negative seconds as canonical ISO text")
+    void shouldFormatNegativeDurationEndpointReturnsIsoText() throws Exception {
+        String body = """
+                {
+                    "action": "FORMAT",
+                    "seconds": -5400
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/duration")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.action").value("FORMAT"))
+                .andExpect(jsonPath("$.data.iso").value("-PT1H30M"))
+                .andExpect(jsonPath("$.data.negative").value(true))
+                .andExpect(jsonPath("$.data.hours").value(1))
+                .andExpect(jsonPath("$.data.minutes").value(30))
+                .andExpect(jsonPath("$.data.totalSeconds").value(-5400));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/duration - should return 400 BAD_REQUEST for malformed durations")
+    void shouldRejectMalformedDurationRequestsWith400() throws Exception {
+        String unsupportedCalendarUnit = "unsupported calendar unit (years or months are not allowed)";
+        String unparseable = "Unable to parse ISO-8601 duration";
+        String empty = "Duration input cannot be empty";
+
+        String[] bodies = {
+                """
+                {"action": "PARSE", "input": "P"}
+                """,
+                """
+                {"action": "PARSE", "input": "P1M"}
+                """,
+                """
+                {"action": "PARSE", "input": "PT1H2X"}
+                """,
+                """
+                {"action": "PARSE", "input": ""}
+                """
+        };
+        String[] messages = {unparseable, unsupportedCalendarUnit, unparseable, empty};
+
+        for (int i = 0; i < bodies.length; i++) {
+            mockMvc.perform(post("/api/v1/utils/datetime/duration")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(bodies[i]))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.success").value(false))
+                    .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                    .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString(messages[i])));
+        }
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/duration - is journalled as DATETIME_DURATION and replays identically")
+    void shouldJournalAndReplayDuration() throws Exception {
+        String body = """
+                {
+                    "action": "PARSE",
+                    "input": "PT1.5S"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/duration")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.iso").value("PT1.5S"));
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("DATETIME_DURATION"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.iso").value("PT1.5S"))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        JsonNode storedResult = entry.get("result");
+        AuditEntry before = auditJournal.find(id).orElseThrow();
+        Instant completedAt = before.completedAt();
+
+        MvcResult replay = mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("DATETIME_DURATION"))
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"))
+                .andReturn();
+
+        JsonNode replayedResult = objectMapper.readTree(replay.getResponse().getContentAsString())
+                .get("data").get("result");
+        assertThat(replayedResult).isEqualTo(storedResult);
+
+        AuditEntry after = auditJournal.find(id).orElseThrow();
+        assertThat(after.operation()).isEqualTo(OperationType.DATETIME_DURATION);
+        assertThat(after.completedAt()).isEqualTo(completedAt);
+        assertThat(after.result()).isEqualTo(before.result());
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/duration - echoes X-Request-Id and rejects invalid fields with 400")
+    void shouldPropagateRequestIdOnDuration() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/datetime/duration")
+                        .header("X-Request-Id", "corr-duration01")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "PARSE", "input": "P2W"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-Request-Id", "corr-duration01"))
+                .andExpect(jsonPath("$.data.iso").value("P14D"));
+
+        mockMvc.perform(post("/api/v1/utils/datetime/duration")
+                        .header("X-Request-Id", "corr-duration02")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "BOGUS", "input": "PT1H"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(header().string("X-Request-Id", "corr-duration02"))
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", org.hamcrest.Matchers.hasItem("action must be one of PARSE, FORMAT")));
+
+        mockMvc.perform(post("/api/v1/utils/datetime/duration")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "FORMAT", "seconds": 1, "nanos": 1000000000}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", org.hamcrest.Matchers.hasItem("nanos must be between 0 and 999999999")));
     }
 }

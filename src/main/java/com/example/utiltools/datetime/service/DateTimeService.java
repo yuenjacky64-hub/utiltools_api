@@ -5,6 +5,8 @@ import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
+import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
+import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.dto.TimeZoneInfo;
@@ -22,6 +24,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @Service
@@ -37,6 +40,17 @@ public class DateTimeService {
 
     /** Largest absolute epoch-seconds value whose millisecond form still fits in a {@code long}. */
     private static final long MAX_EPOCH_SECONDS_FOR_MILLIS = 9_223_372_036_854_775L;
+
+    private static final int MAX_DURATION_INPUT_LENGTH = 64;
+    private static final long SECONDS_PER_WEEK = 604_800L;
+    private static final long SECONDS_PER_DAY = 86_400L;
+
+    /** Week/day/hour/minute/second ISO-8601 duration grammar; anchored and linear-time. */
+    private static final Pattern ISO_DURATION = Pattern.compile(
+            "^P(?:(\\d+)W)?(?:(\\d+)D)?(?:T(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+)(?:\\.(\\d+))?S)?)?$");
+
+    /** Calendar-dependent year/month components in the date part (the {@code M} of {@code PT1M} is minutes). */
+    private static final Pattern CALENDAR_UNIT = Pattern.compile("^P[^T]*\\d+(?:\\.\\d+)?[YM]");
 
     public DateTimeConvertResponse convert(DateTimeConvertRequest request) {
         Instant instant = parseInstant(request.input(), request.inputFormat());
@@ -110,6 +124,24 @@ public class DateTimeService {
         );
     }
 
+    /**
+     * Parses or formats an ISO-8601 duration. {@code PARSE} accepts week/day/hour/minute/second
+     * components with fractional seconds; {@code FORMAT} renders canonical ISO-8601 text from
+     * signed seconds plus optional nanoseconds.
+     *
+     * <p>The method is a pure function of its request: no clock, no locale, no timezone database
+     * and no mutable state. Throws {@link IllegalArgumentException} for every rejected input.</p>
+     */
+    public DateTimeDurationResponse duration(DateTimeDurationRequest request) {
+        String action = request.action() == null ? "" : request.action().trim().toUpperCase(Locale.ROOT);
+        return switch (action) {
+            case "PARSE" -> parseDuration(request.input());
+            case "FORMAT" -> formatDuration(request.seconds(), request.nanos());
+            default -> throw new IllegalArgumentException(
+                    "Unsupported action: " + request.action() + ". Expected one of PARSE, FORMAT");
+        };
+    }
+
     public DateTimeDiffResponse diff(DateTimeDiffRequest request) {
         Instant start = parseInstant(request.start());
         Instant end = parseInstant(request.end());
@@ -174,6 +206,145 @@ public class DateTimeService {
         }
 
         return new TimeZoneListResponse(applied, limit, total, entries);
+    }
+
+    private DateTimeDurationResponse parseDuration(String input) {
+        String trimmed = input == null ? "" : input.trim();
+        if (trimmed.isEmpty()) {
+            throw new IllegalArgumentException("Duration input cannot be empty");
+        }
+        if (trimmed.length() > MAX_DURATION_INPUT_LENGTH) {
+            throw new IllegalArgumentException(
+                    "Duration input is too long (max " + MAX_DURATION_INPUT_LENGTH + " characters)");
+        }
+
+        boolean negative = false;
+        String magnitude = trimmed;
+        if (magnitude.startsWith("-")) {
+            negative = true;
+            magnitude = magnitude.substring(1);
+        } else if (magnitude.startsWith("+")) {
+            magnitude = magnitude.substring(1);
+        }
+
+        if (CALENDAR_UNIT.matcher(magnitude).find()) {
+            throw new IllegalArgumentException(
+                    "Duration uses unsupported calendar unit (years or months are not allowed): " + trimmed);
+        }
+
+        Matcher m = ISO_DURATION.matcher(magnitude);
+        boolean anyComponent = m.matches()
+                && (m.group(1) != null || m.group(2) != null || m.group(3) != null
+                || m.group(4) != null || m.group(5) != null);
+        if (!anyComponent) {
+            throw new IllegalArgumentException("Unable to parse ISO-8601 duration: " + trimmed);
+        }
+        if (m.group(6) != null && m.group(6).length() > 9) {
+            throw new IllegalArgumentException(
+                    "Duration fractional seconds are limited to nanosecond precision");
+        }
+
+        long total;
+        int nanos;
+        try {
+            long weeks = component(m.group(1));
+            long days = component(m.group(2));
+            long hours = component(m.group(3));
+            long minutes = component(m.group(4));
+            long whole = component(m.group(5));
+            nanos = m.group(6) == null ? 0
+                    : Integer.parseInt((m.group(6) + "000000000").substring(0, 9));
+            total = Math.multiplyExact(weeks, SECONDS_PER_WEEK);
+            total = Math.addExact(total, Math.multiplyExact(days, SECONDS_PER_DAY));
+            total = Math.addExact(total, Math.multiplyExact(hours, 3_600L));
+            total = Math.addExact(total, Math.multiplyExact(minutes, 60L));
+            total = Math.addExact(total, whole);
+        } catch (ArithmeticException | NumberFormatException e) {
+            throw new IllegalArgumentException("Duration out of range: " + trimmed, e);
+        }
+
+        return buildDurationResponse("PARSE", input, negative, total, nanos);
+    }
+
+    private DateTimeDurationResponse formatDuration(Long seconds, Integer nanos) {
+        if (seconds == null) {
+            throw new IllegalArgumentException("seconds is required when action is FORMAT");
+        }
+        int fraction = nanos == null ? 0 : nanos;
+        if (fraction < 0 || fraction > 999_999_999) {
+            throw new IllegalArgumentException("nanos must be between 0 and 999999999");
+        }
+        if (seconds == Long.MIN_VALUE) {
+            throw new IllegalArgumentException("Duration out of range: " + seconds);
+        }
+        boolean negative = seconds < 0;
+        long magnitude = negative ? -seconds : seconds;
+        return buildDurationResponse("FORMAT", null, negative, magnitude, fraction);
+    }
+
+    /** Builds the sign-magnitude response: {@code nanos} is always the magnitude of the fraction. */
+    private DateTimeDurationResponse buildDurationResponse(
+            String action, String input, boolean negative, long magnitudeSeconds, int nanos) {
+        long days = magnitudeSeconds / SECONDS_PER_DAY;
+        long remainder = magnitudeSeconds % SECONDS_PER_DAY;
+        long hours = remainder / 3_600L;
+        long minutes = (remainder % 3_600L) / 60L;
+        long seconds = remainder % 60L;
+        String iso = toIso(negative, magnitudeSeconds, nanos);
+        long totalSeconds = negative ? -magnitudeSeconds : magnitudeSeconds;
+        return new DateTimeDurationResponse(
+                action,
+                input,
+                iso,
+                negative,
+                days,
+                (int) hours,
+                (int) minutes,
+                (int) seconds,
+                nanos,
+                totalSeconds);
+    }
+
+    private String toIso(boolean negative, long magnitudeSeconds, int nanos) {
+        long d = magnitudeSeconds / SECONDS_PER_DAY;
+        long rem = magnitudeSeconds % SECONDS_PER_DAY;
+        long h = rem / 3_600L;
+        long mi = (rem % 3_600L) / 60L;
+        long s = rem % 60L;
+        boolean hasTime = h > 0 || mi > 0 || s > 0 || nanos > 0;
+        StringBuilder sb = new StringBuilder();
+        if (negative) {
+            sb.append('-');
+        }
+        sb.append('P');
+        if (d > 0) {
+            sb.append(d).append('D');
+        }
+        if (hasTime) {
+            sb.append('T');
+            if (h > 0) {
+                sb.append(h).append('H');
+            }
+            if (mi > 0) {
+                sb.append(mi).append('M');
+            }
+            if (s > 0 || nanos > 0) {
+                sb.append(s);
+                if (nanos > 0) {
+                    String fraction = String.format("%09d", nanos).replaceAll("0+$", "");
+                    sb.append('.').append(fraction);
+                }
+                sb.append('S');
+            }
+        }
+        if (!hasTime && d == 0) {
+            sb.append("T0S");
+        }
+        return sb.toString();
+    }
+
+    private static long component(String value) {
+        return value == null ? 0L : Long.parseLong(value);
     }
 
     private Instant parseInstant(String input) {

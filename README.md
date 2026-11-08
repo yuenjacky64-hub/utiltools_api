@@ -136,6 +136,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/datetime/convert` | Convert epoch timestamp or ISO string to target timezone & pattern |
 | `POST` | `/api/v1/utils/datetime/diff` | Calculate duration & difference between two datetime points |
 | `POST` | `/api/v1/utils/datetime/shift` | Add or subtract a duration in a target IANA timezone (DST- and month-end-aware) |
+| `POST` | `/api/v1/utils/datetime/duration` | Parse an ISO-8601 duration into components and total seconds, or format signed seconds/nanos back to canonical ISO-8601 text |
 | `GET` | `/api/v1/utils/datetime/current` | Fetch current time in UTC and target timezone |
 | `GET` | `/api/v1/utils/datetime/timezones` | List IANA timezones with current UTC offsets, optionally filtered by `prefix` |
 | `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-256, SHA-512, MD5) or HMAC |
@@ -469,6 +470,46 @@ curl "http://localhost:8080/api/v1/utils/datetime/timezones?prefix=Asia&limit=3"
   "timestamp": "2026-10-30T16:50:38.802324893Z"
 }
 ```
+
+#### F. Parse / Format ISO-8601 Durations
+Turns an ISO-8601 duration into components plus total seconds (`PARSE`), or turns signed seconds/nanos back into
+canonical ISO-8601 text (`FORMAT`). Parsing accepts an optional leading `+`/`-` and the week, day, hour, minute and
+second designators, including fractional seconds (`P2W`, `P1DT2H30M`, `PT1.5S`, `PT0S`); weeks are expanded into
+days. Calendar-dependent units (`P1Y`, `P1M`), a bare `P`, and malformed or overlong input are rejected with HTTP 400.
+Every call is journalled as `DATETIME_DURATION` and replays deterministically.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/datetime/duration \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "PARSE",
+    "input": "P1DT2H30M"
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "DateTime duration processed successfully",
+  "data": {
+    "action": "PARSE",
+    "input": "P1DT2H30M",
+    "iso": "P1DT2H30M",
+    "negative": false,
+    "days": 1,
+    "hours": 2,
+    "minutes": 30,
+    "seconds": 0,
+    "nanos": 0,
+    "totalSeconds": 95400
+  },
+  "timestamp": "2026-10-30T16:50:38.802324893Z"
+}
+```
+
+`FORMAT` goes the other way and keeps the sign, so `{"action": "FORMAT", "seconds": -5400}` answers
+`"iso": "-PT1H30M"`, while `{"action": "FORMAT", "seconds": 1, "nanos": 500000000}` answers `"iso": "PT1.5S"`.
 
 ---
 

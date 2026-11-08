@@ -5,6 +5,8 @@ import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
+import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
+import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.dto.TimeZoneInfo;
@@ -423,5 +425,168 @@ class DateTimeServiceTest {
         assertThatThrownBy(() -> dateTimeService.convert(request))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("does not match inputFormat EPOCH_MILLIS");
+    }
+
+    @Test
+    @DisplayName("Should parse ISO-8601 duration components and total seconds")
+    void shouldParseIsoDurationComponents() {
+        DateTimeDurationResponse response =
+                dateTimeService.duration(new DateTimeDurationRequest("PARSE", "P1DT2H30M", null, null));
+
+        assertThat(response.action()).isEqualTo("PARSE");
+        assertThat(response.input()).isEqualTo("P1DT2H30M");
+        assertThat(response.negative()).isFalse();
+        assertThat(response.days()).isEqualTo(1);
+        assertThat(response.hours()).isEqualTo(2);
+        assertThat(response.minutes()).isEqualTo(30);
+        assertThat(response.seconds()).isZero();
+        assertThat(response.nanos()).isZero();
+        assertThat(response.totalSeconds()).isEqualTo(95400L);
+        assertThat(response.iso()).isEqualTo("P1DT2H30M");
+
+        DateTimeDurationResponse zero =
+                dateTimeService.duration(new DateTimeDurationRequest("PARSE", "PT0S", null, null));
+        assertThat(zero.totalSeconds()).isZero();
+        assertThat(zero.iso()).isEqualTo("PT0S");
+
+        DateTimeDurationResponse lowercaseAction =
+                dateTimeService.duration(new DateTimeDurationRequest("parse", "+PT1H", null, null));
+        assertThat(lowercaseAction.action()).isEqualTo("PARSE");
+        assertThat(lowercaseAction.iso()).isEqualTo("PT1H");
+    }
+
+    @Test
+    @DisplayName("Should normalise weeks to days and reject calendar-dependent units")
+    void shouldNormalizeWeeksAndRejectCalendarUnits() {
+        DateTimeDurationResponse response =
+                dateTimeService.duration(new DateTimeDurationRequest("PARSE", "P2W", null, null));
+
+        assertThat(response.days()).isEqualTo(14);
+        assertThat(response.totalSeconds()).isEqualTo(1209600L);
+        assertThat(response.iso()).isEqualTo("P14D");
+
+        assertThatThrownBy(() -> dateTimeService.duration(new DateTimeDurationRequest("PARSE", "P1M", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("unsupported calendar unit (years or months are not allowed)");
+        assertThatThrownBy(() -> dateTimeService.duration(new DateTimeDurationRequest("PARSE", "P1Y", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("unsupported calendar unit (years or months are not allowed)");
+
+        // The M after T is minutes, not a month.
+        DateTimeDurationResponse minutes =
+                dateTimeService.duration(new DateTimeDurationRequest("PARSE", "PT1M", null, null));
+        assertThat(minutes.minutes()).isEqualTo(1);
+        assertThat(minutes.iso()).isEqualTo("PT1M");
+    }
+
+    @Test
+    @DisplayName("Should parse negative and fractional-second durations with sign-magnitude components")
+    void shouldParseNegativeAndFractionalDurations() {
+        DateTimeDurationResponse negative =
+                dateTimeService.duration(new DateTimeDurationRequest("PARSE", "-PT1H30M", null, null));
+
+        assertThat(negative.negative()).isTrue();
+        assertThat(negative.hours()).isEqualTo(1);
+        assertThat(negative.minutes()).isEqualTo(30);
+        assertThat(negative.totalSeconds()).isEqualTo(-5400L);
+        assertThat(negative.iso()).isEqualTo("-PT1H30M");
+
+        DateTimeDurationResponse fractional =
+                dateTimeService.duration(new DateTimeDurationRequest("PARSE", "PT1.5S", null, null));
+
+        assertThat(fractional.seconds()).isEqualTo(1);
+        assertThat(fractional.nanos()).isEqualTo(500000000);
+        assertThat(fractional.totalSeconds()).isEqualTo(1L);
+        assertThat(fractional.iso()).isEqualTo("PT1.5S");
+
+        // Sign-magnitude keeps -1.5s exact instead of Duration.getSeconds()'s floor of -2.
+        DateTimeDurationResponse negativeFraction =
+                dateTimeService.duration(new DateTimeDurationRequest("PARSE", "-PT1.5S", null, null));
+
+        assertThat(negativeFraction.negative()).isTrue();
+        assertThat(negativeFraction.seconds()).isEqualTo(1);
+        assertThat(negativeFraction.nanos()).isEqualTo(500000000);
+        assertThat(negativeFraction.totalSeconds()).isEqualTo(-1L);
+    }
+
+    @Test
+    @DisplayName("Should format signed seconds and round-trip a parsed fractional duration")
+    void shouldFormatSecondsAndRoundTripFractionalDuration() {
+        DateTimeDurationResponse formatted =
+                dateTimeService.duration(new DateTimeDurationRequest("FORMAT", null, -5400L, null));
+
+        assertThat(formatted.action()).isEqualTo("FORMAT");
+        assertThat(formatted.input()).isNull();
+        assertThat(formatted.negative()).isTrue();
+        assertThat(formatted.days()).isZero();
+        assertThat(formatted.hours()).isEqualTo(1);
+        assertThat(formatted.minutes()).isEqualTo(30);
+        assertThat(formatted.totalSeconds()).isEqualTo(-5400L);
+        assertThat(formatted.iso()).isEqualTo("-PT1H30M");
+
+        assertThat(dateTimeService.duration(new DateTimeDurationRequest("FORMAT", null, 0L, null)).iso())
+                .isEqualTo("PT0S");
+        assertThat(dateTimeService.duration(new DateTimeDurationRequest("FORMAT", null, 0L, 500000000)).iso())
+                .isEqualTo("PT0.5S");
+
+        DateTimeDurationResponse parsed =
+                dateTimeService.duration(new DateTimeDurationRequest("PARSE", "PT1.5S", null, null));
+        DateTimeDurationResponse roundTrip = dateTimeService.duration(
+                new DateTimeDurationRequest("FORMAT", null, parsed.totalSeconds(), parsed.nanos()));
+
+        assertThat(roundTrip.seconds()).isEqualTo(parsed.seconds());
+        assertThat(roundTrip.nanos()).isEqualTo(parsed.nanos());
+        assertThat(roundTrip.iso()).isEqualTo(parsed.iso());
+    }
+
+    @Test
+    @DisplayName("Should reject malformed, overlong and out-of-range durations")
+    void shouldRejectMalformedAndOutOfRangeDurations() {
+        assertThatThrownBy(() -> dateTimeService.duration(new DateTimeDurationRequest("PARSE", "P", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unable to parse ISO-8601 duration");
+        assertThatThrownBy(() -> dateTimeService.duration(new DateTimeDurationRequest("PARSE", "PT1H2X", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unable to parse ISO-8601 duration");
+        assertThatThrownBy(() -> dateTimeService.duration(new DateTimeDurationRequest("PARSE", "  ", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Duration input cannot be empty");
+        assertThatThrownBy(() -> dateTimeService.duration(new DateTimeDurationRequest("PARSE", null, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Duration input cannot be empty");
+        assertThatThrownBy(() -> dateTimeService.duration(
+                new DateTimeDurationRequest("PARSE", "P" + "1".repeat(65) + "D", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Duration input is too long (max 64 characters)");
+        assertThatThrownBy(() -> dateTimeService.duration(
+                new DateTimeDurationRequest("PARSE", "PT1.1234567891S", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("fractional seconds are limited to nanosecond precision");
+
+        // 20 digits fails Long.parseLong; 106751991167301 weeks overflows the long product.
+        assertThatThrownBy(() -> dateTimeService.duration(
+                new DateTimeDurationRequest("PARSE", "P99999999999999999999W", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Duration out of range");
+        assertThatThrownBy(() -> dateTimeService.duration(
+                new DateTimeDurationRequest("PARSE", "P106751991167301W", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Duration out of range");
+        assertThatThrownBy(() -> dateTimeService.duration(
+                new DateTimeDurationRequest("FORMAT", null, Long.MIN_VALUE, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Duration out of range");
+        assertThatThrownBy(() -> dateTimeService.duration(
+                new DateTimeDurationRequest("FORMAT", null, 1L, 1000000000)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("nanos must be between 0 and 999999999");
+        assertThatThrownBy(() -> dateTimeService.duration(
+                new DateTimeDurationRequest("FORMAT", null, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("seconds is required when action is FORMAT");
+        assertThatThrownBy(() -> dateTimeService.duration(
+                new DateTimeDurationRequest("BOGUS", null, 1L, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unsupported action");
     }
 }
