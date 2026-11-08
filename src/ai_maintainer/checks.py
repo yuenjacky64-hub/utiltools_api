@@ -86,6 +86,7 @@ class FrameworkStatus:
     last_completed_task: str | None
     source: str
     heartbeat_age_sec: float | None
+    active_task_id: str | None = None  # newest non-terminal task that has a _signal.txt
 
 
 def _as_text(value: Any) -> str | None:
@@ -354,6 +355,8 @@ def _scan_active_task(
     active_tasks = 0
     last_completed: str | None = None
     last_completed_mtime: float | None = None
+    active_task_id: str | None = None
+    active_id_mtime: float | None = None
     min_age: float | None = None
 
     try:
@@ -406,6 +409,13 @@ def _scan_active_task(
             queue_depth += 1
             continue
         active_tasks += 1
+        newest = max(mtimes) if mtimes else 0.0
+        if active_id_mtime is None or newest > active_id_mtime or (
+            newest == active_id_mtime
+            and (active_task_id is None or child.name < active_task_id)
+        ):
+            active_id_mtime = newest
+            active_task_id = child.name
 
     if min_age is None:
         orchestrator = "down"
@@ -420,6 +430,7 @@ def _scan_active_task(
         last_completed_task=last_completed,
         source=SOURCE_DISK,
         heartbeat_age_sec=min_age,
+        active_task_id=active_task_id,
     )
 
 
@@ -460,6 +471,7 @@ def probe_framework_status(
             last_completed_task=None,
             source=SOURCE_NONE,
             heartbeat_age_sec=None,
+            active_task_id=None,
         )
     return _scan_active_task(
         state_root, now=time.time() if now is None else now, stale_sec=stale_sec

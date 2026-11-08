@@ -35,6 +35,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
   - [Run with Docker](#run-with-docker)
 - [Automated Testing](#-automated-testing)
 - [Configuration Check (`python3 cli.py check`)](#-configuration-check-python3-clipy-check)
+- [Maintainer Status (`python3 cli.py status [--json]`)](#-maintainer-status-python3-clipy-status---json)
 
 ---
 
@@ -2081,3 +2082,59 @@ the `--maintainer-root` flag for the root being validated). The three path field
 tuning values), and any other key makes the `config.consistency` row fail with
 `unknown config key(s) in config.json: [...]`. There is no `.env` layer; `config.json` and the
 `MAINTAINER_*` variables are the only configuration sources.
+
+---
+
+## 📊 Maintainer Status (`python3 cli.py status [--json]`)
+
+`status` is the read-only reporter next to `check`. It summarises what the maintainer is doing —
+daemon heartbeat, orchestrator, active task, queue, memory and the persisted counters — without
+starting the engine, acquiring a lock, enqueuing work or writing any file:
+
+```bash
+python3 cli.py status          # human-readable summary
+python3 cli.py status --json   # one JSON object on stdout, for tooling
+```
+
+```text
+maintainer status
+daemon: running (source=active_task, heartbeat_age=12.0s)
+orchestrator: up
+active task: UTILTOOLS-60
+queue: busy (1 queued, 2 active, last completed UTILTOOLS-59)
+memory: rss 15.0 MiB, peak 14.9 MiB
+counters: total_cycles=12 bugs_patched=3 total_learnings=7
+latest task run: UTILTOOLS-60 in_progress (age 42.0s)
+unavailable: none
+```
+
+`--json` prints exactly one JSON object (single line, trailing newline) whose top-level keys are
+`daemon_status`, `orchestrator_up`, `orchestrator_status`, `active_task_id`, `queue_state`,
+`queue_depth`, `active_tasks`, `last_completed_task`, `heartbeat_age_sec`, `memory`,
+`total_cycles`, `bugs_patched`, `total_learnings`, `latest_task_run`, `generated_at`, `sources`
+and `unavailable`. Text mode renders those same fields, so the two modes never disagree. The
+payload is a superset of the required core key set: `last_completed_task` and
+`heartbeat_age_sec` are additional documented keys (INV-1 requires presence, not exclusivity).
+Every number is finite, so the document parses with a strict JSON parser (`NaN`/`Infinity` are
+dropped to `null` rather than emitted).
+
+- `daemon_status` is `running` (heartbeat younger than 900 s), `stale` or `unknown`;
+  `orchestrator_up` is `true`/`false`/`null` alongside the same value as `orchestrator_status`.
+- Counters are read from the read-only document `<state_root>/maintainer_status.json`
+  (`total_cycles`, `bugs_patched`, `total_learnings`, optional `latest_task_run`). The file is an
+  input only: `status` never creates, refreshes or migrates it. Missing or malformed documents
+  yield `null` values plus the field name in `unavailable`, never an error. Only a regular file is
+  read (a FIFO, device or directory at that path is ignored) and a bounded read is parsed, so
+  oversized, deeply nested or invalid documents degrade instead of raising.
+- In text mode every document-supplied string is flattened to one printable line, so a task id
+  cannot forge extra report lines.
+- `memory` describes the process running `status` (`rss_kb`/`peak_rss_kb` from `/proc`, or
+  `available: false`).
+- `sources` says where each value came from (`FrameworkWatcher`, `active_task`, the counter
+  document, `this_process`, `none`/`unavailable`), so a `null` is attributable.
+- No config values, model ids or absolute paths appear in the output.
+
+**Exit codes:** `0` — a report was rendered (this holds for `running` and `stale` alike, and for
+configured-but-unreachable state); `2` — argparse usage error. `status` never exits `1`; the
+verdict belongs to `check`. `--maintainer-root PATH` and `--config PATH` override the root and the
+`config.json` that are read.
