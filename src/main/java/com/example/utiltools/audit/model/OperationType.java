@@ -10,6 +10,7 @@ public enum OperationType {
     DATETIME_CURRENT(false),
     CRYPTO_HASH(true),
     CRYPTO_BASE64(true),
+    CRYPTO_BASE32(true),
     CRYPTO_URL(true),
     CRYPTO_UUID(false),
     JSON_FORMAT(true),

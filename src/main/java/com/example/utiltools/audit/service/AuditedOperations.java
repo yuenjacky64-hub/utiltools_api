@@ -4,6 +4,8 @@ import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.OperationType;
 import com.example.utiltools.common.RequestContext;
 import com.example.utiltools.common.ReplayConflictException;
+import com.example.utiltools.crypto.dto.Base32Request;
+import com.example.utiltools.crypto.dto.Base32Response;
 import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
@@ -114,6 +116,10 @@ public class AuditedOperations {
         return record(OperationType.CRYPTO_BASE64, request, () -> cryptoService.base64(request));
     }
 
+    public Base32Response base32(Base32Request request) {
+        return record(OperationType.CRYPTO_BASE32, request, () -> cryptoService.base32(request));
+    }
+
     public UrlResponse url(UrlRequest request) {
         return record(OperationType.CRYPTO_URL, request, () -> cryptoService.url(request));
     }
@@ -183,6 +189,7 @@ public class AuditedOperations {
             case DATETIME_CURRENT -> dateTimeService.getCurrentTime(timeZoneOf(request));
             case CRYPTO_HASH -> cryptoService.hash((HashRequest) request);
             case CRYPTO_BASE64 -> cryptoService.base64((Base64Request) request);
+            case CRYPTO_BASE32 -> cryptoService.base32((Base32Request) request);
             case CRYPTO_URL -> cryptoService.url((UrlRequest) request);
             case CRYPTO_UUID -> cryptoService.generateUuids(intOf(request, "count"), booleanOf(request, "compact"),
                     stringOf(request, "version"));
