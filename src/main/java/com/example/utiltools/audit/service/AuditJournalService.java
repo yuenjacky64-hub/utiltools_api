@@ -301,18 +301,33 @@ public class AuditJournalService {
     }
 
     /**
-     * Newest-first snapshot of reaped-entry tombstones, clamped to {@code [1, maxEntries]}.
+     * Newest-first snapshot of reaped-entry tombstones, clamped to {@code [1, maxEntries]} and,
+     * when {@code reason} is non-null, restricted to tombstones carrying that reason.
+     *
+     * <p>Read-only: it never runs a reap pass, never appends a tombstone and never touches an
+     * entry, so polling it cannot reclaim anything. The filter is applied before the size check,
+     * so {@code limit} bounds the returned rows, not the scanned rows.</p>
      */
-    public List<ReapRecord> reapLog(int limit) {
+    public List<ReapRecord> reapLog(int limit, ReapReason reason) {
         int effectiveLimit = Math.min(Math.max(1, limit), maxEntries);
         synchronized (lock) {
             List<ReapRecord> snapshot = new ArrayList<>();
             Iterator<ReapRecord> it = reaped.descendingIterator();
             while (it.hasNext() && snapshot.size() < effectiveLimit) {
-                snapshot.add(it.next());
+                ReapRecord tombstone = it.next();
+                if (reason == null || tombstone.reason() == reason) {
+                    snapshot.add(tombstone);
+                }
             }
             return snapshot;
         }
+    }
+
+    /**
+     * Newest-first snapshot of reaped-entry tombstones, clamped to {@code [1, maxEntries]}.
+     */
+    public List<ReapRecord> reapLog(int limit) {
+        return reapLog(limit, null);
     }
 
     /** Assumes the lock is held. Appends a tombstone and keeps the log bounded. */

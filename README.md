@@ -160,6 +160,7 @@ utiltools_api/
 | `GET` | `/api/v1/utils/audit/entries/{id}` | Fetch a single journal entry (redacted request/result) |
 | `POST` | `/api/v1/utils/audit/entries/{id}/replay` | Replay a deterministic SUCCEEDED entry and verify the outcome |
 | `POST` | `/api/v1/utils/audit/verify` | Sweep-verify up to `limit` (default `20`, clamped to `max-entries`) SUCCEEDED entries in one pass and report per-entry `VERIFIED` / `MISMATCH` / `FAILED` / `SKIPPED` |
+| `GET` | `/api/v1/utils/audit/reaps` | List reaper tombstones (newest first) with optional `limit` (default `50`, clamped to `max-entries`) and `reason` filter; read-only |
 
 ---
 
@@ -1204,6 +1205,39 @@ operation runs, so a concurrent reaper pass or an eviction (the journal is bound
 reported `SKIPPED` / `EVICTED`. Every original `state`, `result`, `completedAt`, `request` and
 `replayable` value is left exactly as it was — only the attached `replay` record changes. There is
 no background sweep: verification runs only when an operator calls the endpoint.
+
+### D. Inspect the reaper tombstone log
+
+Every entry the background reaper reclaims leaves a bounded `ReapRecord` tombstone behind, so an
+operator can see *why* it was reclaimed. The log is newest-first and read-only.
+
+```bash
+curl "http://localhost:8080/api/v1/utils/audit/reaps?limit=2&reason=STALE_PENDING"
+```
+```json
+{
+  "success": true,
+  "message": "Reap tombstones retrieved successfully",
+  "data": [
+    {
+      "status": "REAPED",
+      "entryId": "9d2a5f7c1e0b3a41",
+      "operation": "JSON_QUERY",
+      "reason": "STALE_PENDING",
+      "detail": "PENDING entry exceeded the reap threshold",
+      "reapedAt": "2026-10-31T00:56:12.003Z"
+    }
+  ],
+  "requestId": "corr-crypto5678",
+  "timestamp": "2026-10-31T00:56:12.008Z"
+}
+```
+
+`reason` accepts `REPLAY_LEASE_EXPIRED`, `MANUALLY_REAPED`, `STALE_PENDING` and `OVERSIZE_PAYLOAD`
+(omit for all); `limit` defaults to `50` and is clamped to `[1, max-entries]`. An unknown `reason`
+value or a non-numeric `limit` answers `400 BAD_REQUEST` in the standard envelope. The route never
+triggers a reap pass, never mutates an entry and never writes a journal record — polling it cannot
+reclaim anything, and the log is in-process, so it is empty again after a restart.
 
 ---
 

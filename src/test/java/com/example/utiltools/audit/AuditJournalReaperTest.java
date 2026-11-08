@@ -414,4 +414,69 @@ class AuditJournalReaperTest {
         assertThat(journal.find(succeeded.id()).orElseThrow()).isEqualTo(succeeded);
         assertThat(journal.find(failed.id()).orElseThrow()).isEqualTo(failedBefore);
     }
+
+    private AuditJournalService mixedReasonJournal() {
+        AuditJournalService mixed = new AuditJournalService(new ObjectMapper(), MAX_ENTRIES, 200,
+                STALE_SECONDS, LEASE_SECONDS, clock);
+        AuditEntry stale = mixed.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000001");
+        assertThat(mixed.reapStalePending(stale.createdAt().plusNanos(1))).isEqualTo(1);
+
+        AuditEntry oversize = mixed.begin(OperationType.CRYPTO_HASH,
+                Map.of("input", "x".repeat(400)), "req-00000002");
+        assertThat(oversize.replayable()).isFalse();
+        mixed.succeed(oversize.id(), hashResponse());
+        assertThat(mixed.reap()).isEqualTo(1);
+        return mixed;
+    }
+
+    @Test
+    @DisplayName("reapLog(limit, reason) clamps the limit, filters by reason and keeps newest-first order")
+    void shouldClampReapLogLimitAndFilterByReason() {
+        AuditJournalService mixed = mixedReasonJournal();
+
+        assertThat(mixed.reapLog(10, null)).hasSize(2);
+        assertThat(mixed.reapLog(10, null).get(0).reason()).isEqualTo(ReapReason.OVERSIZE_PAYLOAD);
+        assertThat(mixed.reapLog(10, null).get(1).reason()).isEqualTo(ReapReason.STALE_PENDING);
+
+        assertThat(mixed.reapLog(0, null)).hasSize(1);
+        assertThat(mixed.reapLog(-3, null)).hasSize(1);
+        assertThat(mixed.reapLog(1000, null)).hasSize(2);
+
+        List<ReapRecord> staleOnly = mixed.reapLog(10, ReapReason.STALE_PENDING);
+        assertThat(staleOnly).hasSize(1);
+        assertThat(staleOnly).allSatisfy(row -> assertThat(row.reason()).isEqualTo(ReapReason.STALE_PENDING));
+
+        List<ReapRecord> newestOversize = mixed.reapLog(1, ReapReason.OVERSIZE_PAYLOAD);
+        assertThat(newestOversize).hasSize(1);
+        assertThat(newestOversize.get(0).reason()).isEqualTo(ReapReason.OVERSIZE_PAYLOAD);
+
+        assertThat(mixed.reapLog(10, ReapReason.REPLAY_LEASE_EXPIRED)).isEmpty();
+        assertThat(mixed.reapLog(10, null)).isEqualTo(mixed.reapLog(10));
+    }
+
+    @Test
+    @DisplayName("reading the reap log never reaps, never mutates an entry and never appends a tombstone")
+    void shouldNotReapOrMutateOnReapLogRead() {
+        AuditJournalService mixed = mixedReasonJournal();
+        List<ReapRecord> before = mixed.reapLog(10);
+        int sizeBefore = mixed.size();
+        List<AuditEntry> entriesBefore = new ArrayList<>();
+        for (ReapRecord tombstone : before) {
+            mixed.find(tombstone.entryId()).ifPresent(entriesBefore::add);
+        }
+
+        for (int i = 0; i < 3; i++) {
+            mixed.reapLog(50);
+            mixed.reapLog(50, ReapReason.STALE_PENDING);
+            mixed.reapLog(50, ReapReason.OVERSIZE_PAYLOAD);
+        }
+
+        assertThat(mixed.size()).isEqualTo(sizeBefore);
+        assertThat(mixed.reapLog(10)).isEqualTo(before);
+        for (AuditEntry entry : entriesBefore) {
+            assertThat(mixed.find(entry.id())).contains(entry);
+        }
+        assertThat(mixed.reap()).isZero();
+        assertThat(mixed.reapLog(10)).isEqualTo(before);
+    }
 }
