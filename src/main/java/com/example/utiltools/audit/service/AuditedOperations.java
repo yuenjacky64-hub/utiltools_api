@@ -17,6 +17,8 @@ import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
+import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
+import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.service.DateTimeService;
@@ -92,6 +94,10 @@ public class AuditedOperations {
 
     public DateTimeShiftResponse shift(DateTimeShiftRequest request) {
         return record(OperationType.DATETIME_SHIFT, request, () -> dateTimeService.shift(request));
+    }
+
+    public DateTimeDurationResponse duration(DateTimeDurationRequest request) {
+        return record(OperationType.DATETIME_DURATION, request, () -> dateTimeService.duration(request));
     }
 
     public CurrentTimeResponse current(String timeZone) {
@@ -173,6 +179,7 @@ public class AuditedOperations {
             case DATETIME_CONVERT -> dateTimeService.convert((DateTimeConvertRequest) request);
             case DATETIME_DIFF -> dateTimeService.diff((DateTimeDiffRequest) request);
             case DATETIME_SHIFT -> dateTimeService.shift((DateTimeShiftRequest) request);
+            case DATETIME_DURATION -> dateTimeService.duration((DateTimeDurationRequest) request);
             case DATETIME_CURRENT -> dateTimeService.getCurrentTime(timeZoneOf(request));
             case CRYPTO_HASH -> cryptoService.hash((HashRequest) request);
             case CRYPTO_BASE64 -> cryptoService.base64((Base64Request) request);
