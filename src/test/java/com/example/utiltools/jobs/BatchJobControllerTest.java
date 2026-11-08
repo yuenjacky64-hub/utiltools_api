@@ -7,6 +7,8 @@ import com.example.utiltools.ratelimit.ClientKeyResolver;
 import com.example.utiltools.ratelimit.RateLimitProperties;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
@@ -798,5 +800,65 @@ class BatchJobControllerTest {
         mockMvc.perform(post("/api/v1/utils/jobs/job-running-3/heartbeat"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+    }
+
+    /** DOD-13 / REQ-01: deadlineSeconds is validated to 1..3600 at the HTTP boundary. */
+    @ParameterizedTest(name = "deadlineSeconds={0} is rejected")
+    @ValueSource(ints = {0, -5, 3601})
+    @DisplayName("POST /api/v1/utils/jobs/hash - should reject an out-of-range deadlineSeconds with 400")
+    void shouldReturn400WhenDeadlineSecondsOutOfRange(int deadlineSeconds) throws Exception {
+        String body = """
+                {
+                    "algorithm": "SHA-256",
+                    "items": ["alpha"],
+                    "deadlineSeconds": %d
+                }
+                """.formatted(deadlineSeconds);
+
+        mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details").isArray())
+                .andExpect(jsonPath("$.details", org.hamcrest.Matchers.hasItem(
+                        org.hamcrest.Matchers.containsString("deadlineSeconds"))));
+    }
+
+    /** DOD-14 / REQ-02: deadlineAt is exposed on both the single-job and the list read paths. */
+    @Test
+    @DisplayName("GET /api/v1/utils/jobs/{jobId} - should expose deadlineAt for a live job")
+    void shouldExposeDeadlineAtOnJobStatus() throws Exception {
+        String body = """
+                {
+                    "algorithm": "SHA-256",
+                    "items": ["alpha", "beta"],
+                    "deadlineSeconds": 60
+                }
+                """;
+
+        MvcResult accepted = mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.data.deadlineAt").isNotEmpty())
+                .andExpect(jsonPath("$.data.deadlineAt", org.hamcrest.Matchers.matchesPattern(
+                        "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z")))
+                .andReturn();
+        String jobId = com.jayway.jsonpath.JsonPath.read(accepted.getResponse().getContentAsString(),
+                "$.data.jobId");
+
+        mockMvc.perform(get("/api/v1/utils/jobs/" + jobId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.jobId").value(jobId))
+                .andExpect(jsonPath("$.data.deadlineAt").isNotEmpty())
+                .andExpect(jsonPath("$.data.deadlineAt", org.hamcrest.Matchers.matchesPattern(
+                        "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z")));
+
+        mockMvc.perform(get("/api/v1/utils/jobs"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].jobId").value(jobId))
+                .andExpect(jsonPath("$.data[0].deadlineAt").isNotEmpty());
     }
 }

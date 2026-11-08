@@ -32,6 +32,13 @@ import java.util.List;
  * is never disclosed as results. Being a primitive, it is serialized on every status; every
  * pre-existing component keeps its name and meaning, and both earlier constructor shapes are
  * retained.</p>
+ *
+ * <p>{@code deadlineAt} is the additive total-life bound: {@code createdAt + deadlineSeconds} when
+ * the job carries a bound, and null when no bound applies (the default). It is projected for every
+ * status, so a client can see the bound on a QUEUED, RUNNING, FAILED and COMPLETED job alike; a job
+ * whose bound passes is FAILED with error {@code JOB_DEADLINE_EXCEEDED} and keeps its checkpoint
+ * prefix. Being nullable it is simply absent from the JSON when no bound applies, and the previous
+ * 15-, 14- and 12-component constructor shapes still compile and report null.</p>
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record BatchHashJobResponse(
@@ -49,8 +56,22 @@ public record BatchHashJobResponse(
         List<JobAttempt> attempts,
         Instant executionLeaseExpiresAt,
         Instant lastHeartbeatAt,
-        int completedItems
+        int completedItems,
+        Instant deadlineAt
 ) {
+
+    /**
+     * Backward-compatible constructor for callers compiled against the 15-component checkpoint
+     * shape: such a caller cannot express a deadline, so {@code deadlineAt} is null.
+     */
+    public BatchHashJobResponse(String jobId, String idempotencyKey, JobStatus status, int itemCount,
+            List<HashResponse> results, String error, Instant createdAt, Instant startedAt,
+            Instant completedAt, int attempt, int maxAttempts, List<JobAttempt> attempts,
+            Instant executionLeaseExpiresAt, Instant lastHeartbeatAt, int completedItems) {
+        this(jobId, idempotencyKey, status, itemCount, results, error, createdAt, startedAt, completedAt,
+                attempt, maxAttempts, attempts, executionLeaseExpiresAt, lastHeartbeatAt, completedItems,
+                null);
+    }
 
     /**
      * Backward-compatible constructor for callers compiled against the 12-component shape: a
@@ -74,6 +95,6 @@ public record BatchHashJobResponse(
             Instant executionLeaseExpiresAt, Instant lastHeartbeatAt) {
         this(jobId, idempotencyKey, status, itemCount, results, error, createdAt, startedAt, completedAt,
                 attempt, maxAttempts, attempts, executionLeaseExpiresAt, lastHeartbeatAt,
-                results == null ? 0 : results.size());
+                results == null ? 0 : results.size(), null);
     }
 }
