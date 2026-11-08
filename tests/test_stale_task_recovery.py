@@ -1,6 +1,7 @@
 """Stale-task detection and recovery for the maintainer poll tick.
 
-Covers brief REQ-01 .. REQ-04 (DOD-01 .. DOD-08 in the plan). The clock is
+Covers brief REQ-01 .. REQ-04 (DOD-01 .. DOD-08 in the plan, plus the
+daemon-thread half of DOD-09). The clock is
 always injected, so the 300 s stale timeout and the 60 s recovery grace are
 asserted at their boundaries without sleeping, and the monitor step is
 scripted through the existing ``_monitor_step`` seam so no production seam had
@@ -309,7 +310,7 @@ def test_preempted_and_quarantined_tasks_are_not_recovered() -> None:
 
 
 def test_scheduler_thread_sweeps_stale_tasks() -> None:
-    """DOD-09 / REQ-03: the existing daemon thread carries the recovery path."""
+    """DOD-09 (thread half) / REQ-03: the daemon thread carries the recovery."""
 
     slow = _spec("slow", steps_required=10)
     engine, _, clock = _build([slow], quarantine_sweep_interval_sec=0.01)
