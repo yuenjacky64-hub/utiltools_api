@@ -23,7 +23,7 @@ import java.util.List;
 
 @RestController
 @RequestMapping("/api/v1/utils/jobs")
-@Tag(name = "Batch Hash Jobs", description = "Asynchronous, bounded batch hashing with idempotent submission and queued-job cancellation")
+@Tag(name = "Batch Hash Jobs", description = "Asynchronous, bounded batch hashing with idempotent submission and cooperative job cancellation")
 public class BatchJobController {
 
     private final BatchHashJobService jobService;
@@ -61,7 +61,7 @@ public class BatchJobController {
     @GetMapping
     @Operation(summary = "List recent batch hash jobs",
             description = "Returns a bounded, newest-first list of job snapshots; an optional status filter "
-                    + "accepts QUEUED/RUNNING/COMPLETED/FAILED/CANCELLED, limit defaults to 20 and is clamped "
+                    + "accepts QUEUED/RUNNING/CANCELLING/COMPLETED/FAILED/CANCELLED, limit defaults to 20 and is clamped "
                     + "to 1..100, an empty registry or a filter that matches nothing answers 200 with an empty "
                     + "data array (never 404), and an unknown status value answers 400 BAD_REQUEST")
     public ApiResponse<List<BatchHashJobResponse>> list(
@@ -76,7 +76,10 @@ public class BatchJobController {
                     + "A RUNNING job carries an executionLeaseExpiresAt/lastHeartbeatAt lease that its "
                     + "worker renews before hashing each item; a job whose lease lapses is moved to FAILED "
                     + "with error EXECUTION_LEASE_EXPIRED, after which POST /api/v1/utils/jobs/{jobId}/retry "
-                    + "starts attempt+1. Hashing is checkpointed per item: completedItems reports how many "
+                    + "starts attempt+1. A DELETE on a RUNNING job moves it to CANCELLING, which the worker "
+                    + "honours at its next checkpoint (completedItems stays 0 and results stay null while the job "
+                    + "is CANCELLING); a CANCELLING job whose lease lapses is reaped straight to CANCELLED. "
+                    + "Hashing is checkpointed per item: completedItems reports how many "
                     + "leading items are durably hashed (0..itemCount), results stays null until the job is "
                     + "COMPLETED, and a retry resumes at completedItems instead of rehashing the prefix")
     public ApiResponse<BatchHashJobResponse> status(@PathVariable String jobId) {
@@ -84,10 +87,13 @@ public class BatchJobController {
     }
 
     @DeleteMapping("/{jobId}")
-    @Operation(summary = "Cancel a queued batch hash job",
-            description = "Withdraws a job that is still QUEUED; a repeated DELETE on a CANCELLED job is "
-                    + "idempotent, a RUNNING/COMPLETED/FAILED job returns 409 JOB_CANCELLATION_CONFLICT, "
-                    + "and an unknown or evicted id returns 404 JOB_NOT_FOUND")
+    @Operation(summary = "Cancel a batch hash job",
+            description = "Cancellation is cooperative. A QUEUED job is withdrawn immediately (QUEUED -> CANCELLED); "
+                    + "a RUNNING job is moved to CANCELLING and answers 200 with status CANCELLING, its worker stops "
+                    + "at the next checkpoint and terminalizes CANCELLED (the lease reaper or the shutdown drain does "
+                    + "it if the worker never returns). A repeated DELETE on a CANCELLING or CANCELLED job is "
+                    + "idempotent and returns the current snapshot, a COMPLETED/FAILED job returns "
+                    + "409 JOB_CANCELLATION_CONFLICT, and an unknown or evicted id returns 404 JOB_NOT_FOUND")
     public ApiResponse<BatchHashJobResponse> cancel(@PathVariable String jobId) {
         return ApiResponse.success(jobService.cancel(jobId), "Job cancelled");
     }
