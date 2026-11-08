@@ -34,6 +34,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
   - [Run with Packaged JAR](#run-with-packaged-jar)
   - [Run with Docker](#run-with-docker)
 - [Automated Testing](#-automated-testing)
+- [Configuration Check (`python3 cli.py check`)](#-configuration-check-python3-clipy-check)
 
 ---
 
@@ -2033,3 +2034,41 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`AuditTrailTest`**: Bounded audit ring buffer ordering and capacity-eviction behaviour.
 - **`JsonQueryCircuitOpenTest`**: End-to-end proof that an `OPEN` breaker maps to a `503` `CIRCUIT_OPEN` envelope on `/api/v1/utils/json/query`.
 - **`UtiltoolsApiApplicationTests`**: Spring ApplicationContext loading verification.
+
+---
+
+## 🔎 Configuration Check (`python3 cli.py check`)
+
+The repository ships a small Python maintainer toolkit under `src/ai_maintainer/`. Before running a
+maintenance cycle, pre-flight the resolved `MaintainerConfig` with the read-only `check` command:
+
+```bash
+python3 cli.py check
+```
+
+It prints one row per check to stdout, sends any failure lines to stderr, and never writes state,
+enqueues a task or starts the engine loop.
+
+```text
+[PASS] paths.maintainer_root       /home/me/ai_team
+[SKIP] paths.ai_team_root          not configured
+[PASS] config.consistency          configuration layers load cleanly
+[PASS] models.primary_model        primary_model: free tier for cli=pi
+[WARN] framework.orchestrator      unknown (no FrameworkWatcher and no active_task directory)
+[INFO] framework.queue             unknown (n/a queued, n/a active, last completed none)
+check: 3 passed, 0 failed, 1 skipped, 1 warnings
+```
+
+**Exit codes:** `0` — every check passed (warnings and skips are fine); `1` — at least one `FAIL`
+row; `2` — argparse usage error (unknown flag / subcommand).
+
+**Check ids:** `paths.maintainer_root`, `paths.ai_team_root`, `paths.default_project_root`
+(must be existing directories, unset optional paths are skipped), `config.consistency`
+(env → `.env` → `config.json` → defaults must load), `models.primary_model`,
+`models.secondary_model` (must be free tier when their CLI is `pi`), `framework.orchestrator`
+(orchestrator up/down from `FrameworkWatcher.get_status()` or the `active_task` heartbeat) and
+`framework.queue` (queue state, active task count, last completed task).
+
+Rows are `PASS`, `FAIL`, `SKIP`, `WARN` or `INFO`. Configure the paths with `MAINTAINER_ROOT`,
+`MAINTAINER_AI_TEAM_ROOT`, `MAINTAINER_DEFAULT_PROJECT_ROOT` (or the matching `config.json`
+keys).
