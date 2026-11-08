@@ -12,6 +12,9 @@ import java.util.Objects;
  * Capacity-bounded, transition-only audit trail. The oldest entry is evicted once the
  * configured capacity is reached, so {@code size() <= capacity()} is an invariant.
  * Timestamps come from an injected {@link Clock} so the package holds no ambient time source.
+ *
+ * <p>Every row carries the fingerprint it belongs to. The legacy single-fingerprint overloads
+ * book against {@link Fingerprints#DEFAULT}, so pre-existing callers compile and read unchanged.</p>
  */
 public final class AuditTrail {
 
@@ -32,13 +35,20 @@ public final class AuditTrail {
         this.clock = Objects.requireNonNull(clock, "clock");
     }
 
+    /** Legacy single-fingerprint row: booked against {@link Fingerprints#DEFAULT}. */
     public synchronized AuditEntry record(String breaker, CircuitState from, CircuitState to,
+                                          CircuitTrigger trigger, String reason) {
+        return record(breaker, Fingerprints.DEFAULT, from, to, trigger, reason);
+    }
+
+    public synchronized AuditEntry record(String breaker, String fingerprint, CircuitState from, CircuitState to,
                                           CircuitTrigger trigger, String reason) {
         if (entries.size() == capacity) {
             entries.removeFirst();
         }
         sequence++;
-        AuditEntry entry = new AuditEntry(sequence, clock.instant(), breaker, from, to, trigger, reason);
+        AuditEntry entry = new AuditEntry(sequence, clock.instant(), breaker,
+                Fingerprints.normalize(fingerprint), from, to, trigger, reason);
         entries.addLast(entry);
         return entry;
     }
