@@ -2047,16 +2047,19 @@ python3 cli.py check
 ```
 
 It prints one row per check to stdout, sends any failure lines to stderr, and never writes state,
-enqueues a task or starts the engine loop.
+enqueues a task or starts the engine loop. `--maintainer-root PATH` and `--config PATH` override
+the root and the `config.json` that are validated.
 
 ```text
 [PASS] paths.maintainer_root       /home/me/ai_team
 [SKIP] paths.ai_team_root          not configured
+[SKIP] paths.default_project_root  not configured
 [PASS] config.consistency          configuration layers load cleanly
-[PASS] models.primary_model        primary_model: free tier for cli=pi
+[PASS] models.primary_model        primary_model: free for cli=pi (llama3:free)
+[SKIP] models.secondary_model      secondary_model: cli not pi (unset), tier not checked
 [WARN] framework.orchestrator      unknown (no FrameworkWatcher and no active_task directory)
 [INFO] framework.queue             unknown (n/a queued, n/a active, last completed none)
-check: 3 passed, 0 failed, 1 skipped, 1 warnings
+check: 3 passed, 0 failed, 3 skipped, 1 warnings
 ```
 
 **Exit codes:** `0` — every check passed (warnings and skips are fine); `1` — at least one `FAIL`
@@ -2064,11 +2067,17 @@ row; `2` — argparse usage error (unknown flag / subcommand).
 
 **Check ids:** `paths.maintainer_root`, `paths.ai_team_root`, `paths.default_project_root`
 (must be existing directories, unset optional paths are skipped), `config.consistency`
-(env → `.env` → `config.json` → defaults must load), `models.primary_model`,
+(the `MaintainerConfig.load` layers — built-in defaults → optional `must_config.py` →
+`config.json` → `MAINTAINER_*` environment variables → keyword overrides — must load), `models.primary_model`,
 `models.secondary_model` (must be free tier when their CLI is `pi`), `framework.orchestrator`
 (orchestrator up/down from `FrameworkWatcher.get_status()` or the `active_task` heartbeat) and
 `framework.queue` (queue state, active task count, last completed task).
 
-Rows are `PASS`, `FAIL`, `SKIP`, `WARN` or `INFO`. Configure the paths with `MAINTAINER_ROOT`,
-`MAINTAINER_AI_TEAM_ROOT`, `MAINTAINER_DEFAULT_PROJECT_ROOT` (or the matching `config.json`
-keys).
+Rows are `PASS`, `FAIL`, `SKIP`, `WARN` or `INFO`. Configure the paths with the environment
+variables `MAINTAINER_ROOT`, `MAINTAINER_AI_TEAM_ROOT` and `MAINTAINER_DEFAULT_PROJECT_ROOT` (or
+the `--maintainer-root` flag for the root being validated). The three path fields are **not**
+`MaintainerConfig` fields, so they cannot be set from `config.json`: that file only accepts
+`MaintainerConfig` keys (`primary_cli`, `primary_model`, `secondary_cli`, `secondary_model` and the
+tuning values), and any other key makes the `config.consistency` row fail with
+`unknown config key(s) in config.json: [...]`. There is no `.env` layer; `config.json` and the
+`MAINTAINER_*` variables are the only configuration sources.

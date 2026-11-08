@@ -56,6 +56,7 @@ CHECKED_CLI = "pi"
 SIGNAL_FILE = "_signal.txt"
 PROGRESS_FILE = "agent_progress.log"
 ACTIVE_TASK_DIR = "active_task"
+SIGNAL_READ_LIMIT = 4096
 
 _UP_TOKENS = frozenset({"up", "running", "alive", "ok", "true", "healthy"})
 _DOWN_TOKENS = frozenset({"down", "stopped", "dead", "false"})
@@ -231,7 +232,12 @@ def check_config_consistency(
         MaintainerConfig.load(
             config_path=config_path, maintainer_root=maintainer_root, env=env
         )
-    except (ValueError, OSError) as exc:
+    except Exception as exc:  # noqa: BLE001 - a pre-flight row must never traceback
+        # ``MaintainerConfig.load`` raises ValueError/OSError for bad values and
+        # paths, but ``_load_must_config`` imports the optional ``must_config``
+        # module, so a present-but-broken one raises ImportError/SyntaxError
+        # (or anything else at import time). Every raise becomes a FAIL row with
+        # the verbatim message: REQ-05 asks for a clear message, not a traceback.
         return CheckResult("config.consistency", STATUS_FAIL, str(exc))
     return CheckResult(
         "config.consistency", STATUS_PASS, "configuration layers load cleanly"
@@ -257,7 +263,7 @@ def check_models(values: Mapping[str, str | None]) -> list[CheckResult]:
             )
             continue
         if is_free_model(model):
-            label = model or "unset"
+            label = (model or "").strip() or "unset"
             results.append(
                 CheckResult(check_id, STATUS_PASS, f"{model_field}: free for cli=pi ({label})")
             )
@@ -372,7 +378,10 @@ def _scan_active_task(
             if signal_path.is_file():
                 has_signal = True
                 mtimes.append(signal_path.stat().st_mtime)
-                token = _first_signal_token(signal_path.read_text(encoding="utf-8", errors="replace"))
+                with signal_path.open(encoding="utf-8", errors="replace") as handle:
+                    # Only the leading token matters; bound the read so a rotated
+                    # or oversized signal file cannot be loaded whole.
+                    token = _first_signal_token(handle.read(SIGNAL_READ_LIMIT))
         except OSError:
             # A task directory can be reaped mid-scan; degrade, never raise.
             continue
