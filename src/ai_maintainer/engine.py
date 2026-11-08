@@ -158,6 +158,24 @@ class MaintainerEngine:
         with self._lock:
             return list(self._events)
 
+    @property
+    def signal_gate(self) -> Callable[[str], Any] | None:
+        """The installed REQ-03 admit-hook, if any."""
+
+        return self._signal_gate
+
+    def install_signal_gate(self, gate: Callable[[str], Any] | None) -> None:
+        """Install the REQ-03 admit-hook on an engine built without one.
+
+        ``serve()`` constructs the engine before the consistency service exists,
+        so the wiring seam is a setter rather than a second constructor
+        argument; passing ``None`` uninstalls the gate (unconditional admission,
+        the pre-task behaviour).
+        """
+
+        with self._lock:
+            self._signal_gate = gate
+
     def run_cycle(self) -> CycleResult:
         """Execute at most ``max_steps_per_cycle`` monitor steps."""
 

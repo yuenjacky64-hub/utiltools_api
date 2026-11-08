@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -28,14 +29,17 @@ from ai_maintainer.consistency import (
     run_startup_recovery,
 )
 from ai_maintainer.engine import MaintainerEngine
+from ai_maintainer.state_signal_impl import build_signal_gate
 
 __all__ = [
     "CONSISTENCY_CHECK_PATH",
     "FINGERPRINT_STATE_PATH",
     "build_handler",
+    "default_consistency_service",
     "fingerprint_state_payload",
     "run_startup_recovery",
     "serve",
+    "wire_signal_gate",
 ]
 
 FINGERPRINT_STATE_PATH = "/api/v1/maintainer/engine/fingerprint-state"
@@ -46,6 +50,33 @@ CONSISTENCY_CHECK_PATH = "/api/v1/utils/consistency-check"
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 CONTENT_TYPE = "application/json; charset=utf-8"
+
+#: Process-wide fallback service. Memoised on purpose: the report route, the
+#: startup job and the signal gate must share one instance, because the instance
+#: owns the lock, the audit journal handle and the ``findings[]`` buffer. A
+#: per-request instance would make ``findings[]`` structurally always empty and
+#: would give up the serialisation the repair path relies on.
+_DEFAULT_SERVICE: ConsistencyService | None = None
+_DEFAULT_SERVICE_LOCK = threading.Lock()
+
+
+def default_consistency_service() -> ConsistencyService:
+    """The shared service over the ambient configuration (built once)."""
+
+    global _DEFAULT_SERVICE
+    with _DEFAULT_SERVICE_LOCK:
+        if _DEFAULT_SERVICE is None:
+            _DEFAULT_SERVICE = ConsistencyService.from_environment()
+        return _DEFAULT_SERVICE
+
+
+def wire_signal_gate(
+    engine: MaintainerEngine, service: ConsistencyService
+) -> None:
+    """Install the REQ-03 admit-hook on ``engine`` unless one is already set."""
+
+    if engine.signal_gate is None:
+        engine.install_signal_gate(build_signal_gate(service))
 
 
 def fingerprint_state_payload(
@@ -117,7 +148,10 @@ def build_handler(
         def _handle_consistency(self) -> None:
             """Read-only cross-store report; never repairs (REQ-01)."""
 
-            if self.command != "GET":
+            # ``HEAD`` is answered like ``GET`` with the body suppressed by
+            # ``_write_json``: a GET route normally answers HEAD, so a 405 here
+            # would be a route-contract surprise (other methods stay 405).
+            if self.command not in ("GET", "HEAD"):
                 self._write_json(
                     405,
                     {"error": "method_not_allowed"},
@@ -134,8 +168,10 @@ def build_handler(
                 self._write_json(404, {"error": "task_not_found", "task": task})
                 return
             try:
-                service = consistency if consistency is not None else (
-                    ConsistencyService.from_environment()
+                service = (
+                    consistency
+                    if consistency is not None
+                    else default_consistency_service()
                 )
                 payload: dict[str, Any] = {"path": CONSISTENCY_CHECK_PATH}
                 payload.update(service.report(task=task))
@@ -188,13 +224,22 @@ def serve(
     the server from starting.
     """
 
+    service = consistency
     try:
-        if consistency is not None:
-            consistency.recover_all()
+        if service is None and engine.signal_gate is None:
+            # One shared service for the gate, the route and the startup job.
+            service = default_consistency_service()
+        if service is not None:
+            service.recover_all()
         else:
             run_startup_recovery()
     except Exception:  # pragma: no cover - defensive: startup must not abort
         pass
+    if service is not None:
+        # REQ-03 at runtime: the engine asks the gate before adopting a task, so
+        # a transition that would drift the stores is refused by the same
+        # validation the route and the startup job use.
+        wire_signal_gate(engine, service)
     server = ThreadingHTTPServer((host, port), build_handler(engine, consistency=consistency))
     engine.start_scheduler(sweep_interval_sec)
     try:

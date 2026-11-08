@@ -48,6 +48,7 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -150,6 +151,16 @@ ACTIVE_STATES = frozenset({TaskState.PENDING, TaskState.IN_PROGRESS, TaskState.R
 #: Evidence cap for a single journal ``before`` image.
 HEAD_LIMIT = checks.SIGNAL_READ_LIMIT
 
+#: Bounded tail window for the (rotatable, unbounded) progress store. Only the
+#: last non-empty line is evidence, so a seek-from-EOF window is enough; the
+#: window is larger than ``HEAD_LIMIT`` so a normal line survives whole and a
+#: pathological line is truncated instead of the whole file being read.
+PROGRESS_TAIL_LIMIT = 65536
+
+#: Bound on retained signal-rejection findings: every element is copied into
+#: every report, so the buffer is bounded like the engine's event deque.
+FINDINGS_MAXLEN = 64
+
 
 class UnknownTaskError(KeyError):
     """Raised by the report route for a task id the orchestrator does not track."""
@@ -193,6 +204,12 @@ def token_for_state(state: str | TaskState | None) -> str | None:
     resolved = _as_state(state)
     if resolved is None:
         return None
+    # Only terminal evidence can be the canonical state of a drifted task
+    # (``INV-CON-1``: archive > terminal signal > timeline > progress). Writing
+    # an active token would forge a generation number the orchestrator never
+    # issued, so an active ``state`` is not writable evidence.
+    if resolved not in TERMINAL_STATES:
+        return None
     return TOKEN_BY_STATE.get(resolved)
 
 
@@ -222,6 +239,41 @@ def _last_nonempty_line(text: str) -> str | None:
         if stripped:
             found = stripped
     return found
+
+
+def _cap(text: str | None) -> str | None:
+    """Bound one evidence string to ``HEAD_LIMIT`` (journal + report cap)."""
+
+    if text is None or len(text) <= HEAD_LIMIT:
+        return text
+    return text[:HEAD_LIMIT]
+
+
+def _bounded(value: Any) -> Any:
+    """Recursively cap every string in a finding-like structure."""
+
+    if isinstance(value, str):
+        return _cap(value)
+    if isinstance(value, Mapping):
+        return {key: _bounded(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_bounded(item) for item in value]
+    return value
+
+
+def _read_tail(path: Path, limit: int) -> str:
+    """Decode the last ``limit`` bytes of ``path`` (bounded read, no whole file).
+
+    The window always ends at EOF, so the *last* line is intact unless that one
+    line alone exceeds the window — in which case the truncated tail is capped
+    by :func:`_cap` before it is used as evidence.
+    """
+
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - limit))
+        return handle.read(limit).decode("utf-8", errors="replace")
 
 
 @dataclass(frozen=True)
@@ -358,6 +410,13 @@ def _read_signal(task_dir: Path) -> StoreReading:
 
 
 def _read_progress(task_dir: Path) -> StoreReading:
+    """Read the *tail* of the progress store: bounded, never the whole file.
+
+    Plan §5: "line-limited tail scan for logs". One unauthenticated report can
+    visit every task, so an unbounded read here would fan out into a full-file
+    read of every progress log on each request.
+    """
+
     present = False
     for name in PROGRESS_FILES:
         path = task_dir / name
@@ -365,12 +424,14 @@ def _read_progress(task_dir: Path) -> StoreReading:
             if not path.is_file():
                 continue
             present = True
-            with path.open(encoding="utf-8", errors="replace") as handle:
-                last = _last_nonempty_line(handle.read())
+            last = _last_nonempty_line(_read_tail(path, PROGRESS_TAIL_LIMIT))
         except OSError:
             continue
         if last is not None:
-            return StoreReading(present=True, state=token_state(last), evidence=last)
+            bounded = _cap(last)
+            return StoreReading(
+                present=True, state=token_state(bounded), evidence=bounded
+            )
     return StoreReading(present=present)
 
 
@@ -398,7 +459,7 @@ def _read_timeline(path: Path | None, task_id: str) -> StoreReading:
                     continue
                 resolved = _timeline_state(record)
                 if resolved is not None:
-                    state, evidence = resolved, stripped
+                    state, evidence = resolved, _cap(stripped)
     except OSError:
         return StoreReading(present=True)
     return StoreReading(present=True, state=state, evidence=evidence)
@@ -606,7 +667,7 @@ class ConsistencyService:
             roots.journal_path, clock=clock
         )
         self._lock = threading.RLock()
-        self._findings: list[dict[str, Any]] = []
+        self._findings: deque[dict[str, Any]] = deque(maxlen=FINDINGS_MAXLEN)
 
     @classmethod
     def from_environment(cls) -> "ConsistencyService":
@@ -630,7 +691,7 @@ class ConsistencyService:
     def record_finding(self, finding: Mapping[str, Any]) -> dict[str, Any]:
         """Retain one unresolved signal rejection for the report's ``findings[]``."""
 
-        entry = dict(finding)
+        entry = _bounded(dict(finding))
         with self._lock:
             self._findings.append(entry)
         return entry
@@ -673,14 +734,6 @@ class ConsistencyService:
                 "stores": list(REPORT_STORES),
                 "tasks": entries,
                 "findings": list(self._findings),
-                "roots": {
-                    "state_root": None
-                    if self._roots.state_root is None
-                    else str(self._roots.state_root),
-                    "journal": None
-                    if self._roots.journal_path is None
-                    else str(self._roots.journal_path),
-                },
             }
 
     # ---------------------------------------------------------------- recovery
@@ -777,19 +830,50 @@ class ConsistencyService:
         return snapshot.to_report(applied=True, reason="recovered")
 
     def _write_signal(self, task_id: str, token: str) -> None:
-        """Replace ``_signal.txt`` atomically (write tmp, then ``os.replace``)."""
+        """Replace ``_signal.txt`` atomically (write tmp, then ``os.replace``).
+
+        The classification already skipped a symlinked slot, but classify and
+        write are two separate syscalls: the slot is therefore re-checked
+        immediately before the temp file is created *and* again immediately
+        before the replace, so a swap that happens in between fails the repair
+        (``FAILED`` journal line, stores untouched) instead of writing outside
+        the state root. The temp file is opened ``O_NOFOLLOW`` so the write
+        itself cannot follow a planted link.
+        """
 
         state_root = self._roots.state_root
         if state_root is None:  # pragma: no cover - defensive
             raise OSError("no state root")
         task_dir = state_root / task_id
+        _guard_writable_slot(task_dir, state_root)
         target = task_dir / SIGNAL_FILE
         tmp = task_dir / (SIGNAL_FILE + ".tmp")
-        with tmp.open("w", encoding="utf-8") as handle:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(tmp, flags, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(token + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, target)
+        try:
+            _guard_writable_slot(task_dir, state_root)  # narrows the swap window
+            os.replace(tmp, target)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:  # pragma: no cover - defensive
+                pass
+            raise
+
+
+def _guard_writable_slot(task_dir: Path, state_root: Path) -> None:
+    """Refuse to write through a slot that is a symlink or escapes the root."""
+
+    if task_dir.is_symlink():
+        raise OSError("symlinked task slot")
+    resolved_root = state_root.resolve()
+    resolved = task_dir.resolve()
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        raise OSError("task slot escapes the state root")
 
 
 # --------------------------------------------------------------------------- #

@@ -591,3 +591,311 @@ def test_state_for_token_covers_declared_vocabulary():
     assert state_for_token("In Progress 3").name == "IN_PROGRESS"
     assert state_for_token("Running 1").name == "RUNNING"
     assert state_for_token("gibberish") is None
+
+
+# --------------------------------------------------------------------------- #
+# Family 7: reviewer-v1 findings pinned (v2 redevelopment)
+#
+# One test per MUST_FIX / SHOULD_FIX / NIT, so a re-appearing defect fails on
+# its own finding instead of as a vague drift regression.
+# --------------------------------------------------------------------------- #
+
+
+def _engine_with_task(task: str = TASK, gate=None):
+    """Engine whose single curriculum task is ``task`` (nothing is monitored yet)."""
+
+    from ai_maintainer.config import MaintainerConfig
+    from ai_maintainer.engine import MaintainerEngine
+    from ai_maintainer.tasks.curriculum import Difficulty, TaskCurriculum, TaskSpec
+
+    config = MaintainerConfig(max_steps_per_cycle=4)
+    curriculum = TaskCurriculum(
+        specs=[
+            TaskSpec(
+                name=task,
+                difficulty=Difficulty.EASY,
+                steps_required=4,
+                last_proposed_cycle=100,
+            )
+        ],
+        config=config,
+        clock=FrozenClock(),
+    )
+    return MaintainerEngine(
+        curriculum, config=config, clock=FrozenClock(), signal_gate=gate
+    )
+
+
+def _get(url: str, method: str = "GET"):
+    return urllib.request.urlopen(urllib.request.Request(url, method=method))
+
+
+def _serve(handler):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def _stop(server, thread) -> None:
+    try:
+        server.shutdown()
+    finally:
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_progress_scan_is_a_bounded_tail_not_a_whole_file_read(roots, service):
+    """MUST_FIX consistency.py:369 — one huge progress line cannot blow up."""
+
+    from ai_maintainer.consistency import HEAD_LIMIT, PROGRESS_TAIL_LIMIT
+
+    path = task_dir(roots) / TASK_PROGRESS_FILE
+    path.write_text(
+        "step=started\n" + ("x" * (PROGRESS_TAIL_LIMIT * 3)) + "done\n",
+        encoding="utf-8",
+    )
+
+    reading = read_snapshot(TASK, roots).progress
+
+    assert reading.present is True
+    assert reading.evidence is not None
+    assert len(reading.evidence) <= HEAD_LIMIT
+    assert path.stat().st_size > PROGRESS_TAIL_LIMIT
+
+
+def test_progress_report_echoes_capped_evidence(roots, service):
+    """MUST_FIX consistency.py:369 — nothing unbounded reaches the HTTP report."""
+
+    from ai_maintainer.consistency import HEAD_LIMIT
+
+    padded = ("y" * 20000) + "running"
+    write_progress(roots, padded)
+    write_signal(roots, "done")
+
+    snapshot = read_snapshot(TASK, roots)
+    assert snapshot.progress.evidence is not None
+    assert len(snapshot.progress.evidence) <= HEAD_LIMIT
+
+    payload = service.report(task=TASK)
+    progress = payload["tasks"][0]["stores"]["progress"]
+    assert "evidence" not in progress
+    assert padded not in json.dumps(payload)
+
+
+def test_signal_gate_rejects_archived_transition_on_the_engine(roots, service):
+    """MUST_FIX engine.py:648 — REQ-03 is wired into a real ``run_cycle``."""
+
+    from ai_maintainer.state_signal_impl import build_signal_gate
+
+    archive_task(roots, "hist_tasks")
+    write_signal(roots, "Running 1")
+    engine = _engine_with_task(gate=build_signal_gate(service))
+
+    result = engine.run_cycle()
+
+    assert result.monitored is None
+    rejected = [event for event in engine.events if event["event"] == "SIGNAL_REJECTED"]
+    assert rejected and rejected[0]["code"] == CODE_ALREADY_ARCHIVED
+    assert rejected[0]["task"] == TASK
+    operations = [entry["op"] for entry in journal(roots)]
+    assert operations.count(OperationType.SIGNAL_REJECTED.value) == 1
+    assert service.findings[0]["code"] == CODE_ALREADY_ARCHIVED
+    assert engine._curriculum.specs[0].state.name != "RUNNING"
+
+
+def test_signal_gate_admits_a_slot_without_a_declared_signal(roots, service):
+    """MUST_FIX engine.py:648 — the gate guards transitions, not admission."""
+
+    from ai_maintainer.state_signal_impl import build_signal_gate
+
+    write_progress(roots, "running")
+    engine = _engine_with_task(gate=build_signal_gate(service))
+
+    assert engine.run_cycle().monitored == TASK
+    assert not [event for event in engine.events if event["event"] == "SIGNAL_REJECTED"]
+
+
+def test_wire_signal_gate_installs_once_and_keeps_the_first_gate(roots, service):
+    """MUST_FIX engine.py:648 — the production wiring seam is exercised."""
+
+    from ai_maintainer.api import wire_signal_gate
+
+    engine = _engine_with_task()
+    assert engine.signal_gate is None
+
+    wire_signal_gate(engine, service)
+    installed = engine.signal_gate
+    assert installed is not None
+
+    wire_signal_gate(engine, service)
+    assert engine.signal_gate is installed
+
+
+def test_default_service_is_shared_across_requests_and_gate(roots, service, monkeypatch):
+    """MUST_FIX api.py:138 — the fallback service is one instance, not per request."""
+
+    from ai_maintainer import api
+    from ai_maintainer.state_signal_impl import build_signal_gate
+
+    monkeypatch.setattr(api, "_DEFAULT_SERVICE", None)
+    monkeypatch.setattr(
+        ConsistencyService, "from_environment", classmethod(lambda cls: service)
+    )
+
+    assert api.default_consistency_service() is api.default_consistency_service()
+    assert api.default_consistency_service() is service
+
+    # A gate rejection recorded on that instance is visible through the route
+    # that has no service injected: ``findings[]`` is no longer always empty.
+    archive_task(roots, "hist_tasks")
+    write_signal(roots, "Running 1")
+    engine = _engine_with_task(gate=build_signal_gate(service))
+    engine.run_cycle()
+
+    server, thread = _serve(build_handler(engine))
+    try:
+        host, port = server.server_address[:2]
+        with _get(f"http://{host}:{port}{CONSISTENCY_CHECK_PATH}") as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        _stop(server, thread)
+
+    assert payload["findings"][0]["code"] == CODE_ALREADY_ARCHIVED
+
+
+def test_consistency_route_rejects_non_get_with_allow_header(roots, service):
+    """SHOULD_FIX api.py:120 — DOD-02's method contract is now pinned."""
+
+    server, thread = _serve(build_handler(None, consistency=service))
+    try:
+        host, port = server.server_address[:2]
+        url = f"http://{host}:{port}{CONSISTENCY_CHECK_PATH}"
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _get(url, method="POST")
+        assert excinfo.value.code == 405
+        assert excinfo.value.headers["Allow"] == "GET"
+    finally:
+        _stop(server, thread)
+
+
+def test_consistency_route_404s_for_an_unknown_path(roots, service):
+    """SHOULD_FIX api.py:120 — the new route did not widen the 404 contract."""
+
+    server, thread = _serve(build_handler(None, consistency=service))
+    try:
+        host, port = server.server_address[:2]
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            _get(f"http://{host}:{port}/api/v1/utils/not-a-route")
+        assert excinfo.value.code == 404
+    finally:
+        _stop(server, thread)
+
+
+def test_consistency_route_answers_head_like_get(roots, service):
+    """NIT api.py:120 — HEAD is answered by the GET route, body suppressed."""
+
+    write_progress(roots, "Done 5")
+    server, thread = _serve(build_handler(None, consistency=service))
+    try:
+        host, port = server.server_address[:2]
+        url = f"http://{host}:{port}{CONSISTENCY_CHECK_PATH}"
+        with _get(url, method="HEAD") as response:
+            assert response.status == 200
+            assert response.read() == b""
+    finally:
+        _stop(server, thread)
+
+
+def test_signal_head_journal_evidence_is_capped(roots, service):
+    """SHOULD_FIX state_signal_impl.py:101 — the journal stays bounded."""
+
+    from ai_maintainer.state_signal_impl import INCOMING_LIMIT
+
+    write_signal(roots, "gibberish " + ("z" * (INCOMING_LIMIT * 5)))
+    snapshot = read_snapshot(TASK, roots)
+
+    decision = validate_transition(
+        TASK,
+        snapshot.signal.evidence or "",
+        snapshot=snapshot,
+        audit=service.audit,
+    )
+
+    assert decision.code == CODE_UNSUPPORTED_SIGNAL
+    head = decision.evidence["signal_head"]
+    assert head is not None and len(head) <= INCOMING_LIMIT
+    before = journal(roots)[0]["before"]
+    assert all(
+        not isinstance(value, str) or len(value) <= INCOMING_LIMIT
+        for value in before.values()
+    )
+
+
+def test_findings_buffer_is_bounded(roots, service):
+    """SHOULD_FIX consistency.py:635 — memory and response amplification capped."""
+
+    from ai_maintainer.consistency import FINDINGS_MAXLEN, HEAD_LIMIT
+
+    for index in range(FINDINGS_MAXLEN + 5):
+        service.record_finding(
+            {
+                "code": CODE_ALREADY_ARCHIVED,
+                "task": f"T-{index}",
+                "detail": "d" * 5000,
+            }
+        )
+
+    findings = service.findings
+    assert len(findings) == FINDINGS_MAXLEN
+    assert findings[-1]["task"] == f"T-{FINDINGS_MAXLEN + 4}"
+    assert all(len(finding["detail"]) <= HEAD_LIMIT for finding in findings)
+    assert len(service.report()["findings"]) == FINDINGS_MAXLEN
+
+
+def test_repair_refuses_a_symlink_swapped_into_the_slot(roots, service, tmp_path):
+    """SHOULD_FIX consistency.py:779 — the write re-checks the slot it opens."""
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / SIGNAL_FILE).write_text("Running 1\n", encoding="utf-8")
+    assert roots.state_root is not None
+    (roots.state_root / TASK).symlink_to(outside)
+
+    with pytest.raises(OSError):
+        service._write_signal(TASK, "Done")
+
+    assert (outside / SIGNAL_FILE).read_text(encoding="utf-8") == "Running 1\n"
+    assert not (outside / f"{SIGNAL_FILE}.tmp").exists()
+
+
+def test_report_omits_absolute_store_paths(roots, service):
+    """NIT consistency.py:676 — the endpoint contract is what §4 asked for."""
+
+    write_progress(roots, "Done 5")
+
+    report = service.report()
+
+    assert "roots" not in report
+    assert str(roots.state_root) not in json.dumps(report)
+
+
+def test_token_for_state_only_offers_terminal_tokens():
+    """NIT consistency.py:190 — a repair never forges an active generation."""
+
+    from ai_maintainer.consistency import TaskState, token_for_state
+
+    # Active generations are not writable evidence: a repair must never invent
+    # a generation number the orchestrator never issued.
+    assert token_for_state(TaskState.RUNNING) is None
+    assert token_for_state(TaskState.IN_PROGRESS) is None
+    assert token_for_state(TaskState.PENDING) is None
+    assert token_for_state("gibberish") is None
+    # Terminal evidence is writable and round-trips through ``state_for_token``.
+    for state, token in (
+        (TaskState.COMPLETED, "Done"),
+        (TaskState.FAILED, "Error"),
+        (TaskState.CANCELLED, "Rejected"),
+    ):
+        assert token_for_state(state) == token
+        assert state_for_token(token) is state

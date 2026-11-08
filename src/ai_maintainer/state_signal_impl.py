@@ -30,6 +30,7 @@ mid-air ``Running 1``), and a terminal token is compared against the archive
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -50,6 +51,7 @@ __all__ = [
     "CODE_UNKNOWN_TASK",
     "CODE_UNSUPPORTED_SIGNAL",
     "SignalDecision",
+    "build_signal_gate",
     "finding_for",
     "validate_transition",
 ]
@@ -63,6 +65,7 @@ CODE_UNSUPPORTED_SIGNAL = "UNSUPPORTED_SIGNAL"
 CODE_TERMINAL_MISMATCH = "TERMINAL_MISMATCH"
 
 INCOMING_LIMIT = 200
+GATE_ENGINE_ADMIT = "engine_admit"
 
 
 @dataclass(frozen=True)
@@ -94,16 +97,26 @@ def _signal_head(text: str) -> str | None:
     return None
 
 
+def _head(text: str | None) -> str | None:
+    """Cap one evidence string so the journal stays bounded (plan §5)."""
+
+    if text is None or len(text) <= INCOMING_LIMIT:
+        return text
+    return text[:INCOMING_LIMIT]
+
+
 def _evidence(
     snapshot: TaskStoreSnapshot | None, signal_text: str, gate: str | None
 ) -> dict[str, Any]:
     return {
-        "signal_head": _signal_head(signal_text),
+        "signal_head": _head(_signal_head(signal_text)),
         "incoming": signal_text.strip()[:INCOMING_LIMIT],
         "canonical": None if snapshot is None else snapshot.canonical,
         "canonical_source": None if snapshot is None else snapshot.canonical_source,
         "archive": None if snapshot is None else snapshot.archive.name,
-        "existing_signal_head": None if snapshot is None else snapshot.signal.evidence,
+        "existing_signal_head": (
+            None if snapshot is None else _head(snapshot.signal.evidence)
+        ),
         "gate": gate,
     }
 
@@ -182,3 +195,38 @@ def finding_for(decision: SignalDecision) -> dict[str, Any]:
         "detail": decision.detail,
         "evidence": dict(decision.evidence),
     }
+
+
+def build_signal_gate(
+    service: Any, *, gate: str = GATE_ENGINE_ADMIT
+) -> Callable[[str], SignalDecision]:
+    """Build the engine admit-hook (REQ-03 at runtime) over ``service``.
+
+    The engine calls the hook once per candidate per cycle with the task id; it
+    is the same validation the HTTP route and the startup job use, so the
+    rejection path — ``SIGNAL_REJECTED`` journal entry, ``findings[]`` entry,
+    engine ``SIGNAL_REJECTED`` event — is one implementation, not three.
+
+    A task slot that declares no signal (``_signal.txt`` absent/empty) has no
+    transition to validate and is admitted: the gate guards transitions, it does
+    not introduce a new admission requirement.
+    """
+
+    def admit(task_id: str) -> SignalDecision:
+        snapshot = service.snapshot(task_id)
+        declared = snapshot.signal.evidence if snapshot.signal.present else None
+        if declared is None:
+            return SignalDecision(
+                accepted=True,
+                code=CODE_ACCEPTED,
+                task=task_id,
+                canonical=snapshot.canonical,
+            )
+        decision = validate_transition(
+            task_id, declared, snapshot=snapshot, audit=service.audit, gate=gate
+        )
+        if not decision.accepted:
+            service.record_finding(finding_for(decision))
+        return decision
+
+    return admit
