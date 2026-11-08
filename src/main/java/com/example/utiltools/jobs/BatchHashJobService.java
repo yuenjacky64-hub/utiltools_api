@@ -126,13 +126,13 @@ public class BatchHashJobService {
     private static final Comparator<MutableJob> LIST_ORDER_INVERSE = LIST_ORDER.reversed();
 
     /**
-     * Oldest {@code completedAt} first, {@code jobId} ascending as the deterministic tie-break. A
-     * terminal row always carries {@code completedAt}; the defensive {@code nullsFirst} arm keeps a
-     * hypothetical null from throwing inside the registry section and treats it as the oldest row.
+     * Oldest {@code completedAt} first, {@code jobId} ascending as the deterministic tie-break, so
+     * repeated passes over the same registry pick the same victims in the same order. Only terminal
+     * rows that carry a {@code completedAt} become candidates (Plan §4.2), so no row passed to this
+     * comparator is ever null there.
      */
     private static final Comparator<MutableJob> EVICTION_ORDER =
-            Comparator.comparing((MutableJob job) -> job.completedAt,
-                            Comparator.nullsFirst(Comparator.<Instant>naturalOrder()))
+            Comparator.comparing((MutableJob job) -> job.completedAt)
                     .thenComparing(job -> job.jobId);
 
     private final CryptoService cryptoService;
@@ -842,7 +842,8 @@ public class BatchHashJobService {
      * time-based retention and then count-based retention ({@link #enforceRetainedJobCapLocked()}) in
      * the same section.</p>
      *
-     * @return the number of evicted jobs
+     * @return the total number of rows this pass removed: the time-based evictions plus the terminal
+     *         rows removed because the retained-row cap was exceeded (Plan §4.5)
      */
     public int evictExpiredJobs(Instant cutoff) {
         int evicted = 0;
@@ -870,9 +871,9 @@ public class BatchHashJobService {
             }
             // Count-based retention rides the same pass, under the same lock: an idle registry still
             // converges on the cap even if no terminal transition happens to run enforcement.
-            enforceRetainedJobCapLocked();
+            int enforced = enforceRetainedJobCapLocked();
+            return evicted + enforced;
         }
-        return evicted;
     }
 
     /**
@@ -886,22 +887,41 @@ public class BatchHashJobService {
         }
     }
 
-    /** Enforces the retained-row cap; the caller must already hold {@code registryLock}. */
-    private void enforceRetainedJobCapLocked() {
-        List<MutableJob> terminal = new ArrayList<>();
+    /**
+     * Enforces the retained-row cap; the caller must already hold {@code registryLock}.
+     *
+     * <p>At most {@code maxRetainedJobs} terminal rows survive: {@code QUEUED}, {@code RUNNING} and
+     * {@code CANCELLING} rows are never candidates, so a registry full of live work stays above the
+     * cap instead of losing a job a client is still polling.</p>
+     *
+     * @return the number of terminal rows evicted by this pass
+     */
+    private int enforceRetainedJobCapLocked() {
+        if (jobs.size() <= maxRetainedJobs) {
+            return 0; // fast path: fewer rows than the cap cannot violate it, so no scan at all
+        }
+        List<MutableJob> candidates = new ArrayList<>();
         for (MutableJob job : jobs.values()) {
-            if (isTerminal(job.status)) {
-                terminal.add(job);
+            synchronized (job) { // registryLock -> job monitor is the only legal order
+                if (isTerminal(job.status) && job.completedAt != null) {
+                    candidates.add(job);
+                }
             }
         }
-        int excess = terminal.size() - maxRetainedJobs;
+        int excess = candidates.size() - maxRetainedJobs;
         if (excess <= 0) {
-            return; // the common case: a snapshot of the registry only, never a write
+            return 0; // the common case: non-terminal rows are what push the registry over the cap
         }
-        terminal.sort(EVICTION_ORDER); // oldest completedAt first, jobId ascending on ties
+        candidates.sort(EVICTION_ORDER); // oldest completedAt first, jobId ascending on ties
         int evicted = 0;
-        for (int i = 0; i < excess; i++) {
-            MutableJob victim = terminal.get(i);
+        // Every candidate is walked, not just the first `excess` slots: a victim skipped below (a
+        // concurrent retry flipped it back to QUEUED, or another writer already removed it) is
+        // replaced by the next-oldest candidate, so one skip cannot leave the registry above the cap
+        // until the following pass.
+        for (MutableJob victim : candidates) {
+            if (evicted >= excess) {
+                break;
+            }
             synchronized (victim) {
                 // Re-checked under the monitor: a victim is only removed while it is still terminal
                 // and still the row this pass selected, so a concurrent retry cannot be unmapped.
@@ -922,6 +942,7 @@ public class BatchHashJobService {
             log.debug("batch-hash retention: evicted={} terminal jobs beyond the cap of {}", evicted,
                     maxRetainedJobs);
         }
+        return evicted;
     }
 
     private static boolean isTerminal(JobStatus status) {
@@ -984,6 +1005,12 @@ public class BatchHashJobService {
             if (released) {
                 releaseQuota(job.clientKey); // after the monitor block (REQ-08)
             }
+            // REQ-02, enforcement site #4 (Plan §4.3): this pass just published a terminal row (reaped
+            // FAILED, or a finalised CANCELLED) — the two `continue` branches above are the only way
+            // to skip this line. It runs after the monitor block, so the order stays
+            // registryLock -> job monitor, and it is not gated on `released`: a quota claim already
+            // spent by another writer must not leave the terminal row in place until the next pass.
+            enforceRetainedJobCap();
         }
         return reaped;
     }
@@ -1075,6 +1102,11 @@ public class BatchHashJobService {
             if (released) {
                 releaseQuota(job.clientKey); // after the monitor block (REQ-08)
             }
+            // REQ-02, enforcement site #6 (Plan §4.3): the drain sweep publishes FAILED (JOB_SHUTDOWN)
+            // rows in bulk, and the `continue` above is the only path that settles no row. Enforced
+            // after the monitor block and after releaseQuota, so the order stays
+            // registryLock -> job monitor and a drain sweep cannot push the registry past the cap.
+            enforceRetainedJobCap();
         }
         return failed;
     }
