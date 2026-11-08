@@ -1734,6 +1734,7 @@ utiltools.jobs.retention-seconds=300
 utiltools.jobs.cleanup-interval-ms=60000
 utiltools.jobs.max-attempts=3
 utiltools.jobs.max-active-jobs-per-client=20
+utiltools.jobs.max-retained-jobs=1000
 ```
 
 | Property | Default | Meaning |
@@ -1744,6 +1745,7 @@ utiltools.jobs.max-active-jobs-per-client=20
 | `utiltools.jobs.cleanup-interval-ms` | `60000` | Interval of the scheduled eviction pass (`@EnableScheduling`); `QUEUED`/`RUNNING`/`CANCELLING` jobs are never evicted, and `CANCELLED` jobs are evicted on the same retention cutoff as `COMPLETED`/`FAILED` |
 | `utiltools.jobs.max-attempts` | `3` | Ceiling on execution attempts per job, where the first submission is attempt `1`; a `FAILED` job at this count answers `409 JOB_RETRY_CONFLICT`. Values below `1` are clamped to `1`. Global — it is not settable per request |
 | `utiltools.jobs.max-active-jobs-per-client` | `20` | Ceiling on one client's concurrent **non-terminal** jobs (`QUEUED`, `RUNNING` or `CANCELLING`), keyed by the same identity the rate limiter resolves (see [G](#g-rate-limiting-interaction-explicit-decision)); one more submission answers `429 JOB_QUOTA_EXCEEDED` with `limit` and `activeJobs` in `details`. A slot is released as each job reaches `COMPLETED`, `FAILED` or `CANCELLED` — a `DELETE` on a `RUNNING` job records the cancellation without releasing the slot, which is released once by the terminal `CANCELLED` write. Values below `1` fail startup. Set it at or above `worker-count + queue-capacity` to restore pre-quota (unbounded per client) admission |
+| `utiltools.jobs.max-retained-jobs` | `1000` | Hard cap on retained **terminal** rows (`COMPLETED`, `FAILED`, `CANCELLED`) in the in-memory registry, enforced together with `retention-seconds`: once the cap is exceeded the oldest terminal job by `completedAt` is unregistered (with its idempotency key) so a fast submit/complete churn cannot grow the registry without bound. `QUEUED`, `RUNNING` and `CANCELLING` rows are never evicted, so the registry stays at or below `max-retained-jobs + worker-count + queue-capacity` rows. Values below `1` fail startup |
 
 #### G. Rate limiting interaction (explicit decision)
 

@@ -35,6 +35,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -1599,6 +1600,545 @@ class BatchHashJobServiceTest {
         crypto.unblock("running");
     }
 
+    @Test
+    @DisplayName("retention cap - terminal rows beyond max-retained-jobs are evicted oldest completedAt first")
+    void shouldCapRetainedTerminalJobsAndEvictOldestFirst() {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        int cap = 3;
+        service = cappedService(clock, new CryptoService(), 1, 20, cap);
+
+        List<String> jobIds = new ArrayList<>();
+        for (int i = 0; i < cap + 2; i++) {
+            BatchHashJobResponse accepted = service.submit(
+                    new BatchHashRequest("SHA-256", List.of("item-" + i), null, null));
+            awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+            jobIds.add(accepted.jobId());
+            // A distinct completion instant per row makes the eviction order observable.
+            clock.advanceSeconds(1);
+        }
+
+        // Exactly the cap survives, and the survivors are the newest rows: no surviving row is
+        // re-registered or mutated by the eviction pass. The last completion's cap pass runs after
+        // its job-monitor section, so await convergence rather than sampling mid-pass.
+        awaitRegistryKeys(jobIds.subList(2, cap + 2).toArray(new String[0]));
+        assertThat(registryKeys("jobs")).containsExactlyInAnyOrderElementsOf(jobIds.subList(2, cap + 2));
+        assertThatThrownBy(() -> service.getJob(jobIds.get(0))).isInstanceOf(JobNotFoundException.class);
+        assertThatThrownBy(() -> service.getJob(jobIds.get(1))).isInstanceOf(JobNotFoundException.class);
+        BatchHashJobResponse newest = service.getJob(jobIds.get(cap + 1));
+        assertThat(newest.status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(newest.results()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("retention cap - QUEUED, RUNNING and CANCELLING rows survive any count pressure")
+    void shouldNeverEvictNonTerminalJobsUnderCapPressure() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        StallingCryptoService crypto = new StallingCryptoService("hold");
+        int cap = 2;
+        service = cappedService(clock, crypto, 2, 20, cap);
+
+        BatchHashJobResponse held = service.submit(
+                new BatchHashRequest("SHA-256", List.of("hold"), null, "held-key"));
+        assertThat(crypto.awaitEntered("hold")).isTrue();
+        assertThat(service.getJob(held.jobId()).status()).isEqualTo(JobStatus.RUNNING);
+
+        // The second worker keeps completing rows, so the terminal count is pushed past the cap
+        // repeatedly while a non-terminal row is registered.
+        for (int i = 0; i < cap + 3; i++) {
+            BatchHashJobResponse accepted = service.submit(
+                    new BatchHashRequest("SHA-256", List.of("quick-" + i), null, null));
+            awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+            clock.advanceSeconds(1);
+        }
+
+        assertThat(awaitRegistrySize(cap + 1)).contains(held.jobId());
+        assertThat(service.getJob(held.jobId()).status()).isEqualTo(JobStatus.RUNNING);
+
+        // A time-based pass past retention-seconds still removes every eligible terminal row...
+        assertThat(service.evictExpiredJobs(clock.instant().plusSeconds(3600))).isEqualTo(cap);
+        // ...and leaves the running row alone.
+        assertThat(registryKeys("jobs")).containsExactly(held.jobId());
+
+        crypto.releaseAll();
+        BatchHashJobResponse completed = awaitStatus(held.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.results()).hasSize(1);
+        assertThat(registryKeys("jobs")).containsExactly(held.jobId()); // still under the cap
+    }
+
+    @Test
+    @DisplayName("retention cap - an evicted idempotency key starts exactly one new job")
+    void shouldStartNewJobWhenIdempotencyKeyOfEvictedJobIsReused() {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        int cap = 1;
+        service = cappedService(clock, new CryptoService(), 1, 20, cap);
+
+        BatchHashRequest keyed = new BatchHashRequest("SHA-256", List.of("reuse"), null, "reuse-key");
+        BatchHashJobResponse first = service.submit(keyed);
+        awaitStatus(first.jobId(), JobStatus.COMPLETED);
+        clock.advanceSeconds(1);
+
+        // One more terminal row is one row more than the cap allows, so the keyed row is the victim.
+        BatchHashJobResponse second = service.submit(
+                new BatchHashRequest("SHA-256", List.of("other"), null, null));
+        awaitStatus(second.jobId(), JobStatus.COMPLETED);
+
+        awaitRegistryKeys(second.jobId()); // the cap pass for the keyed row runs after its completion
+        assertThatThrownBy(() -> service.getJob(first.jobId())).isInstanceOf(JobNotFoundException.class);
+        assertThat(registryKeys("jobs")).containsExactly(second.jobId());
+        assertThat(registryKeys("idempotencyIndex")).isEmpty(); // the mapping went with the row
+
+        clock.advanceSeconds(1);
+        BatchHashJobResponse fresh = service.submit(keyed);
+        assertThat(fresh.jobId()).isNotEqualTo(first.jobId());
+        awaitStatus(fresh.jobId(), JobStatus.COMPLETED); // the new row ages out second, not first
+        awaitRegistryKeys(fresh.jobId());
+        assertThat(idempotencyIndexView()).containsOnlyKeys("reuse-key");
+        assertThat(idempotencyIndexView()).containsEntry("reuse-key", fresh.jobId());
+        // ...and the duplicate path now answers with the new row, not the evicted one.
+        assertThat(service.submit(keyed).jobId()).isEqualTo(fresh.jobId());
+    }
+
+    @Test
+    @DisplayName("retention cap - a non-positive max-retained-jobs is refused at construction")
+    void shouldRejectNonPositiveMaxRetainedJobsAtConstruction() {
+        for (int invalid : new int[] {0, -1}) {
+            assertThatThrownBy(() -> new BatchHashJobService(new CryptoService(), 1, 10, 300, 3,
+                    30, 5000, 0, 20, invalid, Clock.systemUTC(), null))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("utiltools.jobs.max-retained-jobs");
+        }
+
+    }
+
+    @Test
+    @DisplayName("retention cap - the pre-cap constructor overloads keep the documented default")
+    void shouldApplyDefaultMaxRetainedJobsToLegacyConstructors() {
+        // Every pre-existing overload stays source-compatible and applies the same default cap,
+        // so direct-construction callers (and the tests above) compile unchanged.
+        List<BatchHashJobService> legacy = List.of(
+                new BatchHashJobService(new CryptoService(), 1, 10, 300, 3),
+                new BatchHashJobService(new CryptoService(), 1, 10, 300, 3, Clock.systemUTC()),
+                new BatchHashJobService(new CryptoService(), 1, 10, 300, 3, 30, 5000, Clock.systemUTC()));
+        try {
+            for (BatchHashJobService defaults : legacy) {
+                assertThat(intValue(defaults, "maxRetainedJobs"))
+                        .isEqualTo(BatchHashJobService.DEFAULT_MAX_RETAINED_JOBS)
+                        .isEqualTo(1000);
+            }
+        } finally {
+            legacy.forEach(BatchHashJobService::shutdown);
+        }
+    }
+
+    @Test
+    @DisplayName("retention cap - concurrent duplicate submit versus eviction never dangles a mapping")
+    void shouldKeepDuplicateSubmitAndEvictionLinearizable() throws Exception {
+        int cap = 2;
+        int workers = 2;
+        int queueCapacity = 30;
+        int rounds = 60;
+        AtomicBoolean stop = new AtomicBoolean();
+        AtomicInteger unresolvableNonTerminal = new AtomicInteger();
+        AtomicInteger danglingMappings = new AtomicInteger();
+        AtomicInteger aboveBound = new AtomicInteger();
+        Set<String> returnedIds = ConcurrentHashMap.newKeySet();
+
+        service = new BatchHashJobService(new CryptoService(), workers, queueCapacity, 300, 3,
+                30, 5000, 0, 1000, cap, Clock.systemUTC(), null);
+        BatchHashRequest duplicate = new BatchHashRequest("SHA-256", List.of("dupe"), null, "race-key");
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        try {
+            Future<?> duplicateSubmitter = pool.submit(() -> {
+                for (int i = 0; i < rounds; i++) {
+                    BatchHashJobResponse accepted = submitEventually(duplicate);
+                    returnedIds.add(accepted.jobId());
+                    // A non-terminal row is never evicted, so its 202 must stay resolvable; a
+                    // terminal row may legitimately be reaped right after the response is built.
+                    if (accepted.status() == JobStatus.QUEUED || accepted.status() == JobStatus.RUNNING
+                            || accepted.status() == JobStatus.CANCELLING) {
+                        try {
+                            service.getJob(accepted.jobId());
+                        } catch (JobNotFoundException e) {
+                            unresolvableNonTerminal.incrementAndGet();
+                        }
+                    }
+                }
+            });
+            Future<?> churn = pool.submit(() -> {
+                for (int i = 0; i < rounds; i++) {
+                    submitEventually(new BatchHashRequest("SHA-256", List.of("churn-" + i), null, null));
+                }
+            });
+            Future<?> evictor = pool.submit(() -> {
+                while (!stop.get()) {
+                    service.evictExpiredJobs(Instant.now().plusSeconds(86_400));
+                }
+            });
+            Future<?> sampler = pool.submit(() -> {
+                while (!stop.get()) {
+                    // Reading both registries under the production monitor yields one atomic view:
+                    // this is exactly the invariant a same-key submission relies on.
+                    synchronized (registryLock()) {
+                        Set<String> rows = registryKeys("jobs");
+                        if (rows.size() > cap + workers + queueCapacity) {
+                            aboveBound.incrementAndGet();
+                        }
+                        for (String jobId : idempotencyIndexView().values()) {
+                            if (!rows.contains(jobId)) {
+                                danglingMappings.incrementAndGet();
+                            }
+                        }
+                    }
+                }
+            });
+            duplicateSubmitter.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            churn.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            stop.set(true);
+            evictor.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            sampler.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } finally {
+            stop.set(true);
+            pool.shutdownNow();
+        }
+
+        assertThat(returnedIds).isNotEmpty();
+        assertThat(unresolvableNonTerminal.get()).isZero();
+        assertThat(danglingMappings.get()).isZero();
+        assertThat(aboveBound.get()).isZero();
+
+        // Quiesced: the key answers with a live row, and never with an unregistered id.
+        BatchHashJobResponse after = service.submit(duplicate);
+        assertThat(service.getJob(after.jobId()).jobId()).isEqualTo(after.jobId());
+        synchronized (registryLock()) {
+            Set<String> rows = registryKeys("jobs");
+            assertThat(rows.size()).isLessThanOrEqualTo(cap + workers + queueCapacity);
+            String target = idempotencyIndexView().get("race-key");
+            if (target != null) {
+                assertThat(rows).contains(target);
+                assertThat(target).isEqualTo(after.jobId());
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("retention cap - time-based eviction still applies when the cap is not binding")
+    void shouldKeepTimeBasedEvictionWithCountCap() {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        service = cappedService(clock, new CryptoService(), 1, 20, 1000);
+
+        BatchHashJobResponse first = service.submit(
+                new BatchHashRequest("SHA-256", List.of("time-1"), null, null));
+        awaitStatus(first.jobId(), JobStatus.COMPLETED);
+        clock.advanceSeconds(1);
+        BatchHashJobResponse second = service.submit(
+                new BatchHashRequest("SHA-256", List.of("time-2"), null, null));
+        awaitStatus(second.jobId(), JobStatus.COMPLETED);
+        clock.advanceSeconds(1);
+
+        // Inside the retention window and far below the cap: a pass removes nothing. The scheduled
+        // caller passes the retention cutoff (now - retention-seconds), not the current instant.
+        Instant cutoff = clock.instant().minusSeconds(300);
+        assertThat(service.evictExpiredJobs(cutoff)).isZero();
+        assertThat(registryKeys("jobs")).containsExactlyInAnyOrder(first.jobId(), second.jobId());
+
+        // Past retention-seconds the time-based pass still removes both rows: the cap only adds a
+        // second reason to evict, it does not replace the retention window.
+        clock.advanceSeconds(3600);
+        assertThat(service.evictExpiredJobs(clock.instant().minusSeconds(300))).isEqualTo(2);
+        assertThat(registryKeys("jobs")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("retention cap - a retention pass cannot run while another thread holds registryLock")
+    void shouldBlockEvictionWhileRegistryLockIsHeld() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        service = cappedService(clock, new CryptoService(), 1, 20, 10);
+        BatchHashJobResponse expired = service.submit(
+                new BatchHashRequest("SHA-256", List.of("locked"), null, null));
+        awaitStatus(expired.jobId(), JobStatus.COMPLETED);
+        clock.advanceSeconds(3600); // the row is evictable, so the pass has real work to do
+
+        CountDownLatch holding = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Object lock = registryLock();
+        Thread holder = new Thread(() -> {
+            synchronized (lock) {
+                holding.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }, "registry-lock-holder");
+        holder.start();
+        try {
+            assertThat(holding.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+
+            CountDownLatch passDone = new CountDownLatch(1);
+            Thread evictor = new Thread(() -> {
+                service.evictExpiredJobs(clock.instant());
+                passDone.countDown();
+            }, "retention-pass");
+            evictor.start();
+            // The pass must still be blocked on the registry monitor: this is the lock
+            // participation the duplicate-submit-versus-eviction race depends on.
+            assertThat(passDone.await(300, TimeUnit.MILLISECONDS)).isFalse();
+
+            release.countDown();
+            assertThat(passDone.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+            evictor.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+        } finally {
+            release.countDown();
+            holder.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+        }
+
+        assertThat(registryKeys("jobs")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("retention cap - eviction mutates no survivor and releases no quota slot")
+    void shouldNotMutateSurvivorsOrReleaseQuotaWhenEvictingUnderCap() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        StallingCryptoService crypto = new StallingCryptoService("hold");
+        AuditJournalService journal = newJournal();
+        // One retained terminal row and one non-terminal job per client: the tightest legal setup.
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3, 30, 5000, 0, 1, 1, clock, journal);
+
+        String victimClient = "198.51.100.10";
+        String survivorClient = "198.51.100.11";
+        BatchHashJobResponse victim = service.submit(
+                new BatchHashRequest("SHA-256", List.of("victim"), null, null), victimClient);
+        awaitStatus(victim.jobId(), JobStatus.COMPLETED);
+        awaitActiveJobs(victimClient, 0);
+        clock.advanceSeconds(1);
+
+        BatchHashJobResponse survivor = service.submit(
+                new BatchHashRequest("SHA-256", List.of("hold"), null, "survivor-key"), survivorClient);
+        assertThat(crypto.awaitEntered("hold")).isTrue();
+        BatchHashJobResponse before = service.getJob(survivor.jobId());
+        assertThat(before.status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(before.attempt()).isEqualTo(1);
+        List<AuditEntry> auditBefore = batchHashEntries(journal, survivor.jobId());
+        assertThat(auditBefore).isNotEmpty();
+
+        // A third identity completes a row, so the terminal count exceeds the cap by exactly one and
+        // the oldest terminal row (the victim) is the eviction target.
+        clock.advanceSeconds(1);
+        BatchHashJobResponse pressure = service.submit(
+                new BatchHashRequest("SHA-256", List.of("pressure"), null, null), "198.51.100.12");
+        awaitStatus(pressure.jobId(), JobStatus.COMPLETED);
+
+        awaitRegistryKeys(survivor.jobId(), pressure.jobId());
+        assertThatThrownBy(() -> service.getJob(victim.jobId())).isInstanceOf(JobNotFoundException.class);
+        assertThat(registryKeys("jobs")).containsExactlyInAnyOrder(survivor.jobId(), pressure.jobId());
+
+        // The survivor is byte-identical: identity fields, attempt history and audit rows untouched.
+        BatchHashJobResponse after = service.getJob(survivor.jobId());
+        assertThat(after.jobId()).isEqualTo(before.jobId());
+        assertThat(after.status()).isEqualTo(before.status());
+        assertThat(after.attempt()).isEqualTo(before.attempt());
+        assertThat(after.attempts()).isEqualTo(before.attempts());
+        assertThat(after.completedItems()).isEqualTo(before.completedItems());
+        assertThat(after.startedAt()).isEqualTo(before.startedAt());
+        assertThat(batchHashEntries(journal, survivor.jobId())).isEqualTo(auditBefore);
+
+        // No quota slot was released by the eviction: the survivor's client is still at its limit.
+        assertThat(service.activeJobsForClient(survivorClient)).isEqualTo(1);
+        assertThatThrownBy(() -> service.submit(
+                new BatchHashRequest("SHA-256", List.of("again"), null, null), survivorClient))
+                .isInstanceOfSatisfying(JobQuotaExceededException.class, refused -> {
+                    assertThat(refused.limit()).isEqualTo(1);
+                    assertThat(refused.activeJobs()).isEqualTo(1);
+                });
+        assertThat(service.activeJobsForClient(survivorClient)).isEqualTo(1);
+
+        // Letting the gated worker finish keeps no thread behind; the survivor itself may be the next
+        // count-pressure victim (the clock is frozen, so both rows share a completedAt), which is
+        // exactly why the assertions above ran while it was still non-terminal.
+        crypto.releaseAll();
+        awaitActiveJobs(survivorClient, 0);
+    }
+
+    @Test
+    @DisplayName("retention cap - reaping a stalled execution trims the row it terminalised")
+    void shouldEnforceRetainedJobCapWhenReaperTerminalisesRow() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        StallingCryptoService crypto = new StallingCryptoService("reaped");
+        int cap = 1;
+        service = cappedService(clock, crypto, 2, 20, cap);
+
+        // The cap is already full with one completed row before the reaper publishes its own.
+        BatchHashJobResponse settled = service.submit(
+                new BatchHashRequest("SHA-256", List.of("settled"), null, null));
+        awaitStatus(settled.jobId(), JobStatus.COMPLETED);
+        clock.advanceSeconds(1);
+
+        BatchHashJobResponse stalled = service.submit(
+                new BatchHashRequest("SHA-256", List.of("reaped"), null, null));
+        try {
+            assertThat(crypto.awaitEntered("reaped")).isTrue();
+            clock.advanceSeconds(LEASE_SECONDS + 1);
+
+            // The reap writes the second terminal row (Plan §4.3 site #4): enforcement runs there too,
+            // so the reaped status never leaves the registry one row above the cap.
+            assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+
+            awaitRegistryKeys(stalled.jobId());
+            assertThat(registryKeys("jobs")).containsExactly(stalled.jobId());
+            assertThatThrownBy(() -> service.getJob(settled.jobId()))
+                    .isInstanceOf(JobNotFoundException.class);
+            assertThat(service.getJob(stalled.jobId()).status()).isEqualTo(JobStatus.FAILED);
+            assertThat(service.getJob(stalled.jobId()).error())
+                    .isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        } finally {
+            // The fenced worker must not resurrect the reaped attempt, nor add a row.
+            crypto.releaseAll();
+        }
+        awaitStatus(stalled.jobId(), JobStatus.FAILED);
+        assertThat(registryKeys("jobs")).containsExactly(stalled.jobId());
+    }
+
+    @Test
+    @DisplayName("retention cap - the drain sweep trims the rows it terminalises")
+    void shouldEnforceRetainedJobCapWhenDrainTerminalisesRows() {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        StallingCryptoService crypto = new StallingCryptoService("held-a", "held-b");
+        int cap = 1;
+        service = cappedService(clock, crypto, 2, 20, cap);
+
+        BatchHashJobResponse settled = service.submit(
+                new BatchHashRequest("SHA-256", List.of("settled"), null, null));
+        awaitStatus(settled.jobId(), JobStatus.COMPLETED);
+        clock.advanceSeconds(1);
+
+        BatchHashJobResponse heldA = service.submit(
+                new BatchHashRequest("SHA-256", List.of("held-a"), null, null));
+        BatchHashJobResponse heldB = service.submit(
+                new BatchHashRequest("SHA-256", List.of("held-b"), null, null));
+        assertThat(crypto.awaitEntered("held-a")).isTrue();
+        assertThat(crypto.awaitEntered("held-b")).isTrue();
+        BatchHashJobResponse queued = service.submit(
+                new BatchHashRequest("SHA-256", List.of("waiting"), null, null));
+        assertThat(queued.status()).isEqualTo(JobStatus.QUEUED);
+
+        try {
+            // The forced phase publishes three FAILED rows at once (Plan §4.3 site #6). Each settled
+            // row runs the cap pass, so the sweep cannot leave the registry above the cap.
+            service.shutdown();
+
+            assertThat(registryKeys("jobs")).hasSize(cap);
+            assertThat(registryKeys("jobs")).doesNotContain(settled.jobId());
+            assertThatThrownBy(() -> service.getJob(settled.jobId()))
+                    .isInstanceOf(JobNotFoundException.class);
+            // The drained rows are terminal and resolvable: only the oldest row was dropped.
+            Set<String> drained = Set.of(heldA.jobId(), heldB.jobId(), queued.jobId());
+            assertThat(registryKeys("jobs")).isSubsetOf(drained);
+            assertThat(service.getJob(registryKeys("jobs").iterator().next()).status())
+                    .isEqualTo(JobStatus.FAILED);
+        } finally {
+            crypto.releaseAll();
+        }
+    }
+
+    @Test
+    @DisplayName("retention cap - the retention pass reports its count-pressure removals")
+    void shouldCountCountPressureRemovalsInRetentionPassReturnValue() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        StallingCryptoService crypto = new StallingCryptoService("pile-0", "pile-1", "pile-2", "pile-3");
+        int cap = 1;
+        service = cappedService(clock, crypto, 4, 20, cap);
+
+        List<String> accepted = new ArrayList<>();
+        // Holding the registry monitor makes the pile-up deterministic: every completing worker
+        // publishes its terminal status and then blocks in its own cap pass, so four terminal rows are
+        // registered above a cap of one when the pass below runs. submit() and the pass both
+        // synchronize on the same (re-entrant) monitor, so both run on this thread.
+        synchronized (registryLock()) {
+            for (int i = 0; i < 4; i++) {
+                BatchHashJobResponse job = service.submit(
+                        new BatchHashRequest("SHA-256", List.of("pile-" + i), null, null));
+                accepted.add(job.jobId());
+            }
+            for (int i = 0; i < 4; i++) {
+                assertThat(crypto.awaitEntered("pile-" + i)).isTrue();
+            }
+            crypto.releaseAll();
+            for (String jobId : accepted) {
+                awaitStatus(jobId, JobStatus.COMPLETED);
+            }
+            assertThat(registryKeys("jobs")).hasSize(4); // blocked hooks, no trim yet
+
+            // Nothing is past retention-seconds here, so all three removals are count-pressure ones
+            // and the pass must report them (Plan §4.5: evicted + enforced).
+            assertThat(service.evictExpiredJobs(clock.instant().minusSeconds(300))).isEqualTo(3);
+            assertThat(registryKeys("jobs")).hasSize(cap);
+        }
+
+        awaitRegistrySize(cap);
+        assertThat(registryKeys("jobs")).hasSize(cap);
+    }
+
+    /** A service whose retained-row cap is small enough for a handful of jobs to exceed it. */
+    private BatchHashJobService cappedService(MutableJobClock clock, CryptoService crypto, int workers,
+            int queueCapacity, int maxRetainedJobs) {
+        return new BatchHashJobService(crypto, workers, queueCapacity, 300, 3,
+                30, 5000, 0, 1000, maxRetainedJobs, clock, null);
+    }
+
+    /** Submits, retrying while the bounded queue is full: these tests are about retention, not queueing. */
+    private BatchHashJobResponse submitEventually(BatchHashRequest request) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline) {
+            try {
+                return service.submit(request);
+            } catch (JobQueueFullException e) {
+                try {
+                    Thread.sleep(2);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted while retrying a submission", interrupted);
+                }
+            }
+        }
+        throw new AssertionError("The bounded queue never accepted " + request);
+    }
+
+    /** The production registry monitor, so a test can read an atomic view of both maps. */
+    private Object registryLock() {
+        try {
+            Field field = BatchHashJobService.class.getDeclaredField("registryLock");
+            field.setAccessible(true);
+            return field.get(service);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Cannot read the batch hash registry lock", e);
+        }
+    }
+
+    /** Snapshot of the {@code idempotencyIndex} (key -> jobId), read like {@link #registryKeys(String)}. */
+    private Map<String, String> idempotencyIndexView() {
+        try {
+            Field field = BatchHashJobService.class.getDeclaredField("idempotencyIndex");
+            field.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            Map<String, String> map = (Map<String, String>) field.get(service);
+            return Map.copyOf(map);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Cannot read BatchHashJobService.idempotencyIndex", e);
+        }
+    }
+
+    /** Reads an {@code int} tuning field, so a test can prove the default cap is applied. */
+    private int intValue(Object target, String fieldName) {
+        try {
+            Field field = BatchHashJobService.class.getDeclaredField(fieldName);
+            field.setAccessible(true);
+            return field.getInt(target);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Cannot read BatchHashJobService." + fieldName, e);
+        }
+    }
+
     /**
      * Submits a single-item job, lets the worker stall inside {@code hash()}, advances the clock past
      * the lease and reaps it, returning the reaped snapshot.
@@ -1640,6 +2180,57 @@ class BatchHashJobServiceTest {
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Cannot read BatchHashJobService." + fieldName, e);
         }
+    }
+
+    /**
+     * Waits until the {@code jobs} registry converges on exactly {@code expectedIds}, then returns the
+     * observed set.
+     *
+     * <p>A terminal transition publishes its status under the job monitor and only then runs the cap
+     * pass, which must take {@code registryLock} <em>after</em> leaving that monitor
+     * ({@code registryLock -> job monitor} is the only legal order). A row that has just become
+     * terminal is therefore still registered for the few microseconds the completing worker needs to
+     * re-acquire the registry lock, so these tests await convergence instead of sampling the registry
+     * in the middle of an enforcement pass.</p>
+     */
+    private Set<String> awaitRegistryKeys(String... expectedIds) {
+        Set<String> expected = Set.of(expectedIds);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        Set<String> observed = Set.of();
+        while (System.nanoTime() < deadline) {
+            observed = registryKeys("jobs");
+            if (observed.equals(expected)) {
+                return observed;
+            }
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while awaiting the jobs registry", e);
+            }
+        }
+        throw new AssertionError("jobs registry did not converge on " + expected
+                + "; last observed " + observed);
+    }
+
+    /** Waits until the {@code jobs} registry holds exactly {@code expectedSize} rows (see above). */
+    private Set<String> awaitRegistrySize(int expectedSize) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        Set<String> observed = Set.of();
+        while (System.nanoTime() < deadline) {
+            observed = registryKeys("jobs");
+            if (observed.size() == expectedSize) {
+                return observed;
+            }
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while awaiting the jobs registry", e);
+            }
+        }
+        throw new AssertionError("jobs registry did not converge on " + expectedSize
+                + " rows; last observed " + observed);
     }
 
     /** Runs {@code cancel} expecting a conflict and returns the exception for field-level assertions. */
