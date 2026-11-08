@@ -21,6 +21,7 @@ public enum OperationType {
     JSON_MERGE_PATCH(true),
     JSON_TO_CSV(true),
     JSON_FROM_CSV(true),
+    JSON_CSV_TO_JSON(true),
     JSON_TO_NDJSON(true),
     JSON_FROM_NDJSON(true),
     JSON_DIFF(true),

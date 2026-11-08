@@ -24,6 +24,8 @@ import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.service.DateTimeService;
+import com.example.utiltools.json.dto.JsonCsvRequest;
+import com.example.utiltools.json.dto.JsonCsvResponse;
 import com.example.utiltools.json.dto.JsonDiffRequest;
 import com.example.utiltools.json.dto.JsonDiffResponse;
 import com.example.utiltools.json.dto.JsonFlattenRequest;
@@ -171,6 +173,10 @@ public class AuditedOperations {
         return record(OperationType.JSON_FROM_CSV, request, () -> jsonService.fromCsv(request));
     }
 
+    public JsonCsvResponse csvToJson(JsonCsvRequest request) {
+        return record(OperationType.JSON_CSV_TO_JSON, request, () -> jsonService.csvToJson(request));
+    }
+
     public JsonToNdjsonResponse toNdjson(JsonToNdjsonRequest request) {
         return record(OperationType.JSON_TO_NDJSON, request, () -> jsonService.toNdjson(request));
     }
@@ -219,6 +225,7 @@ public class AuditedOperations {
             case JSON_MERGE_PATCH -> jsonService.mergePatch((JsonMergePatchRequest) request);
             case JSON_TO_CSV -> jsonService.toCsv((JsonToCsvRequest) request);
             case JSON_FROM_CSV -> jsonService.fromCsv((JsonFromCsvRequest) request);
+            case JSON_CSV_TO_JSON -> jsonService.csvToJson((JsonCsvRequest) request);
             case JSON_TO_NDJSON -> jsonService.toNdjson((JsonToNdjsonRequest) request);
             case JSON_FROM_NDJSON -> jsonService.fromNdjson((JsonFromNdjsonRequest) request);
             case JSON_DIFF -> jsonService.diff((JsonDiffRequest) request);
