@@ -131,6 +131,7 @@ class MaintainerEngine:
         config: MaintainerConfig | None = None,
         clock: Callable[[], float] = time.monotonic,
         probe: Callable[[str], bool] | None = None,
+        signal_gate: Callable[[str], Any] | None = None,
     ) -> None:
         self._curriculum = curriculum
         self._config = config if config is not None else curriculum.config
@@ -142,6 +143,7 @@ class MaintainerEngine:
         self._buckets: dict[str, FingerprintBucket] = {}
         self._task_fingerprint: dict[str, str] = {}
         self._probe = probe
+        self._signal_gate = signal_gate
         self._scheduler_thread: threading.Thread | None = None
         self._scheduler_stop = threading.Event()
 
@@ -184,12 +186,18 @@ class MaintainerEngine:
                 if self._monitored is None:
                     if incoming is None:
                         break
+                    if not self._admit(incoming):
+                        reported_skips.add(incoming.name)
+                        continue
                     self._adopt(incoming)
                 elif (
                     incoming is not None
                     and incoming is not self._monitored
                     and self._should_preempt(incoming, self._monitored, now)
                 ):
+                    if not self._admit(incoming):
+                        reported_skips.add(incoming.name)
+                        continue
                     previous = self._monitored
                     self._preempt(incoming, previous, cycle=cycle)
                     preempted_name = previous.name
@@ -626,6 +634,46 @@ class MaintainerEngine:
         bucket = self._buckets.get(fingerprint)
         return bucket is not None and bucket.is_quarantined(now)
 
+    def _admit(self, task: TaskSpec) -> bool:
+        """Signal-gate seam (REQ-03): may ``task`` be adopted/stepped this cycle?
+
+        With no gate installed — the default — admissibility is unconditional
+        and the engine behaves exactly as before this task existed. A gate is
+        asked once per candidate per cycle; a rejection appends exactly one
+        ``SIGNAL_REJECTED`` event carrying the gate's ``code`` and the engine
+        moves on to the next candidate. A gate that raises is treated as a
+        rejection (``GATE_ERROR``) rather than being allowed to kill the loop.
+        """
+
+        gate = self._signal_gate
+        if gate is None:
+            return True
+        try:
+            decision = gate(task.name)
+        except Exception as error:
+            self._events.append(
+                {
+                    "event": "SIGNAL_REJECTED",
+                    "task": task.name,
+                    "code": "GATE_ERROR",
+                    "detail": type(error).__name__,
+                    "cycle": self._cycles,
+                }
+            )
+            return False
+        if decision is None or getattr(decision, "accepted", False):
+            return True
+        self._events.append(
+            {
+                "event": "SIGNAL_REJECTED",
+                "task": task.name,
+                "code": getattr(decision, "code", "REJECTED"),
+                "detail": getattr(decision, "detail", ""),
+                "cycle": self._cycles,
+            }
+        )
+        return False
+
     def _select_next_task(
         self, now: float, reported_skips: set[str] | None = None
     ) -> TaskSpec | None:
@@ -639,6 +687,11 @@ class MaintainerEngine:
         best_key: tuple[int, int] | None = None
         for index, task in enumerate(self._curriculum.specs):
             if task.state not in NON_TERMINAL:
+                continue
+            if reported_skips is not None and task.name in reported_skips:
+                # Signal-gate rejection: reported once, then skipped for the
+                # rest of the cycle — this is what terminates an all-rejected
+                # cycle instead of spinning on the same candidate.
                 continue
             if self._is_fingerprint_quarantined(task, now):
                 fingerprint = self._task_fingerprint[task.name]
