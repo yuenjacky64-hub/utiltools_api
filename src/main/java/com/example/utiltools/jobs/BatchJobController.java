@@ -48,7 +48,13 @@ public class BatchJobController {
 
     @PostMapping("/hash")
     @Operation(summary = "Submit a batch hash job",
-            description = "Accepts a batch and returns 202 with a job id; an optional idempotencyKey deduplicates submissions")
+            description = "Accepts a batch and returns 202 with a job id; an optional idempotencyKey deduplicates "
+                    + "submissions. An optional deadlineSeconds (1..3600) bounds the job's total life - queue wait "
+                    + "plus execution - and is part of the idempotency identity: the same key with a different "
+                    + "deadline answers 409 IDEMPOTENCY_CONFLICT, while the same effective deadline (explicit or "
+                    + "taken from the configured server default) still deduplicates to one job. When no deadline "
+                    + "applies the response carries no deadlineAt and the pre-existing duplicate-submission "
+                    + "behaviour is unchanged")
     public ResponseEntity<ApiResponse<BatchHashJobResponse>> submit(@Valid @RequestBody BatchHashRequest request,
             HttpServletRequest httpServletRequest) {
         // The per-client admission quota is charged to the identity the rate limiter resolves, so a
@@ -63,7 +69,9 @@ public class BatchJobController {
             description = "Returns a bounded, newest-first list of job snapshots; an optional status filter "
                     + "accepts QUEUED/RUNNING/CANCELLING/COMPLETED/FAILED/CANCELLED, limit defaults to 20 and is clamped "
                     + "to 1..100, an empty registry or a filter that matches nothing answers 200 with an empty "
-                    + "data array (never 404), and an unknown status value answers 400 BAD_REQUEST")
+                    + "data array (never 404), and an unknown status value answers 400 BAD_REQUEST. Each element "
+                    + "carries the additive deadlineAt (createdAt + the effective deadline) when a bound applies, "
+                    + "and JOB_DEADLINE_EXCEEDED is distinct from EXECUTION_LEASE_EXPIRED")
     public ApiResponse<List<BatchHashJobResponse>> list(
             @RequestParam(required = false) JobStatus status,
             @RequestParam(defaultValue = "20") int limit) {
@@ -76,7 +84,12 @@ public class BatchJobController {
                     + "A RUNNING job carries an executionLeaseExpiresAt/lastHeartbeatAt lease that its "
                     + "worker renews before hashing each item; a job whose lease lapses is moved to FAILED "
                     + "with error EXECUTION_LEASE_EXPIRED, after which POST /api/v1/utils/jobs/{jobId}/retry "
-                    + "starts attempt+1. A DELETE on a RUNNING job moves it to CANCELLING, which the worker "
+                    + "starts attempt+1. A job submitted with deadlineSeconds (or bound by the configured "
+                    + "server default) also reports the additive deadlineAt = createdAt + effective deadline; "
+                    + "a job that passes it is moved to FAILED with error JOB_DEADLINE_EXCEEDED even while its "
+                    + "lease is live, completedItems reports the committed prefix and results stays null, and "
+                    + "the same retry starts attempt+1 with a fresh deadline and resumes at that prefix. A "
+                    + "DELETE on a RUNNING job moves it to CANCELLING, which the worker "
                     + "honours at its next checkpoint (completedItems stays 0 and results stay null while the job "
                     + "is CANCELLING); a CANCELLING job whose lease lapses is reaped straight to CANCELLED. "
                     + "Hashing is checkpointed per item: completedItems reports how many "
@@ -92,7 +105,8 @@ public class BatchJobController {
                     + "a RUNNING job is moved to CANCELLING and answers 200 with status CANCELLING, its worker stops "
                     + "at the next checkpoint and terminalizes CANCELLED (the lease reaper or the shutdown drain does "
                     + "it if the worker never returns). A repeated DELETE on a CANCELLING or CANCELLED job is "
-                    + "idempotent and returns the current snapshot, a COMPLETED/FAILED job returns "
+                    + "idempotent and returns the current snapshot, a CANCELLING job that also passes its "
+                    + "deadline still ends CANCELLED (a withdrawal beats a deadline), a COMPLETED/FAILED job returns "
                     + "409 JOB_CANCELLATION_CONFLICT, and an unknown or evicted id returns 404 JOB_NOT_FOUND")
     public ApiResponse<BatchHashJobResponse> cancel(@PathVariable String jobId) {
         return ApiResponse.success(jobService.cancel(jobId), "Job cancelled");

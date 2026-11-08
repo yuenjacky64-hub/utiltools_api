@@ -87,6 +87,13 @@ public class BatchHashJobService {
     /** Error recorded on a RUNNING attempt whose execution lease lapsed without a renewal. */
     public static final String EXECUTION_LEASE_EXPIRED = "EXECUTION_LEASE_EXPIRED";
 
+    /**
+     * Error recorded on a QUEUED or RUNNING attempt whose total-life deadline passed before the batch
+     * finished. Distinct from {@link #EXECUTION_LEASE_EXPIRED}: a live lease does not excuse a
+     * deadline, and the checkpoint prefix is kept so a retry resumes where the deadline cut in.
+     */
+    public static final String JOB_DEADLINE_EXCEEDED = "JOB_DEADLINE_EXCEEDED";
+
     /** Error recorded on a non-terminal job the {@code @PreDestroy} drain failed on the way down. */
     public static final String JOB_SHUTDOWN = "JOB_SHUTDOWN";
 
@@ -95,6 +102,9 @@ public class BatchHashJobService {
 
     /** Per-client ceiling on non-terminal jobs when the property is not configured. */
     static final int DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT = 20;
+
+    /** Upper bound on the configured default deadline, mirroring the request's 1..3600 range. */
+    private static final long MAX_DEADLINE_SECONDS = 3600;
 
     /** Hard ceiling on retained terminal job rows when the property is not configured. */
     static final int DEFAULT_MAX_RETAINED_JOBS = 1000;
@@ -145,7 +155,11 @@ public class BatchHashJobService {
     private final long executionReaperIntervalMs;
     private final long shutdownGraceSeconds;
     private final int maxActiveJobsPerClient;
+    /** Server-side default bound applied when a request omits {@code deadlineSeconds}; 0 disables it. */
+    private final long defaultDeadlineSeconds;
+
     private final int maxRetainedJobs;
+
     private final Clock clock;
 
     /**
@@ -213,6 +227,7 @@ public class BatchHashJobService {
             @Value("${utiltools.jobs.execution-reaper-interval-ms:5000}") long executionReaperIntervalMs,
             @Value("${utiltools.jobs.shutdown-grace-seconds:30}") long shutdownGraceSeconds,
             @Value("${utiltools.jobs.max-active-jobs-per-client:20}") int maxActiveJobsPerClient,
+            @Value("${utiltools.jobs.default-deadline-seconds:0}") long defaultDeadlineSeconds,
             @Value("${utiltools.jobs.max-retained-jobs:1000}") int maxRetainedJobs,
             Clock clock) {
         this.cryptoService = cryptoService;
@@ -242,6 +257,13 @@ public class BatchHashJobService {
             throw new IllegalArgumentException(
                     "utiltools.jobs.max-active-jobs-per-client must be positive, was " + maxActiveJobsPerClient);
         }
+        // 0 is legal and means "no server default"; anything outside 0..3600 would let a
+        // configuration value admit a deadline the request validator rejects, so it fails loudly.
+        if (defaultDeadlineSeconds < 0 || defaultDeadlineSeconds > MAX_DEADLINE_SECONDS) {
+            throw new IllegalArgumentException(
+                    "utiltools.jobs.default-deadline-seconds must be between 0 and 3600, was "
+                            + defaultDeadlineSeconds);
+        }
         // A non-positive cap would either evict every terminal row or disable retention entirely.
         if (maxRetainedJobs <= 0) {
             throw new IllegalArgumentException(
@@ -249,12 +271,28 @@ public class BatchHashJobService {
         }
         this.executionLeaseSeconds = executionLeaseSeconds;
         this.executionReaperIntervalMs = executionReaperIntervalMs;
+        this.defaultDeadlineSeconds = defaultDeadlineSeconds;
         this.shutdownGraceSeconds = shutdownGraceSeconds;
         this.maxActiveJobsPerClient = maxActiveJobsPerClient;
         this.maxRetainedJobs = maxRetainedJobs;
         this.clock = clock == null ? Clock.systemUTC() : clock;
         this.executor = new ThreadPoolExecutor(workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(queueCapacity), new ThreadPoolExecutor.AbortPolicy());
+    }
+
+    /**
+     * Test/compatibility overload: an explicit drain grace with auditing disabled. The parameter
+     * list is unchanged from before the retained-row cap and the configurable default deadline
+     * existed, so the cap keeps its default and deadlines are disabled ({@code 0}). Unannotated on
+     * purpose — Spring must keep selecting the {@code @Autowired} constructor above.
+     */
+    public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
+            long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
+            long executionReaperIntervalMs, long shutdownGraceSeconds, int maxActiveJobsPerClient,
+            Clock clock) {
+        this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
+                executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
+                maxActiveJobsPerClient, 0L, DEFAULT_MAX_RETAINED_JOBS, clock);
     }
 
     /**
@@ -308,19 +346,6 @@ public class BatchHashJobService {
     }
 
     /**
-     * Test/compatibility overload: an explicit drain grace with auditing disabled (the retained-row
-     * cap keeps its default). The parameter list is unchanged from before the cap existed.
-     */
-    public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
-            long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
-            long executionReaperIntervalMs, long shutdownGraceSeconds, int maxActiveJobsPerClient,
-            Clock clock) {
-        this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
-                executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
-                maxActiveJobsPerClient, DEFAULT_MAX_RETAINED_JOBS, clock, null);
-    }
-
-    /**
      * Test convenience: an explicit drain grace so a test can exercise the forced phase without
      * sleeping. The journal stays last, so {@code null} still means "auditing disabled".
      */
@@ -330,7 +355,7 @@ public class BatchHashJobService {
             Clock clock, AuditJournalService journal) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
-                maxActiveJobsPerClient, DEFAULT_MAX_RETAINED_JOBS, clock);
+                maxActiveJobsPerClient, 0L, DEFAULT_MAX_RETAINED_JOBS, clock);
         this.journal = journal;
     }
 
@@ -344,7 +369,22 @@ public class BatchHashJobService {
             int maxRetainedJobs, Clock clock, AuditJournalService journal) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
-                maxActiveJobsPerClient, maxRetainedJobs, clock);
+                maxActiveJobsPerClient, 0L, maxRetainedJobs, clock);
+        this.journal = journal;
+    }
+
+    /**
+     * Test convenience: an explicit server default deadline and journal, so a test can exercise the
+     * defaulted and disabled bound without a Spring context. Unannotated on purpose — Spring must keep
+     * selecting the {@code @Autowired} constructor above.
+     */
+    public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
+            long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
+            long executionReaperIntervalMs, long shutdownGraceSeconds, int maxActiveJobsPerClient,
+            long defaultDeadlineSeconds, Clock clock, AuditJournalService journal) {
+        this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
+                executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
+                maxActiveJobsPerClient, defaultDeadlineSeconds, DEFAULT_MAX_RETAINED_JOBS, clock);
         this.journal = journal;
     }
 
@@ -395,7 +435,11 @@ public class BatchHashJobService {
         String key = (request.idempotencyKey() == null || request.idempotencyKey().isBlank())
                 ? null
                 : request.idempotencyKey();
-        String fingerprint = fingerprint(request.algorithm(), request.items(), request.secretKey());
+        // Resolved once, before the registry section: the bound is part of the job's identity, so it
+        // must be the same value the fingerprint is computed from and the job is stamped with.
+        long effectiveDeadlineSeconds = resolveEffectiveDeadline(request.deadlineSeconds());
+        String fingerprint = fingerprint(request.algorithm(), request.items(), request.secretKey(),
+                effectiveDeadlineSeconds);
 
         synchronized (registryLock) {
             if (key != null) {
@@ -433,7 +477,7 @@ public class BatchHashJobService {
 
             MutableJob job = new MutableJob(UUID.randomUUID().toString(), key,
                     request.algorithm(), request.items(), request.secretKey(), fingerprint, Instant.now(clock),
-                    quotaKey, maxAttempts);
+                    quotaKey, maxAttempts, effectiveDeadlineSeconds);
             // Reserve before publishing: the increment and the registrations below share this
             // registryLock section, so the quota can neither be bypassed nor double-counted.
             activeJobsByClient.merge(quotaKey, 1, Integer::sum);
@@ -490,6 +534,30 @@ public class BatchHashJobService {
 
     private static String normalizeClientKey(String clientKey) {
         return (clientKey == null || clientKey.isBlank()) ? ClientKeyResolver.UNKNOWN_CLIENT : clientKey;
+    }
+
+    /**
+     * The bound this submission is charged against: the per-request value when present, otherwise the
+     * configured server default. {@code 0} means "no bound", which is exactly today's behaviour.
+     *
+     * <p>The per-request range is re-checked here rather than only on the record: bean validation
+     * guards the HTTP route, but a direct caller (a test, an internal scheduler) never passes through
+     * it, and a value of {@code 0} would otherwise short-circuit this method into "unbounded" instead
+     * of failing. Rejecting it loudly keeps one meaning for {@code 0} - the configured default - and
+     * never turns a malformed request into a silently immortal job.</p>
+     *
+     * @throws IllegalArgumentException when the request value is outside {@code 1..3600}
+     */
+    private long resolveEffectiveDeadline(Integer requestDeadlineSeconds) {
+        if (requestDeadlineSeconds == null) {
+            return defaultDeadlineSeconds;
+        }
+        long requested = requestDeadlineSeconds.longValue();
+        if (requested < 1 || requested > MAX_DEADLINE_SECONDS) {
+            throw new IllegalArgumentException(
+                    "deadlineSeconds must be between 1 and 3600, was " + requested);
+        }
+        return requested;
     }
 
     /** Decrements (and removes at zero) a client's counter entry. Caller must hold {@code registryLock}. */
@@ -627,6 +695,11 @@ public class BatchHashJobService {
                 job.results = null;
                 job.lastHeartbeatAt = null; // the new attempt stamps its own lease at admission
                 job.executionLeaseExpiresAt = null;
+                // A fresh window measured from the retry, not from createdAt: a creation-based bound
+                // would re-expire the instant the requeued attempt was admitted. Zero stays unbounded.
+                job.deadlineAt = job.deadlineSeconds > 0
+                        ? Instant.now(clock).plusSeconds(job.deadlineSeconds)
+                        : null;
                 job.attemptRequestIds.put(admittedAttempt, requestId);
                 try {
                     executor.execute(() -> executeAttempt(job.jobId, admittedAttempt));
@@ -781,6 +854,76 @@ public class BatchHashJobService {
         if (released) {
             releaseQuota(job.clientKey); // after the monitor block (REQ-08)
             enforceRetainedJobCap(); // outside the monitor: registryLock -> job monitor, never reverse
+        }
+        return true;
+    }
+
+    /**
+     * True when {@code job} carries a total-life bound that has been reached at {@code now}. The
+     * boundary matches the lease comparison ({@code !expiry.isAfter(now)}): a job is out of time
+     * <em>at</em> its {@code deadlineAt}, not only after it. Callers pass the clock instant.
+     */
+    private static boolean deadlinePassed(MutableJob job, Instant now) {
+        return job.deadlineAt != null && !job.deadlineAt.isAfter(now);
+    }
+
+    /**
+     * True when {@code job} holds an execution lease that expired at or before {@code now}. Extracted
+     * so the lease path keeps byte-identical semantics for jobs without a deadline.
+     */
+    private static boolean leaseLapsed(MutableJob job, Instant now) {
+        return job.executionLeaseExpiresAt != null && !job.executionLeaseExpiresAt.isAfter(now);
+    }
+
+    /**
+     * Writes the single non-terminal -> {@code FAILED} / {@link #JOB_DEADLINE_EXCEEDED} transition.
+     * The caller must already hold the job monitor, so the terminal write, the attempt upsert, the
+     * audit close and the reservation claim can never be split by a concurrent writer.
+     *
+     * <p>Deadline failure is not cancellation: the committed checkpoint prefix is deliberately left
+     * alone (a retry resumes at that index) while {@code results} stays null, so a job that ran out of
+     * time never publishes a partial digest. The lease is cleared because the attempt is over.</p>
+     *
+     * @return {@code true} when this call claimed the quota reservation; the caller releases the slot
+     *         after leaving the monitor section
+     */
+    private boolean failDeadlineLocked(MutableJob job, int generation, Instant now) {
+        // A QUEUED generation was never admitted, so no worker is carrying its request id any more:
+        // drop the mapping here so a job that expired in the queue retains no correlation ids of
+        // generations that can never run (a RUNNING generation is cleaned by its own worker exit).
+        if (job.status == JobStatus.QUEUED) {
+            job.attemptRequestIds.remove(generation);
+        }
+        job.status = JobStatus.FAILED;
+        job.error = JOB_DEADLINE_EXCEEDED;
+        job.completedAt = now;
+        job.results = null; // no partial digest is ever published for a job that ran out of time
+        job.executionLeaseExpiresAt = null;
+        job.lastHeartbeatAt = null;
+        recordAttempt(job, generation, JobStatus.FAILED, job.startedAt, now, JOB_DEADLINE_EXCEEDED);
+        // Closes the entry this attempt opened (a no-op for a QUEUED job that never admitted) and drops
+        // its id, so the worker's own late outcome finds nothing left to close: one journal row.
+        failQuietly(job, generation, JOB_DEADLINE_EXCEEDED);
+        return job.quotaReserved.compareAndSet(true, false);
+    }
+
+    /**
+     * Terminalizes a RUNNING job whose deadline passed outside the monitor, releasing the quota slot
+     * after the section. Mirrors {@link #finalizeCancelled}.
+     *
+     * @return {@code true} when this call wrote the terminal status, {@code false} when the attempt was
+     *         already settled (or is CANCELLING, whose withdrawal keeps priority)
+     */
+    private boolean finalizeDeadline(MutableJob job, int generation) {
+        boolean released;
+        synchronized (job) {
+            if (job.attempt != generation || job.status != JobStatus.RUNNING) {
+                return false; // cancelled, retried or reaped while the item was being hashed
+            }
+            released = failDeadlineLocked(job, generation, Instant.now(clock));
+        }
+        if (released) {
+            releaseQuota(job.clientKey); // after the monitor block (REQ-08)
         }
         return true;
     }
@@ -955,12 +1098,21 @@ public class BatchHashJobService {
     }
 
     /**
-     * Fails every RUNNING attempt whose execution lease expired at or before {@code now}, exactly
-     * once per attempt. QUEUED jobs hold no lease, and terminal jobs (including an already reaped
-     * FAILED job) are skipped, so a second pass over the same {@code now} reaps nothing and writes
-     * nothing. The reaped attempt keeps its attempt number, so the worker that stalled inside
-     * {@code hash} fails its status fence when it finally returns and cannot overwrite this
-     * snapshot; {@link #retry(String)} then starts {@code attempt + 1}.
+     * Reaps every non-terminal attempt whose execution lease lapsed at or before {@code now} and every
+     * non-terminal attempt whose total-life deadline passed at or before {@code now}, exactly once per
+     * attempt. This is the backstop for work no worker ever reaches: a QUEUED job that was never
+     * admitted fails on its deadline even though it holds no lease, and a RUNNING job fails on its
+     * deadline <em>even while its execution lease is still live</em>, so a worker that keeps renewing
+     * cannot hash a large batch indefinitely.
+     *
+     * <p>Precedence is fixed: a CANCELLING job is terminalized {@code CANCELLED} (the operator's
+     * withdrawal beats both the deadline and the lease), then a RUNNING job is failed on its deadline
+     * before its lease is considered, then a QUEUED job is failed on its deadline. Every branch leaves
+     * the status terminal (or the job untouched), so a second pass over the same {@code now} reaps
+     * nothing and writes no attempt row, no journal row and no quota release. The reaped attempt keeps
+     * its attempt number, so the worker that stalled inside {@code hash} fails its status fence when it
+     * finally returns and cannot overwrite this snapshot; {@link #retry(String)} then starts
+     * {@code attempt + 1}.
      *
      * <p>The pass is clock-free, holds one job monitor at a time and never removes a job, so monitor
      * hold time stays a function of the scalar writes below and the pass cannot deadlock with the
@@ -974,32 +1126,49 @@ public class BatchHashJobService {
         for (MutableJob job : jobs.values()) {
             boolean released = false;
             synchronized (job) {
-                if (job.executionLeaseExpiresAt == null || job.executionLeaseExpiresAt.isAfter(now)) {
-                    continue; // no lease at all, or the lease is still live
-                }
                 if (job.status == JobStatus.CANCELLING) {
-                    // A pending cancellation whose worker stalled: honour the request rather than
-                    // overwriting it with FAILED, so the caller-visible outcome stays CANCELLED.
+                    if (!deadlinePassed(job, now) && !leaseLapsed(job, now)) {
+                        continue; // neither bound reached: leave the pending withdrawal to its worker
+                    }
+                    // A pending cancellation whose worker stalled (or whose bound passed): honour the
+                    // request rather than overwriting it with FAILED, so the outcome stays CANCELLED.
                     released = finalizeCancelledLocked(job, job.attempt);
                     reaped++;
                 } else if (job.status == JobStatus.RUNNING) {
-                    job.status = JobStatus.FAILED;
-                    job.error = EXECUTION_LEASE_EXPIRED;
-                    job.completedAt = now;
-                    job.results = null;
-                    job.executionLeaseExpiresAt = null;
-                    job.lastHeartbeatAt = null;
-                    recordAttempt(job, job.attempt, JobStatus.FAILED, job.startedAt, now,
-                            EXECUTION_LEASE_EXPIRED);
-                    // Close the audit entry the stalled worker opened: the fence keeps that worker from
-                    // writing its own (late) outcome, so this is the only terminal write for the attempt.
-                    failQuietly(job, job.attempt, EXECUTION_LEASE_EXPIRED);
-                    // Claimed in the same section as the terminal write; a late worker fenced by this
-                    // reap never reaches its own claim, so the slot is released exactly once.
-                    released = job.quotaReserved.compareAndSet(true, false);
+                    if (deadlinePassed(job, now)) {
+                        // Total-execution bound reached: this wins over a still-live lease, because a
+                        // worker that renews forever would otherwise hash the batch indefinitely.
+                        released = failDeadlineLocked(job, job.attempt, now);
+                        reaped++;
+                    } else if (leaseLapsed(job, now)) {
+                        job.status = JobStatus.FAILED;
+                        job.error = EXECUTION_LEASE_EXPIRED;
+                        job.completedAt = now;
+                        job.results = null;
+                        job.executionLeaseExpiresAt = null;
+                        job.lastHeartbeatAt = null;
+                        recordAttempt(job, job.attempt, JobStatus.FAILED, job.startedAt, now,
+                                EXECUTION_LEASE_EXPIRED);
+                        // Close the audit entry the stalled worker opened: the fence keeps that worker
+                        // from writing its own (late) outcome, so this is the only terminal write for
+                        // the attempt.
+                        failQuietly(job, job.attempt, EXECUTION_LEASE_EXPIRED);
+                        // Claimed in the same section as the terminal write; a late worker fenced by
+                        // this reap never reaches its own claim, so the slot is released exactly once.
+                        released = job.quotaReserved.compareAndSet(true, false);
+                        reaped++;
+                    }
+                } else if (job.status == JobStatus.QUEUED) {
+                    if (!deadlinePassed(job, now)) {
+                        continue; // still waiting inside its bound
+                    }
+                    // Queue-wait bound reached on a job no worker ever admitted: it opened no audit
+                    // entry (failQuietly is then a no-op), yet the attempt row is recorded so a retry
+                    // is attempt 2 resuming from index 0.
+                    released = failDeadlineLocked(job, job.attempt, now);
                     reaped++;
                 } else {
-                    continue; // QUEUED holds no lease; terminal jobs are already settled
+                    continue; // terminal jobs are already settled
                 }
             }
             if (released) {
@@ -1136,7 +1305,8 @@ public class BatchHashJobService {
                     job.attempt, job.maxAttempts, List.copyOf(job.attemptHistory),
                     running ? job.executionLeaseExpiresAt : null,
                     running ? job.lastHeartbeatAt : null,
-                    completedItems);
+                    completedItems,
+                    job.deadlineAt); // projected for every status: null when the job has no bound
         }
     }
 
@@ -1154,27 +1324,44 @@ public class BatchHashJobService {
 
     private void executeJob(MutableJob job, int generation) {
         try {
+            boolean deadlineExpired = false;
+            boolean admissionReleased = false;
             synchronized (job) {
                 if (job.status != JobStatus.QUEUED || job.attempt != generation) {
                     return; // fenced: a superseded generation (or a cancelled/retried job) writes nothing
                 }
                 Instant now = Instant.now(clock);
-                job.status = JobStatus.RUNNING;
-                job.startedAt = now;
-                job.lastHeartbeatAt = now;
-                job.executionLeaseExpiresAt = now.plusSeconds(executionLeaseSeconds);
-                // The attempt continues at the checkpoint's next index; recorded before the audit
-                // descriptor is built so both attempt history and journal agree on where it started.
-                int resumedFrom = job.checkpoint.size();
-                job.attemptResumedFrom.put(generation, resumedFrom);
-                // Admission is the moment the attempt "starts": install the submitter's correlation
-                // id on this (possibly reused) pool thread and open exactly one audit entry here.
-                RequestContext.set(job.attemptRequestIds.get(generation));
-                String entryId = beginQuietly(job, generation);
-                if (entryId != null) {
-                    job.attemptAuditEntryIds.put(generation, entryId);
+                if (deadlinePassed(job, now)) {
+                    // Queue-wait expiry: the bound passed before a worker admitted the job. It fails
+                    // here exactly as the reaper would fail it - no audit entry is opened and no item
+                    // is hashed, so completedItems stays 0 - and the quota is released below.
+                    deadlineExpired = true;
+                    admissionReleased = failDeadlineLocked(job, generation, now);
+                } else {
+                    job.status = JobStatus.RUNNING;
+                    job.startedAt = now;
+                    job.lastHeartbeatAt = now;
+                    job.executionLeaseExpiresAt = now.plusSeconds(executionLeaseSeconds);
+                    // The attempt continues at the checkpoint's next index; recorded before the audit
+                    // descriptor is built so both attempt history and journal agree where it started.
+                    int resumedFrom = job.checkpoint.size();
+                    job.attemptResumedFrom.put(generation, resumedFrom);
+                    // Admission is the moment the attempt "starts": install the submitter's
+                    // correlation id on this (possibly reused) pool thread and open exactly one audit
+                    // entry here.
+                    RequestContext.set(job.attemptRequestIds.get(generation));
+                    String entryId = beginQuietly(job, generation);
+                    if (entryId != null) {
+                        job.attemptAuditEntryIds.put(generation, entryId);
+                    }
+                    recordAttempt(job, generation, JobStatus.RUNNING, job.startedAt, null, null);
                 }
-                recordAttempt(job, generation, JobStatus.RUNNING, job.startedAt, null, null);
+            }
+            if (deadlineExpired) {
+                if (admissionReleased) {
+                    releaseQuota(job.clientKey); // after the monitor block (REQ-08)
+                }
+                return;
             }
             try {
                 int resumedFrom = job.attemptResumedFrom.getOrDefault(generation, 0);
@@ -1204,26 +1391,34 @@ public class BatchHashJobService {
                             // the status half of this fence is what stops a late COMPLETED write.
                             return; // fenced: the attempt was reaped while hashing
                         }
-                        if (job.checkpoint.size() != job.items.size()) {
-                            // Unreachable through input; surfaces as an ordinary FAILED job rather than
-                            // publishing a short result list.
-                            throw new IllegalStateException("checkpoint prefix does not cover the batch");
+                        Instant now = Instant.now(clock);
+                        if (deadlinePassed(job, now)) {
+                            // The bound wins over a last-item completion: the committed prefix stays as
+                            // the retry resume point and results stay null, so no partial digest is
+                            // published for a job that ran out of time.
+                            released = failDeadlineLocked(job, generation, now);
+                        } else {
+                            if (job.checkpoint.size() != job.items.size()) {
+                                // Unreachable through input; surfaces as an ordinary FAILED job rather
+                                // than publishing a short result list.
+                                throw new IllegalStateException("checkpoint prefix does not cover the batch");
+                            }
+                            job.results = List.copyOf(job.checkpoint); // the full ordered prefix, input order
+                            job.checkpoint.clear(); // results own the values; retained state stays bounded
+                            job.error = null;
+                            job.status = JobStatus.COMPLETED;
+                            job.completedAt = Instant.now(clock);
+                            job.lastHeartbeatAt = null;
+                            job.executionLeaseExpiresAt = null;
+                            recordAttempt(job, generation, JobStatus.COMPLETED, job.startedAt,
+                                    job.completedAt, null);
+                            // Same section that wrote the terminal status: the audit outcome can never
+                            // disagree with the snapshot, and a journal fault cannot change it.
+                            succeedQuietly(job, generation, "COMPLETED");
+                            // Claimed in the same section as the terminal write: the slot covering this
+                            // attempt is released exactly once, by the writer that terminated it.
+                            released = job.quotaReserved.compareAndSet(true, false);
                         }
-                        job.results = List.copyOf(job.checkpoint); // the full ordered prefix, input order
-                        job.checkpoint.clear(); // results now own the values; retained state stays bounded
-                        job.error = null;
-                        job.status = JobStatus.COMPLETED;
-                        job.completedAt = Instant.now(clock);
-                        job.lastHeartbeatAt = null;
-                        job.executionLeaseExpiresAt = null;
-                        recordAttempt(job, generation, JobStatus.COMPLETED, job.startedAt, job.completedAt,
-                                null);
-                        // Same section that wrote the terminal status: the audit outcome can never
-                        // disagree with the snapshot, and a journal fault cannot change it.
-                        succeedQuietly(job, generation, "COMPLETED");
-                        // Claimed in the same section as the terminal write: the slot covering this
-                        // attempt is released exactly once, by the writer that terminated it.
-                        released = job.quotaReserved.compareAndSet(true, false);
                     }
                 }
                 if (released) {
@@ -1285,6 +1480,7 @@ public class BatchHashJobService {
      */
     private boolean renewLease(MutableJob job, int generation) {
         boolean cancelPending = false;
+        boolean deadlinePending = false;
         synchronized (job) {
             if (job.attempt != generation) {
                 return false;
@@ -1293,6 +1489,10 @@ public class BatchHashJobService {
                 cancelPending = true; // terminalized below, outside this monitor section
             } else if (job.status != JobStatus.RUNNING) {
                 return false;
+            } else if (deadlinePassed(job, Instant.now(clock))) {
+                // The total-life bound wins over a renewal: the lease is not re-armed, so the attempt
+                // stops hashing at the index it had committed and the prefix is kept for a retry.
+                deadlinePending = true; // terminalized below, outside this monitor section
             } else {
                 job.lastHeartbeatAt = Instant.now(clock);
                 job.executionLeaseExpiresAt = job.lastHeartbeatAt.plusSeconds(executionLeaseSeconds);
@@ -1301,6 +1501,8 @@ public class BatchHashJobService {
         }
         if (cancelPending) {
             finalizeCancelled(job, generation);
+        } else if (deadlinePending) {
+            finalizeDeadline(job, generation);
         }
         return false;
     }
@@ -1501,10 +1703,11 @@ public class BatchHashJobService {
         private final List<HashResponse> checkpoint;
         private final Instant lastHeartbeatAt;
         private final Instant executionLeaseExpiresAt;
+        private final Instant deadlineAt;
 
         private FailedState(int attempt, Instant startedAt, Instant completedAt, String error,
                 List<HashResponse> results, List<HashResponse> checkpoint, Instant lastHeartbeatAt,
-                Instant executionLeaseExpiresAt) {
+                Instant executionLeaseExpiresAt, Instant deadlineAt) {
             this.attempt = attempt;
             this.startedAt = startedAt;
             this.completedAt = completedAt;
@@ -1513,11 +1716,13 @@ public class BatchHashJobService {
             this.checkpoint = checkpoint;
             this.lastHeartbeatAt = lastHeartbeatAt;
             this.executionLeaseExpiresAt = executionLeaseExpiresAt;
+            this.deadlineAt = deadlineAt;
         }
 
         private static FailedState of(MutableJob job) {
             return new FailedState(job.attempt, job.startedAt, job.completedAt, job.error, job.results,
-                    List.copyOf(job.checkpoint), job.lastHeartbeatAt, job.executionLeaseExpiresAt);
+                    List.copyOf(job.checkpoint), job.lastHeartbeatAt, job.executionLeaseExpiresAt,
+                    job.deadlineAt);
         }
 
         private void restore(MutableJob job) {
@@ -1531,6 +1736,7 @@ public class BatchHashJobService {
             job.checkpoint.addAll(checkpoint);
             job.lastHeartbeatAt = lastHeartbeatAt;
             job.executionLeaseExpiresAt = executionLeaseExpiresAt;
+            job.deadlineAt = deadlineAt; // a refused requeue must not leave a future deadline behind
         }
     }
 
@@ -1545,8 +1751,15 @@ public class BatchHashJobService {
      * {@code SHA256}/{@code SHA-256} style aliases, with {@code null} and blank secrets treated as
      * equivalent. An unsupported algorithm is <em>not</em> rejected here — it keeps its trimmed
      * upper-cased spelling so it still reaches the worker and becomes a {@code FAILED} job.</p>
+     *
+     * <p>The effective deadline is part of a request's identity, appended <em>after</em> the secret
+     * key and only when it is enabled, so the same idempotency key with a different bound conflicts
+     * while deadline-free traffic canonicalises byte-identically to before. The added bytes are a
+     * presence marker plus a length-prefixed field, which no deadline-free encoding can produce, so
+     * the encoding stays injective.</p>
      */
-    private static String fingerprint(String algorithm, List<String> items, String secretKey) {
+    private static String fingerprint(String algorithm, List<String> items, String secretKey,
+            long effectiveDeadlineSeconds) {
         String canonicalAlgorithm = normalizeAlgorithmForFingerprint(algorithm);
         boolean secretPresent = secretKey != null && !secretKey.isBlank();
         StringBuilder canonical = new StringBuilder(96 + items.size() * 24);
@@ -1557,6 +1770,10 @@ public class BatchHashJobService {
         }
         canonical.append(secretPresent ? '1' : '0');
         appendField(canonical, secretPresent ? secretKey : "");
+        if (effectiveDeadlineSeconds > 0) {
+            canonical.append('1');
+            appendField(canonical, Long.toString(effectiveDeadlineSeconds));
+        }
         byte[] canonicalBytes = canonical.toString().getBytes(StandardCharsets.UTF_8);
         return HexFormat.of().formatHex(sha256(canonicalBytes));
     }
@@ -1597,6 +1814,8 @@ public class BatchHashJobService {
         private final String clientKey;
         private final Instant createdAt;
         private final int maxAttempts;
+        /** Resolved total-life bound in seconds; {@code 0} means "unbounded" (today's behaviour). */
+        private final long deadlineSeconds;
         /**
          * True while this job holds a slot in {@code activeJobsByClient}. Flipped to true when the
          * reservation is taken and claimed ({@code compareAndSet(true, false)}) in the same monitor
@@ -1623,11 +1842,17 @@ public class BatchHashJobService {
         private Instant completedAt;
         private Instant lastHeartbeatAt;
         private Instant executionLeaseExpiresAt;
+        /**
+         * Absolute total-life bound, frozen at submit ({@code createdAt + deadlineSeconds}) and restarted
+         * at retry. {@code null} when the job is unbounded, so no deadline check ever fires.
+         */
+        private Instant deadlineAt;
         private List<HashResponse> results;
         private String error;
 
         private MutableJob(String jobId, String idempotencyKey, String algorithm, List<String> items,
-                String secretKey, String fingerprint, Instant createdAt, String clientKey, int maxAttempts) {
+                String secretKey, String fingerprint, Instant createdAt, String clientKey, int maxAttempts,
+                long deadlineSeconds) {
             this.jobId = jobId;
             this.idempotencyKey = idempotencyKey;
             this.algorithm = algorithm;
@@ -1637,6 +1862,8 @@ public class BatchHashJobService {
             this.createdAt = createdAt;
             this.clientKey = clientKey;
             this.maxAttempts = maxAttempts;
+            this.deadlineSeconds = deadlineSeconds;
+            this.deadlineAt = deadlineSeconds > 0 ? createdAt.plusSeconds(deadlineSeconds) : null;
         }
     }
 }
