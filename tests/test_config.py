@@ -212,3 +212,33 @@ def test_fingerprint_config_defaults_and_validation(
             maintainer_root=tmp_path,
             env={"MAINTAINER_FINGERPRINT_QUARANTINE_SEC": "soon"},
         )
+
+
+def test_stale_knobs_default_and_validate(tmp_path: Path) -> None:
+    """DOD-05 / REQ-02: ``POLL_STALE_TIMEOUT_SEC`` default, env and validation."""
+
+    config = MaintainerConfig()
+    assert config.stale_timeout_sec == 300.0
+    assert isinstance(config.stale_timeout_sec, float)
+    assert config.stale_recovery_grace_sec == 60.0
+
+    env = {
+        "MAINTAINER_STALE_TIMEOUT_SEC": "120",
+        "MAINTAINER_STALE_RECOVERY_GRACE_SEC": "30",
+    }
+    loaded = MaintainerConfig.load(maintainer_root=tmp_path, env=env)
+    assert loaded.stale_timeout_sec == 120.0
+    assert loaded.stale_recovery_grace_sec == 30.0
+
+    # ``0`` is a legal grace: recover as soon as the timeout is breached.
+    assert MaintainerConfig(stale_recovery_grace_sec=0).stale_recovery_grace_sec == 0.0
+
+    with pytest.raises(ValueError, match="stale_timeout_sec must be > 0"):
+        MaintainerConfig(stale_timeout_sec=0.0)
+    with pytest.raises(ValueError, match="stale_recovery_grace_sec must be >= 0"):
+        MaintainerConfig(stale_recovery_grace_sec=-1.0)
+    with pytest.raises(ValueError, match="must be a number"):
+        MaintainerConfig.load(
+            maintainer_root=tmp_path,
+            env={"MAINTAINER_STALE_TIMEOUT_SEC": "five minutes"},
+        )

@@ -33,6 +33,10 @@ DEFAULT_BLOCKED_BACKOFF_BASE_SEC = 0.1
 DEFAULT_BLOCKED_BACKOFF_MAX_SEC = 30.0
 DEFAULT_MAX_FINGERPRINT_BUCKETS = 64
 
+# Stale-task state machine thresholds (both in the unit the clock reports).
+DEFAULT_STALE_TIMEOUT_SEC = 300.0
+DEFAULT_STALE_RECOVERY_GRACE_SEC = 60.0
+
 DEFAULT_PRIMARY_CLI: str | None = None
 DEFAULT_PRIMARY_MODEL: str | None = None
 DEFAULT_SECONDARY_CLI: str | None = None
@@ -136,6 +140,8 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
             "quarantine_sweep_interval_sec",
             "blocked_backoff_base_sec",
             "blocked_backoff_max_sec",
+            "stale_timeout_sec",
+            "stale_recovery_grace_sec",
         ):
             if isinstance(value, bool):
                 raise ValueError(f"{key} must be a number")
@@ -191,6 +197,8 @@ class MaintainerConfig:
     blocked_backoff_base_sec: float = DEFAULT_BLOCKED_BACKOFF_BASE_SEC
     blocked_backoff_max_sec: float = DEFAULT_BLOCKED_BACKOFF_MAX_SEC
     max_fingerprint_buckets: int = DEFAULT_MAX_FINGERPRINT_BUCKETS
+    stale_timeout_sec: float = DEFAULT_STALE_TIMEOUT_SEC
+    stale_recovery_grace_sec: float = DEFAULT_STALE_RECOVERY_GRACE_SEC
 
     def __post_init__(self) -> None:
         interval = self.prioritization_aging_interval_ms
@@ -238,6 +246,20 @@ class MaintainerConfig:
         buckets = self.max_fingerprint_buckets
         if not isinstance(buckets, int) or isinstance(buckets, bool) or buckets < 1:
             raise ValueError("max_fingerprint_buckets must be >= 1")
+        stale_timeout = self.stale_timeout_sec
+        if (
+            isinstance(stale_timeout, bool)
+            or not isinstance(stale_timeout, (int, float))
+            or stale_timeout <= 0
+        ):
+            raise ValueError("stale_timeout_sec must be > 0")
+        stale_grace = self.stale_recovery_grace_sec
+        if (
+            isinstance(stale_grace, bool)
+            or not isinstance(stale_grace, (int, float))
+            or stale_grace < 0
+        ):
+            raise ValueError("stale_recovery_grace_sec must be >= 0")
 
     @property
     def aging_threshold_seconds(self) -> float:
