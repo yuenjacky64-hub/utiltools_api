@@ -1,5 +1,8 @@
 package com.example.utiltools.json;
 
+import com.example.utiltools.json.dto.JsonDiffDetail;
+import com.example.utiltools.json.dto.JsonDiffRequest;
+import com.example.utiltools.json.dto.JsonDiffResponse;
 import com.example.utiltools.json.dto.JsonFlattenRequest;
 import com.example.utiltools.json.dto.JsonFromCsvRequest;
 import com.example.utiltools.json.dto.JsonFromCsvResponse;
@@ -987,6 +990,158 @@ class JsonServiceTest {
                     .extracting(ConstraintViolation::getMessage)
                     .containsExactly("patch content is required");
             assertThat(validator.validate(new JsonMergePatchRequest("{}", "{}"))).isEmpty();
+        }
+    }
+
+    // ---------------------------------------------------------------- JSON Diff
+
+    @Test
+    @DisplayName("Should diff nested objects reporting added, removed and changed paths")
+    void shouldDiffNestedObjectsReportingAddedRemovedAndChanged() {
+        JsonDiffResponse response = jsonService.diff(new JsonDiffRequest(
+                "{\"a\":1,\"b\":{\"c\":2,\"e\":{\"x\":1}},\"g\":\"keep\"}",
+                "{\"a\":1,\"b\":{\"c\":5},\"f\":true}"));
+
+        assertThat(response.added()).containsExactly("f");
+        assertThat(response.removed()).containsExactly("b.e", "g");
+        assertThat(response.changed()).containsOnlyKeys("b.c", "b.e", "g", "f");
+        assertThat(response.summary()).isEqualTo("1 added, 2 removed, 1 changed");
+    }
+
+    @Test
+    @DisplayName("Should diff arrays by index and report out-of-range elements")
+    void shouldDiffArraysByIndexAndReportOutOfRangeElements() {
+        JsonDiffResponse shrunk = jsonService.diff(new JsonDiffRequest(
+                "{\"d\":[1,2,3]}", "{\"d\":[1,9]}"));
+
+        assertThat(shrunk.added()).isEmpty();
+        assertThat(shrunk.removed()).containsExactly("d[2]");
+        assertThat(shrunk.changed().get("d[1]"))
+                .isEqualTo(new JsonDiffDetail("d[1]", "2", "9", JsonDiffDetail.CHANGED));
+        assertThat(shrunk.summary()).isEqualTo("0 added, 1 removed, 1 changed");
+
+        JsonDiffResponse grown = jsonService.diff(new JsonDiffRequest(
+                "{\"d\":[1]}", "{\"d\":[1,2]}"));
+
+        assertThat(grown.added()).containsExactly("d[1]");
+        assertThat(grown.removed()).isEmpty();
+        assertThat(grown.summary()).isEqualTo("1 added, 0 removed, 0 changed");
+    }
+
+    @Test
+    @DisplayName("Should report no changes for identical documents")
+    void shouldReportNoChangesForIdenticalDocuments() {
+        JsonDiffResponse response = jsonService.diff(new JsonDiffRequest(
+                "{\"a\":[1,{\"b\":null}],\"c\":\"x\"}", "{\"c\":\"x\",\"a\":[1,{\"b\":null}]}"));
+
+        assertThat(response.added()).isEmpty();
+        assertThat(response.removed()).isEmpty();
+        assertThat(response.changed()).isEmpty();
+        assertThat(response.summary()).isEqualTo("No differences found");
+    }
+
+    @Test
+    @DisplayName("Should report a scalar or type mismatch of the whole document at the root sentinel")
+    void shouldReportRootSentinelForScalarAndTypeMismatch() {
+        JsonDiffResponse scalars = jsonService.diff(new JsonDiffRequest("1", "2"));
+
+        assertThat(scalars.added()).isEmpty();
+        assertThat(scalars.removed()).isEmpty();
+        assertThat(scalars.changed()).containsOnlyKeys("$");
+        assertThat(scalars.changed().get("$"))
+                .isEqualTo(new JsonDiffDetail("$", "1", "2", JsonDiffDetail.CHANGED));
+        assertThat(scalars.summary()).isEqualTo("0 added, 0 removed, 1 changed");
+
+        JsonDiffResponse types = jsonService.diff(new JsonDiffRequest("{\"a\":1}", "[1]"));
+
+        assertThat(types.changed()).containsOnlyKeys("$");
+        assertThat(types.changed().get("$").oldValue()).isEqualTo("{\"a\":1}");
+        assertThat(types.changed().get("$").newValue()).isEqualTo("[1]");
+    }
+
+    @Test
+    @DisplayName("Should render dotted member names in brackets so paths stay unambiguous")
+    void shouldRenderDottedMemberNamesInBracketsSoPathsStayUnambiguous() {
+        JsonDiffResponse response = jsonService.diff(new JsonDiffRequest(
+                "{\"x.y\":1,\"a[0]\":2,\"z\":{\"p'q\":3}}", "{\"x.y\":9,\"a[0]\":8,\"z\":{\"p'q\":7}}"));
+
+        assertThat(response.changed())
+                .containsOnlyKeys("['x.y']", "['a[0]']", "z['p\\'q']");
+        assertThat(response.changed().get("['x.y']").oldValue()).isEqualTo("1");
+        assertThat(response.changed().get("['x.y']").newValue()).isEqualTo("9");
+        assertThat(response.changed().get("z['p\\'q']").changeType()).isEqualTo(JsonDiffDetail.CHANGED);
+        assertThat(response.summary()).isEqualTo("0 added, 0 removed, 3 changed");
+    }
+
+    @Test
+    @DisplayName("Should carry path, old value, new value and change type for every detail")
+    void shouldCarryOldAndNewValuesAndChangeTypeForEveryDetail() {
+        JsonDiffResponse response = jsonService.diff(new JsonDiffRequest(
+                "{\"keep\":1,\"gone\":{\"k\":[1]},\"swap\":true}", "{\"keep\":1,\"fresh\":null,\"swap\":\"yes\"}"));
+
+        assertThat(response.changed().get("gone"))
+                .isEqualTo(new JsonDiffDetail("gone", "{\"k\":[1]}", null, JsonDiffDetail.REMOVED));
+        assertThat(response.changed().get("fresh"))
+                .isEqualTo(new JsonDiffDetail("fresh", null, "null", JsonDiffDetail.ADDED));
+        assertThat(response.changed().get("swap"))
+                .isEqualTo(new JsonDiffDetail("swap", "true", "\"yes\"", JsonDiffDetail.CHANGED));
+        response.changed().forEach((path, detail) -> assertThat(detail.path()).isEqualTo(path));
+        assertThat(response.summary()).isEqualTo("1 added, 1 removed, 1 changed");
+    }
+
+    @Test
+    @DisplayName("Should reject malformed jsonA and jsonB with the offending field named")
+    void shouldRejectMalformedJsonAAndJsonBLabelled() {
+        assertThatThrownBy(() -> jsonService.diff(new JsonDiffRequest("{", "{}")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageStartingWith("Invalid JSON content in jsonA: ");
+        assertThatThrownBy(() -> jsonService.diff(new JsonDiffRequest("{}", "[1,")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageStartingWith("Invalid JSON content in jsonB: ");
+    }
+
+    @Test
+    @DisplayName("Should reject a document nested deeper than the depth cap")
+    void shouldRejectTooDeepDocumentForDiff() {
+        String deep = "1";
+        for (int i = 0; i < 64; i++) {
+            deep = "{\"k\":" + deep + "}";
+        }
+        String deepSide = deep;
+        assertThatThrownBy(() -> jsonService.diff(new JsonDiffRequest(deepSide, "{\"k\":1}")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("jsonA depth must not exceed 64");
+
+        String allowed = "1";
+        for (int i = 0; i < 63; i++) {
+            allowed = "{\"k\":" + allowed + "}";
+        }
+        String allowedSide = allowed;
+        assertThat(jsonService.diff(new JsonDiffRequest(allowedSide, "{\"k\":1}")).summary())
+                .isEqualTo("0 added, 0 removed, 1 changed");
+    }
+
+    @Test
+    @DisplayName("Should reject a diff exceeding the change cap")
+    void shouldRejectDiffExceedingChangeCap() {
+        String huge = flatDocument(MAX_KEYS + 1);
+        assertThatThrownBy(() -> jsonService.diff(new JsonDiffRequest("{}", huge)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("diff must not contain more than " + MAX_KEYS + " changes");
+    }
+
+    @Test
+    @DisplayName("Should validate the diff request fields")
+    void shouldValidateJsonDiffRequest() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+            assertThat(validator.validate(new JsonDiffRequest("", "{}")))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("jsonA content is required");
+            assertThat(validator.validate(new JsonDiffRequest("{}", " ")))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("jsonB content is required");
+            assertThat(validator.validate(new JsonDiffRequest("{}", "{}"))).isEmpty();
         }
     }
 

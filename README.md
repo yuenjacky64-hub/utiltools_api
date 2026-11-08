@@ -152,6 +152,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/merge-patch` | Apply an RFC 7396 merge-patch document (`null` deletes, objects merge recursively, arrays/scalars replace) as a journalled `JSON_MERGE_PATCH` |
 | `POST` | `/api/v1/utils/json/to-ndjson` | Export a JSON array as NDJSON / JSON Lines: one compact value per line, `lineCount` and `sizeBytes`, journalled as `JSON_TO_NDJSON` |
 | `POST` | `/api/v1/utils/json/from-ndjson` | Import NDJSON / JSON Lines into a JSON array: blank lines and CRLF tolerated, errors name the 1-based line number, 10000-record bound, journalled as `JSON_FROM_NDJSON` |
+| `POST` | `/api/v1/utils/json/diff` | Compare two JSON documents and report `added`, `removed` and `changed` paths (with old/new values and a pinned `summary`) at any nesting level, journalled as `JSON_DIFF` |
 | `POST` | `/api/v1/utils/text/transform` | Apply a deterministic case/format operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`) to a string |
 | `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
 | `POST` | `/api/v1/utils/text/replace` | Replace every (or, with `all=false`, the first) occurrence of a literal or regex `pattern`, reporting `replacements`, `changed` and code-point `length` |
@@ -1004,7 +1005,58 @@ parsed and never mutated, so the same request is replay-stable.
 fields return **HTTP 400** `VALIDATION_ERROR`; a patch nested deeper than 64 object levels is rejected with
 **HTTP 400** instead of overflowing the stack.
 
-#### F. Circuit breaker & probe lease recovery
+#### F. Structural Diff (added / removed / changed)
+
+`POST /api/v1/utils/json/diff` compares two documents and reports what differs. `jsonA` is the *old* side and
+`jsonB` the *new* side; both are strings holding JSON. The journalled operation is `json/diff` (`JSON_DIFF`), so
+the call appears in the audit journal with `SUCCEEDED` state and replays as `VERIFIED`.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/json/diff \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonA": "{\"a\":1,\"b\":{\"c\":2,\"e\":{\"x\":1}},\"g\":\"keep\"}",
+    "jsonB": "{\"a\":1,\"b\":{\"c\":5},\"f\":true}"
+  }'
+```
+
+**Response (200):**
+
+```json
+{
+  "success": true,
+  "message": "JSON documents diffed successfully",
+  "data": {
+    "added": ["f"],
+    "removed": ["b.e", "g"],
+    "changed": {
+      "b.c":       { "path": "b.c",       "oldValue": "2",       "newValue": "5",      "changeType": "CHANGED" },
+      "b.e":       { "path": "b.e",       "oldValue": "{\"x\":1}", "newValue": null,     "changeType": "REMOVED" },
+      "g":         { "path": "g",         "oldValue": "\"keep\"", "newValue": null,     "changeType": "REMOVED" },
+      "f":         { "path": "f",         "oldValue": null,        "newValue": "true",   "changeType": "ADDED" }
+    },
+    "summary": "1 added, 2 removed, 1 changed"
+  },
+  "timestamp": "2026-10-30T16:50:39.127057574Z"
+}
+```
+
+Objects are compared member by member in first-seen order (member order alone is not a change), arrays position by
+position, so out-of-range elements are reported at `path[i]`; a scalar or type mismatch is a single `CHANGED` detail
+carrying both compact JSON values, and a whole-root mismatch is reported at the sentinel path `$`. Every change -
+added, removed and changed - also appears in `changed`, keyed by its rendered path, which is why `JsonDiffDetail`
+carries `changeType` (`ADDED`, `REMOVED`, `CHANGED`). `oldValue`/`newValue` are compact JSON text and the missing side
+is `null`. `summary` reads `<n> added, <n> removed, <n> changed`, or `No differences found` when the documents are
+byte-equal after parsing. A member name containing `.`, `[`, `]`, `'`, `\` or `$` renders as `['a.b']` (with `\` and
+`'` escaped), so distinct structural paths can never collide in `changed`. Nothing is mutated, and the ordering is
+deterministic, so the same request is replay-stable.
+
+**Errors:** malformed `jsonA` or `jsonB` returns **HTTP 400** `BAD_REQUEST` naming that field
+(`Invalid JSON content in jsonA: ...`); blank fields return **HTTP 400** `VALIDATION_ERROR` (`jsonA content is
+required` / `jsonB content is required`); a document nested deeper than 64 object levels is rejected with
+`jsonA depth must not exceed 64`, and more than 10000 changes is rejected as well - both **HTTP 400**.
+
+#### G. Circuit breaker & probe lease recovery
 
 The JSONPath query path runs behind a single `CLOSED` / `OPEN` / `HALF_OPEN` circuit breaker, exposed
 read-only by `GET /api/v1/utils/resilience` and driven by hand with `POST /api/v1/utils/resilience/probe`.
