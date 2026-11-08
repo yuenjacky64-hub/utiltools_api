@@ -1,6 +1,8 @@
 package com.example.utiltools.json;
 
 import com.example.utiltools.json.dto.JsonFlattenRequest;
+import com.example.utiltools.json.dto.JsonFromCsvRequest;
+import com.example.utiltools.json.dto.JsonFromCsvResponse;
 import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
@@ -11,6 +13,8 @@ import com.example.utiltools.json.dto.JsonPatchResponse;
 import com.example.utiltools.json.dto.JsonPatchRequest;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
+import com.example.utiltools.json.dto.JsonToCsvRequest;
+import com.example.utiltools.json.dto.JsonToCsvResponse;
 import com.example.utiltools.json.dto.JsonUnflattenRequest;
 import com.example.utiltools.json.dto.JsonUnflattenResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
@@ -982,6 +986,244 @@ class JsonServiceTest {
             assertThat(validator.validate(new JsonMergePatchRequest("{}", "{}"))).isEmpty();
         }
     }
+
+    @Test
+    @DisplayName("Should quote CSV fields carrying the delimiter, a quote, CR or LF")
+    void shouldQuoteDelimitersQuotesAndEmbeddedNewlines() {
+        String json = "[{\"name\":\"a,b\",\"quote\":\"say \\\"hi\\\"\",\"multiline\":\"l1\\nl2\","
+                + "\"cr\":\"x\\ry\",\"plain\":\"ok\",\"missing\":null}]";
+
+        JsonToCsvResponse response = jsonService.toCsv(new JsonToCsvRequest(json, null));
+
+        assertThat(response.csv()).isEqualTo(
+                "name,quote,multiline,cr,plain,missing\r\n"
+                        + "\"a,b\",\"say \"\"hi\"\"\",\"l1\nl2\",\"x\ry\",ok,");
+        assertThat(response.headers()).containsExactly("name", "quote", "multiline", "cr", "plain", "missing");
+        assertThat(response.rowCount()).isEqualTo(1);
+        assertThat(response.columnCount()).isEqualTo(6);
+        assertThat(response.sizeBytes()).isEqualTo(response.csv().getBytes(StandardCharsets.UTF_8).length);
+    }
+
+    @Test
+    @DisplayName("Should emit tab separated CSV for both the \\t escape and a literal tab")
+    void shouldEmitTabSeparatedOutput() {
+        String json = "[{\"a\":\"1\",\"b\":\"2\"},{\"a\":\"3\",\"b\":null}]";
+
+        JsonToCsvResponse escaped = jsonService.toCsv(new JsonToCsvRequest(json, "\\t"));
+        JsonToCsvResponse literal = jsonService.toCsv(new JsonToCsvRequest(json, "\t"));
+
+        assertThat(escaped.csv()).isEqualTo("a\tb\r\n1\t2\r\n3\t");
+        assertThat(literal.csv()).isEqualTo(escaped.csv());
+    }
+
+    @Test
+    @DisplayName("Should default the delimiter to comma and return an empty export for an empty array")
+    void shouldDefaultCsvOptions() {
+        assertThat(jsonService.toCsv(new JsonToCsvRequest("[{\"a\":\"1\",\"b\":\"2\"}]", null)).csv())
+                .isEqualTo("a,b\r\n1,2");
+        assertThat(jsonService.toCsv(new JsonToCsvRequest("[{\"a\":\"1\"}]", "")).csv())
+                .isEqualTo("a\r\n1");
+
+        JsonToCsvResponse empty = jsonService.toCsv(new JsonToCsvRequest("[]", null));
+        assertThat(empty.csv()).isEmpty();
+        assertThat(empty.rowCount()).isZero();
+        assertThat(empty.columnCount()).isZero();
+        assertThat(empty.headers()).isEmpty();
+
+        JsonFromCsvResponse imported = jsonService.fromCsv(new JsonFromCsvRequest("a,b\r\n1,2", null, null));
+        assertThat(imported.columns()).containsExactly("a", "b");
+        assertThat(imported.rowCount()).isEqualTo(1);
+        assertThat(imported.resultJson().get(0).get("b").asText()).isEqualTo("2");
+    }
+
+    @Test
+    @DisplayName("Should parse quoted CSV fields, doubled quotes and LF/CRLF/CR line endings")
+    void shouldParseQuotedFieldsAndLineEndings() {
+        String csv = "\"a,b\",\"say \"\"hi\"\"\",\"l1\nl2\"\r\nx,y,z\np,q,r\r";
+
+        JsonFromCsvResponse response = jsonService.fromCsv(new JsonFromCsvRequest(csv, ",", true));
+
+        assertThat(response.columns()).containsExactly("a,b", "say \"hi\"", "l1\nl2");
+        assertThat(response.rowCount()).isEqualTo(2);
+        assertThat(response.columnCount()).isEqualTo(3);
+        assertThat(response.resultJson().get(0).get("a,b").asText()).isEqualTo("x");
+        assertThat(response.resultJson().get(1).get("say \"hi\"").asText()).isEqualTo("q");
+        assertThat(response.resultJson().get(1).get("l1\nl2").asText()).isEqualTo("r");
+    }
+
+    @Test
+    @DisplayName("Should tolerate a UTF-8 BOM when importing CSV")
+    void shouldTolerateUtf8BomOnImport() {
+        JsonFromCsvResponse response = jsonService.fromCsv(new JsonFromCsvRequest("\uFEFFa,b\r\n1,2", ",", true));
+
+        assertThat(response.columns()).containsExactly("a", "b");
+        assertThat(response.resultJson().get(0).fieldNames()).toIterable().containsExactly("a", "b");
+        assertThat(response.resultJson().get(0).get("a").asText()).isEqualTo("1");
+    }
+
+    @Test
+    @DisplayName("Should map blank headers to columnN and fall back to column1..N without a header")
+    void shouldUsePositionalColumnsWhenHasHeaderIsFalse() {
+        JsonFromCsvResponse blankHeader = jsonService.fromCsv(new JsonFromCsvRequest(",b\r\n1,2", ",", true));
+        assertThat(blankHeader.columns()).containsExactly("column1", "b");
+        assertThat(blankHeader.resultJson().get(0).get("column1").asText()).isEqualTo("1");
+        // hasHeader omitted defaults to true, so the first record is still the header.
+        JsonFromCsvResponse omittedHeaderFlag = jsonService.fromCsv(new JsonFromCsvRequest(",b\r\n1,2", null, null));
+        assertThat(omittedHeaderFlag.columns()).containsExactly("column1", "b");
+        assertThat(omittedHeaderFlag.rowCount()).isEqualTo(1);
+
+        JsonFromCsvResponse headerless = jsonService.fromCsv(new JsonFromCsvRequest("1,2\n3,4", ",", false));
+        assertThat(headerless.columns()).containsExactly("column1", "column2");
+        assertThat(headerless.rowCount()).isEqualTo(2);
+        assertThat(headerless.resultJson().get(1).get("column2").asText()).isEqualTo("4");
+        // Short rows are padded with empty cells so every object carries every column.
+        JsonFromCsvResponse ragged = jsonService.fromCsv(new JsonFromCsvRequest("1,2\n3", ",", false));
+        assertThat(ragged.resultJson().get(1).get("column2").asText()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Should round trip flat string valued objects through CSV")
+    void shouldRoundTripStringValuedFlatObjects() throws JsonProcessingException {
+        String json = "[{\"name\":\"Ada, Lovelace\",\"note\":\"line1\\r\\nline2\","
+                + "\"quote\":\"a \\\"quoted\\\" word\",\"empty\":\"\",\"tabbed\":\"a\\tb\"}]";
+
+        JsonToCsvResponse exported = jsonService.toCsv(new JsonToCsvRequest(json, null));
+        JsonFromCsvResponse imported =
+                jsonService.fromCsv(new JsonFromCsvRequest(exported.csv(), null, true));
+
+        assertThat(imported.rowCount()).isEqualTo(1);
+        assertThat(imported.resultJson()).isEqualTo(new ObjectMapper().readTree(json));
+    }
+
+    @Test
+    @DisplayName("Should reject non-array JSON when exporting to CSV")
+    void shouldRejectNonArrayJsonContent() {
+        assertThatThrownBy(() -> jsonService.toCsv(new JsonToCsvRequest("{\"a\":1}", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("json content must be an array of objects");
+        assertThatThrownBy(() -> jsonService.toCsv(new JsonToCsvRequest("[1,2,3]", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("json array must contain only objects");
+    }
+
+    @Test
+    @DisplayName("Should reject nested values when exporting to CSV")
+    void shouldRejectNestedValuesInCsvExport() {
+        assertThatThrownBy(() -> jsonService.toCsv(new JsonToCsvRequest("[{\"a\":{\"b\":1}}]", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("nested values are not supported in CSV export");
+        assertThatThrownBy(() -> jsonService.toCsv(new JsonToCsvRequest("[{\"a\":[1,2]}]", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("nested values are not supported in CSV export");
+    }
+
+    @Test
+    @DisplayName("Should reject malformed CSV input")
+    void shouldRejectMalformedCsv() {
+        assertThatThrownBy(() -> jsonService.fromCsv(new JsonFromCsvRequest("\"a,b", ",", true)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("unterminated quoted field");
+        assertThatThrownBy(() -> jsonService.fromCsv(new JsonFromCsvRequest("a,\"b\"x,c", ",", true)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("unexpected character after closing quote");
+        assertThatThrownBy(() -> jsonService.fromCsv(new JsonFromCsvRequest("a,b\r\n1,2,3", ",", true)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("row 2 has 3 fields but the header has 2");
+        assertThatThrownBy(() -> jsonService.fromCsv(new JsonFromCsvRequest("", ",", true)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("csv content is required");
+    }
+
+    @Test
+    @DisplayName("Should reject duplicate CSV header names")
+    void shouldRejectDuplicateHeaderNames() {
+        assertThatThrownBy(() -> jsonService.fromCsv(new JsonFromCsvRequest("a,b,a\r\n1,2,3", ",", true)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("duplicate header name: a");
+    }
+
+    @Test
+    @DisplayName("Should enforce the row, column and cell bounds on both conversion directions")
+    void shouldRejectOversizedCsvInputAndOutput() {
+        StringBuilder wide = new StringBuilder("[{");
+        for (int i = 0; i <= MAX_KEYS; i++) {
+            if (i > 0) {
+                wide.append(',');
+            }
+            wide.append("\"c").append(i).append("\":1");
+        }
+        wide.append("}]");
+        assertThatThrownBy(() -> jsonService.toCsv(new JsonToCsvRequest(wide.toString(), null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("columns must not exceed " + MAX_KEYS);
+
+        StringBuilder tall = new StringBuilder("[");
+        for (int i = 0; i <= MAX_KEYS; i++) {
+            if (i > 0) {
+                tall.append(',');
+            }
+            tall.append("{}");
+        }
+        tall.append(']');
+        assertThatThrownBy(() -> jsonService.toCsv(new JsonToCsvRequest(tall.toString(), null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("rows must not exceed " + MAX_KEYS);
+
+        StringBuilder importTall = new StringBuilder("h");
+        for (int i = 0; i <= MAX_KEYS; i++) {
+            importTall.append("\r\nv");
+        }
+        assertThatThrownBy(() -> jsonService.fromCsv(new JsonFromCsvRequest(importTall.toString(), ",", true)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("rows must not exceed " + MAX_KEYS);
+
+        StringBuilder importWide = new StringBuilder("h0");
+        for (int i = 1; i <= MAX_KEYS; i++) {
+            importWide.append(",h").append(i);
+        }
+        importWide.append("\r\n");
+        assertThatThrownBy(() -> jsonService.fromCsv(new JsonFromCsvRequest(importWide.toString(), ",", true)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("columns must not exceed " + MAX_KEYS);
+
+        String dataRow = "x" + ",x".repeat(500);
+        StringBuilder grid = new StringBuilder("h0");
+        for (int i = 1; i <= 500; i++) {
+            grid.append(",h").append(i);
+        }
+        for (int r = 0; r < 2000; r++) {
+            grid.append("\r\n").append(dataRow);
+        }
+        assertThatThrownBy(() -> jsonService.fromCsv(new JsonFromCsvRequest(grid.toString(), ",", true)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("conversion exceeds " + MAX_CELLS + " cells");
+    }
+
+    @Test
+    @DisplayName("Should validate CSV request fields")
+    void shouldValidateCsvRequestFields() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+            assertThat(validator.validate(new JsonToCsvRequest(" ", null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("json content is required");
+            assertThat(validator.validate(new JsonToCsvRequest("a".repeat(1_000_001), null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("json content must be at most 1000000 characters");
+            assertThat(validator.validate(new JsonToCsvRequest("[{\"a\":1}]", null))).isEmpty();
+
+            assertThat(validator.validate(new JsonFromCsvRequest("", null, true)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("csv content is required");
+            assertThat(validator.validate(new JsonFromCsvRequest("a".repeat(1_000_001), null, true)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("csv content must be at most 1000000 characters");
+            assertThat(validator.validate(new JsonFromCsvRequest("a\r\n1", null, null))).isEmpty();
+        }
+    }
+
+    private static final int MAX_KEYS = 10000;
+    private static final int MAX_CELLS = 1000000;
 
     private static String flatDocument(int keyCount) {
         StringBuilder json = new StringBuilder("{");
