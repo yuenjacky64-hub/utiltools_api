@@ -816,6 +816,111 @@ class JsonControllerTest {
         assertThat(afterEntries.size()).isEqualTo(entryCount);
     }
 
+    @Test
+    @DisplayName("POST /api/v1/utils/json/to-ndjson - should export an array as NDJSON")
+    void shouldConvertJsonArrayToNdjson() throws Exception {
+        String body = requestBody("json", "[{\"a\":1},{\"b\":2}]");
+
+        String response = mockMvc.perform(post("/api/v1/utils/json/to-ndjson")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.lineCount").value(2))
+                .andReturn().getResponse().getContentAsString();
+
+        JsonNode data = new ObjectMapper().readTree(response).path("data");
+        String expected = "{\"a\":1}\n{\"b\":2}";
+        assertThat(data.path("ndjson").asText()).isEqualTo(expected);
+        assertThat(data.path("sizeBytes").asInt())
+                .isEqualTo(expected.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/from-ndjson - should import NDJSON with blank lines")
+    void shouldConvertNdjsonToJsonArray() throws Exception {
+        String body = requestBody("ndjson", "{\"a\":1}\n\n{\"b\":2}\n");
+
+        mockMvc.perform(post("/api/v1/utils/json/from-ndjson")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.recordCount").value(2))
+                .andExpect(jsonPath("$.data.resultJson[0].a").value(1))
+                .andExpect(jsonPath("$.data.resultJson[1].b").value(2));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/from-ndjson|to-ndjson - should return 400 with the physical line number")
+    void shouldReturnBadRequestWithPhysicalLineNumber() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/from-ndjson")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("ndjson", "{\"a\":1}\n\n{not json}")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("Invalid JSON on line 3")));
+
+        mockMvc.perform(post("/api/v1/utils/json/to-ndjson")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "{\"a\":1}")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("json content must be an array")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/to-ndjson|from-ndjson - journalled and replay VERIFIED")
+    void shouldJournalAndReplayNdjsonConversions() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/to-ndjson")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "[{\"a\":1},{\"b\":2}]")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.lineCount").value(2));
+        mockMvc.perform(post("/api/v1/utils/json/from-ndjson")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("ndjson", "{\"a\":1}\n{\"b\":2}")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.recordCount").value(2));
+
+        String entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[?(@.operation == 'JSON_TO_NDJSON')]").exists())
+                .andExpect(jsonPath("$.data[?(@.operation == 'JSON_FROM_NDJSON')]").exists())
+                .andReturn().getResponse().getContentAsString();
+
+        String toNdjsonId = entryIdOf(entries, "JSON_TO_NDJSON");
+        String fromNdjsonId = entryIdOf(entries, "JSON_FROM_NDJSON");
+        int entryCount = new ObjectMapper().readTree(entries).path("data").size();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", toNdjsonId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"));
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", fromNdjsonId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"));
+
+        String afterReplay = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        JsonNode afterEntries = new ObjectMapper().readTree(afterReplay).path("data");
+        assertThat(afterEntries.size()).isEqualTo(entryCount);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/from-ndjson - should reject more than 10000 records")
+    void shouldEnforceNdjsonRecordBoundThroughEndpoint() throws Exception {
+        StringBuilder ndjson = new StringBuilder("0");
+        for (int i = 1; i <= 10000; i++) {
+            ndjson.append('\n').append(i);
+        }
+
+        mockMvc.perform(post("/api/v1/utils/json/from-ndjson")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("ndjson", ndjson.toString())))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value(containsString("records must not exceed 10000")));
+    }
+
     private static String requestBody(String field, String value) throws Exception {
         return new ObjectMapper().createObjectNode().put(field, value).toString();
     }

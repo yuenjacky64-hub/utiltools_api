@@ -6,6 +6,8 @@ import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
 import com.example.utiltools.json.dto.JsonFromCsvRequest;
 import com.example.utiltools.json.dto.JsonFromCsvResponse;
+import com.example.utiltools.json.dto.JsonFromNdjsonRequest;
+import com.example.utiltools.json.dto.JsonFromNdjsonResponse;
 import com.example.utiltools.json.dto.JsonMergePatchRequest;
 import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonPatchOperation;
@@ -15,6 +17,8 @@ import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonToCsvRequest;
 import com.example.utiltools.json.dto.JsonToCsvResponse;
+import com.example.utiltools.json.dto.JsonToNdjsonRequest;
+import com.example.utiltools.json.dto.JsonToNdjsonResponse;
 import com.example.utiltools.json.dto.JsonUnflattenRequest;
 import com.example.utiltools.json.dto.JsonUnflattenResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
@@ -47,6 +51,7 @@ import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -64,6 +69,8 @@ public class JsonService {
     static final int MAX_KEYS = 10000;
     /** Most cells (rows x columns) one CSV conversion may emit or import. */
     static final int MAX_CELLS = 1000000;
+    /** Most NDJSON records one from-NDJSON conversion may import. */
+    static final int MAX_NDJSON_RECORDS = 10000;
     private static final int CSV_UNQUOTED = 0;
     private static final int CSV_QUOTED = 1;
     private static final int CSV_QUOTE_IN_QUOTED = 2;
@@ -546,6 +553,62 @@ public class JsonService {
             }
         }
         return new JsonFromCsvResponse(resultJson, rowCount, columnCount, List.copyOf(columns));
+    }
+
+    /**
+     * Exports a JSON array as Newline Delimited JSON: one compact JSON value per line, joined by a
+     * single newline with no trailing newline. The output depends only on the request body.
+     */
+    public JsonToNdjsonResponse toNdjson(JsonToNdjsonRequest request) {
+        JsonNode root = parseTree(request.json());
+        if (!root.isArray()) {
+            throw new IllegalArgumentException("json content must be an array");
+        }
+        StringBuilder ndjson = new StringBuilder();
+        int lineCount = 0;
+        for (JsonNode element : root) {
+            if (lineCount > 0) {
+                ndjson.append('\n');
+            }
+            try {
+                ndjson.append(objectMapper.writeValueAsString(element));
+            } catch (JsonProcessingException e) {
+                throw new IllegalArgumentException("Invalid JSON content: " + e.getOriginalMessage(), e);
+            }
+            lineCount++;
+        }
+        String text = ndjson.toString();
+        return new JsonToNdjsonResponse(text, lineCount, text.getBytes(StandardCharsets.UTF_8).length);
+    }
+
+    /**
+     * Imports Newline Delimited JSON: each non-blank physical line is one independent JSON value,
+     * blank lines and CRLF endings are tolerated, input order is preserved and a malformed line is
+     * reported with its 1-based physical line number. An empty document yields an empty array.
+     */
+    public JsonFromNdjsonResponse fromNdjson(JsonFromNdjsonRequest request) {
+        String document = Optional.ofNullable(request)
+                .map(JsonFromNdjsonRequest::ndjson)
+                .orElse("");
+        ArrayNode records = objectMapper.createArrayNode();
+        int physicalLine = 0;
+        for (String raw : document.split("\n", -1)) {
+            physicalLine++;
+            String line = raw.endsWith("\r") ? raw.substring(0, raw.length() - 1) : raw;
+            if (line.isBlank()) {
+                continue;
+            }
+            try {
+                records.add(objectMapper.readTree(line));
+            } catch (JsonProcessingException e) {
+                throw new IllegalArgumentException("Invalid JSON on line " + physicalLine + ": "
+                        + e.getOriginalMessage(), e);
+            }
+            if (records.size() > MAX_NDJSON_RECORDS) {
+                throw new IllegalArgumentException("records must not exceed " + MAX_NDJSON_RECORDS);
+            }
+        }
+        return new JsonFromNdjsonResponse(records, records.size());
     }
 
     /**
