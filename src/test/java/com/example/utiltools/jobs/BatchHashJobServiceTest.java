@@ -3869,4 +3869,493 @@ class BatchHashJobServiceTest {
         throw new AssertionError("Client " + clientKey + " active jobs did not reach " + expected
                 + "; last observed " + service.activeJobsForClient(clientKey));
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // Total-life deadlines: queue wait and execution (REQ-01..REQ-05, DOD-01..DOD-12)
+    // ---------------------------------------------------------------------------------------------
+
+    /** The three-item batch whose committed prefix the mid-batch deadline tests assert on. */
+    private static final List<String> DEADLINE_ITEMS = List.of("alpha", "bravo", "charlie");
+
+    /** Bound used by the deadline tests: strictly shorter than {@link #LEASE_SECONDS}. */
+    private static final long DEADLINE_SECONDS = 5;
+
+    /**
+     * Service wired for the deadline tests: one worker, an explicit queue capacity, the test clock and
+     * the supplied journal. {@code defaultDeadlineSeconds} is {@code 0} ("no server default") so each
+     * test governs its bound through the request itself.
+     */
+    private BatchHashJobService newDeadlineService(CryptoService crypto, int queueCapacity,
+            MutableJobClock clock, AuditJournalService journal) {
+        return new BatchHashJobService(crypto, 1, queueCapacity, 300, 3, LEASE_SECONDS, 5000, 0L,
+                BatchHashJobService.DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT, 0L, clock, journal);
+    }
+
+    /**
+     * DOD-01 / REQ-01, REQ-04: a job that waits out its bound fails without hashing anything -
+     * {@code FAILED} + {@code JOB_DEADLINE_EXCEEDED}, a non-null {@code completedAt}, no item hashed,
+     * no published results, and its quota slot released exactly once.
+     */
+    @Test
+    @DisplayName("deadline - a QUEUED job that outlives its bound fails without hashing any item")
+    void shouldFailQueuedJobAtDeadlineWithoutHashingAnyItem() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("parked");
+        String client = "198.51.100.71";
+        service = newDeadlineService(crypto, 1, clock, journal);
+
+        // The only worker is parked inside the first job, so the second job can only ever wait.
+        BatchHashJobResponse parked = service.submit(
+                new BatchHashRequest("SHA-256", List.of("parked"), null, null), client);
+        assertThat(crypto.awaitEntered("parked")).isTrue();
+        assertThat(awaitRunningAttempt(parked.jobId(), 1).status()).isEqualTo(JobStatus.RUNNING);
+        BatchHashJobResponse waiting = service.submit(new BatchHashRequest("SHA-256",
+                List.of("waiting-1", "waiting-2"), null, "deadline-queued", (int) DEADLINE_SECONDS),
+                client);
+        try {
+            assertThat(waiting.status()).isEqualTo(JobStatus.QUEUED);
+            assertThat(waiting.deadlineAt())
+                    .isEqualTo(waiting.createdAt().plusSeconds(DEADLINE_SECONDS));
+
+            clock.advanceSeconds(DEADLINE_SECONDS);
+            assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+
+            BatchHashJobResponse failed = service.getJob(waiting.jobId());
+            assertThat(failed.status()).isEqualTo(JobStatus.FAILED);
+            assertThat(failed.error()).isEqualTo(BatchHashJobService.JOB_DEADLINE_EXCEEDED);
+            assertThat(failed.completedAt()).isEqualTo(clock.instant());
+            assertThat(failed.completedItems()).isZero();
+            assertThat(failed.results()).isNull(); // nothing was published
+            assertThat(failed.attempts()).hasSize(1);
+            assertThat(failed.attempts().get(0).attempt()).isEqualTo(1);
+            assertThat(failed.attempts().get(0).status()).isEqualTo(JobStatus.FAILED);
+            assertThat(failed.attempts().get(0).error())
+                    .isEqualTo(BatchHashJobService.JOB_DEADLINE_EXCEEDED);
+            // The attempt never reached a worker: no item was hashed and no BATCH_HASH row was opened.
+            assertThat(crypto.count("waiting-1")).isZero();
+            assertThat(crypto.count("waiting-2")).isZero();
+            assertThat(batchHashEntries(journal, waiting.jobId())).isEmpty();
+            // The slot is freed exactly once: a second pass over the same instant changes nothing.
+            awaitActiveJobs(client, 1);
+            assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+            assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+            assertThat(service.getJob(waiting.jobId()).completedAt()).isEqualTo(clock.instant());
+        } finally {
+            crypto.unblock("parked");
+        }
+        awaitStatus(parked.jobId(), JobStatus.COMPLETED);
+        awaitActiveJobs(client, 0);
+        assertThat(crypto.count("waiting-1")).isZero(); // still never hashed once the worker freed up
+    }
+
+    /**
+     * DOD-02 / REQ-03: a job that runs out of time mid-batch ends {@code FAILED} with
+     * {@code completedItems} equal to the committed prefix, {@code results} still null (no partial
+     * digest is ever published) and exactly one closed {@code BATCH_HASH} row carrying the deadline
+     * error.
+     *
+     * <p>The gate holds the worker inside the <em>first</em> item's hash, so exactly one item is
+     * committed when the bound lapses: the release commits that item (prefix 1) and the renewal
+     * before item 2 then trips the bound - the checkpoint the retry test resumes from.</p>
+     */
+    @Test
+    @DisplayName("deadline - a job that runs out of time mid-batch keeps its prefix and publishes nothing")
+    void shouldFailMidBatchJobAtDeadlineKeepingCommittedPrefix() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("alpha");
+        String client = "198.51.100.72";
+        service = newDeadlineService(crypto, 10, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(new BatchHashRequest("SHA-256",
+                DEADLINE_ITEMS, null, "deadline-mid-batch", (int) DEADLINE_SECONDS), client);
+        assertThat(awaitRunningAttempt(accepted.jobId(), 1).status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(crypto.awaitEntered("alpha")).isTrue(); // the worker is inside the first hash
+        clock.advanceSeconds(DEADLINE_SECONDS); // ...and the bound lapses while it is in flight
+        crypto.unblock("alpha"); // commit item 1, then the renewal before item 2 trips the bound
+
+        BatchHashJobResponse failed = awaitStatus(accepted.jobId(), JobStatus.FAILED);
+        assertThat(failed.error()).isEqualTo(BatchHashJobService.JOB_DEADLINE_EXCEEDED);
+        assertThat(failed.completedAt()).isEqualTo(clock.instant());
+        assertThat(failed.completedItems()).isEqualTo(1); // the committed prefix, kept for a retry
+        assertThat(failed.results()).isNull();
+        assertThat(failed.attempts()).hasSize(1);
+        assertThat(failed.attempts().get(0).status()).isEqualTo(JobStatus.FAILED);
+        assertThat(crypto.count("bravo")).isZero(); // the attempt stopped at the fence, not mid-append
+        assertThat(crypto.count("charlie")).isZero();
+
+        List<AuditEntry> entries = batchHashEntries(journal, accepted.jobId());
+        assertThat(entries).hasSize(1); // one attempt, one row, closed exactly once
+        assertThat(entries.get(0).state()).isEqualTo(JournalState.FAILED);
+        assertThat(entries.get(0).errorCode()).isEqualTo(BatchHashJobService.JOB_DEADLINE_EXCEEDED);
+        awaitActiveJobs(client, 0); // the quota slot is released exactly once
+    }
+
+    /**
+     * DOD-03 / REQ-05: the deadline-failed job is retryable, the retry starts attempt 2 with a fresh
+     * window measured from the retry instant and resumes from the retained checkpoint, so it
+     * completes with the full ordered digest list.
+     */
+    @Test
+    @DisplayName("deadline - a retry starts a fresh window and resumes from the retained prefix")
+    void shouldResumeFromRetainedCheckpointAfterDeadlineFailure() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("alpha");
+        String client = "198.51.100.73";
+        service = newDeadlineService(crypto, 10, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(new BatchHashRequest("SHA-256",
+                DEADLINE_ITEMS, null, "deadline-retry", (int) DEADLINE_SECONDS), client);
+        assertThat(awaitRunningAttempt(accepted.jobId(), 1).status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(crypto.awaitEntered("alpha")).isTrue();
+        clock.advanceSeconds(DEADLINE_SECONDS);
+        crypto.unblock("alpha");
+        BatchHashJobResponse failed = awaitStatus(accepted.jobId(), JobStatus.FAILED);
+        assertThat(failed.deadlineAt()).isEqualTo(LEASE_START.plusSeconds(DEADLINE_SECONDS));
+        awaitActiveJobs(client, 0);
+
+        BatchHashJobResponse retried = service.retry(accepted.jobId());
+        assertThat(retried.status()).isEqualTo(JobStatus.QUEUED);
+        // The retry reuses the same job: the attempt-2 row is written when a worker admits it.
+        assertThat(retried.attempts()).hasSize(1); // only attempt 1 has been recorded so far
+        // A fresh window measured from the retry instant - not from createdAt, not from the expiry.
+        assertThat(retried.deadlineAt()).isEqualTo(clock.instant().plusSeconds(DEADLINE_SECONDS));
+        assertThat(retried.deadlineAt()).isAfter(failed.deadlineAt());
+
+        BatchHashJobResponse completed = awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.completedItems()).isEqualTo(DEADLINE_ITEMS.size());
+        assertThat(completed.results()).hasSize(DEADLINE_ITEMS.size());
+        CryptoService reference = new CryptoService();
+        for (int i = 0; i < DEADLINE_ITEMS.size(); i++) {
+            assertThat(completed.results().get(i).digest()).isEqualTo(
+                    reference.hash(new HashRequest("SHA-256", DEADLINE_ITEMS.get(i), null)).digest());
+        }
+        assertThat(completed.attempts()).hasSize(2);
+        assertThat(completed.attempts().get(1).attempt()).isEqualTo(2); // the retry is a new attempt
+        assertThat(completed.attempts().get(1).status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(completed.attempts().get(1).resumedFrom()).isEqualTo(1); // resumed, not restarted
+        assertThat(crypto.count("alpha")).isEqualTo(1); // the retained prefix was not re-hashed
+        assertThat(batchHashEntries(journal, accepted.jobId(), JournalState.SUCCEEDED)).hasSize(1);
+        awaitActiveJobs(client, 0);
+    }
+
+    /**
+     * DOD-03 / REQ-05: a retry does not inherit the expired window - the fresh bound is measured from
+     * the retry instant (strictly after the instant the failed job recorded) and survives the
+     * terminal write.
+     */
+    @Test
+    @DisplayName("deadline - a retry restarts the window instead of inheriting the expired one")
+    void shouldRestartDeadlineWindowOnRetry() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("parked");
+        String client = "198.51.100.80";
+        service = newDeadlineService(crypto, 2, clock, journal);
+
+        BatchHashJobResponse parked = service.submit(
+                new BatchHashRequest("SHA-256", List.of("parked"), null, null), client);
+        assertThat(crypto.awaitEntered("parked")).isTrue();
+        BatchHashJobResponse expiring = service.submit(new BatchHashRequest("SHA-256",
+                List.of("window-retry"), null, "deadline-window", (int) DEADLINE_SECONDS), client);
+        clock.advanceSeconds(DEADLINE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        BatchHashJobResponse failed = service.getJob(expiring.jobId());
+        assertThat(failed.error()).isEqualTo(BatchHashJobService.JOB_DEADLINE_EXCEEDED);
+
+        clock.advanceSeconds(30); // an arbitrary later instant: the retry measures its window from here
+        BatchHashJobResponse retried = service.retry(expiring.jobId());
+        assertThat(retried.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(retried.attempt()).isEqualTo(2);
+        assertThat(retried.deadlineAt()).isEqualTo(clock.instant().plusSeconds(DEADLINE_SECONDS));
+        assertThat(retried.deadlineAt()).isAfter(failed.deadlineAt()); // the old window is not inherited
+
+        crypto.unblock("parked");
+        BatchHashJobResponse completed = awaitStatus(expiring.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.deadlineAt()).isEqualTo(retried.deadlineAt()); // survives the write
+        awaitStatus(parked.jobId(), JobStatus.COMPLETED);
+        awaitActiveJobs(client, 0);
+    }
+
+    /**
+     * DOD-02 / REQ-03, REQ-04: a late {@code executeAttempt} for an attempt that already failed at its
+     * deadline writes nothing - no status flip, no second attempt row, no late audit row and no extra
+     * quota release.
+     */
+    @Test
+    @DisplayName("deadline - a late executeAttempt cannot overwrite the FAILED snapshot")
+    void shouldFenceLateExecuteAttemptAgainstFailedSnapshot() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("parked");
+        String client = "198.51.100.74";
+        service = newDeadlineService(crypto, 1, clock, journal);
+
+        BatchHashJobResponse parked = service.submit(
+                new BatchHashRequest("SHA-256", List.of("parked"), null, null), client);
+        assertThat(crypto.awaitEntered("parked")).isTrue();
+        BatchHashJobResponse expiring = service.submit(new BatchHashRequest("SHA-256",
+                List.of("late-1"), null, "deadline-late", (int) DEADLINE_SECONDS), client);
+        assertThat(expiring.status()).isEqualTo(JobStatus.QUEUED);
+        clock.advanceSeconds(DEADLINE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1); // the waiting job only
+        BatchHashJobResponse failed = service.getJob(expiring.jobId());
+        assertThat(failed.status()).isEqualTo(JobStatus.FAILED);
+        try {
+            // The reaped attempt's worker finally shows up: the status/attempt fence rejects it.
+            service.executeAttempt(expiring.jobId(), 1);
+            // The slot was released once, by the reaper - the late worker releases nothing.
+            assertThat(service.activeJobsForClient(client)).isEqualTo(1); // the parked job only
+        } finally {
+            crypto.unblock("parked");
+        }
+
+        BatchHashJobResponse after = service.getJob(expiring.jobId());
+        assertThat(after.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(after.error()).isEqualTo(BatchHashJobService.JOB_DEADLINE_EXCEEDED);
+        assertThat(after.completedAt()).isEqualTo(failed.completedAt());
+        assertThat(after.completedItems()).isZero();
+        assertThat(after.results()).isNull();
+        assertThat(after.attempts()).hasSize(1); // no second attempt row
+        assertThat(batchHashEntries(journal, expiring.jobId())).isEmpty(); // and no late audit row
+        assertThat(crypto.count("late-1")).isZero(); // the late worker hashed nothing
+        awaitStatus(parked.jobId(), JobStatus.COMPLETED);
+        awaitActiveJobs(client, 0); // and the expired job never released a second slot
+    }
+
+    /**
+     * DOD-04 / REQ-04: an operator's withdrawal wins at the deadline - a {@code CANCELLING} job past
+     * its bound terminalizes as {@code CANCELLED} (never {@code FAILED} /
+     * {@code JOB_DEADLINE_EXCEEDED}), releasing its slot exactly once.
+     */
+    @Test
+    @DisplayName("deadline - a CANCELLING job still ends CANCELLED when its bound is reached")
+    void shouldHonourCancellingAtDeadline() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("second");
+        String client = "198.51.100.75";
+        service = newDeadlineService(crypto, 10, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(new BatchHashRequest("SHA-256",
+                List.of("first", "second"), null, "deadline-cancel", (int) DEADLINE_SECONDS), client);
+        assertThat(awaitRunningAttempt(accepted.jobId(), 1).status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(crypto.awaitEntered("second")).isTrue();
+        assertThat(service.cancel(accepted.jobId()).status()).isEqualTo(JobStatus.CANCELLING);
+
+        clock.advanceSeconds(DEADLINE_SECONDS); // the bound is reached while the withdrawal is pending
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        BatchHashJobResponse cancelled = service.getJob(accepted.jobId());
+        assertThat(cancelled.status()).isEqualTo(JobStatus.CANCELLED);
+        assertThat(cancelled.error()).isNull(); // the deadline never overwrites the withdrawal
+        assertThat(cancelled.completedAt()).isEqualTo(clock.instant());
+        assertThat(cancelled.results()).isNull();
+        assertThat(cancelled.completedItems()).isZero();
+        assertThat(service.activeJobsForClient(client)).isZero();
+
+        crypto.unblock("second"); // the parked worker cannot revive the settled attempt
+        BatchHashJobResponse settled = awaitStatus(accepted.jobId(), JobStatus.CANCELLED);
+        assertThat(settled.completedAt()).isEqualTo(clock.instant());
+        assertThat(settled.error()).isNull();
+    }
+
+    /**
+     * DOD-05 / REQ-04: the bound outranks a <em>live</em> execution lease - a worker that keeps
+     * renewing can never hash past its deadline.
+     */
+    @Test
+    @DisplayName("deadline - a RUNNING job fails at its bound even while its execution lease is live")
+    void shouldFailRunningJobAtDeadlineWithLiveLease() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("second");
+        String client = "198.51.100.76";
+        service = newDeadlineService(crypto, 10, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(new BatchHashRequest("SHA-256",
+                List.of("first", "second"), null, "deadline-live-lease", (int) DEADLINE_SECONDS), client);
+        assertThat(awaitRunningAttempt(accepted.jobId(), 1).status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(crypto.awaitEntered("second")).isTrue();
+
+        // Past the bound but well inside the lease: only the total-life bound can settle this job.
+        clock.advanceSeconds(DEADLINE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        BatchHashJobResponse failed = service.getJob(accepted.jobId());
+        assertThat(failed.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(failed.error()).isEqualTo(BatchHashJobService.JOB_DEADLINE_EXCEEDED);
+        assertThat(failed.completedItems()).isEqualTo(1);
+        assertThat(failed.results()).isNull();
+        awaitActiveJobs(client, 0);
+
+        crypto.unblock("second");
+        BatchHashJobResponse settled = awaitStatus(accepted.jobId(), JobStatus.FAILED);
+        assertThat(settled.completedAt()).isEqualTo(clock.instant());
+        assertThat(settled.completedItems()).isEqualTo(1); // the late worker appended nothing
+    }
+
+    /**
+     * DOD-06 / REQ-04: every reaper pass is idempotent - a second pass over the same instant returns
+     * 0 and writes no attempt, no audit row and no quota release.
+     */
+    @Test
+    @DisplayName("deadline - a second reaper pass over a settled job is a no-op")
+    void shouldNoOpSecondDeadlineReaperPass() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("second");
+        String client = "198.51.100.77";
+        service = newDeadlineService(crypto, 10, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(new BatchHashRequest("SHA-256",
+                List.of("first", "second"), null, "deadline-idempotent", (int) DEADLINE_SECONDS), client);
+        assertThat(crypto.awaitEntered("second")).isTrue();
+        clock.advanceSeconds(DEADLINE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+
+        BatchHashJobResponse first = service.getJob(accepted.jobId());
+        int journalRows = journal.size();
+        int attempts = first.attempts().size();
+        assertThat(service.activeJobsForClient(client)).isZero();
+
+        assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+        BatchHashJobResponse second = service.getJob(accepted.jobId());
+        assertThat(second.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(second.completedAt()).isEqualTo(first.completedAt());
+        assertThat(second.attempts()).hasSize(attempts); // no extra attempt row
+        assertThat(journal.size()).isEqualTo(journalRows); // no extra audit row
+        assertThat(service.activeJobsForClient(client)).isZero(); // no double release (never negative)
+        assertThat(batchHashEntries(journal, accepted.jobId())).hasSize(1);
+
+        crypto.unblock("second");
+        awaitStatus(accepted.jobId(), JobStatus.FAILED);
+    }
+
+    /**
+     * DOD-07 / DOD-11 / REQ-01: the effective bound is part of the idempotency identity - the same key
+     * with a different deadline is a 409 conflict, an identical submission is still a replay, and a
+     * request without a value fingerprints the configured default.
+     */
+    @Test
+    @DisplayName("deadline - the effective bound is part of the idempotency fingerprint")
+    void shouldConflictOnSameKeyWithDifferentDeadline() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        service = new BatchHashJobService(new CryptoService(), 1, 10, 300, 3, LEASE_SECONDS, 5000, 0L,
+                BatchHashJobService.DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT, 60L, clock, newJournal());
+        String client = "198.51.100.78";
+        List<String> items = List.of("fingerprint");
+
+        BatchHashJobResponse first = service.submit(
+                new BatchHashRequest("SHA-256", items, null, "fp-key", 30), client);
+        assertThat(first.deadlineAt()).isEqualTo(first.createdAt().plusSeconds(30));
+        assertThatThrownBy(() -> service.submit(
+                new BatchHashRequest("SHA-256", items, null, "fp-key", 60), client))
+                .isInstanceOf(IdempotencyConflictException.class);
+        // A replay of the very same submission is still deduplicated, not conflicted.
+        assertThat(service.submit(new BatchHashRequest("SHA-256", items, null, "fp-key", 30), client)
+                .jobId()).isEqualTo(first.jobId());
+
+        // No per-request value: the configured default is the effective bound, and it fingerprints the
+        // same whether it arrives by default or explicitly.
+        BatchHashJobResponse defaulted = service.submit(
+                new BatchHashRequest("SHA-256", items, null, "fp-default"), client);
+        assertThat(defaulted.deadlineAt()).isEqualTo(defaulted.createdAt().plusSeconds(60));
+        assertThat(service.submit(new BatchHashRequest("SHA-256", items, null, "fp-default", 60), client)
+                .jobId()).isEqualTo(defaulted.jobId());
+        assertThatThrownBy(() -> service.submit(
+                new BatchHashRequest("SHA-256", items, null, "fp-default", 5), client))
+                .isInstanceOf(IdempotencyConflictException.class);
+    }
+
+    /**
+     * DOD-08 / REQ-01: {@code 0} disables the server default, so a request without a value stays
+     * unbounded exactly as before - no {@code deadlineAt}, and the reaper never fails it for time.
+     */
+    @Test
+    @DisplayName("deadline - a disabled default leaves unbounded jobs on today's behaviour")
+    void shouldDisableDeadlineWhenDefaultIsZero() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        service = newDeadlineService(new CryptoService(), 10, clock, newJournal());
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("unbounded"), null, "no-deadline-key"));
+        assertThat(accepted.deadlineAt()).isNull();
+        BatchHashJobResponse completed = awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.deadlineAt()).isNull();
+
+        clock.advanceSeconds(7200); // two hours later the retired job is still not "late"
+        assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+        assertThat(service.getJob(accepted.jobId()).status()).isEqualTo(JobStatus.COMPLETED);
+        // ...and the duplicate submission still returns the existing job rather than a 409.
+        assertThat(service.submit(
+                new BatchHashRequest("SHA-256", List.of("unbounded"), null, "no-deadline-key")).jobId())
+                .isEqualTo(accepted.jobId());
+    }
+
+    /**
+     * DOD-09 / REQ-01: the configured default is validated on the same {@code 0..3600} range as the
+     * request, so a bad {@code utiltools.jobs.default-deadline-seconds} fails at startup rather than
+     * per submission.
+     */
+    @Test
+    @DisplayName("deadline - an out-of-range configured default is rejected at construction")
+    void shouldRejectDefaultDeadlineOutsideRange() {
+        CryptoService crypto = new CryptoService();
+        for (long invalid : new long[] {-1L, 3601L}) {
+            assertThatThrownBy(() -> new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000,
+                    0L, BatchHashJobService.DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT, invalid,
+                    new MutableJobClock(LEASE_START), null))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("utiltools.jobs.default-deadline-seconds");
+        }
+    }
+
+    /**
+     * DOD-10 / REQ-01: a per-request value outside {@code 1..3600} is rejected even when the service is
+     * called directly, so {@code 0} can never be smuggled in as "unbounded": no job row and no quota
+     * slot is created.
+     */
+    @Test
+    @DisplayName("deadline - a direct submit with an out-of-range deadline is refused")
+    void shouldRejectOutOfRangeRequestDeadlineOnDirectSubmit() {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        service = newDeadlineService(new CryptoService(), 10, clock, newJournal());
+        String client = "198.51.100.79";
+
+        for (int invalid : new int[] {0, -5, 3601}) {
+            assertThatThrownBy(() -> service.submit(new BatchHashRequest("SHA-256",
+                    List.of("invalid"), null, "invalid-deadline-" + invalid, invalid), client))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("deadlineSeconds");
+        }
+        assertThat(service.activeJobsForClient(client)).isZero(); // no slot consumed
+        assertThat(service.listJobs(null, 20)).isEmpty(); // and no job row registered
+    }
+
+    /**
+     * DOD-12 / REQ-02: {@code deadlineAt} is an additive snapshot component projected for every status,
+     * while the pre-deadline constructors still build a response with no bound.
+     */
+    @Test
+    @DisplayName("deadline - the snapshot exposes deadlineAt and keeps the older constructors")
+    void shouldExposeDeadlineAtOnSnapshot() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        List<JobAttempt> attempts = List.of(new JobAttempt(1, JobStatus.COMPLETED, LEASE_START,
+                LEASE_START, null));
+        BatchHashJobResponse legacy = new BatchHashJobResponse("job-legacy", null, JobStatus.COMPLETED, 1,
+                List.of(), null, LEASE_START, LEASE_START, LEASE_START, 1, 3, attempts,
+                LEASE_START.plusSeconds(30), LEASE_START.plusSeconds(10));
+        assertThat(legacy.deadlineAt()).isNull(); // 14-component compatibility constructor
+
+        service = newDeadlineService(new CryptoService(), 10, clock, newJournal());
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("snapshot"), null, null, 60));
+        assertThat(accepted.deadlineAt()).isEqualTo(accepted.createdAt().plusSeconds(60));
+        BatchHashJobResponse completed = awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.deadlineAt()).isEqualTo(accepted.deadlineAt()); // projected after the write
+        assertThat(service.getJob(accepted.jobId()).deadlineAt()).isEqualTo(accepted.deadlineAt());
+        assertThat(service.listJobs(null, 20)).extracting(BatchHashJobResponse::deadlineAt)
+                .containsExactly(accepted.deadlineAt());
+    }
 }
