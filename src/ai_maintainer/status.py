@@ -21,6 +21,7 @@ text and JSON output cannot disagree.
 from __future__ import annotations
 
 import json
+import math
 import resource
 import sys
 import time
@@ -83,10 +84,16 @@ def _read_status_doc(path: Path | None) -> dict[str, Any] | None:
 
     if path is None:
         return None
+    # Same guard as the sibling probe (checks.py): a FIFO/device/socket at this
+    # path would block ``open()`` forever, so only regular files are read.
+    if not path.is_file():
+        return None
     try:
         with path.open(encoding="utf-8", errors="replace") as handle:
             raw = json.loads(handle.read(STATUS_READ_LIMIT))
-    except (OSError, ValueError):
+    # RecursionError: json's C scanner raises it for deeply nested input inside
+    # the read window; it is not a ValueError, so it must be named here (INV-3).
+    except (OSError, ValueError, RecursionError):
         return None
     if not isinstance(raw, dict):
         return None
@@ -108,7 +115,9 @@ def _float_or_none(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        number = float(value)
+        # ``json.loads`` accepts bare NaN/Infinity; those are not JSON numbers.
+        return number if math.isfinite(number) else None
     return None
 
 
@@ -267,6 +276,15 @@ def _mib_text(value: Any) -> str:
     return f"{float(value) / 1024.0:.1f} MiB"
 
 
+def _clean(value: Any, default: str = "unknown") -> str:
+    """One printable line: a document-supplied string cannot forge extra lines."""
+
+    if not isinstance(value, str) or not value.strip():
+        return default
+    cleaned = "".join(char if char.isprintable() else " " for char in value).strip()
+    return cleaned or default
+
+
 def format_text(payload: Mapping[str, Any]) -> str:
     """Render the payload for humans. Reads only the dict it is given (INV-6)."""
 
@@ -279,25 +297,26 @@ def format_text(payload: Mapping[str, Any]) -> str:
     latest = payload.get("latest_task_run")
     if isinstance(latest, Mapping):
         latest_line = (
-            f"{latest.get('task_id')} {latest.get('status')} "
+            f"{_clean(latest.get('task_id'))} {_clean(latest.get('status'))} "
             f"(age {_age_text(latest.get('completed_age_sec'))})"
         )
     else:
         latest_line = "unknown"
 
     unavailable = payload.get("unavailable") or []
-    unavailable_line = ", ".join(str(name) for name in unavailable) or "none"
+    unavailable_line = ", ".join(_clean(name) for name in unavailable) or "none"
 
     lines = [
         "maintainer status",
-        f"daemon: {payload.get('daemon_status')} "
-        f"(source={(payload.get('sources') or {}).get('orchestrator')}, "
+        f"daemon: {_clean(payload.get('daemon_status'))} "
+        f"(source={_clean((payload.get('sources') or {}).get('orchestrator'))}, "
         f"heartbeat_age={_age_text(payload.get('heartbeat_age_sec'))})",
-        f"orchestrator: {payload.get('orchestrator_status')}",
-        f"active task: {payload.get('active_task_id') or 'unknown'}",
-        f"queue: {payload.get('queue_state')} ({_int_text(payload.get('queue_depth'))} queued, "
+        f"orchestrator: {_clean(payload.get('orchestrator_status'))}",
+        f"active task: {_clean(payload.get('active_task_id'))}",
+        f"queue: {_clean(payload.get('queue_state'))} "
+        f"({_int_text(payload.get('queue_depth'))} queued, "
         f"{_int_text(payload.get('active_tasks'))} active, "
-        f"last completed {payload.get('last_completed_task') or 'none'})",
+        f"last completed {_clean(payload.get('last_completed_task'), 'none')})",
         f"memory: {memory_line}",
         f"counters: total_cycles={_int_text(payload.get('total_cycles'))} "
         f"bugs_patched={_int_text(payload.get('bugs_patched'))} "
@@ -308,7 +327,19 @@ def format_text(payload: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def render_json(payload: Mapping[str, Any]) -> str:
-    """One JSON document (sorted keys, JSON-safe values per INV-2)."""
+def _json_safe(value: Any) -> Any:
+    """Copy of the payload without non-finite floats (``NaN`` is not JSON)."""
 
-    return json.dumps(payload, sort_keys=True)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def render_json(payload: Mapping[str, Any]) -> str:
+    """One strictly valid JSON document (sorted keys, finite numbers per INV-2)."""
+
+    return json.dumps(_json_safe(payload), sort_keys=True, allow_nan=False)

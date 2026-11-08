@@ -2112,14 +2112,22 @@ unavailable: none
 `daemon_status`, `orchestrator_up`, `orchestrator_status`, `active_task_id`, `queue_state`,
 `queue_depth`, `active_tasks`, `last_completed_task`, `heartbeat_age_sec`, `memory`,
 `total_cycles`, `bugs_patched`, `total_learnings`, `latest_task_run`, `generated_at`, `sources`
-and `unavailable`. Text mode renders those same fields, so the two modes never disagree.
+and `unavailable`. Text mode renders those same fields, so the two modes never disagree. The
+payload is a superset of the required core key set: `last_completed_task` and
+`heartbeat_age_sec` are additional documented keys (INV-1 requires presence, not exclusivity).
+Every number is finite, so the document parses with a strict JSON parser (`NaN`/`Infinity` are
+dropped to `null` rather than emitted).
 
 - `daemon_status` is `running` (heartbeat younger than 900 s), `stale` or `unknown`;
   `orchestrator_up` is `true`/`false`/`null` alongside the same value as `orchestrator_status`.
 - Counters are read from the read-only document `<state_root>/maintainer_status.json`
   (`total_cycles`, `bugs_patched`, `total_learnings`, optional `latest_task_run`). The file is an
   input only: `status` never creates, refreshes or migrates it. Missing or malformed documents
-  yield `null` values plus the field name in `unavailable`, never an error.
+  yield `null` values plus the field name in `unavailable`, never an error. Only a regular file is
+  read (a FIFO, device or directory at that path is ignored) and a bounded read is parsed, so
+  oversized, deeply nested or invalid documents degrade instead of raising.
+- In text mode every document-supplied string is flattened to one printable line, so a task id
+  cannot forge extra report lines.
 - `memory` describes the process running `status` (`rss_kb`/`peak_rss_kb` from `/proc`, or
   `available: false`).
 - `sources` says where each value came from (`FrameworkWatcher`, `active_task`, the counter

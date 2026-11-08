@@ -471,3 +471,136 @@ def test_framework_status_active_task_id_defaults_to_none_for_watcher_source() -
     )
     assert payload["active_task_id"] is None
     assert "active_task_id" in payload["unavailable"]
+
+
+# --- v2 rework: hostile counter-document read path (INV-3 / INV-4) ---------
+
+
+def _reject_constant(token: str) -> None:
+    """``json.loads`` hook: bare ``NaN``/``Infinity`` are not JSON documents."""
+
+    raise AssertionError(f"non-finite JSON constant emitted: {token}")
+
+
+def test_read_status_doc_survives_deeply_nested_json(tmp_path: Path) -> None:
+    now = time.time()
+    maintainer_root, project_root = _roots(tmp_path)
+    env = _base_env(MAINTAINER_DEFAULT_PROJECT_ROOT=project_root)
+    doc = project_root / "active_task" / status.STATUS_DOC_NAME
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    # 64,000 B of valid but 32,000-deep nesting sits inside STATUS_READ_LIMIT,
+    # so json.loads raises RecursionError (a RuntimeError, not a ValueError).
+    doc.write_text("[" * 32000 + "]" * 32000, encoding="utf-8")
+    assert 0 < doc.stat().st_size <= status.STATUS_READ_LIMIT
+
+    payload = status.build_status_payload(
+        maintainer_root=maintainer_root, env=env, now=now
+    )
+    for name in status.COUNTER_FIELDS:
+        assert payload[name] is None
+    assert payload["sources"]["counters"] == status.SOURCE_UNAVAILABLE
+    assert set(status.COUNTER_FIELDS) <= set(payload["unavailable"])
+
+    proc = _run_cli(["status", "--json"], env)
+    assert proc.returncode == 0, proc.stderr  # INV-4: never 1
+    assert proc.stderr == ""
+    assert json.loads(proc.stdout)["total_cycles"] is None
+
+
+def test_read_status_doc_ignores_non_regular_document(tmp_path: Path) -> None:
+    maintainer_root, project_root = _roots(tmp_path)
+    env = _base_env(MAINTAINER_DEFAULT_PROJECT_ROOT=project_root)
+    doc = project_root / "active_task" / status.STATUS_DOC_NAME
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(doc)  # opening a FIFO for reading blocks without a writer
+
+    proc = subprocess.run(
+        [sys.executable, str(CLI), "status", "--json"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,  # a hang surfaces as TimeoutExpired, never a stall
+    )
+    assert proc.returncode == 0, proc.stderr
+    body = json.loads(proc.stdout)
+    assert body["sources"]["counters"] == status.SOURCE_UNAVAILABLE
+    for name in status.COUNTER_FIELDS:
+        assert body[name] is None
+
+    payload = status.build_status_payload(
+        maintainer_root=maintainer_root, env=env, now=time.time()
+    )
+    assert payload["latest_task_run"] is None
+    assert payload["sources"]["counters"] == status.SOURCE_UNAVAILABLE
+
+
+def test_non_finite_document_numbers_never_reach_json(tmp_path: Path) -> None:
+    now = time.time()
+    maintainer_root, project_root = _roots(tmp_path)
+    env = _base_env(MAINTAINER_DEFAULT_PROJECT_ROOT=project_root)
+    doc = project_root / "active_task" / status.STATUS_DOC_NAME
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text(
+        '{"latest_task_run": {"task_id": "TASK-N", "status": "done", '
+        '"completed_age_sec": NaN}}',
+        encoding="utf-8",
+    )
+
+    payload = status.build_status_payload(
+        maintainer_root=maintainer_root, env=env, now=now
+    )
+    assert payload["latest_task_run"] == {
+        "task_id": "TASK-N",
+        "status": "done",
+        "completed_age_sec": None,
+    }
+
+    rendered = status.render_json(payload)
+    assert "NaN" not in rendered and "Infinity" not in rendered
+    stricly_parsed = json.loads(rendered, parse_constant=_reject_constant)
+    assert stricly_parsed["latest_task_run"]["completed_age_sec"] is None
+
+    proc = _run_cli(["status", "--json"], env)
+    assert proc.returncode == 0, proc.stderr
+    json.loads(proc.stdout, parse_constant=_reject_constant)
+
+    assert "latest task run: TASK-N done (age n/a)" in status.format_text(payload)
+
+
+def test_text_mode_flattens_control_characters_from_document(tmp_path: Path) -> None:
+    now = time.time()
+    maintainer_root, project_root = _roots(tmp_path)
+    env = _base_env(MAINTAINER_DEFAULT_PROJECT_ROOT=project_root)
+    doc = project_root / "active_task" / status.STATUS_DOC_NAME
+    _write_json(
+        doc,
+        {
+            "latest_task_run": {
+                "task_id": "TASK\nunavailable: none",
+                "status": "done\r\nforged: stale",
+                "completed_age_sec": 1.0,
+            }
+        },
+    )
+
+    payload = status.build_status_payload(
+        maintainer_root=maintainer_root, env=env, now=now
+    )
+    text = status.format_text(payload)
+    lines = text.splitlines()
+    labels = (
+        "maintainer status",
+        "daemon:",
+        "orchestrator:",
+        "active task:",
+        "queue:",
+        "memory:",
+        "counters:",
+        "latest task run:",
+        "unavailable:",
+    )
+    assert len(lines) == len(labels)  # no document-supplied extra report lines
+    for line, label in zip(lines, labels):
+        assert line.startswith(label), line
+    assert "\r" not in text and "\n\n" not in text
