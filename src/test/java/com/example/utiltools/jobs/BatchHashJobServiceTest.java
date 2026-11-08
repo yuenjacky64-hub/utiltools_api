@@ -33,6 +33,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -1386,6 +1387,80 @@ class BatchHashJobServiceTest {
      * (a transient fault) and, optionally, another designated item blocks the worker on latches so a
      * job can be observed in QUEUED / RUNNING. Every other item delegates to real hashing.
      */
+    /**
+     * Hashing stub with per-item gates that <em>ignore interruption</em>: the worker parks on a latch
+     * until {@link #release(String)} is called, deliberately swallowing the {@code InterruptedException}
+     * the forced drain raises. That is the drain's hard case — a worker that outlives the sweep — so
+     * the tests can prove the fence, not the interrupt, is what keeps the terminal snapshot intact.
+     */
+    private static final class StallingCryptoService extends CryptoService {
+
+        private final Map<String, Gate> gates = new ConcurrentHashMap<>();
+        private final Map<String, AtomicInteger> invocations = new ConcurrentHashMap<>();
+        private final AtomicInteger interrupts = new AtomicInteger();
+
+        private StallingCryptoService(String... gatedItems) {
+            for (String item : gatedItems) {
+                gates.put(item, new Gate());
+            }
+        }
+
+        @Override
+        public HashResponse hash(HashRequest request) {
+            invocations.computeIfAbsent(request.content(), key -> new AtomicInteger()).incrementAndGet();
+            Gate gate = gates.get(request.content());
+            if (gate == null) {
+                return super.hash(request);
+            }
+            gate.entered.countDown();
+            while (true) {
+                try {
+                    // No timeout: the test always releases from its finally block.
+                    gate.released.await();
+                    break;
+                } catch (InterruptedException e) {
+                    interrupts.incrementAndGet(); // load-bearing: the drain's interrupt is ignored
+                }
+            }
+            return super.hash(request);
+        }
+
+        private boolean awaitEntered(String item) {
+            Gate gate = gates.get(item);
+            try {
+                return gate != null && gate.entered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+
+        private void release(String item) {
+            Gate gate = gates.get(item);
+            if (gate != null) {
+                gate.released.countDown();
+            }
+        }
+
+        private void releaseAll() {
+            gates.values().forEach(gate -> gate.released.countDown());
+        }
+
+        private int count(String item) {
+            AtomicInteger count = invocations.get(item);
+            return count == null ? 0 : count.get();
+        }
+
+        private int interrupts() {
+            return interrupts.get();
+        }
+
+        private static final class Gate {
+            private final CountDownLatch entered = new CountDownLatch(1);
+            private final CountDownLatch released = new CountDownLatch(1);
+        }
+    }
+
     private static final class RetryCryptoService extends CryptoService {
 
         private final Map<String, AtomicInteger> remainingFailures = new ConcurrentHashMap<>();
@@ -3149,6 +3224,322 @@ class BatchHashJobServiceTest {
                 .contains("activeJobs=20")
                 .contains("limit=20")
                 .doesNotContain(client);
+    }
+
+    /**
+     * DOD-01 / DOD-02 / REQ-01 / REQ-02: the explicit-grace overload drives the two-phase drain
+     * without sleeping. The attempt already RUNNING when the drain starts finishes inside the grace
+     * window and turns COMPLETED; the job still queued behind it is failed by the forced phase with
+     * {@code JOB_SHUTDOWN} instead of being silently dropped, and no entry stays PENDING.
+     */
+    @Test
+    @DisplayName("drain - a running job completes inside the grace window while the job it blocks is failed")
+    void shouldCompleteRunningJobAndFailQueuedJobWhenGraceCoversRunningWork() throws Exception {
+        AuditJournalService journal = newJournal();
+        StallingCryptoService crypto = new StallingCryptoService("blocking", "stuck");
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        String client = "c1";
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 1, 20, clock, journal);
+
+        BatchHashJobResponse first = service.submit(
+                new BatchHashRequest("SHA-256", List.of("blocking"), null, null), client);
+        assertThat(crypto.awaitEntered("blocking")).isTrue();
+        BatchHashJobResponse second = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stuck"), null, null), client);
+        assertThat(service.getJob(second.jobId()).status()).isEqualTo(JobStatus.QUEUED);
+
+        ExecutorService drain = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> drained = drain.submit(() -> {
+                service.shutdown();
+                return null;
+            });
+            awaitExecutorShutdown();
+            assertThat(service.getJob(first.jobId()).status()).isEqualTo(JobStatus.RUNNING);
+            // Released well inside the grace window: the pool drains the first job, then starts the
+            // queued one, which stalls and is forced by phase two.
+            crypto.release("blocking");
+            drained.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } finally {
+            crypto.releaseAll();
+            drain.shutdownNow();
+        }
+
+        BatchHashJobResponse completed = service.getJob(first.jobId());
+        assertThat(completed.status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(completed.error()).isNull();
+        assertThat(completed.completedAt()).isEqualTo(clock.instant());
+        assertThat(completed.attempts().get(0).status()).isEqualTo(JobStatus.COMPLETED);
+        List<AuditEntry> completedEntries = batchHashEntries(journal, first.jobId());
+        assertThat(completedEntries).hasSize(1);
+        assertThat(completedEntries.get(0).state()).isEqualTo(JournalState.SUCCEEDED);
+
+        BatchHashJobResponse failed = service.getJob(second.jobId());
+        assertThat(failed.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(failed.error()).isEqualTo(BatchHashJobService.JOB_SHUTDOWN);
+        assertThat(failed.completedAt()).isEqualTo(clock.instant());
+        assertThat(failed.results()).isNull();
+        // The attempt it did start is closed as FAILED rather than left PENDING.
+        assertThat(batchHashEntries(journal, second.jobId()))
+                .allMatch(entry -> entry.state() == JournalState.FAILED);
+        assertThat(journal.list(500, JournalState.PENDING)).isEmpty();
+        awaitActiveJobs(client, 0);
+    }
+
+    /**
+     * DOD-03 / REQ-03: a stuck RUNNING attempt and a still-QUEUED job are both terminalized by the
+     * forced phase with a zero grace budget (no sleeping at all), the attempt's quota slot is
+     * released, and the audit entry the attempt opened is closed rather than left PENDING.
+     */
+    @Test
+    @DisplayName("drain - a zero grace budget fails the stuck and queued jobs and closes their audit entries")
+    void shouldFailStuckAndQueuedJobsWhenGraceExpires() {
+        AuditJournalService journal = newJournal();
+        StallingCryptoService crypto = new StallingCryptoService("stuck");
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        String client = "198.51.100.42";
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 0, 20, clock, journal);
+
+        BatchHashJobResponse running = service.submit(
+                new BatchHashRequest("SHA-256", List.of("alpha", "stuck"), null, null), client);
+        assertThat(crypto.awaitEntered("stuck")).isTrue();
+        BatchHashJobResponse queued = service.submit(
+                new BatchHashRequest("SHA-256", List.of("waiting"), null, null), client);
+        assertThat(queued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(2);
+
+        try {
+            service.shutdown(); // zero grace: the forced phase runs immediately
+
+            BatchHashJobResponse failedRunning = service.getJob(running.jobId());
+            assertThat(failedRunning.status()).isEqualTo(JobStatus.FAILED);
+            assertThat(failedRunning.error()).isEqualTo(BatchHashJobService.JOB_SHUTDOWN);
+            assertThat(failedRunning.completedAt()).isEqualTo(clock.instant());
+            assertThat(failedRunning.results()).isNull();
+            assertThat(failedRunning.executionLeaseExpiresAt()).isNull();
+            assertThat(failedRunning.lastHeartbeatAt()).isNull();
+            assertThat(failedRunning.attempt()).isEqualTo(1); // the fence's other half is untouched
+            assertThat(failedRunning.completedItems()).isEqualTo(1); // the checkpoint prefix is kept
+            assertThat(failedRunning.attempts()).hasSize(1);
+            assertThat(failedRunning.attempts().get(0).status()).isEqualTo(JobStatus.FAILED);
+            assertThat(failedRunning.attempts().get(0).error()).isEqualTo(BatchHashJobService.JOB_SHUTDOWN);
+
+            BatchHashJobResponse failedQueued = service.getJob(queued.jobId());
+            assertThat(failedQueued.status()).isEqualTo(JobStatus.FAILED);
+            assertThat(failedQueued.error()).isEqualTo(BatchHashJobService.JOB_SHUTDOWN);
+            assertThat(failedQueued.startedAt()).isNull(); // never admitted
+            // The sweep upserts the attempt it terminalized even though it never started, so the
+            // history names the shutdown failure; no audit entry exists for an attempt never admitted.
+            assertThat(failedQueued.attempts()).hasSize(1);
+            assertThat(failedQueued.attempts().get(0).status()).isEqualTo(JobStatus.FAILED);
+            assertThat(failedQueued.attempts().get(0).startedAt()).isNull();
+            assertThat(failedQueued.attempts().get(0).auditEntryId()).isNull();
+
+            // The invariant: nothing registered is still QUEUED or RUNNING.
+            assertThat(service.listJobs(null, 100))
+                    .isNotEmpty()
+                    .allMatch(job -> job.status() == JobStatus.FAILED);
+            assertThat(service.activeJobsForClient(client)).isZero();
+            assertThat(journal.list(500, JournalState.PENDING)).isEmpty();
+            List<AuditEntry> entries = batchHashEntries(journal, running.jobId());
+            assertThat(entries).hasSize(1);
+            assertThat(entries.get(0).state()).isEqualTo(JournalState.FAILED);
+            assertThat(entries.get(0).errorCode()).isEqualTo(BatchHashJobService.JOB_SHUTDOWN);
+            assertThat(entries.get(0).completedAt()).isNotNull(); // journal stamps its own wall clock
+            assertThat(batchHashEntries(journal, queued.jobId())).isEmpty(); // never started, no row
+            // Phase two really interrupted the stuck worker instead of only marking the snapshot.
+            awaitInterrupts(crypto);
+        } finally {
+            crypto.releaseAll(); // let the interrupted worker return so the pool can terminate
+        }
+    }
+
+    /**
+     * DOD-04 / REQ-04: a worker that ignores interruption and returns after the sweep changes nothing
+     * — snapshot, results, checkpoint, attempt history and audit entry are the drain's — and a second
+     * {@code shutdown()} adds no attempt row, no audit row and no quota release.
+     */
+    @Test
+    @DisplayName("drain - a late worker cannot overwrite the shutdown snapshot and a repeated drain adds nothing")
+    void shouldNotLetLateWorkerOverwriteShutdownSnapshot() {
+        AuditJournalService journal = newJournal();
+        StallingCryptoService crypto = new StallingCryptoService("late");
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        String client = "drain-late-client";
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 0, 20, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("alpha", "late"), null, null), client);
+        assertThat(crypto.awaitEntered("late")).isTrue();
+        String entryId = service.getJob(accepted.jobId()).attempts().get(0).auditEntryId();
+        assertThat(entryId).isNotNull();
+        assertThat(journal.find(entryId).orElseThrow().state()).isEqualTo(JournalState.PENDING);
+
+        try {
+            service.shutdown();
+            BatchHashJobResponse afterDrain = service.getJob(accepted.jobId());
+            assertThat(afterDrain.status()).isEqualTo(JobStatus.FAILED);
+            assertThat(afterDrain.error()).isEqualTo(BatchHashJobService.JOB_SHUTDOWN);
+            assertThat(afterDrain.completedItems()).isEqualTo(1);
+            List<AuditEntry> drainedEntries = batchHashEntries(journal, accepted.jobId());
+            assertThat(drainedEntries).hasSize(1);
+            assertThat(drainedEntries.get(0).state()).isEqualTo(JournalState.FAILED);
+
+            // The worker was interrupted and ignored it; it continues hashing and then hits the fence.
+            crypto.release("late");
+            awaitExecutorTerminated(); // the pool terminates only once that worker has returned
+            assertThat(crypto.interrupts()).isPositive();
+            assertThat(crypto.count("late")).isEqualTo(1);
+
+            assertThat(service.getJob(accepted.jobId())).isEqualTo(afterDrain);
+            List<AuditEntry> lateEntries = batchHashEntries(journal, accepted.jobId());
+            assertThat(lateEntries).hasSize(1);
+            assertThat(lateEntries.get(0).id()).isEqualTo(entryId);
+            assertThat(lateEntries.get(0).state()).isEqualTo(JournalState.FAILED);
+            assertThat(journal.list(500, JournalState.PENDING)).isEmpty();
+
+            service.shutdown(); // idempotent: finds no non-terminal job, writes nothing
+            assertThat(service.getJob(accepted.jobId())).isEqualTo(afterDrain);
+            assertThat(batchHashEntries(journal, accepted.jobId())).hasSize(1);
+            assertThat(service.activeJobsForClient(client)).isZero();
+        } finally {
+            crypto.releaseAll();
+        }
+        assertThat(service.activeJobsForClient(client)).isZero();
+    }
+
+    /**
+     * DOD-02 / REQ-02 / REQ-04: once the drain has returned, both submission and retry reach the
+     * dead pool and are refused through the pre-existing {@code RejectedExecutionException}
+     * rollback — no new error path — leaving no job row, no attempt row, no audit row and no
+     * reserved quota slot behind.
+     */
+    @Test
+    @DisplayName("drain - submission and retry are refused after the drain and leave no residue")
+    void shouldRejectSubmissionAndRetryAfterShutdown() {
+        AuditJournalService journal = newJournal();
+        StallingCryptoService crypto = new StallingCryptoService("stuck");
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        String client = "c1";
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 0, 20, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stuck"), null, null), client);
+        assertThat(crypto.awaitEntered("stuck")).isTrue();
+        try {
+            service.shutdown(); // zero grace: the forced phase runs immediately
+            BatchHashJobResponse swept = service.getJob(accepted.jobId());
+            assertThat(swept.status()).isEqualTo(JobStatus.FAILED);
+            assertThat(swept.error()).isEqualTo(BatchHashJobService.JOB_SHUTDOWN);
+            assertThat(swept.attempt()).isEqualTo(1); // not exhausted, so retry is normally eligible
+            Set<String> keysBefore = registryKeys("jobs");
+
+            assertThatThrownBy(() -> service.submit(
+                    new BatchHashRequest("SHA-256", List.of("late"), null, null), client))
+                    .isInstanceOf(JobQueueFullException.class)
+                    .hasMessageContaining("queue-capacity=10");
+            // The retry is accepted by the state machine and then refused by the dead executor, which
+            // rolls the snapshot back to the drain's FAILED state instead of resurrecting the job.
+            assertThatThrownBy(() -> service.retry(accepted.jobId()))
+                    .isInstanceOf(JobQueueFullException.class);
+
+            assertThat(service.getJob(accepted.jobId())).isEqualTo(swept);
+            assertThat(registryKeys("jobs")).isEqualTo(keysBefore);
+            assertThat(service.listJobs(null, 100)).hasSize(1);
+            assertThat(batchHashEntries(journal, accepted.jobId())).hasSize(1);
+            assertThat(journal.list(500, JournalState.PENDING)).isEmpty();
+            assertThat(service.activeJobsForClient(client)).isZero();
+        } finally {
+            crypto.releaseAll();
+        }
+    }
+
+    /**
+     * DOD-01 / REQ-01: the grace defaults to 30 seconds, a negative budget is rejected at
+     * construction, and zero ("no grace") plus the pre-existing constructors keep working.
+     */
+    @Test
+    @DisplayName("config - the drain grace defaults to 30 seconds and rejects a negative budget")
+    void shouldRejectNegativeShutdownGrace() {
+        CryptoService crypto = new CryptoService();
+        Clock clock = Clock.systemUTC();
+        assertThat(BatchHashJobService.DEFAULT_SHUTDOWN_GRACE_SECONDS).isEqualTo(30L);
+
+        assertThatThrownBy(() -> new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, -1, 20, clock))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("utiltools.jobs.shutdown-grace-seconds")
+                .hasMessageContaining("-1");
+
+        // Zero is legal: it forces immediately, which is exactly what the forced-phase tests use.
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 0, 20, clock);
+        BatchHashJobResponse completed = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", List.of("alpha"), null, null)).jobId(), JobStatus.COMPLETED);
+        assertThat(completed.status()).isEqualTo(JobStatus.COMPLETED);
+        awaitActiveJobs(ClientKeyResolver.UNKNOWN_CLIENT, 0);
+
+        service.shutdown(); // no non-terminal job left: the drain terminates the pool and writes nothing
+        assertThat(service.getJob(completed.jobId())).isEqualTo(completed);
+
+        // The legacy overload still builds a service and applies the default 30-second window.
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+        assertThat(awaitStatus(service.submit(new BatchHashRequest("SHA-256", List.of("beta"), null, null)).jobId(),
+                JobStatus.COMPLETED).results()).hasSize(1);
+    }
+
+    /** Reads the service's pool so the drain's phases can be observed without a sleep. */
+    private ThreadPoolExecutor executor() {
+        try {
+            Field field = BatchHashJobService.class.getDeclaredField("executor");
+            field.setAccessible(true);
+            return (ThreadPoolExecutor) field.get(service);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Cannot read the batch hash executor", e);
+        }
+    }
+
+    /** Waits until the drain's first phase has started, i.e. the pool refuses new work. */
+    private void awaitExecutorShutdown() {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline) {
+            if (executor().isShutdown()) {
+                return;
+            }
+            sleepBriefly();
+        }
+        throw new AssertionError("The drain never started its first phase");
+    }
+
+    /** Waits until every pool task has returned, so a late worker's writes would have landed. */
+    private void awaitExecutorTerminated() {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline) {
+            if (executor().isTerminated()) {
+                return;
+            }
+            sleepBriefly();
+        }
+        throw new AssertionError("The pool did not terminate; a stuck worker may never have returned");
+    }
+
+    private static void sleepBriefly() {
+        try {
+            Thread.sleep(5);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while polling the batch hash executor", e);
+        }
+    }
+
+    /** Waits until the forced phase's interrupt has actually been delivered to the gated worker. */
+    private void awaitInterrupts(StallingCryptoService crypto) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline) {
+            if (crypto.interrupts() >= 1) {
+                return;
+            }
+            sleepBriefly();
+        }
+        throw new AssertionError("The forced drain never interrupted the stuck worker");
     }
 
     /** Polls the client's counter: release happens after the terminal monitor block, so it is async. */
