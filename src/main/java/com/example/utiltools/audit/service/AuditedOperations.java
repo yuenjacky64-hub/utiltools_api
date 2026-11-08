@@ -30,6 +30,8 @@ import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
 import com.example.utiltools.json.dto.JsonFromCsvRequest;
 import com.example.utiltools.json.dto.JsonFromCsvResponse;
+import com.example.utiltools.json.dto.JsonFromNdjsonRequest;
+import com.example.utiltools.json.dto.JsonFromNdjsonResponse;
 import com.example.utiltools.json.dto.JsonMergePatchRequest;
 import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
@@ -38,6 +40,8 @@ import com.example.utiltools.json.dto.JsonUnflattenResponse;
 import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonToCsvRequest;
 import com.example.utiltools.json.dto.JsonToCsvResponse;
+import com.example.utiltools.json.dto.JsonToNdjsonRequest;
+import com.example.utiltools.json.dto.JsonToNdjsonResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.service.JsonService;
@@ -165,6 +169,14 @@ public class AuditedOperations {
         return record(OperationType.JSON_FROM_CSV, request, () -> jsonService.fromCsv(request));
     }
 
+    public JsonToNdjsonResponse toNdjson(JsonToNdjsonRequest request) {
+        return record(OperationType.JSON_TO_NDJSON, request, () -> jsonService.toNdjson(request));
+    }
+
+    public JsonFromNdjsonResponse fromNdjson(JsonFromNdjsonRequest request) {
+        return record(OperationType.JSON_FROM_NDJSON, request, () -> jsonService.fromNdjson(request));
+    }
+
     public TextTransformResponse transform(TextTransformRequest request) {
         return record(OperationType.TEXT_TRANSFORM, request, () -> textService.transform(request));
     }
@@ -201,6 +213,8 @@ public class AuditedOperations {
             case JSON_MERGE_PATCH -> jsonService.mergePatch((JsonMergePatchRequest) request);
             case JSON_TO_CSV -> jsonService.toCsv((JsonToCsvRequest) request);
             case JSON_FROM_CSV -> jsonService.fromCsv((JsonFromCsvRequest) request);
+            case JSON_TO_NDJSON -> jsonService.toNdjson((JsonToNdjsonRequest) request);
+            case JSON_FROM_NDJSON -> jsonService.fromNdjson((JsonFromNdjsonRequest) request);
             case TEXT_TRANSFORM -> textService.transform((TextTransformRequest) request);
             case TEXT_STATS -> textService.stats((TextStatsRequest) request);
             case TEXT_REPLACE -> textService.replace((TextReplaceRequest) request);
