@@ -3,6 +3,7 @@ package com.example.utiltools.json;
 import com.example.utiltools.json.dto.JsonFlattenRequest;
 import com.example.utiltools.json.dto.JsonFromCsvRequest;
 import com.example.utiltools.json.dto.JsonFromCsvResponse;
+import com.example.utiltools.json.dto.JsonFromNdjsonRequest;
 import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
 import com.example.utiltools.json.dto.JsonFormatResponse;
@@ -15,6 +16,8 @@ import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonToCsvRequest;
 import com.example.utiltools.json.dto.JsonToCsvResponse;
+import com.example.utiltools.json.dto.JsonToNdjsonRequest;
+import com.example.utiltools.json.dto.JsonToNdjsonResponse;
 import com.example.utiltools.json.dto.JsonUnflattenRequest;
 import com.example.utiltools.json.dto.JsonUnflattenResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
@@ -1219,6 +1222,148 @@ class JsonServiceTest {
                     .extracting(ConstraintViolation::getMessage)
                     .containsExactly("csv content must be at most 1000000 characters");
             assertThat(validator.validate(new JsonFromCsvRequest("a\r\n1", null, null))).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("Should convert a JSON array to NDJSON with one compact value per line")
+    void shouldConvertJsonArrayToNdjson() {
+        JsonToNdjsonResponse response = jsonService.toNdjson(
+                new JsonToNdjsonRequest("[{\"a\":1},{\"b\":2}]"));
+
+        assertThat(response.ndjson()).isEqualTo("{\"a\":1}\n{\"b\":2}");
+        assertThat(response.lineCount()).isEqualTo(2);
+        assertThat(response.ndjson()).doesNotEndWith("\n");
+        assertThat(response.sizeBytes())
+                .isEqualTo(response.ndjson().getBytes(StandardCharsets.UTF_8).length);
+
+        JsonToNdjsonResponse mixed = jsonService.toNdjson(new JsonToNdjsonRequest("[1,[2],null]"));
+        assertThat(mixed.ndjson()).isEqualTo("1\n[2]\nnull");
+        assertThat(mixed.lineCount()).isEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("Should return empty NDJSON for an empty array")
+    void shouldReturnEmptyNdjsonForEmptyArray() {
+        JsonToNdjsonResponse response = jsonService.toNdjson(new JsonToNdjsonRequest("[]"));
+
+        assertThat(response.ndjson()).isEmpty();
+        assertThat(response.lineCount()).isZero();
+        assertThat(response.sizeBytes()).isZero();
+    }
+
+    @Test
+    @DisplayName("Should reject a non-array root and malformed JSON for NDJSON export")
+    void shouldRejectNonArrayRootForNdjson() {
+        for (String json : List.of("{\"a\":1}", "7", "\"x\"")) {
+            assertThatThrownBy(() -> jsonService.toNdjson(new JsonToNdjsonRequest(json)))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("json content must be an array");
+        }
+        assertThatThrownBy(() -> jsonService.toNdjson(new JsonToNdjsonRequest("{not json")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid JSON content:");
+    }
+
+    @Test
+    @DisplayName("Should convert NDJSON lines back to a JSON array in input order")
+    void shouldConvertNdjsonToJsonArray() {
+        var response = jsonService.fromNdjson(new JsonFromNdjsonRequest(
+                "{\"a\":1}\n[1,2]\n\"text\"\ntrue\nnull"));
+
+        assertThat(response.recordCount()).isEqualTo(5);
+        assertThat(response.resultJson().isArray()).isTrue();
+        assertThat(response.resultJson()).hasSize(5);
+        assertThat(response.resultJson().get(0).path("a").asInt()).isEqualTo(1);
+        assertThat(response.resultJson().get(1).toString()).isEqualTo("[1,2]");
+        assertThat(response.resultJson().get(2).asText()).isEqualTo("text");
+        assertThat(response.resultJson().get(3).asBoolean()).isTrue();
+        assertThat(response.resultJson().get(4).isNull()).isTrue();
+    }
+
+    @Test
+    @DisplayName("Should ignore blank lines and CRLF endings when importing NDJSON")
+    void shouldIgnoreBlankLinesAndCrlf() {
+        var response = jsonService.fromNdjson(new JsonFromNdjsonRequest(
+                "{\"a\":1}\r\n\r\n{\"b\":2}\r\n"));
+
+        assertThat(response.recordCount()).isEqualTo(2);
+        assertThat(response.resultJson().get(0).path("a").asInt()).isEqualTo(1);
+        assertThat(response.resultJson().get(1).path("b").asInt()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("Should report the 1-based physical line number of a malformed NDJSON line")
+    void shouldReportPhysicalLineNumberForMalformedLine() {
+        assertThatThrownBy(() -> jsonService.fromNdjson(
+                new JsonFromNdjsonRequest("{\"a\":1}\n\n{not json}")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid JSON on line 3");
+
+        assertThatThrownBy(() -> jsonService.fromNdjson(new JsonFromNdjsonRequest("1\n2\n]")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid JSON on line 3");
+    }
+
+    @Test
+    @DisplayName("Should treat an empty NDJSON document as an empty array")
+    void shouldAllowEmptyNdjsonDocument() {
+        for (String document : java.util.Arrays.asList(null, "", "   ", "\n\n")) {
+            var response = jsonService.fromNdjson(new JsonFromNdjsonRequest(document));
+            assertThat(response.recordCount()).isZero();
+            assertThat(response.resultJson().isArray()).isTrue();
+            assertThat(response.resultJson()).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("Should enforce the 10000 record bound on NDJSON import")
+    void shouldEnforceNdjsonRecordBound() {
+        String tenThousand = IntStream.range(0, 10000)
+                .mapToObj(String::valueOf)
+                .reduce((a, b) -> a + "\n" + b)
+                .orElseThrow();
+        assertThat(jsonService.fromNdjson(new JsonFromNdjsonRequest(tenThousand)).recordCount())
+                .isEqualTo(10000);
+
+        String tooMany = tenThousand + "\n10000";
+        assertThatThrownBy(() -> jsonService.fromNdjson(new JsonFromNdjsonRequest(tooMany)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("records must not exceed 10000");
+    }
+
+    @Test
+    @DisplayName("Should round-trip NDJSON and empty documents")
+    void shouldRoundTripNdjsonAndEmptyDocuments() throws Exception {
+        ObjectMapper objectMapper = new ObjectMapper();
+        String array = "[{\"a\":1,\"b\":[1,2]},\"text\",null,true,7.5]";
+
+        JsonToNdjsonResponse exported = jsonService.toNdjson(new JsonToNdjsonRequest(array));
+        var imported = jsonService.fromNdjson(new JsonFromNdjsonRequest(exported.ndjson()));
+
+        assertThat(imported.resultJson()).isEqualTo(objectMapper.readTree(array));
+        assertThat(imported.recordCount()).isEqualTo(5);
+
+        JsonToNdjsonResponse emptyArray = jsonService.toNdjson(new JsonToNdjsonRequest("[]"));
+        assertThat(jsonService.fromNdjson(new JsonFromNdjsonRequest(emptyArray.ndjson())).resultJson())
+                .isEmpty();
+        assertThat(jsonService.fromNdjson(new JsonFromNdjsonRequest("")).resultJson()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Should validate the NDJSON request fields")
+    void shouldValidateNdjsonRequestFields() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+            assertThat(validator.validate(new JsonToNdjsonRequest(" ")))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("json content is required");
+            assertThat(validator.validate(new JsonToNdjsonRequest("[{\"a\":1}]"))).isEmpty();
+
+            assertThat(validator.validate(new JsonFromNdjsonRequest(null))).isEmpty();
+            assertThat(validator.validate(new JsonFromNdjsonRequest("a".repeat(1_000_001))))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("ndjson content must be at most 1000000 characters");
         }
     }
 
