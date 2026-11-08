@@ -24,6 +24,8 @@ import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.service.DateTimeService;
+import com.example.utiltools.json.dto.JsonDiffRequest;
+import com.example.utiltools.json.dto.JsonDiffResponse;
 import com.example.utiltools.json.dto.JsonFlattenRequest;
 import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
@@ -177,6 +179,10 @@ public class AuditedOperations {
         return record(OperationType.JSON_FROM_NDJSON, request, () -> jsonService.fromNdjson(request));
     }
 
+    public JsonDiffResponse diff(JsonDiffRequest request) {
+        return record(OperationType.JSON_DIFF, request, () -> jsonService.diff(request));
+    }
+
     public TextTransformResponse transform(TextTransformRequest request) {
         return record(OperationType.TEXT_TRANSFORM, request, () -> textService.transform(request));
     }
@@ -215,6 +221,7 @@ public class AuditedOperations {
             case JSON_FROM_CSV -> jsonService.fromCsv((JsonFromCsvRequest) request);
             case JSON_TO_NDJSON -> jsonService.toNdjson((JsonToNdjsonRequest) request);
             case JSON_FROM_NDJSON -> jsonService.fromNdjson((JsonFromNdjsonRequest) request);
+            case JSON_DIFF -> jsonService.diff((JsonDiffRequest) request);
             case TEXT_TRANSFORM -> textService.transform((TextTransformRequest) request);
             case TEXT_STATS -> textService.stats((TextStatsRequest) request);
             case TEXT_REPLACE -> textService.replace((TextReplaceRequest) request);

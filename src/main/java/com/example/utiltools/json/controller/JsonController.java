@@ -2,6 +2,8 @@ package com.example.utiltools.json.controller;
 
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.ApiResponse;
+import com.example.utiltools.json.dto.JsonDiffRequest;
+import com.example.utiltools.json.dto.JsonDiffResponse;
 import com.example.utiltools.json.dto.JsonFlattenRequest;
 import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
@@ -35,7 +37,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/v1/utils/json")
-@Tag(name = "JSON & Data Processor Utility", description = "Endpoints for formatting, minifying, validating, querying, flattening, unflattening, atomically patching JSON structures, converting between JSON arrays and CSV/TSV tables, and converting between JSON arrays and NDJSON / JSON Lines")
+@Tag(name = "JSON & Data Processor Utility", description = "Endpoints for formatting, minifying, validating, querying, flattening, unflattening, atomically patching JSON structures, converting between JSON arrays and CSV/TSV tables, and converting between JSON arrays and NDJSON / JSON Lines, and diffing two JSON documents")
 public class JsonController {
 
     private final AuditedOperations auditedOperations;
@@ -154,5 +156,20 @@ public class JsonController {
     public ApiResponse<JsonFromNdjsonResponse> fromNdjson(@Valid @RequestBody JsonFromNdjsonRequest request) {
         JsonFromNdjsonResponse result = auditedOperations.fromNdjson(request);
         return ApiResponse.success(result, "NDJSON converted to JSON successfully");
+    }
+
+    @PostMapping("/diff")
+    @Operation(summary = "Diff two JSON documents",
+            description = "Compares jsonA with jsonB and reports added, removed and changed paths. Objects are "
+                    + "compared member by member in first-seen order, arrays position by position ([0], [1], ...), "
+                    + "and a scalar or type change is reported at its own path; a whole-root mismatch is reported at "
+                    + "'$'. changed maps each path to a JsonDiffDetail whose changeType is ADDED, REMOVED or CHANGED, "
+                    + "carrying compact JSON oldValue/newValue (null on the missing side), and summary reads '<n> "
+                    + "added, <n> removed, <n> changed' or 'No differences found'. Malformed jsonA or jsonB returns "
+                    + "400 BAD_REQUEST naming that field, and a document nested deeper than 64 levels or producing "
+                    + "more than 10000 changes is rejected.")
+    public ApiResponse<JsonDiffResponse> diff(@Valid @RequestBody JsonDiffRequest request) {
+        JsonDiffResponse result = auditedOperations.diff(request);
+        return ApiResponse.success(result, "JSON documents diffed successfully");
     }
 }

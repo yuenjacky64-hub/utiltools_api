@@ -1,5 +1,8 @@
 package com.example.utiltools.json.service;
 
+import com.example.utiltools.json.dto.JsonDiffDetail;
+import com.example.utiltools.json.dto.JsonDiffRequest;
+import com.example.utiltools.json.dto.JsonDiffResponse;
 import com.example.utiltools.json.dto.JsonFlattenRequest;
 import com.example.utiltools.json.dto.JsonFlattenResponse;
 import com.example.utiltools.json.dto.JsonFormatRequest;
@@ -48,6 +51,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -71,6 +75,8 @@ public class JsonService {
     static final int MAX_CELLS = 1000000;
     /** Most NDJSON records one from-NDJSON conversion may import. */
     static final int MAX_NDJSON_RECORDS = 10000;
+    /** Path reported by a diff when the two documents differ only in their root kind or value. */
+    private static final String ROOT_PATH = "$";
     private static final int CSV_UNQUOTED = 0;
     private static final int CSV_QUOTED = 1;
     private static final int CSV_QUOTE_IN_QUOTED = 2;
@@ -612,6 +618,117 @@ public class JsonService {
     }
 
     /**
+     * Compares two JSON documents and reports the structural difference at every nesting level.
+     *
+     * <p>Objects are compared member by member (so member order is not a change), arrays position by
+     * position, and any scalar or type mismatch is one {@code CHANGED} detail carrying both rendered
+     * values. Neither parsed tree is mutated and every collection preserves discovery order, so the
+     * same request always yields the same response and replay can verify it. Each change appends one
+     * {@link JsonDiffDetail} to {@code changed} keyed by its injective path, and added/removed
+     * changes additionally append that path to {@code added}/{@code removed}.</p>
+     */
+    public JsonDiffResponse diff(JsonDiffRequest request) {
+        JsonNode a = parseTree(request.jsonA(), "jsonA");
+        JsonNode b = parseTree(request.jsonB(), "jsonB");
+        if (depthOf(a) > MAX_DEPTH) {
+            throw new IllegalArgumentException("jsonA depth must not exceed " + MAX_DEPTH);
+        }
+        if (depthOf(b) > MAX_DEPTH) {
+            throw new IllegalArgumentException("jsonB depth must not exceed " + MAX_DEPTH);
+        }
+        DiffTally tally = new DiffTally();
+        walkDiff(a, b, "", tally);
+        String summary = tally.added.isEmpty() && tally.removed.isEmpty() && tally.changed.isEmpty()
+                ? "No differences found"
+                : tally.added.size() + " added, " + tally.removed.size() + " removed, "
+                        + tally.changedOnly + " changed";
+        return new JsonDiffResponse(List.copyOf(tally.added), List.copyOf(tally.removed),
+                Collections.unmodifiableMap(new LinkedHashMap<>(tally.changed)), summary);
+    }
+
+    private void walkDiff(JsonNode a, JsonNode b, String path, DiffTally tally) {
+        if (a.equals(b)) {
+            return;
+        }
+        if (a.isObject() && b.isObject()) {
+            Iterator<Map.Entry<String, JsonNode>> membersA = a.fields();
+            while (membersA.hasNext()) {
+                Map.Entry<String, JsonNode> member = membersA.next();
+                String memberPath = childPath(path, member.getKey());
+                JsonNode other = b.get(member.getKey());
+                if (other == null) {
+                    tally.record(memberPath, writeCompact(member.getValue()), null, JsonDiffDetail.REMOVED);
+                } else {
+                    walkDiff(member.getValue(), other, memberPath, tally);
+                }
+            }
+            Iterator<Map.Entry<String, JsonNode>> membersB = b.fields();
+            while (membersB.hasNext()) {
+                Map.Entry<String, JsonNode> member = membersB.next();
+                if (!a.has(member.getKey())) {
+                    tally.record(childPath(path, member.getKey()), null, writeCompact(member.getValue()),
+                            JsonDiffDetail.ADDED);
+                }
+            }
+            return;
+        }
+        if (a.isArray() && b.isArray()) {
+            int common = Math.min(a.size(), b.size());
+            for (int i = 0; i < common; i++) {
+                walkDiff(a.get(i), b.get(i), indexPath(path, i), tally);
+            }
+            for (int i = common; i < a.size(); i++) {
+                tally.record(indexPath(path, i), writeCompact(a.get(i)), null, JsonDiffDetail.REMOVED);
+            }
+            for (int i = common; i < b.size(); i++) {
+                tally.record(indexPath(path, i), null, writeCompact(b.get(i)), JsonDiffDetail.ADDED);
+            }
+            return;
+        }
+        // Scalar values and container/scalar type mismatches: one change at this path. A mismatch of
+        // the two whole documents has no member path, so it is reported at the unreachable sentinel.
+        tally.record(path.isEmpty() ? ROOT_PATH : path, writeCompact(a), writeCompact(b),
+                JsonDiffDetail.CHANGED);
+    }
+
+    /**
+     * Renders the path of an object member. A plain name extends a dotted path; any other name is
+     * bracketed and quoted so that no two distinct structural paths can render identically.
+     */
+    private static String childPath(String parent, String member) {
+        if (isPlainName(member)) {
+            return parent.isEmpty() ? member : parent + "." + member;
+        }
+        StringBuilder rendered = new StringBuilder(parent).append("['");
+        for (int i = 0; i < member.length(); i++) {
+            char c = member.charAt(i);
+            if (c == '\\' || c == '\'') {
+                rendered.append('\\');
+            }
+            rendered.append(c);
+        }
+        return rendered.append("']").toString();
+    }
+
+    private static String indexPath(String parent, int index) {
+        return parent + "[" + index + "]";
+    }
+
+    /** A name is plain when it needs no quoting and can never be confused with another path. */
+    private static boolean isPlainName(String name) {
+        if (name.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c == '.' || c == '[' || c == ']' || c == '\'' || c == '\\' || c == '$') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Accepts the two-character escape {@code \t}, a literal tab, or any other single character;
      * null or blank means comma.
      */
@@ -771,14 +888,23 @@ public class JsonService {
     }
 
     private JsonNode parseTree(String json) {
+        return parseTree(json, null);
+    }
+
+    /**
+     * Parses a JSON document, optionally naming the request field it came from. A null label keeps the
+     * legacy {@code Invalid JSON content: ...} wording used by every single-document endpoint.
+     */
+    private JsonNode parseTree(String json, String label) {
+        String prefix = label == null ? "Invalid JSON content" : "Invalid JSON content in " + label;
         try {
             JsonNode node = objectMapper.readTree(json);
             if (node == null) {
-                throw new IllegalArgumentException("Invalid JSON content: document is empty");
+                throw new IllegalArgumentException(prefix + ": document is empty");
             }
             return node;
         } catch (JsonProcessingException e) {
-            throw new IllegalArgumentException("Invalid JSON content: " + e.getOriginalMessage(), e);
+            throw new IllegalArgumentException(prefix + ": " + e.getOriginalMessage(), e);
         }
     }
 
@@ -791,6 +917,29 @@ public class JsonService {
     /** Mutable counter for the merge-patch walk: the service bean itself stays stateless. */
     private static final class MergeTally {
         private int removedKeys;
+    }
+
+    /** Accumulates diff details in discovery order: the service bean itself stays stateless. */
+    private static final class DiffTally {
+        private final List<String> added = new ArrayList<>();
+        private final List<String> removed = new ArrayList<>();
+        private final Map<String, JsonDiffDetail> changed = new LinkedHashMap<>();
+        private int changedOnly;
+        private int recorded;
+
+        private void record(String path, String oldValue, String newValue, String changeType) {
+            if (++recorded > MAX_KEYS) {
+                throw new IllegalArgumentException("diff must not contain more than " + MAX_KEYS + " changes");
+            }
+            if (JsonDiffDetail.ADDED.equals(changeType)) {
+                added.add(path);
+            } else if (JsonDiffDetail.REMOVED.equals(changeType)) {
+                removed.add(path);
+            } else {
+                changedOnly++;
+            }
+            changed.put(path, new JsonDiffDetail(path, oldValue, newValue, changeType));
+        }
     }
 
     private Runnable applyOperation(PatchDocument doc, JsonPatchOperation entry) {

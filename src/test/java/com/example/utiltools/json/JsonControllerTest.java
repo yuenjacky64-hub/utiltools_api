@@ -635,6 +635,106 @@ class JsonControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/utils/json/diff - should report nested differences and journal JSON_DIFF")
+    void shouldDiffTwoJsonDocuments() throws Exception {
+        String body = """
+                {
+                    "jsonA": "{\\"a\\":1,\\"b\\":{\\"c\\":2,\\"d\\":[1,2,3]},\\"e\\":true}",
+                    "jsonB": "{\\"a\\":1,\\"b\\":{\\"c\\":5,\\"d\\":[1,2]},\\"f\\":true}"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("JSON documents diffed successfully"))
+                .andExpect(jsonPath("$.data.added[0]").value("f"))
+                .andExpect(jsonPath("$.data.removed[0]").value("b.d[2]"))
+                .andExpect(jsonPath("$.data.removed[1]").value("e"))
+                .andExpect(jsonPath("$.data.changed['b.c'].changeType").value("CHANGED"))
+                .andExpect(jsonPath("$.data.changed['b.c'].oldValue").value("2"))
+                .andExpect(jsonPath("$.data.changed['b.c'].newValue").value("5"))
+                .andExpect(jsonPath("$.data.changed['f'].changeType").value("ADDED"))
+                .andExpect(jsonPath("$.data.summary").value("1 added, 2 removed, 1 changed"));
+
+        String entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[?(@.operation == 'JSON_DIFF')]").exists())
+                .andReturn().getResponse().getContentAsString();
+        String entryId = entryIdOf(entries, "JSON_DIFF");
+        for (JsonNode entry : new ObjectMapper().readTree(entries).path("data")) {
+            if (entryId.equals(entry.path("id").asText())) {
+                assertThat(entry.path("state").asText()).isEqualTo("SUCCEEDED");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/diff - journalled as JSON_DIFF and replay VERIFIED")
+    void shouldJournalJsonDiffAndReplayVerified() throws Exception {
+        String body = """
+                {
+                    "jsonA": "{\\"a\\":[1,{\\"b\\":2}]}",
+                    "jsonB": "{\\"a\\":[1,{\\"b\\":3}],\\"c\\":null}"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk());
+
+        String entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        String entryId = entryIdOf(entries, "JSON_DIFF");
+        int entryCount = new ObjectMapper().readTree(entries).path("data").size();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", entryId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"));
+
+        JsonNode afterEntries = new ObjectMapper()
+                .readTree(mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                        .andExpect(status().isOk())
+                        .andReturn().getResponse().getContentAsString())
+                .path("data");
+        assertThat(afterEntries.size()).isEqualTo(entryCount);
+        for (JsonNode entry : afterEntries) {
+            if (entryId.equals(entry.path("id").asText())) {
+                assertThat(entry.path("operation").asText()).isEqualTo("JSON_DIFF");
+                assertThat(entry.path("state").asText()).isEqualTo("SUCCEEDED");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/diff - should return 400 for malformed jsonA")
+    void shouldReturnBadRequestForMalformedJsonAOnDiff() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"jsonA\": \"{\", \"jsonB\": \"{}\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message", containsString("jsonA")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/diff - should reject blank fields")
+    void shouldRejectBlankJsonAOnDiff() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"jsonA\": \"\", \"jsonB\": \"{}\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]", containsString("jsonA content is required")));
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/json/to-csv - should export an array of flat objects as RFC 4180 CSV")
     void shouldConvertJsonArrayToCsv() throws Exception {
         String payload = "[{\"a\":\"x,y\",\"b\":\"say \\\"hi\\\"\",\"c\":\"l1\\nl2\",\"n\":null}]";
