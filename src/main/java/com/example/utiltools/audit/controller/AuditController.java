@@ -3,6 +3,8 @@ package com.example.utiltools.audit.controller;
 import com.example.utiltools.audit.dto.JournalVerifyResponse;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
+import com.example.utiltools.audit.model.ReapReason;
+import com.example.utiltools.audit.model.ReapRecord;
 import com.example.utiltools.audit.service.AuditJournalService;
 import com.example.utiltools.audit.service.AuditReplayService;
 import com.example.utiltools.common.ApiResponse;
@@ -74,5 +76,17 @@ public class AuditController {
     public ApiResponse<JournalVerifyResponse> verify(
             @RequestParam(value = "limit", required = false, defaultValue = "20") int limit) {
         return ApiResponse.success(replayService.verify(limit), "Journal verification sweep completed");
+    }
+
+    @GetMapping("/reaps")
+    @Operation(summary = "List reaper tombstones",
+               description = "Returns the newest reaped-entry tombstones first, optionally filtered by reason. "
+                   + "Bounded: `limit` (default 50) is clamped to utiltools.audit.max-entries. Read-only — no "
+                   + "reap pass runs and no entry, tombstone or journal record is created or changed. An unknown "
+                   + "reason answers 400 BAD_REQUEST.")
+    public ApiResponse<List<ReapRecord>> reaps(
+            @RequestParam(value = "limit", required = false, defaultValue = "50") int limit,
+            @RequestParam(value = "reason", required = false) ReapReason reason) {
+        return ApiResponse.success(journal.reapLog(limit, reason), "Reap tombstones retrieved successfully");
     }
 }
