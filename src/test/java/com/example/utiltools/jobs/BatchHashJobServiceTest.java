@@ -490,26 +490,244 @@ class BatchHashJobServiceTest {
         assertThat(awaitStatus(running.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
     }
 
+    /**
+     * DOD-01 / REQ-02 / REQ-03: cancelling a RUNNING job records a cooperative request instead of
+     * failing it. The snapshot turns CANCELLING while the worker is still inside {@code hash}, the
+     * client keeps its quota slot, a repeat DELETE returns the same snapshot without writing, and the
+     * worker terminalizes CANCELLED exactly once at its next checkpoint - no results, no prefix, one
+     * audit close carrying the CANCELLED outcome and one quota release.
+     */
     @Test
-    @DisplayName("cancel - a RUNNING job is rejected with a conflict carrying the job id and status")
-    void shouldRejectCancellationOfRunningJob() throws Exception {
+    @DisplayName("cancel - a RUNNING job turns CANCELLING and its worker finalizes CANCELLED at the checkpoint")
+    void shouldMarkRunningJobCancellingAndFinalizeCancelledAtCheckpoint() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
         CountDownLatch enteredHash = new CountDownLatch(1);
         CountDownLatch releaseHash = new CountDownLatch(1);
         CountingCryptoService crypto = new CountingCryptoService(enteredHash, releaseHash, "blocked");
-        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
+        String client = "198.51.100.31";
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 1, clock, journal);
+        assertThat(service.activeJobsForClient(client)).isZero(); // the pre-submit count
 
-        BatchHashJobResponse running =
-                service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null));
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("blocked", "later"), null, null), client);
         assertThat(enteredHash.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
+        assertThat(awaitRunningAttempt(accepted.jobId(), 1).status()).isEqualTo(JobStatus.RUNNING);
 
-        JobCancellationConflictException conflict = conflictFrom(running.jobId());
-        assertThat(conflict.jobId()).isEqualTo(running.jobId());
-        assertThat(conflict.status()).isEqualTo(JobStatus.RUNNING);
-        assertThat(conflict.getMessage()).contains(running.jobId()).contains("RUNNING");
-        assertThat(service.getJob(running.jobId()).status()).isEqualTo(JobStatus.RUNNING);
+        BatchHashJobResponse cancelling = service.cancel(accepted.jobId());
+        assertThat(cancelling.status()).isEqualTo(JobStatus.CANCELLING);
+        assertThat(cancelling.error()).isNull();
+        assertThat(cancelling.results()).isNull();
+        assertThat(cancelling.completedItems()).isZero();
+        assertThat(cancelling.completedAt()).isNull();
+        // Only RUNNING projects lease state, so the snapshot hides it - but the request released
+        // nothing: a reaper pass one second inside the lease finds no expired execution, and the
+        // client's quota slot still belongs to the in-flight worker.
+        assertThat(cancelling.executionLeaseExpiresAt()).isNull();
+        assertThat(cancelling.lastHeartbeatAt()).isNull();
+        clock.advanceSeconds(LEASE_SECONDS - 1);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+        assertThat(service.getJob(accepted.jobId()).status()).isEqualTo(JobStatus.CANCELLING);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+        // CANCELLING is non-terminal for listing: filterable as itself, never as CANCELLED yet.
+        assertThat(service.listJobs(JobStatus.CANCELLING, 10))
+                .extracting(BatchHashJobResponse::jobId)
+                .containsExactly(accepted.jobId());
+        assertThat(service.listJobs(JobStatus.CANCELLED, 10)).isEmpty();
+        // A repeat DELETE is idempotent and writes nothing.
+        assertThat(service.cancel(accepted.jobId())).isEqualTo(cancelling);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+        assertThat(batchHashEntries(journal, accepted.jobId())).hasSize(1);
+        assertThat(batchHashEntries(journal, accepted.jobId()).get(0).state())
+                .isEqualTo(JournalState.PENDING);
 
         releaseHash.countDown();
-        assertThat(awaitStatus(running.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+        BatchHashJobResponse cancelled = awaitStatus(accepted.jobId(), JobStatus.CANCELLED);
+        assertThat(cancelled.error()).isNull();
+        assertThat(cancelled.results()).isNull();
+        assertThat(cancelled.completedItems()).isZero();
+        assertThat(cancelled.completedAt()).isEqualTo(clock.instant());
+        assertThat(cancelled.executionLeaseExpiresAt()).isNull();
+        assertThat(cancelled.lastHeartbeatAt()).isNull();
+        assertThat(cancelled.attempts()).hasSize(1);
+        assertThat(cancelled.attempts().get(0).status()).isEqualTo(JobStatus.CANCELLED);
+        assertThat(cancelled.attempts().get(0).completedAt()).isEqualTo(clock.instant());
+        assertThat(cancelled.attempts().get(0).error()).isNull();
+        // The batch stopped at the checkpoint: the next item was never hashed.
+        assertThat(crypto.count("later")).isZero();
+        // Exactly one quota release, so a third DELETE still answers the same snapshot.
+        awaitActiveJobs(client, 0);
+        assertThat(service.cancel(accepted.jobId())).isEqualTo(cancelled);
+        assertThat(service.getJob(accepted.jobId())).isEqualTo(cancelled);
+        // Exactly one audit close, journalled as the cancelled outcome.
+        List<AuditEntry> entries = batchHashEntries(journal, accepted.jobId());
+        assertThat(entries).hasSize(1);
+        assertThat(entries.get(0).state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entries.get(0).result().path("outcome").asText()).isEqualTo("CANCELLED");
+    }
+
+    /**
+     * DOD-02 / REQ-03 / REQ-04: a CANCELLING job whose execution lease lapses is terminalized
+     * CANCELLED by the reaper - once, with one attempt-history entry, one audit close and one quota
+     * release - and the worker that ignored the lapse writes nothing when it finally returns.
+     */
+    @Test
+    @DisplayName("reap - a CANCELLING job with a lapsed lease is finalized CANCELLED once and ignores the late worker")
+    void shouldReapCancellingJobAsCancelled() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stall");
+        String client = "198.51.100.32";
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 1, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stall", "tail"), null, null), client);
+        assertThat(crypto.awaitEntered("stall")).isTrue();
+        assertThat(service.cancel(accepted.jobId()).status()).isEqualTo(JobStatus.CANCELLING);
+
+        // A live lease and a non-terminal status: neither eviction nor the reaper touches it.
+        assertThat(service.evictExpiredJobs(clock.instant().plusSeconds(86_400))).isZero();
+        assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+        assertThat(service.getJob(accepted.jobId()).status()).isEqualTo(JobStatus.CANCELLING);
+
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+
+        BatchHashJobResponse cancelled = service.getJob(accepted.jobId());
+        assertThat(cancelled.status()).isEqualTo(JobStatus.CANCELLED);
+        assertThat(cancelled.error()).isNull();
+        assertThat(cancelled.results()).isNull();
+        assertThat(cancelled.completedItems()).isZero();
+        assertThat(cancelled.completedAt()).isEqualTo(clock.instant());
+        assertThat(cancelled.executionLeaseExpiresAt()).isNull();
+        assertThat(cancelled.lastHeartbeatAt()).isNull();
+        assertThat(cancelled.attempt()).isEqualTo(1); // the fence's other half is untouched
+        assertThat(cancelled.attempts()).hasSize(1);
+        assertThat(cancelled.attempts().get(0).status()).isEqualTo(JobStatus.CANCELLED);
+        List<AuditEntry> entries = batchHashEntries(journal, accepted.jobId());
+        assertThat(entries).hasSize(1);
+        assertThat(entries.get(0).state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entries.get(0).result().path("outcome").asText()).isEqualTo("CANCELLED");
+        awaitActiveJobs(client, 0);
+
+        // The late worker returns after the terminal write and changes nothing.
+        crypto.unblock("stall");
+        BatchHashJobResponse marker = service.submit(
+                new BatchHashRequest("SHA-256", List.of("marker"), null, null), client);
+        assertThat(awaitStatus(marker.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+        assertThat(service.getJob(accepted.jobId())).isEqualTo(cancelled);
+        assertThat(crypto.count("tail")).isZero();
+        assertThat(batchHashEntries(journal, accepted.jobId())).hasSize(1);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+        awaitActiveJobs(client, 0);
+    }
+
+    /**
+     * DOD-03 / REQ-04: CANCELLING is not retryable and not renewable - both answer 409 with that very
+     * status and leave the snapshot, the quota and the audit trail untouched.
+     */
+    @Test
+    @DisplayName("cancelling - heartbeat and retry are refused with the CANCELLING status and write nothing")
+    void shouldRejectHeartbeatAndRetryWhileCancelling() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stall");
+        String client = "198.51.100.33";
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, 1, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stall"), null, null), client);
+        assertThat(crypto.awaitEntered("stall")).isTrue();
+        BatchHashJobResponse cancelling = service.cancel(accepted.jobId());
+        assertThat(cancelling.status()).isEqualTo(JobStatus.CANCELLING);
+
+        assertThatThrownBy(() -> service.heartbeat(accepted.jobId()))
+                .isInstanceOfSatisfying(JobRetryConflictException.class,
+                        e -> assertThat(e.status()).isEqualTo(JobStatus.CANCELLING));
+        assertThatThrownBy(() -> service.retry(accepted.jobId()))
+                .isInstanceOfSatisfying(JobRetryConflictException.class,
+                        e -> assertThat(e.status()).isEqualTo(JobStatus.CANCELLING));
+        assertThat(service.getJob(accepted.jobId())).isEqualTo(cancelling);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+        assertThat(batchHashEntries(journal, accepted.jobId())).hasSize(1);
+        assertThat(heartbeatEntries(journal, accepted.jobId())).isEmpty();
+
+        crypto.unblock("stall");
+        BatchHashJobResponse cancelled = awaitStatus(accepted.jobId(), JobStatus.CANCELLED);
+        assertThat(cancelled.results()).isNull();
+        assertThat(cancelled.attempts()).hasSize(1); // the refused retry added no attempt
+        awaitActiveJobs(client, 0);
+        assertThat(batchHashEntries(journal, accepted.jobId())).hasSize(1);
+    }
+
+    /**
+     * DOD-02 / REQ-04: the shutdown drain settles a CANCELLING job as CANCELLED (not as a
+     * JOB_SHUTDOWN failure the caller never asked for) while QUEUED and RUNNING jobs keep the
+     * pre-existing drain semantics, and a late worker from the cancelled attempt writes nothing.
+     */
+    @Test
+    @DisplayName("drain - a CANCELLING job is settled CANCELLED while QUEUED and RUNNING keep JOB_SHUTDOWN")
+    void shouldSettleCancellingJobAsCancelledDuringDrain() {
+        AuditJournalService journal = newJournal();
+        StallingCryptoService crypto = new StallingCryptoService("stuck", "busy");
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        String client = "198.51.100.34";
+        service = new BatchHashJobService(crypto, 2, 10, 300, 3, LEASE_SECONDS, 5000, 0, 20, clock, journal);
+
+        BatchHashJobResponse cancelling = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stuck"), null, null), client);
+        assertThat(crypto.awaitEntered("stuck")).isTrue();
+        BatchHashJobResponse running = service.submit(
+                new BatchHashRequest("SHA-256", List.of("busy"), null, null), client);
+        assertThat(crypto.awaitEntered("busy")).isTrue();
+        BatchHashJobResponse queued = service.submit(
+                new BatchHashRequest("SHA-256", List.of("waiting"), null, null), client);
+        assertThat(queued.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(service.cancel(cancelling.jobId()).status()).isEqualTo(JobStatus.CANCELLING);
+
+        try {
+            service.shutdown(); // zero grace: the forced phase runs immediately
+
+            BatchHashJobResponse cancelled = service.getJob(cancelling.jobId());
+            assertThat(cancelled.status()).isEqualTo(JobStatus.CANCELLED);
+            assertThat(cancelled.error()).isNull();
+            assertThat(cancelled.results()).isNull();
+            assertThat(cancelled.completedItems()).isZero();
+            assertThat(cancelled.completedAt()).isEqualTo(clock.instant());
+            assertThat(cancelled.executionLeaseExpiresAt()).isNull();
+            assertThat(cancelled.lastHeartbeatAt()).isNull();
+            assertThat(cancelled.attempts()).hasSize(1);
+            assertThat(cancelled.attempts().get(0).status()).isEqualTo(JobStatus.CANCELLED);
+
+            BatchHashJobResponse failedRunning = service.getJob(running.jobId());
+            assertThat(failedRunning.status()).isEqualTo(JobStatus.FAILED);
+            assertThat(failedRunning.error()).isEqualTo(BatchHashJobService.JOB_SHUTDOWN);
+            BatchHashJobResponse failedQueued = service.getJob(queued.jobId());
+            assertThat(failedQueued.status()).isEqualTo(JobStatus.FAILED);
+            assertThat(failedQueued.error()).isEqualTo(BatchHashJobService.JOB_SHUTDOWN);
+
+            assertThat(service.listJobs(null, 100))
+                    .extracting(BatchHashJobResponse::status)
+                    .containsExactlyInAnyOrder(JobStatus.CANCELLED, JobStatus.FAILED, JobStatus.FAILED);
+            assertThat(service.activeJobsForClient(client)).isZero();
+            assertThat(journal.list(500, JournalState.PENDING)).isEmpty();
+            List<AuditEntry> entries = batchHashEntries(journal, cancelling.jobId());
+            assertThat(entries).hasSize(1);
+            assertThat(entries.get(0).state()).isEqualTo(JournalState.SUCCEEDED);
+            assertThat(entries.get(0).result().path("outcome").asText()).isEqualTo("CANCELLED");
+
+            // The workers were interrupted and ignored it; they return and hit the fence.
+            crypto.release("stuck");
+            crypto.release("busy");
+            awaitExecutorTerminated();
+            assertThat(service.getJob(cancelling.jobId())).isEqualTo(cancelled);
+            assertThat(batchHashEntries(journal, cancelling.jobId())).hasSize(1);
+            assertThat(service.activeJobsForClient(client)).isZero();
+            service.shutdown(); // idempotent: every job is terminal, nothing is written
+            assertThat(service.getJob(cancelling.jobId())).isEqualTo(cancelled);
+        } finally {
+            crypto.releaseAll();
+        }
     }
 
     @Test
