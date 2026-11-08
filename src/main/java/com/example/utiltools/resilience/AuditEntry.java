@@ -6,6 +6,7 @@ public record AuditEntry(
         long seq,
         Instant timestamp,
         String breaker,
+        String fingerprint,
         CircuitState from,
         CircuitState to,
         CircuitTrigger trigger,
