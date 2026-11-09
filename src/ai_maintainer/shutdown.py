@@ -29,7 +29,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 __all__ = [
+    "CLEANUP_CLEAR_RUNTIME_MARKERS",
     "CLEANUP_PERSIST_TASK_STATE",
+    "CLEANUP_PRUNE_MEMORY",
+    "CLEANUP_PRUNE_STALE_TASK_SLOTS",
     "CLEANUP_RELEASE_FILE_LOCKS",
     "CLEANUP_STOP_SCHEDULER",
     "CLEANUP_WRITE_SHUTDOWN_AUDIT",
@@ -59,6 +62,10 @@ SHUTDOWN_POLL_INTERVAL_SEC = 0.05
 CLEANUP_STOP_SCHEDULER = "stop_scheduler"
 CLEANUP_PERSIST_TASK_STATE = "persist_task_state"
 CLEANUP_RELEASE_FILE_LOCKS = "release_file_locks"
+# UTILTOOLS-76 REQ-03: three more wind-down steps, run after the lock release.
+CLEANUP_CLEAR_RUNTIME_MARKERS = "clear_runtime_markers"
+CLEANUP_PRUNE_STALE_TASK_SLOTS = "prune_stale_task_slots"
+CLEANUP_PRUNE_MEMORY = "prune_memory"
 CLEANUP_WRITE_SHUTDOWN_AUDIT = "write_shutdown_audit"
 
 PERSIST_SKIPPED_NO_STATE_ROOT = "no state root configured"
