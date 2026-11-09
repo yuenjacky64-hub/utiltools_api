@@ -57,3 +57,7 @@ data/maintainer_leases.log
 data/maintainer_leases.log.tmp
 maintainer_leases.log
 maintainer_leases.log.tmp
+
+### Concurrent cycle runtime state (never source) - UTILTOOLS-77 REQ-02 ###
+maintainer_heartbeat.json
+maintainer_heartbeat.json.tmp

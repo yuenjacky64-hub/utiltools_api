@@ -399,7 +399,7 @@ def test_run_cycle_acquires_and_releases_lease(tmp_path: Path) -> None:
     seen: list[Lease] = []
     original = engine._run_cycle_body
 
-    def spying() -> object:
+    def spying(*_args: object, **_kwargs: object) -> object:
         seen.append(engine._require_active_lease())
         return original()
 
@@ -412,7 +412,7 @@ def test_run_cycle_acquires_and_releases_lease(tmp_path: Path) -> None:
     assert [l["status"] for l in engine.lease_snapshot()] == [LEASE_STATUS_RECLAIMED]
 
     # A body exception still releases the slot.
-    def exploding() -> object:
+    def exploding(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("boom")
 
     engine._run_cycle_body = exploding  # type: ignore[method-assign]

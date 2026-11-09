@@ -21,10 +21,12 @@ Design constraints, mirroring the rest of the package:
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import stat
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Collection, Mapping
@@ -56,6 +58,11 @@ class MemoryStore:
         self._clock = clock
         self._records: dict[str, list[Any]] = {name: [] for name in _COLLECTIONS}
         self._issues: list[str] = []
+        # Leaf-most lock in the engine's order (gate -> engine ``_lock`` ->
+        # this), taken by every read/write of the in-memory document so
+        # overlapping cycles cannot interleave a record append with a restore
+        # (UTILTOOLS-77 REQ-05, INV-CONC-7).
+        self._write_lock = threading.RLock()
 
     @classmethod
     def load(
@@ -117,11 +124,12 @@ class MemoryStore:
         """Defensive copy of the document this store would write."""
 
         document: dict[str, Any] = {"version": MEMORY_DOC_VERSION}
-        for name in _COLLECTIONS:
-            document[name] = [
-                dict(record) if isinstance(record, Mapping) else record
-                for record in self._records[name]
-            ]
+        with self._write_lock:
+            for name in _COLLECTIONS:
+                document[name] = [
+                    dict(record) if isinstance(record, Mapping) else record
+                    for record in self._records[name]
+                ]
         return document
 
     def issues(self) -> list[str]:
@@ -129,25 +137,101 @@ class MemoryStore:
 
         return list(self._issues)
 
-    def add_run(self, run: Mapping[str, Any]) -> None:
-        """Append one run record (stamped with ``at`` when absent)."""
+    def add_run(self, run: Mapping[str, Any], *, cycle: int | None = None) -> None:
+        """Append one run record (stamped with ``at`` and ``cycle`` when absent)."""
 
-        self._append("runs", run)
+        self._append("runs", run, cycle=cycle)
 
-    def add_bug_fix(self, bug_fix: Mapping[str, Any]) -> None:
-        """Append one bug-fix record (stamped with ``at`` when absent)."""
+    def add_bug_fix(
+        self, bug_fix: Mapping[str, Any], *, cycle: int | None = None
+    ) -> None:
+        """Append one bug-fix record (stamped with ``at``/``cycle`` when absent)."""
 
-        self._append("bug_fixes", bug_fix)
+        self._append("bug_fixes", bug_fix, cycle=cycle)
 
-    def add_learning(self, learning: Mapping[str, Any]) -> None:
-        """Append one learning record (stamped with ``at`` when absent)."""
+    def add_learning(
+        self, learning: Mapping[str, Any], *, cycle: int | None = None
+    ) -> None:
+        """Append one learning record (stamped with ``at``/``cycle`` when absent)."""
 
-        self._append("learnings", learning)
+        self._append("learnings", learning, cycle=cycle)
 
-    def _append(self, name: str, record: Mapping[str, Any]) -> None:
+    def _append(
+        self, name: str, record: Mapping[str, Any], *, cycle: int | None = None
+    ) -> None:
         stored = dict(record)
         stored.setdefault("at", self._clock())
-        self._records[name].append(stored)
+        if cycle is not None:
+            # A caller-supplied ``cycle`` always wins, so back-filled records
+            # are never rewritten (UTILTOOLS-77 REQ-05).
+            stored.setdefault("cycle", int(cycle))
+        with self._write_lock:
+            self._records[name].append(stored)
+
+    def snapshot_records(self) -> dict[str, list[Any]]:
+        """Deep copy of the three collections, safe to hold across cycles.
+
+        The engine captures this before a cycle body runs and restores it after
+        (UTILTOOLS-77 REQ-02). Copying under ``_write_lock`` means a peer
+        cycle's append cannot land in the middle of the capture, and the copy is
+        total (nested containers included) so a later mutation of the live
+        records cannot rewrite the snapshot.
+        """
+
+        with self._write_lock:
+            return {
+                name: copy.deepcopy(list(self._records[name]))
+                for name in _COLLECTIONS
+            }
+
+    def drop_records(self, *, cycle: int) -> int:
+        """Remove every record stamped with ``cycle``; returns how many went.
+
+        This is the cycle-scoped half of the snapshot restore: when peers are
+        still running the engine must not roll the whole document back, so it
+        deletes only the records its own cycle attributed to itself.
+        """
+
+        wanted = int(cycle)
+        removed = 0
+        with self._write_lock:
+            for name in _COLLECTIONS:
+                kept: list[Any] = []
+                for record in self._records[name]:
+                    if (
+                        isinstance(record, Mapping)
+                        and record.get("cycle") == wanted
+                    ):
+                        removed += 1
+                        continue
+                    kept.append(record)
+                self._records[name] = kept
+        return removed
+
+    def restore_records(self, records: Mapping[str, Any]) -> None:
+        """Replace the in-memory document from a snapshot; never touches disk.
+
+        Only the three known collections are read, and each must be a list -
+        anything else raises ``ValueError`` so a corrupt snapshot cannot
+        silently blank the store. A *missing* collection is also an error
+        rather than an implicit empty list: "unknown" (a failed capture) must
+        never be indistinguishable from "was empty" (UTILTOOLS-77 v2 finding 2).
+        The next :meth:`save` persists the result.
+        """
+
+        restored: dict[str, list[Any]] = {}
+        for name in _COLLECTIONS:
+            if name not in records:
+                raise ValueError(f"restore_records: {name} is missing")
+            value = records[name]
+            if not isinstance(value, list):
+                raise ValueError(f"restore_records: {name} is not a list")
+            restored[name] = [
+                dict(record) if isinstance(record, Mapping) else record
+                for record in value
+            ]
+        with self._write_lock:
+            self._records = restored
 
     def save(self, *, known_task_ids: Collection[str] | None = None) -> list[str]:
         """Validate then persist; returns the issues found (REQ-02)."""
@@ -201,9 +285,12 @@ class MemoryStore:
         orphaned-bug-fix check; ``None`` skips it.
         """
 
-        document = self.records()
-        errors = list(validate_memory_records(document, known_task_ids=known_task_ids))
-        self._issues = list(errors)
+        with self._write_lock:
+            document = self.records()
+            errors = list(
+                validate_memory_records(document, known_task_ids=known_task_ids)
+            )
+            self._issues = list(errors)
         for error in errors:
             LOG.warning("%s", error)
         try:
