@@ -20,15 +20,19 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.PriorityQueue;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -48,6 +52,24 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * as FAILED -> QUEUED while its attempt count is below the configured maximum. An optional
  * idempotency key maps to exactly one job and one execution, and stored results keep the input item
  * order.</p>
+ *
+ * <p>Admission to that bounded executor is <em>fair per client</em>. An accepted attempt is not handed
+ * to the pool by the submitting thread: it is appended to the FIFO lane of its normalized client key
+ * and a single dispatcher thread hands attempts over in round-robin order across the clients that have
+ * queued work, so one client can never occupy both workers plus the whole queue while other clients
+ * wait. Dispatch is a <em>round barrier</em> round robin: the dispatcher walks the ring of clients with
+ * queued work, serving each at most once per round, and only opens the next round when no client with a
+ * pending lane is still unserved in the current one. Because a client that enqueues mid-round joins that
+ * round at the tail of the ring (its cursor starts at "not yet served"), the guarantee is structural:
+ * while several clients have queued work, no client is dispatched twice before every other client with
+ * queued work has been dispatched once, so a client waits behind at most
+ * {@code (clients-with-queued-work - 1)} dispatches, however deep any single lane grows and whatever the
+ * dispatch history of the clients involved. Fairness
+ * changes <em>order only</em>: the global bound stays {@code worker-count + queue-capacity} accepted
+ * (queued or running) attempts, the per-client quota, idempotency, cancellation, retry, deadline and
+ * retention semantics are untouched, and a submission that would exceed the global bound is still
+ * refused with a {@link JobQueueFullException} that leaves no job row, no idempotency mapping, no
+ * attempt correlation and no quota or capacity increment behind.</p>
  *
  * <p>Each execution attempt carries a generation equal to its 1-based attempt number. A worker
  * captures its generation at admission and writes RUNNING, COMPLETED or FAILED only while
@@ -102,6 +124,9 @@ public class BatchHashJobService {
 
     /** Per-client ceiling on non-terminal jobs when the property is not configured. */
     static final int DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT = 20;
+
+    /** Name of the single fair-admission dispatcher thread (daemon: it never keeps the JVM alive). */
+    private static final String DISPATCHER_THREAD_NAME = "batch-hash-dispatcher";
 
     /** Upper bound on the configured default deadline, mirroring the request's 1..3600 range. */
     private static final long MAX_DEADLINE_SECONDS = 3600;
@@ -181,6 +206,57 @@ public class BatchHashJobService {
      * ({@code worker-count + queue-capacity}) and not by the client population.
      */
     private final Map<String, Integer> activeJobsByClient = new HashMap<>();
+
+    /**
+     * Fair-admission state (REQ-01). {@code lanes} holds the FIFO of queued attempts per normalized
+     * client key, {@code laneOrder} is the dispatch ring over the clients that currently have queued
+     * work, and {@code servedThisRound} is the set of clients already served in the current round. The
+     * dispatcher serves a client only while it is <em>not</em> in {@code servedThisRound}, so every
+     * client with pending work is served exactly once per round and a client waits behind at most
+     * {@code clients-with-queued-work - 1} dispatches. Both containers are guarded by
+     * {@link #dispatchLock}. The set is pruned wholesale whenever the round closes, which happens both
+     * once every client with a pending lane has been served and as soon as the ring is empty (nothing
+     * queued at all, so no queued client can be starved by the marks); a long job keeping a worker busy
+     * therefore cannot accumulate one key per dispatch. The remaining case - a ring that never empties
+     * because one client keeps a lane non-empty while new clients stream in - is capped: once the set
+     * reaches {@code worker-count + queue-capacity} keys the round is closed as well, which restarts
+     * selection at the ring head (the longest-waiting client). The bookkeeping is therefore bounded by
+     * one key per unit of global capacity - never by the client population, by dispatch count or by any
+     * per-client history (Plan §5).
+     */
+    private final Map<String, Deque<LaneEntry>> lanes = new HashMap<>();
+    private final Deque<String> laneOrder = new ArrayDeque<>();
+    private final Set<String> servedThisRound = new HashSet<>();
+
+    /**
+     * Attempts handed to the pool and not yet finished, guarded by {@link #dispatchLock}. The
+     * dispatcher only hands off while this is below {@code worker-count}, so the pool's own queue
+     * stays empty and the per-client lanes (not the pool's FIFO) decide which client runs next. The
+     * global bound is unchanged: {@code reservedCapacity <= worker-count + queue-capacity}, so the
+     * lane depth can never exceed {@code queue-capacity} (REQ-01, REQ-02).
+     */
+    private int dispatchedInFlight;
+
+    /**
+     * Guards the fair-admission state and the dispatcher's wait/notify. It is the innermost lock of
+     * the class: {@code registryLock} and a job monitor may both be held when it is taken, while the
+     * dispatcher never takes either of those (or a job monitor) while it holds it, so no cycle exists.
+     * The executor hand-off always happens <em>outside</em> this lock.
+     */
+    private final Object dispatchLock = new Object();
+
+    /**
+     * Accepted (queued or running) attempts currently holding a global capacity unit. Guarded by
+     * {@link #registryLock} and released exactly once with the per-client claim it was taken with, so
+     * the global bound survives fair admission unchanged (REQ-02).
+     */
+    private int reservedCapacity;
+
+    /** Set by the drain while {@link #dispatchLock} is held; a set flag stops every new hand-off. */
+    private boolean shutdownRequested;
+
+    /** The single fair-admission dispatcher; daemon so it never keeps the JVM alive. */
+    private final Thread dispatcher;
 
     /**
      * Compatibility overload for callers (and tests) that build the service directly: the system
@@ -278,6 +354,12 @@ public class BatchHashJobService {
         this.clock = clock == null ? Clock.systemUTC() : clock;
         this.executor = new ThreadPoolExecutor(workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(queueCapacity), new ThreadPoolExecutor.AbortPolicy());
+        // Fair admission (REQ-01): one dispatcher owns every hand-off, so a submitting thread never
+        // blocks on the pool and the round-robin order is decided in exactly one place. It is a daemon
+        // and waits on dispatchLock, so an abandoned service costs no thread and no runnable work.
+        this.dispatcher = new Thread(this::dispatchLoop, DISPATCHER_THREAD_NAME);
+        this.dispatcher.setDaemon(true);
+        this.dispatcher.start();
     }
 
     /**
@@ -474,6 +556,14 @@ public class BatchHashJobService {
             if (active >= maxActiveJobsPerClient) {
                 throw new JobQuotaExceededException(maxActiveJobsPerClient, active);
             }
+            // REQ-02 order 4: the global admission gate. reservedCapacity counts every accepted
+            // attempt that is queued or running, i.e. exactly the worker-count + queue-capacity bound
+            // the executor used to enforce, and it is checked before anything is registered, so a
+            // refused submission leaves no job row, no idempotency mapping, no attempt correlation and
+            // no counter change behind.
+            if (reservedCapacity >= workerCount + queueCapacity) {
+                throw jobQueueFull();
+            }
 
             MutableJob job = new MutableJob(UUID.randomUUID().toString(), key,
                     request.algorithm(), request.items(), request.secretKey(), fingerprint, Instant.now(clock),
@@ -481,6 +571,7 @@ public class BatchHashJobService {
             // Reserve before publishing: the increment and the registrations below share this
             // registryLock section, so the quota can neither be bypassed nor double-counted.
             activeJobsByClient.merge(quotaKey, 1, Integer::sum);
+            reservedCapacity++; // one global capacity unit per accepted attempt (REQ-02)
             job.quotaReserved.set(true);
             if (key != null) {
                 idempotencyIndex.put(key, job.jobId);
@@ -497,10 +588,9 @@ public class BatchHashJobService {
             // id rather than whatever the reused pool thread happened to carry.
             job.attemptRequestIds.put(1, requestId);
 
-            try {
-                // The first attempt's generation is explicit rather than implicit.
-                executor.execute(() -> executeAttempt(job.jobId, 1));
-            } catch (RejectedExecutionException e) {
+            // REQ-01: the first attempt's generation is explicit rather than implicit, and it enters
+            // this client's FIFO lane instead of being handed to the pool by the request thread.
+            if (!enqueue(job, 1)) {
                 // Rollback must undo BOTH registrations: the idempotency index stores job ids
                 // (String), so the conditional remove must be given the id, not the job object.
                 jobs.remove(job.jobId, job);
@@ -513,8 +603,10 @@ public class BatchHashJobService {
                 // never leave a client looking busier than it is.
                 job.quotaReserved.set(false);
                 decrementQuotaLocked(quotaKey);
-                throw new JobQueueFullException("Hash job queue is full (worker-count=" + workerCount
-                        + ", queue-capacity=" + queueCapacity + "); retry after capacity frees");
+                // REQ-02: the global capacity unit is returned with the quota claim, exactly once,
+                // and the lane never saw the attempt (enqueue refused it), so no orphan entry exists.
+                releaseCapacityLocked();
+                throw jobQueueFull();
             }
 
             return accepted;
@@ -529,6 +621,18 @@ public class BatchHashJobService {
         String quotaKey = normalizeClientKey(clientKey);
         synchronized (registryLock) {
             return activeJobsByClient.getOrDefault(quotaKey, 0);
+        }
+    }
+
+    /**
+     * Accepted (queued or running) attempts currently holding a global capacity unit — the counter
+     * behind the {@code worker-count + queue-capacity} gate. Package-private test observability only:
+     * it lets the rollback tests prove a rejected submission returns the counter to its pre-submission
+     * value (no leaked increment), and it has no production caller.
+     */
+    int reservedCapacityForTests() {
+        synchronized (registryLock) {
+            return reservedCapacity;
         }
     }
 
@@ -581,7 +685,354 @@ public class BatchHashJobService {
     private void releaseQuota(String clientKey) {
         synchronized (registryLock) {
             decrementQuotaLocked(clientKey);
+            releaseCapacityLocked();
         }
+    }
+
+    /**
+     * Returns one global capacity unit. Always paired with a quota release in the same
+     * {@code registryLock} section, and always guarded by the caller's claim-once
+     * {@code quotaReserved} CAS, so a slot can never be returned twice (REQ-02).
+     */
+    private void releaseCapacityLocked() {
+        if (reservedCapacity > 0) {
+            reservedCapacity--;
+        }
+    }
+
+    /**
+     * The queue-full refusal shared by every admission path, so the message an operator reads is
+     * identical whichever bound refused the submission (REQ-02, REQ-04).
+     */
+    private JobQueueFullException jobQueueFull() {
+        return new JobQueueFullException("Hash job queue is full (worker-count=" + workerCount
+                + ", queue-capacity=" + queueCapacity + "); retry after capacity frees");
+    }
+
+    /**
+     * Appends one attempt to its client's FIFO lane and wakes the dispatcher, i.e. the replacement for
+     * the direct {@code executor.execute(...)} hand-off (REQ-01).
+     *
+     * <p>The global capacity unit for the attempt has already been claimed by the caller under
+     * {@code registryLock}, so this method only decides <em>placement</em>; the single reason it can
+     * refuse is a drain that has already closed the lanes, which on both call paths produces exactly
+     * the same rollback as the old executor rejection (REQ-02).</p>
+     *
+     * @return {@code true} when the attempt is queued, {@code false} when a drain refused it
+     */
+    private boolean enqueue(MutableJob job, int generation) {
+        synchronized (dispatchLock) {
+            if (shutdownRequested) {
+                return false;
+            }
+            Deque<LaneEntry> lane = lanes.get(job.clientKey);
+            if (lane == null) {
+                lane = new ArrayDeque<>();
+                lanes.put(job.clientKey, lane);
+                // A client joins the ring at the tail. If it was already served in the live round its
+                // membership in servedThisRound is kept, so a re-enqueue (retry, duplicate) cannot buy
+                // it a second dispatch before the other clients with queued work have had their turn
+                // (REQ-01, REQ-03).
+                laneOrder.addLast(job.clientKey);
+            } else if (!laneOrder.contains(job.clientKey)) {
+                // Defensive: the ring entry is kept while the lane is non-empty, so this cannot fire.
+                laneOrder.addLast(job.clientKey);
+            }
+            lane.addLast(new LaneEntry(job, generation));
+            dispatchLock.notifyAll();
+            return true;
+        }
+    }
+
+    /**
+     * Removes every pending entry of one attempt from its lane. Called by the terminal writers that
+     * withdraw a <em>queued</em> job (cancel, queue-wait deadline expiry) and by the drain, so a
+     * dispatched entry is never a stale generation (REQ-02, REQ-03).
+     *
+     * <p>The capacity and quota units are released by the caller's claim-once
+     * {@code quotaReserved} CAS, never here, so a purge can never double-release a slot.</p>
+     */
+    private void purgeLaneEntries(MutableJob job, int generation) {
+        synchronized (dispatchLock) {
+            Deque<LaneEntry> lane = lanes.get(job.clientKey);
+            if (lane == null) {
+                return;
+            }
+            lane.removeIf(entry -> entry.job() == job && entry.generation() == generation);
+            if (lane.isEmpty()) {
+                forgetLaneLocked(job.clientKey);
+            }
+        }
+    }
+
+    /**
+     * Drops a client's lane once nothing is pending for it: the lane and its ring slot, so the queue
+     * bookkeeping is bounded by "clients with queued work", never "clients ever seen". Its
+     * {@code servedThisRound} membership, if any, is dropped when the round closes (Plan §5). Caller
+     * must hold {@code dispatchLock}.
+     */
+    private void forgetLaneLocked(String clientKey) {
+        lanes.remove(clientKey);
+        laneOrder.remove(clientKey);
+    }
+
+    /** Drops every pending entry; used by the drain, whose sweep then settles the affected rows. */
+    private void clearLanes() {
+        synchronized (dispatchLock) {
+            shutdownRequested = true;
+            lanes.clear();
+            laneOrder.clear();
+            servedThisRound.clear();
+            dispatchedInFlight = 0;
+            dispatchLock.notifyAll();
+        }
+    }
+
+    /**
+     * The client's current pending lane depth. Package-private test/ops observability only, mirroring
+     * {@link #activeJobsForClient}: it is not exposed by any controller and has no production caller,
+     * so {@code BatchHashJobResponse} keeps every one of its fields (REQ-04).
+     */
+    int queuedJobsForClient(String clientKey) {
+        String quotaKey = normalizeClientKey(clientKey);
+        synchronized (dispatchLock) {
+            Deque<LaneEntry> lane = lanes.get(quotaKey);
+            return lane == null ? 0 : lane.size();
+        }
+    }
+
+    /**
+     * The fair-admission dispatcher: the only thread that ever hands work to the pool (REQ-01).
+     *
+     * <p>Selection runs under {@link #dispatchLock} and the hand-off runs outside it, so a full
+     * executor queue can never wedge the dispatcher, and the dispatcher never takes
+     * {@code registryLock} or a job monitor while holding the lock (Plan §4.6).</p>
+     */
+    private void dispatchLoop() {
+        while (true) {
+            List<LaneEntry> handOff = new ArrayList<>();
+            synchronized (dispatchLock) {
+                while (!shutdownRequested) {
+                    if (dispatchedInFlight >= workerCount) {
+                        break; // every worker is busy: the lanes, not the pool queue, hold the backlog
+                    }
+                    LaneEntry entry = pollNextLocked();
+                    if (entry == null) {
+                        break;
+                    }
+                    dispatchedInFlight++;
+                    handOff.add(entry);
+                }
+                if (handOff.isEmpty()) {
+                    if (shutdownRequested) {
+                        return;
+                    }
+                    if (dispatchedInFlight == 0 && laneOrder.isEmpty()) {
+                        // Nothing queued and nothing running: forget the round bookkeeping, so an
+                        // idle service costs nothing and no per-client state outlives the round.
+                        servedThisRound.clear();
+                    }
+                    try {
+                        dispatchLock.wait();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    continue;
+                }
+                if (shutdownRequested) {
+                    return; // the drain takes over every row it still finds non-terminal
+                }
+            }
+            for (LaneEntry entry : handOff) {
+                handOff(entry);
+            }
+        }
+    }
+
+    /**
+     * Hands one admitted entry to the bounded executor. The capacity gate keeps
+     * {@code reservedCapacity <= worker-count + queue-capacity}, so {@link
+     * ThreadPoolExecutor.AbortPolicy} can only fire here if that invariant is broken; the backstop
+     * then puts the entry back at the tail of its own lane instead of losing the attempt - but only
+     * while that attempt is still dispatchable, see {@link #reEnqueue}.
+     */
+    private void handOff(LaneEntry entry) {
+        try {
+            executor.execute(() -> {
+                try {
+                    executeAttempt(entry.job().jobId, entry.generation());
+                } finally {
+                    attemptFinished(); // the worker slot is free again; the dispatcher refills it
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            // Unreachable by the capacity invariant; yield before retrying rather than spin, so a
+            // broken invariant degrades to a slow drain instead of a hot loop or a lost job.
+            attemptFinished();
+            synchronized (dispatchLock) {
+                if (!shutdownRequested) {
+                    try {
+                        dispatchLock.wait(1L);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+            log.warn("batch-hash dispatch: hand-off rejected by the pool; re-queueing the entry", e);
+            reEnqueue(entry);
+        }
+    }
+
+    /**
+     * Marks one handed-off attempt finished and wakes the dispatcher, so the freed worker slot is
+     * refilled from the fair lanes by the dispatcher (never by the worker thread itself). Guarded by
+     * {@code dispatchLock} so the in-flight counter can never undershoot after a drain.
+     */
+    private void attemptFinished() {
+        synchronized (dispatchLock) {
+            if (dispatchedInFlight > 0) {
+                dispatchedInFlight--;
+            }
+            dispatchLock.notifyAll();
+        }
+    }
+
+    /**
+     * Re-appends a rejected hand-off at the tail of its own client's lane, provided the attempt is
+     * still queued and still the live generation.
+     *
+     * <p>The backstop runs after {@link #attemptFinished()}, so a terminal writer (cancel, queue-wait
+     * deadline expiry, drain sweep) can have withdrawn the attempt in between. Those writers already
+     * returned its one capacity unit through the claim-once {@code quotaReserved} CAS, so re-appending
+     * would only put a no-op entry back into the lane and transiently inflate
+     * {@link #queuedJobsForClient}; such an attempt is therefore dropped instead. The status is read
+     * <em>before</em> {@code dispatchLock} is taken, because {@code job monitor -> dispatchLock} is the
+     * only lock order this class allows.</p>
+     */
+    private void reEnqueue(LaneEntry entry) {
+        MutableJob job = entry.job();
+        boolean dispatchable;
+        synchronized (job) {
+            dispatchable = job.status == JobStatus.QUEUED && job.attempt == entry.generation();
+        }
+        if (!dispatchable) {
+            log.debug("batch-hash dispatch: dropped a rejected hand-off for an attempt that is no longer queued (job={})",
+                    job.jobId);
+            return; // terminal or superseded: its slot was released once by the terminal writer
+        }
+        synchronized (dispatchLock) {
+            if (shutdownRequested) {
+                return;
+            }
+            Deque<LaneEntry> lane = lanes.get(entry.job().clientKey);
+            if (lane == null) {
+                lane = new ArrayDeque<>();
+                lanes.put(entry.job().clientKey, lane);
+                laneOrder.addLast(entry.job().clientKey);
+            }
+            lane.addLast(entry);
+            dispatchLock.notifyAll();
+        }
+    }
+
+    /**
+     * Selects and removes the next entry to dispatch, implementing the round barrier that bounds
+     * starvation (REQ-01, Plan §4.2): a client is eligible only while its key is absent from
+     * {@code servedThisRound}; when no client is eligible the round is closed (the set is pruned),
+     * which makes every client with a pending lane eligible again. A client therefore receives at
+     * most one dispatch per round while any other client still has queued work, so the wait is
+     * bounded by the number of clients with queued work - not by the depth of any lane and not by how
+     * much service a client accumulated in earlier rounds.
+     *
+     * <p>Closing the round is the <em>only</em> reset, and it fires on both "no eligible client"
+     * exits: the saturated ring (every pending client was served) and the empty ring (nobody has work
+     * queued). The empty-ring close is what makes the retained set bounded by live work instead of by
+     * dispatch count: without it a long job keeping a worker busy would let the ring drain between
+     * submissions, and every such dispatch would leave one client key behind until the service went
+     * fully idle. The residual case is a ring that never empties - one client keeps a lane non-empty
+     * while new clients stream in - where the round stays open and marks accumulate for clients whose
+     * lanes already drained; so the set is additionally capped at {@code worker-count +
+     * queue-capacity} (one key per unit of live queued work) by closing the round when it is reached.
+     * Memory is therefore O(worker-count + queue-capacity) in all cases, never a function of the
+     * client population or of dispatch count, and a cap-triggered close can only restart the round
+     * from the ring head, so the starvation bound below still holds (REQ-01, Plan §5 Memory).</p>
+     */
+    private LaneEntry pollNextLocked() {
+        if (servedThisRound.size() >= dispatchCapacityLocked()) {
+            // Hard memory cap: a ring that never empties cannot grow the set past one key per unit of
+            // global worker+queue capacity. Closing here restarts the round at the ring head, so the
+            // longest-waiting client is still the first one served.
+            closeRoundLocked();
+        }
+        String chosen = selectEligibleLocked();
+        if (chosen == null) {
+            // The round barrier resets in both cases: everybody pending has been served (saturated
+            // ring), or nothing is queued at all (empty ring), where the close is vacuously fair
+            // because no client has work that these marks could starve.
+            closeRoundLocked();
+            if (laneOrder.isEmpty()) {
+                return null; // nothing queued at all: the caller blocks until a lane refills
+            }
+            chosen = selectEligibleLocked();
+            if (chosen == null) {
+                return null; // unreachable: a fresh round makes every pending client eligible
+            }
+        }
+        Deque<LaneEntry> lane = lanes.get(chosen);
+        LaneEntry entry = lane.pollFirst();
+        servedThisRound.add(chosen);
+        laneOrder.remove(chosen);
+        if (lane.isEmpty()) {
+            // Lane and ring slot go at once; the served mark survives until this round closes, so a
+            // re-enqueue (retry, duplicate) from this client cannot buy it a second dispatch before the
+            // clients that were already waiting have had their turn (REQ-01, REQ-03).
+            forgetLaneLocked(chosen);
+        } else {
+            laneOrder.addLast(chosen); // the ring cursor advances to the next client
+        }
+        return entry;
+    }
+
+    /**
+     * Closes the current round: every client with a pending lane has been served (or nothing is
+     * queued), so the served marks are dropped and the epoch ends with no residue
+     * ({@code servedThisRound} never outlives the round it describes). This is the only reset, so no
+     * counter can drift or wrap, and the set is bounded by the clients with queued work in the live
+     * round rather than by dispatch count or the client population.
+     */
+    private void closeRoundLocked() {
+        servedThisRound.clear();
+    }
+
+    /**
+     * Upper bound on the number of served marks a round may retain: one per unit of live global
+     * capacity ({@code worker-count + queue-capacity}), because that is the most attempts that can be
+     * queued or running at any instant. Caller must hold {@link #dispatchLock}.
+     */
+    private int dispatchCapacityLocked() {
+        return workerCount + queueCapacity;
+    }
+
+    /**
+     * The first client from the head of {@code laneOrder} that still has pending work and has not been
+     * served in the current round, or {@code null} when the round is complete.
+     */
+    private String selectEligibleLocked() {
+        for (String client : laneOrder) {
+            Deque<LaneEntry> lane = lanes.get(client);
+            if (lane == null || lane.isEmpty()) {
+                continue; // defensive: a drained lane is pruned by the writers that drain it
+            }
+            if (!servedThisRound.contains(client)) {
+                return client;
+            }
+        }
+        return null;
+    }
+
+    /** One queued attempt: the job reference plus the generation that fences a superseded attempt. */
+    private record LaneEntry(MutableJob job, int generation) {
     }
 
     /** Current snapshot of a job; throws {@link JobNotFoundException} for unknown or evicted ids. */
@@ -701,13 +1152,12 @@ public class BatchHashJobService {
                         ? Instant.now(clock).plusSeconds(job.deadlineSeconds)
                         : null;
                 job.attemptRequestIds.put(admittedAttempt, requestId);
-                try {
-                    executor.execute(() -> executeAttempt(job.jobId, admittedAttempt));
-                } catch (RejectedExecutionException e) {
+                // REQ-03: the requeued attempt re-enters *this* client's lane at its tail, so it cannot
+                // jump ahead of work other clients already have waiting.
+                if (!enqueue(job, admittedAttempt)) {
                     before.restore(job); // attempt decremented, status FAILED, error/completedAt back
                     job.attemptRequestIds.remove(admittedAttempt); // the attempt never started
-                    throw new JobQueueFullException("Hash job queue is full (worker-count=" + workerCount
-                            + ", queue-capacity=" + queueCapacity + "); retry after capacity frees");
+                    throw jobQueueFull();
                 }
                 keepReservation = true; // only an accepted requeue keeps the slot
                 return snapshot(job); // QUEUED, attempt = 2, attempt-1 entry retained
@@ -748,7 +1198,14 @@ public class BatchHashJobService {
                 job.quotaReserved.set(false); // nothing was reserved, so give the claim back
                 throw new JobQuotaExceededException(maxActiveJobsPerClient, active);
             }
+            // REQ-02: a retried attempt takes a global capacity unit under the same gate as a fresh
+            // submission, so the worker-count + queue-capacity bound is unchanged by fair admission.
+            if (reservedCapacity >= workerCount + queueCapacity) {
+                job.quotaReserved.set(false); // nothing was reserved, so give the claim back
+                throw jobQueueFull();
+            }
             activeJobsByClient.merge(job.clientKey, 1, Integer::sum);
+            reservedCapacity++;
         }
     }
 
@@ -795,6 +1252,11 @@ public class BatchHashJobService {
             job.error = null;
             job.lastHeartbeatAt = null;
             job.executionLeaseExpiresAt = null;
+            // REQ-02/REQ-03: the pending lane entry is withdrawn in the same monitor section as the
+            // terminal write, so a queued job that was just cancelled can never be dispatched (the
+            // worker's status fence would reject it anyway), and its capacity unit is returned once
+            // by the claim-once CAS below rather than by the purge.
+            purgeLaneEntries(job, job.attempt);
             // Same monitor section as the terminal write: exactly one caller can claim the
             // reservation, so a repeated cancel (or a later eviction) cannot release it again.
             released = job.quotaReserved.compareAndSet(true, false);
@@ -893,6 +1355,10 @@ public class BatchHashJobService {
         // generations that can never run (a RUNNING generation is cleaned by its own worker exit).
         if (job.status == JobStatus.QUEUED) {
             job.attemptRequestIds.remove(generation);
+            // REQ-02/REQ-03: a queued attempt whose deadline passed is withdrawn from its lane in the
+            // same monitor section that makes it terminal, so it can never be dispatched afterwards;
+            // the capacity unit goes back with the claim-once CAS at the end of this method.
+            purgeLaneEntries(job, generation);
         }
         job.status = JobStatus.FAILED;
         job.error = JOB_DEADLINE_EXCEEDED;
@@ -1188,14 +1654,21 @@ public class BatchHashJobService {
      * Terminalizes the service: in-flight work gets a bounded grace window, everything still
      * non-terminal afterwards is failed with {@link #JOB_SHUTDOWN}.
      *
-     * <p>Two phases. Phase one calls {@link ThreadPoolExecutor#shutdown()}, so queued work still
-     * runs while {@link #submit} and {@link #retry} are refused through their existing
-     * {@link RejectedExecutionException} rollback, and waits up to the configured grace window for
-     * the pool to terminate. Phase two interrupts whatever is still running and sweeps the registry.
-     * The sweep fails only {@code QUEUED}/{@code RUNNING} jobs, keeps their attempt number and their
-     * checkpoint, and closes each open audit entry exactly once, so a worker that ignores
-     * interruption and returns later writes nothing: the existing status/attempt fence rejects it.
-     * </p>
+     * <p>Two phases. Phase one first ends the fair-admission dispatcher
+     * ({@link #stopDispatcher()}): the drain flag is set and every pending lane entry is dropped under
+     * {@link #dispatchLock}, so from that moment no attempt can be dispatched and {@link #submit} and
+     * {@link #retry} are refused by the lane gate in {@link #enqueue}, rolling back through the same
+     * queue-full path a saturated admission uses ({@link JobQueueFullException}) - not through
+     * {@link RejectedExecutionException}, which remains only the pool's unreachable backstop. Because
+     * the lanes are already empty, the {@link ThreadPoolExecutor#shutdown()} that follows admits no new
+     * work: it only lets the attempts that were <em>already</em> handed off - at most
+     * {@code worker-count} of them - finish inside the configured grace window. Jobs that were still
+     * queued in a lane are consequently never executed; the sweep below settles them
+     * {@link #JOB_SHUTDOWN}. Phase two interrupts whatever is still running
+     * ({@link ThreadPoolExecutor#shutdownNow()}) and sweeps the registry. The sweep fails only
+     * {@code QUEUED}/{@code RUNNING} jobs, keeps their attempt number and their checkpoint, and closes
+     * each open audit entry exactly once, so a worker that ignores interruption and returns later
+     * writes nothing: the existing status/attempt fence rejects it.</p>
      *
      * <p>Idempotent by construction rather than by flag: a second call re-runs no-op
      * {@code shutdown()}/{@code shutdownNow()} and finds no non-terminal job, so it adds no attempt,
@@ -1204,12 +1677,36 @@ public class BatchHashJobService {
     @PreDestroy
     public void shutdown() {
         synchronized (shutdownMonitor) {
-            executor.shutdown(); // phase 1: queued work still runs, new work is refused
+            // The dispatcher is stopped first (REQ-01/REQ-02): after this call no new attempt can be
+            // handed off, every pending lane is dropped, and submit/retry are refused through the
+            // existing queue-full rollback, so the sweep below settles exactly the rows still present.
+            stopDispatcher();
+            // Nothing can be admitted any more (the lanes are gone), so this only waits for the
+            // attempts already handed off; jobs that were queued in a lane are settled by the sweep.
+            executor.shutdown();
             boolean terminated = awaitTerminationBounded(shutdownGraceSeconds);
             List<Runnable> discarded = executor.shutdownNow(); // phase 2: interrupt what is still running
             int failed = failNonTerminalJobs(JOB_SHUTDOWN);
             log.info("batch-hash drain: terminated={}, forced={}, failed={}", terminated, discarded.size(),
                     failed);
+        }
+    }
+
+    /**
+     * Ends the dispatcher and empties every lane.
+     *
+     * <p>Both are done under {@link #dispatchLock} so the dispatcher either sees the flag before its
+     * next selection or is interrupted out of its wait; the caller then joins it (bounded) before the
+     * pool is touched, so no hand-off can race the drain. Any attempt that was already handed off keeps
+     * its capacity unit and is settled by the normal worker/reaper/drain path.</p>
+     */
+    private void stopDispatcher() {
+        clearLanes(); // sets shutdownRequested and drops every pending entry
+        dispatcher.interrupt();
+        try {
+            dispatcher.join(TimeUnit.SECONDS.toMillis(5L));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt(); // never swallow the drain caller's interrupt
         }
     }
 
@@ -1250,6 +1747,11 @@ public class BatchHashJobService {
                     failed++;
                 } else if (job.status == JobStatus.QUEUED || job.status == JobStatus.RUNNING) {
                     Instant now = Instant.now(clock);
+                    if (job.status == JobStatus.QUEUED) {
+                        // Defensive: the dispatcher was stopped (and its lanes dropped) before this
+                        // sweep, so this is a no-op unless a hand-off was still in flight.
+                        purgeLaneEntries(job, job.attempt);
+                    }
                     job.status = JobStatus.FAILED; // the fence's status half now fails for a late worker
                     job.error = error;
                     job.completedAt = now;
