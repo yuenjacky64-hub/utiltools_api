@@ -362,6 +362,31 @@ class MaintainerEngine:
         with self._lock:
             self._memory = memory
 
+    def install_watcher(self, watcher: "Any | None") -> None:
+        """Install the REQ-02 watcher view (``None`` uninstalls it).
+
+        Plan §4.3 seam, mirroring ``install_memory()``: the API layer builds the
+        engine before the monitor snapshot exists, so the read-only view a cycle
+        snapshots must be attachable after construction. The watcher is only
+        read (`get_snapshot()`), never written.
+        """
+
+        with self._lock:
+            self._watcher = watcher
+
+    def install_heartbeat_path(self, heartbeat_path: "str | Path | None") -> None:
+        """Install the REQ-02 heartbeat document path (``None`` uninstalls it).
+
+        Plan §4.3 seam: without a path the engine captures ``None`` and never
+        reads or creates a heartbeat file, which is the pre-task behaviour
+        (INV-CONC-5).
+        """
+
+        with self._lock:
+            self._heartbeat_path = (
+                Path(heartbeat_path) if heartbeat_path is not None else None
+            )
+
     def run_cycle(self) -> CycleResult:
         """Execute at most ``max_steps_per_cycle`` monitor steps.
 
@@ -472,8 +497,15 @@ class MaintainerEngine:
         active_ids: tuple[str, ...] = ()
         if watcher is not None:
             try:
+                # Plan §4.3 / v3 finding 1: read the *production* watcher API -
+                # ``FrameworkWatcher.get_snapshot().active_tasks`` - instead of
+                # a duck-typed ``active_task_ids`` attribute the only shipped
+                # watcher class does not have (which made this capture a silent
+                # no-op). ``ActiveTask`` carries ``task_id``; it is the active
+                # task id the snapshot restores into ``_cycle_active_ids``.
                 active_ids = tuple(
-                    str(item) for item in getattr(watcher, "active_task_ids", ())
+                    str(task.task_id)
+                    for task in watcher.get_snapshot().active_tasks
                 )
             except Exception:  # pragma: no cover - defensive
                 active_ids = ()
@@ -545,6 +577,14 @@ class MaintainerEngine:
             path, data = snapshot.heartbeat
             if data is not None and current_heartbeat(path) != data:
                 heartbeat_result = write_heartbeat(path, data)
+                if heartbeat_result is False and error is None:
+                    # v3 finding 5: a failed restore must not be reported as a
+                    # clean one. ``write_heartbeat`` returns ``False`` when the
+                    # atomic swap could not happen (missing directory, symlink
+                    # swap, ``OSError``); surface it as a restore failure so the
+                    # audit line is ``SNAPSHOT_RESTORE_FAILED`` with
+                    # ``heartbeat_restored: false`` instead of a success.
+                    error = "HEARTBEAT_RESTORE_FAILED"
         # Stay quiet when the restore was a no-op: an uncontended, committed
         # cycle leaves the store exactly as captured, and emitting
         # ``SNAPSHOT_RESTORED`` for it would append an event after the cycle's

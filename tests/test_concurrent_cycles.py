@@ -24,6 +24,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from ai_maintainer.config import MaintainerConfig
 from ai_maintainer.concurrency import (
     CycleAdmissionGate,
@@ -34,14 +36,22 @@ from ai_maintainer.concurrency import (
 )
 from ai_maintainer.engine import MaintainerEngine
 from ai_maintainer.memory.store import MemoryStore
+from ai_maintainer.monitor.models import ActiveTask, FrameworkSnapshot
+from ai_maintainer.monitor.watcher import FrameworkWatcher
 from ai_maintainer.tasks.curriculum import Difficulty, TaskCurriculum
 
 
-class FakeWatcher:
-    """Stand-in ``MemoryWatcher`` exposing only ``active_task_ids``."""
+def _watcher(*task_ids: str) -> FrameworkWatcher:
+    """The **production** watcher over an injected snapshot (v3 finding 1).
 
-    def __init__(self, active_task_ids: tuple[str, ...]) -> None:
-        self.active_task_ids = tuple(active_task_ids)
+    The capture path under test is ``get_snapshot().active_tasks``, so the
+    double must be the real :class:`FrameworkWatcher`; a hand-rolled fake with
+    an invented ``active_task_ids`` attribute hid the dead-code capture.
+    """
+
+    return FrameworkWatcher(
+        FrameworkSnapshot(active_tasks=tuple(ActiveTask(task_id=i) for i in task_ids))
+    )
 
 
 def _make_engine(
@@ -50,7 +60,7 @@ def _make_engine(
     max_cycles: int = 2,
     priority: bool = True,
     memory: MemoryStore | None = None,
-    watcher: FakeWatcher | None = None,
+    watcher: FrameworkWatcher | None = None,
     heartbeat: str | Path | None = None,
     max_shutdown_wait: float = 5.0,
     audit_path: str | Path | None = None,
@@ -388,8 +398,14 @@ def test_engine_per_cycle_attribution_no_cross_cycle_leak(tmp_path: Path) -> Non
     # Two previously-committed cycles, each owning its own records.
     store.add_learning({"id": "L1", "text": "a"}, cycle=5)
     store.add_learning({"id": "L2", "text": "b"}, cycle=6)
-    watcher = FakeWatcher(("t-a",))
+    watcher = _watcher("t-a", "t-b")
     engine = _make_engine(tmp_path, max_cycles=2, memory=store, watcher=watcher)
+
+    # v3 finding 1: the *production* watcher (``get_snapshot().active_tasks``)
+    # must actually reach the snapshot - asserting the capture would have
+    # caught the dead ``active_task_ids`` duck-type.
+    captured = engine._capture_snapshot(cycle=7, difficulty=Difficulty.EASY)
+    assert captured.active_task_ids == ("t-a", "t-b")
 
     results: list[object] = []
     lock = threading.Lock()
@@ -560,3 +576,178 @@ def test_run_forever_multi_cycle_mode_writes_one_audit_line(tmp_path: Path) -> N
     lines = [line for line in audit.read_text(encoding="utf-8").splitlines() if line]
     assert len(lines) == 1, "multi-cycle mode must not duplicate the audit line"
     assert engine.active_cycles == 0
+
+
+# ---------------------------------------------------------------------------
+# REQ-02 / plan §4.3 — late wiring seams for the watcher and heartbeat path
+# ---------------------------------------------------------------------------
+
+
+def test_install_watcher_and_heartbeat_path_seams(tmp_path: Path) -> None:
+    """An engine built without the monitor state can be wired afterwards.
+
+    v3 finding 2: plan §4.3 names ``install_watcher()`` /
+    ``install_heartbeat_path()`` alongside ``install_signal_gate()`` /
+    ``install_memory()``; without them the production API layer (which builds
+    the engine before the monitor snapshot or the state root exists) could not
+    enable watcher/heartbeat capture at all.
+    """
+
+    heartbeat = tmp_path / "state" / "maintainer_heartbeat.json"
+    heartbeat.parent.mkdir()
+    heartbeat.write_bytes(b'{"beat": 1}')
+
+    engine = _make_engine(tmp_path)  # no watcher, no heartbeat path
+    assert engine._capture_snapshot(cycle=1, difficulty=Difficulty.EASY).heartbeat is None
+
+    engine.install_watcher(_watcher("t-a"))
+    engine.install_heartbeat_path(heartbeat)
+    snapshot = engine._capture_snapshot(cycle=2, difficulty=Difficulty.EASY)
+    assert snapshot.active_task_ids == ("t-a",)
+    assert snapshot.heartbeat is not None
+    assert snapshot.heartbeat[0] == heartbeat
+    assert snapshot.heartbeat[1] == b'{"beat": 1}'
+
+    # ``None`` uninstalls both seams (pre-task behaviour restored).
+    engine.install_watcher(None)
+    engine.install_heartbeat_path(None)
+    snapshot = engine._capture_snapshot(cycle=3, difficulty=Difficulty.EASY)
+    assert snapshot.active_task_ids == ()
+    assert snapshot.heartbeat is None
+
+
+# ---------------------------------------------------------------------------
+# REQ-04 / DOD-08 — the store is thread-safe under concurrent writers
+# ---------------------------------------------------------------------------
+
+
+def test_store_concurrent_appends_from_two_threads(tmp_path: Path) -> None:
+    """Two threads appending all three collections keep every record (DOD-08).
+
+    v3 finding 4: nothing drove ``add_run`` / ``add_bug_fix`` /
+    ``add_learning`` from two threads, so the ``_write_lock`` protection REQ-05
+    relies on (overlapping cycles attribute to their own ``cycle``) was
+    unverified. Every append must survive and keep its own attribution.
+    """
+
+    store = MemoryStore(tmp_path / "memory.json")
+    barrier = threading.Barrier(2)
+    per_thread = 25
+
+    def writer(cycle: int) -> None:
+        barrier.wait(5.0)
+        for n in range(per_thread):
+            store.add_run({"id": f"run-{cycle}-{n}"}, cycle=cycle)
+            store.add_bug_fix({"id": f"fix-{cycle}-{n}"}, cycle=cycle)
+            store.add_learning({"id": f"learn-{cycle}-{n}"}, cycle=cycle)
+
+    threads = [threading.Thread(target=writer, args=(c,)) for c in (11, 12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+    assert not any(t.is_alive() for t in threads)
+
+    docs = store.records()
+    for name in ("runs", "bug_fixes", "learnings"):
+        assert len(docs[name]) == 2 * per_thread, f"{name} lost an append"
+        by_cycle = {c: 0 for c in (11, 12)}
+        for record in docs[name]:
+            by_cycle[record["cycle"]] += 1
+        assert by_cycle == {11: per_thread, 12: per_thread}, f"{name} mis-attributed"
+
+
+# ---------------------------------------------------------------------------
+# REQ-02 / INV-CONC-5 — a failed heartbeat restore is not reported as success
+# ---------------------------------------------------------------------------
+
+
+def test_failed_heartbeat_restore_is_reported(tmp_path: Path) -> None:
+    """``write_heartbeat`` returning ``False`` yields ``SNAPSHOT_RESTORE_FAILED``.
+
+    v3 finding 5: the audit condition used to be ``heartbeat_result is not None``
+    with ``error is None``, so a restore that could not be written was logged as
+    ``SNAPSHOT_RESTORED`` (``removed: 0``) - a silent data-loss report.
+    """
+
+    engine = _make_engine(tmp_path)
+    missing = tmp_path / "does-not-exist" / "heartbeat.json"
+    snapshot = CycleSnapshot(cycle=4, heartbeat=(missing, b'{"beat": 2}'))
+
+    engine._restore_snapshot(snapshot, trusted_cycle=4, committed=False)
+
+    events = [event for event in engine.events if event["event"].startswith("SNAPSHOT_")]
+    assert len(events) == 1
+    event = events[0]
+    assert event["event"] == "SNAPSHOT_RESTORE_FAILED"
+    assert event["heartbeat_restored"] is False
+    assert event["error"] == "HEARTBEAT_RESTORE_FAILED"
+    assert not missing.exists(), "the restore must not invent the parent directory"
+
+
+# ---------------------------------------------------------------------------
+# REQ-01 / DOD-01 — the config default, env override and validation
+# ---------------------------------------------------------------------------
+
+
+def test_max_concurrent_cycles_config_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default 2, ``MAINTAINER_MAX_CONCURRENT_CYCLES`` override, ``>= 1`` check.
+
+    v3 finding 3: every other test passed the value explicitly, so the DOD-01
+    default and the ``__post_init__`` guard were unverified.
+    """
+
+    from ai_maintainer import config as config_module
+
+    monkeypatch.setattr(config_module, "_load_must_config", lambda: {})
+
+    assert MaintainerConfig().max_concurrent_cycles == 2, "brief default is 2"
+    assert (
+        MaintainerConfig.load(
+            maintainer_root=tmp_path,
+            env={"MAINTAINER_MAX_CONCURRENT_CYCLES": "3"},
+        ).max_concurrent_cycles
+        == 3
+    ), "the documented env override must win over the default"
+    # A CLI-style override still beats the environment.
+    assert (
+        MaintainerConfig.load(
+            maintainer_root=tmp_path,
+            env={"MAINTAINER_MAX_CONCURRENT_CYCLES": "3"},
+            max_concurrent_cycles=4,
+        ).max_concurrent_cycles
+        == 4
+    )
+    for bad in (0, -1):
+        with pytest.raises(ValueError):
+            MaintainerConfig(max_concurrent_cycles=bad)
+
+
+def test_snapshot_active_cycles_rows(tmp_path: Path) -> None:
+    """``snapshot()["active_cycles"]`` carries one attributed row per live cycle.
+
+    Plan §4 row shape ``{cycle, task, difficulty, admitted_at}`` (v3 finding 4,
+    second half): the operator view must name the cycle, the task its slot
+    adopted, the admission difficulty and the admission timestamp.
+    """
+
+    engine = _make_engine(tmp_path)
+    engine._register_cycle(
+        7, Difficulty.COMPLEX, CycleSnapshot(cycle=7, admitted_at=123.5)
+    )
+    engine._register_cycle(8, Difficulty.EASY, CycleSnapshot(cycle=8, admitted_at=200.0))
+    try:
+        rows = {row["cycle"]: row for row in engine.snapshot()["active_cycles"]}
+        assert set(rows) == {7, 8}
+        assert rows[7]["difficulty"] == "COMPLEX"
+        assert rows[7]["admitted_at"] == 123.5
+        assert rows[8]["difficulty"] == "EASY"
+        assert rows[8]["admitted_at"] == 200.0
+        for row in rows.values():
+            assert {"cycle", "task", "difficulty", "admitted_at"} <= set(row)
+    finally:
+        engine._deregister_cycle(7)
+        engine._deregister_cycle(8)
+    assert engine.snapshot()["active_cycles"] == []
