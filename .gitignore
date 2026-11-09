@@ -46,3 +46,8 @@ maintainer_memory.json.tmp
 data/maintainer_shutdown.log
 _shutdown_state.json
 _shutdown_state.json.tmp
+### Task-cancellation runtime markers (never source) - UTILTOOLS-76 REQ-03 ###
+maintainer.pid
+maintainer.pid.tmp
+maintainer.heartbeat
+maintainer.heartbeat.tmp

@@ -41,6 +41,11 @@ DEFAULT_STALE_RECOVERY_GRACE_SEC = 60.0
 # Upper bound a graceful wind-down waits for an in-flight cycle (clock units).
 DEFAULT_MAX_SHUTDOWN_WAIT_SEC = 300.0
 
+# Count-based retention for the three memory collections (UTILTOOLS-76 REQ-03).
+DEFAULT_MEMORY_MAX_RUNS = 500
+DEFAULT_MEMORY_MAX_BUG_FIXES = 500
+DEFAULT_MEMORY_MAX_LEARNINGS = 500
+
 DEFAULT_PRIMARY_CLI: str | None = None
 DEFAULT_PRIMARY_MODEL: str | None = None
 DEFAULT_SECONDARY_CLI: str | None = None
@@ -250,6 +255,12 @@ class MaintainerConfig:
     data_dir: str | None = None
     reports_dir: str | None = None
 
+    # Memory retention knobs (UTILTOOLS-76 REQ-03): the memory document is
+    # pruned to these maxima at the end of every cycle and on a wind-down.
+    memory_max_runs: int = DEFAULT_MEMORY_MAX_RUNS
+    memory_max_bug_fixes: int = DEFAULT_MEMORY_MAX_BUG_FIXES
+    memory_max_learnings: int = DEFAULT_MEMORY_MAX_LEARNINGS
+
     def __post_init__(self) -> None:
         interval = self.prioritization_aging_interval_ms
         if not isinstance(interval, int) or isinstance(interval, bool) or interval < 0:
@@ -318,6 +329,14 @@ class MaintainerConfig:
             or float(shutdown_wait) < 0.0
         ):
             raise ValueError("max_shutdown_wait_sec must be a finite float >= 0")
+        for name in (
+            "memory_max_runs",
+            "memory_max_bug_fixes",
+            "memory_max_learnings",
+        ):
+            limit = getattr(self, name)
+            if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+                raise ValueError(f"{name} must be >= 1")
 
     @property
     def aging_threshold_seconds(self) -> float:
