@@ -793,8 +793,12 @@ class MaintainerEngine:
         lease: Lease | None = None
         try:
             if not self._framework_idle():
+                # Read the counter under the same lock ``_next_cycle_id`` uses
+                # so the idle-gate report cannot tear against the acquire path.
+                with self._lock:
+                    current_cycle = self._cycles
                 return CycleResult(
-                    cycle=self._cycles,
+                    cycle=current_cycle,
                     monitored=None,
                     priority=None,
                     preempted=None,
@@ -1439,12 +1443,15 @@ class MaintainerEngine:
                 pending[task.name] = effective_priority(
                     task, cycle=self._cycles, now=now, config=self._config
                 ).name
-            return {
-                "monitored": None if monitored is None else monitored.name,
-                "pending": pending,
-                # REQ-02 read surface: additive key, no watcher change needed.
-                "leases": self.lease_snapshot(),
-            }
+        # INV-LEASE-2: ``lease_snapshot()`` takes ``_lease_lock``, so it is
+        # built *after* ``self._lock`` is released — the lease lock is never
+        # acquired while the engine lock is held.
+        return {
+            "monitored": None if monitored is None else monitored.name,
+            "pending": pending,
+            # REQ-02 read surface: additive key, no watcher change needed.
+            "leases": self.lease_snapshot(),
+        }
 
     def fingerprint_state(self, now: float | None = None) -> dict[str, Any]:
         """Lock-protected copy of the per-fingerprint circuit registry."""

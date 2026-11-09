@@ -535,3 +535,27 @@ def test_snapshot_exposes_lease_state(tmp_path: Path) -> None:
     assert engine.snapshot()["leases"][0]["status"] == LEASE_STATUS_ACTIVE
     assert engine.lease_snapshot()[0]["cycle_id"] == "cycle-1"
     engine.release_lease(lease.lease_id)
+
+
+def test_snapshot_builds_lease_view_outside_engine_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """INV-LEASE-2: ``lease_snapshot()`` takes ``_lease_lock``, so ``snapshot()``
+    must call it *after* dropping ``self._lock`` — never nested inside it."""
+
+    engine = _engine(tmp_path)
+    lease = engine.acquire_lease("cycle-1")
+    observed: list[bool] = []
+    real = engine.lease_snapshot
+
+    def spy() -> list[dict]:
+        # ``_lock`` is an RLock, so ``_is_owned()`` reports this thread's hold.
+        observed.append(engine._lock._is_owned())
+        return real()
+
+    monkeypatch.setattr(engine, "lease_snapshot", spy)
+    view = engine.snapshot()
+
+    assert observed == [False]
+    assert [entry["lease_id"] for entry in view["leases"]] == [lease.lease_id]
+    engine.release_lease(lease.lease_id)
