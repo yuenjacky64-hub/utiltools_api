@@ -17,6 +17,9 @@ public enum OperationType {
     JSON_FORMAT(true),
     JSON_VALIDATE(true),
     JSON_QUERY(true),
+    // An opt-in stale answer is a cached last-known-good result, not a fresh deterministic
+    // evaluation: non-deterministic so it can never replay as if it were a live query.
+    JSON_QUERY_FALLBACK(false),
     JSON_FLATTEN(true),
     JSON_UNFLATTEN(true),
     JSON_MERGE_PATCH(true),

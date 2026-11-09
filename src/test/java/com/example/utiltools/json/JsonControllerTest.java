@@ -10,9 +10,12 @@ import com.example.utiltools.crypto.service.CryptoService;
 import com.example.utiltools.datetime.service.DateTimeService;
 import com.example.utiltools.json.dto.JsonFromCsvRequest;
 import com.example.utiltools.json.dto.JsonToCsvRequest;
+import com.example.utiltools.json.service.JsonQueryFallbackCache;
 import com.example.utiltools.json.service.JsonService;
 import com.example.utiltools.json.controller.JsonController;
 import com.example.utiltools.text.service.TextService;
+import com.example.utiltools.resilience.CircuitBreaker;
+import com.example.utiltools.resilience.CircuitState;
 import com.example.utiltools.resilience.ResilienceConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -22,11 +25,13 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
@@ -42,6 +47,12 @@ class JsonControllerTest {
 
     @Autowired
     private MockMvc mockMvc;
+
+    @Autowired
+    private CircuitBreaker circuitBreaker;
+
+    @Autowired
+    private JsonQueryFallbackCache fallbackCache;
 
     @Test
     @DisplayName("POST /api/v1/utils/json/format - should format JSON")
@@ -97,6 +108,104 @@ class JsonControllerTest {
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data.jsonPath").value("$.items[1]"))
                 .andExpect(jsonPath("$.data.result").value(20));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/query - opt-in request is served stale when the circuit is open")
+    @DirtiesContext(methodMode = DirtiesContext.MethodMode.AFTER_METHOD)
+    void shouldServeStaleFallbackEnvelopeWhenCircuitOpen() throws Exception {
+        String optIn = """
+                {
+                    "json": "{\\"items\\": [10, 20, 30]}",
+                    "jsonPath": "$.items[1]",
+                    "allowStaleFallback": true
+                }
+                """;
+
+        // Warm: a live result carries no fallback metadata at all.
+        mockMvc.perform(post("/api/v1/utils/json/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(optIn))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.result").value(20))
+                .andExpect(jsonPath("$.data.staleFallback").value(nullValue()))
+                .andExpect(jsonPath("$.data.cachedAt").value(nullValue()))
+                .andExpect(jsonPath("$.data.cacheAgeMillis").value(nullValue()));
+        assertThat(fallbackCache.stats().size()).isEqualTo(1);
+
+        tripCircuitBreaker();
+        var resetAt = circuitBreaker.resetAt();
+        var auditSize = circuitBreaker.auditTrail().recent(1024).size();
+
+        mockMvc.perform(post("/api/v1/utils/json/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(optIn))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.jsonPath").value("$.items[1]"))
+                .andExpect(jsonPath("$.data.result").value(20))
+                .andExpect(jsonPath("$.data.staleFallback").value(true))
+                .andExpect(jsonPath("$.data.cachedAt").isString())
+                .andExpect(jsonPath("$.data.cacheAgeMillis").isNumber());
+
+        // The degraded read leaves the breaker exactly as it was.
+        assertThat(circuitBreaker.state()).isEqualTo(CircuitState.OPEN);
+        assertThat(circuitBreaker.resetAt()).isEqualTo(resetAt);
+        assertThat(circuitBreaker.consecutiveSuccesses()).isZero();
+        assertThat(circuitBreaker.auditTrail().recent(1024).size()).isEqualTo(auditSize);
+        assertThat(fallbackCache.stats().hits()).isEqualTo(1L);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/query - circuit open without an opt-in cache hit still fails closed")
+    @DirtiesContext(methodMode = DirtiesContext.MethodMode.AFTER_METHOD)
+    void shouldFailClosedWithCircuitOpenEnvelopeOnFallbackMiss() throws Exception {
+        String warm = """
+                {
+                    "json": "{\\"items\\": [10, 20, 30]}",
+                    "jsonPath": "$.items[1]"
+                }
+                """;
+        String otherPath = """
+                {
+                    "json": "{\\"items\\": [10, 20, 30]}",
+                    "jsonPath": "$.items[2]",
+                    "allowStaleFallback": true
+                }
+                """;
+        String noOptIn = """
+                {
+                    "json": "{\\"items\\": [10, 20, 30]}",
+                    "jsonPath": "$.items[1]"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/json/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(warm))
+                .andExpect(status().isOk());
+        tripCircuitBreaker();
+
+        // Opt-in but a different jsonPath: the key is absent, so the caller sees the plain 503.
+        mockMvc.perform(post("/api/v1/utils/json/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(otherPath))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("CIRCUIT_OPEN"))
+                .andExpect(jsonPath("$.details.state").value("OPEN"))
+                .andExpect(jsonPath("$.data").doesNotExist());
+
+        // Warming key but no opt-in: still the unchanged CIRCUIT_OPEN envelope.
+        mockMvc.perform(post("/api/v1/utils/json/query")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(noOptIn))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.error").value("CIRCUIT_OPEN"))
+                .andExpect(jsonPath("$.details.state").value("OPEN"));
+
+        assertThat(fallbackCache.stats().size()).isEqualTo(1);
+        assertThat(circuitBreaker.state()).isEqualTo(CircuitState.OPEN);
     }
 
     @Test
@@ -1309,6 +1418,19 @@ class JsonControllerTest {
                 assertThat(entry.path("state").asText()).isEqualTo("SUCCEEDED");
             }
         }
+    }
+
+    private void tripCircuitBreaker() {
+        for (int i = 0; i < 10 && circuitBreaker.state() != CircuitState.OPEN; i++) {
+            try {
+                circuitBreaker.execute(() -> {
+                    throw new IllegalStateException("forced failure");
+                });
+            } catch (RuntimeException expected) {
+                // the delegate's own exception is rethrown until the threshold opens the circuit
+            }
+        }
+        assertThat(circuitBreaker.state()).isEqualTo(CircuitState.OPEN);
     }
 
     private static String requestBody(String field, String value) throws Exception {

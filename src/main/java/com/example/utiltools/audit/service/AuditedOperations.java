@@ -158,8 +158,17 @@ public class AuditedOperations {
         return record(OperationType.JSON_VALIDATE, request, () -> jsonService.validate(request));
     }
 
+    /**
+     * The journal type is chosen once, before the call, from the request's opt-in flag: an
+     * opted-in call may be answered from the last-known-good cache, so it is journalled as the
+     * non-deterministic {@link OperationType#JSON_QUERY_FALLBACK} and can never replay as a live
+     * deterministic result.
+     */
     public JsonQueryResponse query(JsonQueryRequest request) {
-        return record(OperationType.JSON_QUERY, request, () -> jsonService.query(request));
+        OperationType type = request != null && request.staleFallbackRequested()
+                ? OperationType.JSON_QUERY_FALLBACK
+                : OperationType.JSON_QUERY;
+        return record(type, request, () -> jsonService.query(request));
     }
 
     public JsonFlattenResponse flatten(JsonFlattenRequest request) {
@@ -233,7 +242,9 @@ public class AuditedOperations {
                     stringOf(request, "version"));
             case JSON_FORMAT -> jsonService.format((JsonFormatRequest) request);
             case JSON_VALIDATE -> jsonService.validate((JsonValidateRequest) request);
-            case JSON_QUERY -> jsonService.query((JsonQueryRequest) request);
+            // liveOnly() strips the opt-in flag: replaying a stored opt-in request must never serve
+            // stale data or emit fallback metadata.
+            case JSON_QUERY -> jsonService.query(((JsonQueryRequest) request).liveOnly());
             case JSON_FLATTEN -> jsonService.flatten((JsonFlattenRequest) request);
             case JSON_UNFLATTEN -> jsonService.unflatten((JsonUnflattenRequest) request);
             case JSON_MERGE_PATCH -> jsonService.mergePatch((JsonMergePatchRequest) request);
@@ -250,6 +261,8 @@ public class AuditedOperations {
             // Asynchronous batch hashing is audit-only: a BATCH_HASH entry can never be replayed,
             // because there is no servlet-bound payload to re-run and the operation is
             // non-deterministic. Defence in depth: claimReplay refuses the same entries.
+            case JSON_QUERY_FALLBACK -> throw new ReplayConflictException(null,
+                    "a last-known-good fallback is non-replayable");
             case BATCH_HASH -> throw new ReplayConflictException(null,
                     "batch hashing runs asynchronously and is non-replayable");
         };

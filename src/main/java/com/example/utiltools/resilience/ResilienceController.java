@@ -2,6 +2,7 @@ package com.example.utiltools.resilience;
 
 import com.example.utiltools.common.ApiResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
+import com.example.utiltools.json.service.JsonQueryFallbackCache;
 import com.example.utiltools.json.service.JsonService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -23,14 +24,17 @@ public class ResilienceController {
 
     private final CircuitBreaker circuitBreaker;
     private final JsonService jsonService;
+    private final JsonQueryFallbackCache fallbackCache;
 
-    public ResilienceController(CircuitBreaker circuitBreaker, JsonService jsonService) {
+    public ResilienceController(CircuitBreaker circuitBreaker, JsonService jsonService,
+                                JsonQueryFallbackCache fallbackCache) {
         this.circuitBreaker = circuitBreaker;
         this.jsonService = jsonService;
+        this.fallbackCache = fallbackCache;
     }
 
     @GetMapping
-    @Operation(summary = "Inspect circuit breaker state", description = "Returns the live breaker state, consecutive failure/success counters, the cooldown reset time, the live HALF_OPEN probe claim and lease deadline, the most recent transition audit entries, and the per-fingerprint breakdown of the same state")
+    @Operation(summary = "Inspect circuit breaker state", description = "Returns the live breaker state, consecutive failure/success counters, the cooldown reset time, the live HALF_OPEN probe claim and lease deadline, the most recent transition audit entries, the per-fingerprint breakdown of the same state, and the last-known-good fallback cache counters")
     public ApiResponse<ResilienceResponse> state(@RequestParam(defaultValue = "20") int limit) {
         int bounded = Math.max(0, Math.min(limit, circuitBreaker.auditTrail().capacity()));
         ResilienceResponse response = new ResilienceResponse(
@@ -43,7 +47,8 @@ public class ResilienceController {
                 circuitBreaker.probeLeaseExpiresAt(),
                 circuitBreaker.auditTrail().capacity(),
                 circuitBreaker.auditTrail().recent(bounded),
-                circuitBreaker.fingerprintStates());
+                circuitBreaker.fingerprintStates(),
+                fallbackCache.stats());
         return ApiResponse.success(response, "Resilience state retrieved");
     }
 
