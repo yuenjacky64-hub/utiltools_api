@@ -16,7 +16,10 @@ bodies run outside the lock, exactly like the monitor step body.
 
 from __future__ import annotations
 
+import json
+import logging
 import math
+import os
 import threading
 import time
 from collections import deque
@@ -30,13 +33,17 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
 
 from ai_maintainer.config import MaintainerConfig
 from ai_maintainer.shutdown import (
+    CLEANUP_CLEAR_RUNTIME_MARKERS,
     CLEANUP_PERSIST_TASK_STATE,
+    CLEANUP_PRUNE_MEMORY,
+    CLEANUP_PRUNE_STALE_TASK_SLOTS,
     CLEANUP_RELEASE_FILE_LOCKS,
     CLEANUP_STOP_SCHEDULER,
     CLEANUP_WRITE_SHUTDOWN_AUDIT,
     PERSIST_SKIPPED_NO_STATE_ROOT,
     SHUTDOWN_POLL_INTERVAL_SEC,
     SHUTDOWN_STATE_SCHEMA,
+    SHUTDOWN_STATE_TMP,
     EngineState,
     ShutdownReport,
     default_audit_path,
@@ -56,19 +63,44 @@ from ai_maintainer.tasks.curriculum import (
 )
 
 __all__ = [
+    "CancelReport",
     "CycleResult",
     "DEFAULT_CYCLE_INTERVAL_SEC",
+    "DEFAULT_CANCEL_REASON",
+    "DEFAULT_STOP_REASON",
     "FingerprintBucket",
     "FingerprintCircuitState",
     "MaintainerEngine",
+    "RUNTIME_HEARTBEAT_FILE",
+    "RUNTIME_MARKER_TMP_SUFFIX",
+    "RUNTIME_PID_FILE",
     "error_fingerprint",
 ]
 
 EVENT_LOG_MAXLEN = 100
 DEFAULT_CYCLE_INTERVAL_SEC = 1.0
+DEFAULT_STOP_REASON = "stop_requested"
+DEFAULT_CANCEL_REASON = "cancel_requested"
+
+# Runtime markers: the two files an operator (and ``cli.py stop``) uses to find
+# and stop a live engine. Both live directly under ``state_root`` and both are
+# removed by ``shutdown()`` so a stopped engine leaves no stale artifact.
+RUNTIME_PID_FILE = "maintainer.pid"
+RUNTIME_HEARTBEAT_FILE = "maintainer.heartbeat"
+RUNTIME_MARKER_TMP_SUFFIX = ".tmp"
 
 # Wall-clock seam for the audit record (events keep using the monotonic clock).
 _wall_clock: Callable[[], float] = time.time
+
+# Marker files (plus their ``.tmp`` siblings) removed when the engine stops.
+_RUNTIME_MARKER_NAMES = (
+    RUNTIME_PID_FILE,
+    RUNTIME_PID_FILE + RUNTIME_MARKER_TMP_SUFFIX,
+    RUNTIME_HEARTBEAT_FILE,
+    RUNTIME_HEARTBEAT_FILE + RUNTIME_MARKER_TMP_SUFFIX,
+)
+
+LOG = logging.getLogger(__name__)
 
 
 def _release_quietly(lock: Any) -> bool:
@@ -79,6 +111,27 @@ def _release_quietly(lock: Any) -> bool:
     except Exception:
         return False
     return True
+
+
+def _atomic_marker_write(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` through a ``.tmp`` sibling (INV-MARK-2).
+
+    Uses ``O_NOFOLLOW`` so a planted symlink is refused instead of followed,
+    then ``os.replace`` for an atomic swap. Raises ``OSError`` on any failure;
+    callers treat markers as advisory and swallow it.
+    """
+
+    if path.is_symlink():
+        raise OSError(f"refusing to write runtime marker through symlink: {path}")
+    tmp = path.with_name(path.name + RUNTIME_MARKER_TMP_SUFFIX)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o644)
+    try:
+        os.write(fd, text.encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
 
 
 class FingerprintCircuitState(Enum):
@@ -156,6 +209,34 @@ class CycleResult:
         }
 
 
+@dataclass(frozen=True)
+class CancelReport:
+    """Outcome of one :meth:`MaintainerEngine.cancel_task` call (REQ-01).
+
+    ``state`` is the terminal state of the cancelled task (always ``CANCELLED``
+    when ``cancelled`` is ``True``); with nothing in flight it is ``None`` and
+    ``cancelled`` is ``False``. ``timed_out`` reports whether ``waited_sec`` hit
+    the caller's bound *before* the running cycle left ``run_cycle()``.
+    """
+
+    task: str | None
+    state: str | None
+    cancelled: bool
+    timed_out: bool
+    waited_sec: float
+    reason: str
+
+    def to_dict(self) -> dict:
+        return {
+            "task": self.task,
+            "state": self.state,
+            "cancelled": self.cancelled,
+            "timed_out": self.timed_out,
+            "waited_sec": self.waited_sec,
+            "reason": self.reason,
+        }
+
+
 class MaintainerEngine:
     """Runs maintainer cycles, preempting lower-priority monitoring."""
 
@@ -196,6 +277,12 @@ class MaintainerEngine:
         self._cycle_done = threading.Event()
         self._cycle_done.set()
         self._stop = threading.Event()
+        # UTILTOOLS-76: task-level cancel is a *separate* flag from the engine
+        # stop signal, so cancelling one task never shuts the engine down; both
+        # reasons are kept for the STOP_HONOURED / TASK_CANCELLED events.
+        self._cancel = threading.Event()
+        self._cancel_reason = DEFAULT_CANCEL_REASON
+        self._stop_reason = DEFAULT_STOP_REASON
         self._state = EngineState.IDLE
         self._state_root: Path | None = (
             Path(state_root) if state_root is not None else None
@@ -281,11 +368,19 @@ class MaintainerEngine:
         with self._lock:
             return self._state is EngineState.SHUTTING_DOWN
 
-    def request_stop(self) -> None:
-        """Publish the stop signal the cycle loop polls (idempotent)."""
+    def request_stop(self, reason: str = DEFAULT_STOP_REASON) -> None:
+        """Publish the stop signal the cycle loop polls (idempotent).
+
+        ``reason`` is remembered for the ``STOP_HONOURED`` event and the log
+        line ``run_forever()`` emits, so a wind-down is always attributable
+        (REQ-04). The first reason wins: a later ``SIGTERM`` cannot overwrite
+        the operator's stated reason.
+        """
 
         with self._lock:
             already = self._stop.is_set()
+            if not already:
+                self._stop_reason = str(reason)
             self._stop.set()
             if not already:
                 self._events.append(
@@ -293,6 +388,7 @@ class MaintainerEngine:
                         "event": "STOP_REQUESTED",
                         "cycle": self._cycles,
                         "state": self._state.value,
+                        "reason": self._stop_reason,
                     }
                 )
 
@@ -300,6 +396,115 @@ class MaintainerEngine:
         """Has a wind-down been requested?"""
 
         return self._stop.is_set()
+
+    @property
+    def stop_reason(self) -> str:
+        """Reason recorded by the first :meth:`request_stop` call."""
+
+        with self._lock:
+            return self._stop_reason
+
+    @property
+    def pid_file(self) -> Path | None:
+        """``<state_root>/maintainer.pid``, or ``None`` without a state root."""
+
+        return self._runtime_path(RUNTIME_PID_FILE)
+
+    @property
+    def heartbeat_file(self) -> Path | None:
+        """``<state_root>/maintainer.heartbeat``, or ``None`` without a root."""
+
+        return self._runtime_path(RUNTIME_HEARTBEAT_FILE)
+
+    def should_cancel(self) -> bool:
+        """Has the monitored task been cancelled by :meth:`cancel_task`?"""
+
+        return self._cancel.is_set()
+
+    def cancel_task(
+        self,
+        timeout_sec: float | None = None,
+        *,
+        reason: str = DEFAULT_CANCEL_REASON,
+    ) -> CancelReport:
+        """Cancel the monitored task and wait for its cycle to unwind (REQ-01).
+
+        ``timeout_sec`` bounds the wait and defaults to
+        ``config.max_shutdown_wait_sec``, the same bound a wind-down uses.
+        Returns only after the in-flight cycle has left ``run_cycle()`` (or the
+        bound expired), so a caller never observes a half-cancelled task.
+        """
+
+        timeout = self._cancel_timeout(timeout_sec)
+        started = self._clock()
+        with self._lock:
+            task = self._monitored
+            if task is None or task.state not in NON_TERMINAL:
+                self._events.append(
+                    {
+                        "event": "CANCEL_NOOP",
+                        "cycle": self._cycles,
+                        "task": None if task is None else task.name,
+                        "reason": str(reason),
+                    }
+                )
+                return CancelReport(
+                    task=None if task is None else task.name,
+                    state=None if task is None else task.state.value,
+                    cancelled=False,
+                    timed_out=False,
+                    waited_sec=0.0,
+                    reason=str(reason),
+                )
+            name = task.name
+            self._cancel_reason = str(reason)
+            task.state = TaskState.CANCELLED
+            task.pending_since = None
+            self._monitored = None
+            self._cancel.set()
+            self._events.append(
+                {
+                    "event": "TASK_CANCEL_REQUESTED",
+                    "cycle": self._cycles,
+                    "task": name,
+                    "reason": self._cancel_reason,
+                }
+            )
+
+        # INV-CANCEL-1: the wait holds no engine lock (mirrors ``shutdown()``),
+        # so the running cycle can still commit its step and reach its break.
+        deadline = started + timeout
+        timed_out = False
+        while not self._cycle_done.is_set():
+            remaining = deadline - self._clock()
+            if remaining <= 0.0:
+                timed_out = True
+                break
+            self._sleep(min(SHUTDOWN_POLL_INTERVAL_SEC, remaining))
+        waited_sec = max(0.0, self._clock() - started)
+
+        with self._lock:
+            self._cancel.clear()
+            state = task.state.value
+            self._events.append(
+                {
+                    "event": "TASK_CANCELLED",
+                    "cycle": self._cycles,
+                    "task": name,
+                    "state": state,
+                    "waited_sec": waited_sec,
+                    "timed_out": timed_out,
+                    "reason": self._cancel_reason,
+                }
+            )
+        return CancelReport(
+            task=name,
+            state=state,
+            cancelled=True,
+            timed_out=timed_out,
+            waited_sec=waited_sec,
+            reason=self._cancel_reason,
+        )
 
     def note_task_role(self, task: str, role: str) -> None:
         """Remember which role is driving ``task`` (persisted on wind-down)."""
@@ -353,6 +558,9 @@ class MaintainerEngine:
         self._stop.clear()
         with self._lock:
             self._state = EngineState.IDLE
+        # REQ-03 / INV-MARK-1: markers exist only with a state root, so an
+        # in-process caller that passes none leaves the repo untouched.
+        self._write_runtime_markers()
         try:
             while True:
                 if self.should_stop():
@@ -369,13 +577,17 @@ class MaintainerEngine:
                     with self._lock:
                         if self._state is EngineState.RUNNING:
                             self._state = EngineState.IDLE
+                self._write_runtime_markers()
                 if self.should_stop():
                     break
                 with self._lock:
                     if self._state is EngineState.IDLE:
                         self._state = EngineState.SLEEPING
+                if self.should_stop():
+                    break
                 self._pause(interval)
         finally:
+            self._log_stop_reason()
             return self.shutdown()
 
     def shutdown(self) -> ShutdownReport:
@@ -473,6 +685,32 @@ class MaintainerEngine:
             else:
                 cleanup_steps.append(CLEANUP_RELEASE_FILE_LOCKS)
 
+            # REQ-03 / INV-PRUNE-4: prune after the locks are released, before
+            # the audit record is built, so the record can name the drop counts.
+            pruned_slots: list[str] = []
+            try:
+                pruned_slots = self._prune_stale_task_slots()
+            except Exception:  # pragma: no cover - defensive
+                failed_steps.append(CLEANUP_PRUNE_STALE_TASK_SLOTS)
+            else:
+                cleanup_steps.append(CLEANUP_PRUNE_STALE_TASK_SLOTS)
+
+            memory_dropped = {"runs": 0, "bug_fixes": 0, "learnings": 0}
+            memory = self._memory
+            if memory is not None:
+                memory_dropped, prune_issue = self._prune_memory(memory)
+                if prune_issue is None:
+                    cleanup_steps.append(CLEANUP_PRUNE_MEMORY)
+                else:
+                    failed_steps.append(CLEANUP_PRUNE_MEMORY)
+
+            # INV-MARK-4: marker removal is a cleanup step, so a failure shows
+            # up in ``failed_steps`` instead of being silently ignored.
+            if self._clear_runtime_markers():
+                cleanup_steps.append(CLEANUP_CLEAR_RUNTIME_MARKERS)
+            else:  # pragma: no cover - depends on permissions
+                failed_steps.append(CLEANUP_CLEAR_RUNTIME_MARKERS)
+
             # The audit write is itself a cleanup step; it is queued before the
             # record is built so the record can name it (DOD-09).
             cleanup_steps.append(CLEANUP_WRITE_SHUTDOWN_AUDIT)
@@ -487,6 +725,10 @@ class MaintainerEngine:
                 "persist_failures": list(persist_failures),
                 "persist_skipped_reason": persist_skipped_reason,
                 "released_lock_keys": list(released),
+                "pruned_task_slots": list(pruned_slots),
+                "memory_dropped": dict(memory_dropped),
+                "runtime_markers_cleared": CLEANUP_CLEAR_RUNTIME_MARKERS
+                in cleanup_steps,
                 "timed_out": timed_out,
                 "waited_sec": waited_sec,
                 "max_shutdown_wait_sec": float(self._config.max_shutdown_wait_sec),
@@ -543,6 +785,10 @@ class MaintainerEngine:
             self._evaluate_stale(self._clock())
 
         while steps < self._config.max_steps_per_cycle:
+            # REQ-02: a stop or cancel issued while the previous step was in
+            # flight is honoured here, before any new step starts.
+            if self.should_stop() or self.should_cancel():
+                break
             with self._lock:
                 now = self._clock()
                 if self._monitored is not None and (
@@ -579,6 +825,11 @@ class MaintainerEngine:
                 task.state = TaskState.RUNNING
                 next_progress = task.progress + 1
 
+            if self.should_stop() or self.should_cancel():
+                # No state mutation here: a cancel already parked the task in
+                # CANCELLED and a stop leaves it RUNNING so ``shutdown()`` can
+                # still persist it as active (INV-CANCEL-4 / REQ-03).
+                break
             # Monitor step body runs outside the lock.
             error: BaseException | None = None
             try:
@@ -645,14 +896,27 @@ class MaintainerEngine:
                 self._last_cycle_issues = []
             return []
 
+        # INV-PRUNE-2: prune before save, so the persisted document is already
+        # trimmed when validation sees it.
+        dropped, prune_issue = self._prune_memory(memory)
         try:
             issues = list(memory.save(known_task_ids=known_task_ids))
         except Exception as error:  # pragma: no cover - defensive
             # Memory bookkeeping must never fail a cycle (REQ-03).
             issues = [f"MEMORY_CORRUPT: memory save failed ({type(error).__name__})"]
+        if prune_issue is not None:
+            issues.insert(0, prune_issue)
 
         with self._lock:
             self._last_cycle_issues = list(issues)
+            if any(dropped.values()):
+                self._events.append(
+                    {
+                        "event": "MEMORY_PRUNED",
+                        "cycle": cycle,
+                        "dropped": dict(dropped),
+                    }
+                )
             self._events.append(
                 {
                     "event": "CONSISTENCY",
@@ -921,6 +1185,172 @@ class MaintainerEngine:
         if not math.isfinite(value) or value < 0.0:
             raise ValueError("interval_sec must be a finite float >= 0")
         return value
+
+    def _log_stop_reason(self) -> None:
+        """Record and log why ``run_forever`` left its loop (REQ-04).
+
+        Emits exactly one ``LOG.info`` line carrying the reason plus a
+        ``STOP_HONOURED`` event, both before ``shutdown()`` runs, so the reason
+        survives even when the wind-down later times out.
+        """
+
+        with self._lock:
+            reason = self._stop_reason
+            honoured = self._stop.is_set()
+            cycle = self._cycles
+        LOG.info(
+            "maintainer engine leaving run_forever: reason=%s stop_requested=%s cycle=%d",
+            reason,
+            honoured,
+            cycle,
+        )
+        with self._lock:
+            self._events.append(
+                {
+                    "event": "STOP_HONOURED",
+                    "cycle": cycle,
+                    "reason": reason,
+                    "stop_requested": honoured,
+                }
+            )
+
+    def _cancel_timeout(self, timeout_sec: float | None) -> float:
+        """Resolve the cancel wait bound (INV-CANCEL-2)."""
+
+        if timeout_sec is None:
+            return float(self._config.max_shutdown_wait_sec)
+        if isinstance(timeout_sec, bool) or not isinstance(timeout_sec, (int, float)):
+            raise ValueError("timeout_sec must be a finite float >= 0")
+        value = float(timeout_sec)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("timeout_sec must be a finite float >= 0")
+        return value
+
+    def _runtime_path(self, name: str) -> Path | None:
+        """``<state_root>/<name>``, or ``None`` when no root is configured."""
+
+        root = self._state_root
+        if root is None:
+            return None
+        return Path(root) / name
+
+    def _write_runtime_markers(self) -> None:
+        """Publish ``pid_file`` / ``heartbeat_file``; never raises (INV-MARK-1)."""
+
+        pid_path = self.pid_file
+        heartbeat_path = self.heartbeat_file
+        if pid_path is None or heartbeat_path is None:
+            return
+        with self._lock:
+            cycle = self._cycles
+        try:
+            # The marker root may not exist yet (fresh state root); create it
+            # like the shutdown path does for task slots so a running engine
+            # always publishes its markers rather than silently skipping them.
+            pid_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_marker_write(pid_path, f"{os.getpid()}\n")
+            _atomic_marker_write(
+                heartbeat_path,
+                json.dumps(
+                    {"pid": os.getpid(), "cycle": cycle, "at": _wall_clock()}
+                ),
+            )
+        except OSError:
+            # Markers are advisory: a read-only root must not fail a cycle.
+            return
+
+    def _clear_runtime_markers(self) -> bool:
+        """Remove both markers and their ``.tmp`` siblings (INV-MARK-3).
+
+        Returns ``True`` when every unlink succeeded. A missing file is not an
+        error; an ``OSError`` per file is reported via the return value so
+        ``shutdown()`` can book it in ``failed_steps``.
+        """
+
+        ok = True
+        for name in _RUNTIME_MARKER_NAMES:
+            path = self._runtime_path(name)
+            if path is None:
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                ok = False
+        return ok
+
+    def _prune_memory(self, memory: Any) -> tuple[dict[str, int], str | None]:
+        """Trim the store to the configured maxima (INV-PRUNE-3, never raises)."""
+
+        try:
+            dropped = memory.prune(
+                max_runs=self._config.memory_max_runs,
+                max_bug_fixes=self._config.memory_max_bug_fixes,
+                max_learnings=self._config.memory_max_learnings,
+            )
+        except Exception as error:  # pragma: no cover - defensive
+            return (
+                {"runs": 0, "bug_fixes": 0, "learnings": 0},
+                f"MEMORY_CORRUPT: memory prune failed ({type(error).__name__})",
+            )
+        return {str(key): int(value) for key, value in dropped.items()}, None
+
+    def _prune_stale_task_slots(self) -> list[str]:
+        """Drop leftovers of slots whose task left the curriculum (REQ-03).
+
+        Only ``_shutdown_state.json.tmp`` leftovers and empty directories are
+        removed, so a committed ``_shutdown_state.json`` survives. Symlinked or
+        out-of-root entries are refused; live curriculum names are never
+        touched.
+        """
+
+        root = self._state_root
+        if root is None:
+            return []
+        root_path = Path(root)
+        with self._lock:
+            known = {task.name for task in self._curriculum.specs}
+        try:
+            entries = sorted(root_path.iterdir())
+        except OSError:
+            return []
+        pruned: list[str] = []
+        for entry in entries:
+            name = entry.name
+            if name in known:
+                continue
+            try:
+                if entry.is_symlink() or not entry.is_dir():
+                    continue
+                if entry.parent != root_path:
+                    continue
+                leftover = entry / SHUTDOWN_STATE_TMP
+                try:
+                    leftover.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    continue
+                try:
+                    entry.rmdir()
+                except OSError:
+                    # A committed _shutdown_state.json keeps the slot alive.
+                    pass
+            except OSError:  # pragma: no cover - defensive
+                continue
+            with self._lock:
+                self._active_roles.pop(name, None)
+                self._events.append(
+                    {
+                        "event": "STALE_TASK_SLOT_PRUNED",
+                        "cycle": self._cycles,
+                        "task": name,
+                    }
+                )
+            self.release_file_lock(name)
+            pruned.append(name)
+        return pruned
 
     def _resolve_role(self, task: TaskSpec) -> tuple[str | None, str]:
         """Role driving ``task``: observed value, or an explicit ``None``."""

@@ -154,6 +154,44 @@ class MemoryStore:
 
         return self._save(known_task_ids=known_task_ids)
 
+    def prune(
+        self,
+        *,
+        max_runs: int | None = None,
+        max_bug_fixes: int | None = None,
+        max_learnings: int | None = None,
+    ) -> dict[str, int]:
+        """Trim each collection to its maximum, oldest record first (REQ-03).
+
+        Returns ``{"runs": n, "bug_fixes": n, "learnings": n}`` with the number
+        of records dropped from each collection. A ``None`` limit keeps that
+        collection untouched; a negative limit is treated the same way (the
+        caller's config already rejects values below 1). Nothing is written
+        here - the next :meth:`save` persists the trimmed document.
+        """
+
+        limits = {
+            "runs": max_runs,
+            "bug_fixes": max_bug_fixes,
+            "learnings": max_learnings,
+        }
+        dropped: dict[str, int] = {}
+        for name in _COLLECTIONS:
+            limit = limits[name]
+            records = self._records[name]
+            if limit is None or limit < 0:
+                dropped[name] = 0
+                continue
+            excess = len(records) - int(limit)
+            if excess > 0:
+                # Records are appended oldest-first, so trimming the head keeps
+                # the most recent ``limit`` entries.
+                del records[:excess]
+                dropped[name] = excess
+            else:
+                dropped[name] = 0
+        return dropped
+
     def _save(self, *, known_task_ids: Collection[str] | None = None) -> list[str]:
         """Validate the records, log one warning per issue, write the document.
 
