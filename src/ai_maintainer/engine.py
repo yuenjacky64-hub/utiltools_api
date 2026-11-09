@@ -22,8 +22,9 @@ import math
 import os
 import threading
 import time
+import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -67,10 +68,30 @@ __all__ = [
     "CycleResult",
     "DEFAULT_CYCLE_INTERVAL_SEC",
     "DEFAULT_CANCEL_REASON",
+    "DEFAULT_LEASE_TTL_SEC",
     "DEFAULT_STOP_REASON",
     "FingerprintBucket",
     "FingerprintCircuitState",
+    "LEASE_ACQUIRED",
+    "LEASE_AUDIT_NAME",
+    "LEASE_EXPIRED",
+    "LEASE_HISTORY_MAXLEN",
+    "LEASE_RECLAIMED",
+    "LEASE_REFUSED",
+    "LEASE_RELEASED",
+    "LEASE_STATUS_ACTIVE",
+    "LEASE_STATUS_EXPIRED",
+    "LEASE_STATUS_RECLAIMED",
+    "Lease",
+    "LeaseAuditReporter",
+    "LeaseError",
+    "LeaseHeldError",
+    "LeaseNotHeldError",
+    "LeaseStatus",
+    "LeaseTimeoutError",
+    "LeaseTransitionError",
     "MaintainerEngine",
+    "ReapReport",
     "RUNTIME_HEARTBEAT_FILE",
     "RUNTIME_MARKER_TMP_SUFFIX",
     "RUNTIME_PID_FILE",
@@ -81,6 +102,21 @@ EVENT_LOG_MAXLEN = 100
 DEFAULT_CYCLE_INTERVAL_SEC = 1.0
 DEFAULT_STOP_REASON = "stop_requested"
 DEFAULT_CANCEL_REASON = "cancel_requested"
+
+# Execution leases (REQ-01 .. REQ-05): one ``Lease`` per cycle execution, both
+# the audit vocabulary and the history bound live here so every call site
+# (engine, tests, operator tooling) agrees on the exact tokens.
+LEASE_AUDIT_NAME = "maintainer_leases.log"  # runtime artifact, git-ignored
+DEFAULT_LEASE_TTL_SEC = 60.0
+LEASE_HISTORY_MAXLEN = 100  # memory-growth bound, INV-LEASE-6
+LEASE_STATUS_ACTIVE = "ACTIVE"
+LEASE_STATUS_EXPIRED = "EXPIRED"
+LEASE_STATUS_RECLAIMED = "RECLAIMED"
+LEASE_ACQUIRED = "LEASE_ACQUIRED"
+LEASE_RELEASED = "LEASE_RELEASED"
+LEASE_EXPIRED = "LEASE_EXPIRED"
+LEASE_RECLAIMED = "LEASE_RECLAIMED"
+LEASE_REFUSED = "LEASE_REFUSED"
 
 # Runtime markers: the two files an operator (and ``cli.py stop``) uses to find
 # and stop a live engine. Both live directly under ``state_root`` and both are
@@ -237,6 +273,162 @@ class CancelReport:
         }
 
 
+class LeaseStatus(str, Enum):
+    """Lifecycle of one execution lease (REQ-01).
+
+    ``ACTIVE`` -> ``RECLAIMED`` (released by its owner) or ``ACTIVE`` ->
+    ``EXPIRED`` -> ``RECLAIMED`` (TTL elapsed, swept by the reaper). Both
+    terminal paths end in ``RECLAIMED`` and are distinguished by the audit
+    ``reason`` (``released`` vs ``stale``), never by a second status. A ``str``
+    mixin keeps the field JSON-serialisable and audit lines carry the exact
+    token the brief names.
+    """
+
+    ACTIVE = LEASE_STATUS_ACTIVE
+    EXPIRED = LEASE_STATUS_EXPIRED
+    RECLAIMED = LEASE_STATUS_RECLAIMED
+
+
+@dataclass(frozen=True)
+class Lease:
+    """One typed record per cycle execution (REQ-01).
+
+    ``expires_at`` is ``acquired_at + lease_ttl_sec``. A lease is stale once
+    ``now > expires_at`` *and* its status is still ``ACTIVE`` (REQ-03). Frozen
+    so a reader can never mutate engine state through a snapshot object; every
+    transition goes through :func:`dataclasses.replace`.
+    """
+
+    lease_id: str
+    cycle_id: str
+    acquired_at: float
+    expires_at: float
+    status: LeaseStatus = LeaseStatus.ACTIVE
+
+    def is_expired(self, now: float) -> bool:
+        """True when the TTL elapsed and the lease was never released."""
+
+        return self.status is LeaseStatus.ACTIVE and now > self.expires_at
+
+    def to_dict(self) -> dict:
+        return {
+            "lease_id": self.lease_id,
+            "cycle_id": self.cycle_id,
+            "acquired_at": self.acquired_at,
+            "expires_at": self.expires_at,
+            "status": LeaseStatus(self.status).value,
+        }
+
+
+@dataclass(frozen=True)
+class ReapReport:
+    """Outcome of one :meth:`MaintainerEngine._reap_stale_leases` pass (REQ-03).
+
+    ``reaped`` lists only the ids actually transitioned this pass; ``skipped``
+    counts the leases the pass left alone, so a no-op sweep can never be
+    mistaken for a reclaim.
+    """
+
+    at: float
+    reaped: list[str] = field(default_factory=list)
+    skipped: int = 0
+
+    def to_dict(self) -> dict:
+        return {"at": self.at, "reaped": list(self.reaped), "skipped": self.skipped}
+
+
+class LeaseError(RuntimeError):
+    """Base class for lease state-machine failures."""
+
+
+class LeaseHeldError(LeaseError):
+    """Non-blocking acquire refused: another cycle holds an ACTIVE lease (REQ-02)."""
+
+    def __init__(self, cycle_id: str, held: Lease) -> None:
+        self.cycle_id = cycle_id
+        self.held = held
+        super().__init__(
+            f"lease already held: cycle {cycle_id!r} refused, "
+            f"{held.lease_id} (cycle {held.cycle_id!r}) is ACTIVE"
+        )
+
+
+class LeaseTimeoutError(LeaseError):
+    """A blocking acquire waited past ``timeout`` while a lease stayed ACTIVE."""
+
+    def __init__(self, cycle_id: str, timeout: float | None, held: Lease | None = None) -> None:
+        self.cycle_id = cycle_id
+        self.timeout = timeout
+        self.held = held
+        super().__init__(
+            f"timed out after {timeout!r}s waiting for the active lease "
+            f"to run cycle {cycle_id!r}"
+        )
+
+
+class LeaseNotHeldError(LeaseError):
+    """Release from the wrong thread, or a cycle body entered without a lease."""
+
+    def __init__(self, lease_id: str | None, reason: str) -> None:
+        self.lease_id = lease_id
+        self.reason = reason
+        super().__init__(f"lease {lease_id!r} not held: {reason}")
+
+
+class LeaseTransitionError(LeaseError):
+    """Release/reap of a lease in a terminal state (double-release, unknown id)."""
+
+    def __init__(self, lease_id: str, reason: str) -> None:
+        self.lease_id = lease_id
+        self.reason = reason
+        super().__init__(f"lease {lease_id!r} transition refused: {reason}")
+
+
+class LeaseAuditReporter:
+    """``self.reporter`` for lease events (REQ-05).
+
+    Appends one sorted-key JSON line per lease event to a file in the engine's
+    data directory, so an operator can reconstruct lease history from a file
+    that outlives the process. Delegates to the wind-down audit writer, which
+    creates the parent directory and **never raises** (an ``OSError`` is
+    swallowed and surfaced as ``False``).
+    """
+
+    def __init__(self, path: "str | Path | None", *, clock: Callable[[], float] = time.time) -> None:
+        self._path = None if path is None else Path(path)
+        self._clock = clock
+
+    @property
+    def path(self) -> "Path | None":
+        return self._path
+
+    def record(
+        self,
+        event: str,
+        lease: Lease,
+        *,
+        reason: str | None = None,
+        extra: dict | None = None,
+    ) -> bool:
+        """Append one audit line for ``lease``; ``False`` when nothing was written."""
+
+        if self._path is None:
+            return False
+        payload: dict[str, Any] = {
+            "event": event,
+            "lease_id": lease.lease_id,
+            "cycle_id": lease.cycle_id,
+            "acquired_at": lease.acquired_at,
+            "expires_at": lease.expires_at,
+            "status": LeaseStatus(lease.status).value,
+        }
+        if reason is not None:
+            payload["reason"] = reason
+        if extra:
+            payload.update(extra)
+        return write_shutdown_audit(self._path, payload, clock=self._clock)
+
+
 class MaintainerEngine:
     """Runs maintainer cycles, preempting lower-priority monitoring."""
 
@@ -252,6 +444,9 @@ class MaintainerEngine:
         state_root: "str | Path | None" = None,
         shutdown_audit_path: "str | Path | None" = None,
         role_resolver: Callable[[TaskSpec], str | None] | None = None,
+        lease_ttl_sec: float | None = None,
+        lease_audit_path: "str | Path | None" = None,
+        framework_idle: Callable[[], bool] | None = None,
     ) -> None:
         self._curriculum = curriculum
         self._config = config if config is not None else curriculum.config
@@ -295,6 +490,43 @@ class MaintainerEngine:
         self._file_locks: dict[str, Any] = {}
         self._active_roles: dict[str, str] = {}
         self._role_resolver = role_resolver
+        # UTILTOOLS-78: execution leases (REQ-01..05). ``_lease_lock`` is a
+        # plain Lock, never the mid-cycle RLock: acquire/release must be atomic
+        # on their own and INV-LEASE-2 forbids nesting the two locks. The
+        # reporter keeps lease history in the engine's data directory, which
+        # outlives the process: ``<state_root>/maintainer_leases.log``, else
+        # ``<repo>/data/maintainer_leases.log``.
+        if lease_ttl_sec is None:
+            ttl = DEFAULT_LEASE_TTL_SEC
+        else:
+            ttl = float(lease_ttl_sec)
+            if not math.isfinite(ttl) or ttl <= 0:
+                raise ValueError("lease_ttl_sec must be a finite float > 0")
+        self._lease_ttl_sec = ttl
+        self._lease_lock = threading.Lock()
+        self._lease_cond = threading.Condition(self._lease_lock)
+        self._leases: dict[str, Lease] = {}
+        self._active_lease: Lease | None = None
+        self._lease_owner: int | None = None
+        self._lease_audit_path: Path | None = (
+            Path(lease_audit_path)
+            if lease_audit_path is not None
+            else (
+                self._state_root / LEASE_AUDIT_NAME
+                if self._state_root is not None
+                # No state root: the repo's own data directory, the same
+                # location the wind-down audit journal uses.
+                else default_audit_path().parent / LEASE_AUDIT_NAME
+            )
+        )
+        # REQ-04's "framework idle check" seam. The engine has no framework
+        # predicate of its own, so unset means "always idle" — exactly the
+        # pre-task behaviour for every existing call site.
+        self._framework_idle: Callable[[], bool] = (
+            framework_idle if framework_idle is not None else (lambda: True)
+        )
+        # REQ-05: public, so an operator (or a test) can re-point the reporter.
+        self.reporter = LeaseAuditReporter(self._lease_audit_path)
 
     # ------------------------------------------------------------------ public
 
@@ -348,13 +580,240 @@ class MaintainerEngine:
         with self._lock:
             self._memory = memory
 
+    # ------------------------------------------------------- leases (REQ-01..05)
+
+    def acquire_lease(
+        self,
+        cycle_id: str,
+        *,
+        block: bool = True,
+        timeout: float | None = None,
+    ) -> Lease:
+        """Grant the single execution slot to ``cycle_id`` (REQ-02).
+
+        Blocks while another cycle holds an ``ACTIVE`` lease (``block=True``,
+        the default) so a second cycle can never enter the body concurrently.
+        ``block=False`` refuses immediately with :class:`LeaseHeldError`; a
+        ``timeout`` that elapses raises :class:`LeaseTimeoutError` — the
+        documented escape hatch is the reaper, which frees an expired lease.
+        """
+
+        if not isinstance(cycle_id, str) or not cycle_id:
+            raise ValueError("cycle_id must be a non-empty str")
+        with self._lease_cond:
+            if self._active_lease is not None:
+                if not block:
+                    raise LeaseHeldError(cycle_id, self._active_lease)
+                if not self._lease_cond.wait_for(
+                    lambda: self._active_lease is None, timeout=timeout
+                ):
+                    raise LeaseTimeoutError(cycle_id, timeout, self._active_lease)
+            acquired_at = self._clock()
+            lease = Lease(
+                lease_id=uuid.uuid4().hex,
+                cycle_id=cycle_id,
+                acquired_at=acquired_at,
+                expires_at=acquired_at + self._lease_ttl_sec,
+            )
+            self._leases[lease.lease_id] = lease
+            self._active_lease = lease
+            self._lease_owner = threading.get_ident()
+            self._prune_lease_history()
+            self._lease_cond.notify_all()
+        # INV-LEASE-4: the audit write happens outside the lease lock.
+        self._report(LEASE_ACQUIRED, lease)
+        return lease
+
+    def release_lease(self, lease_id: str) -> Lease:
+        """Release an ``ACTIVE`` lease, making the slot available again (REQ-02).
+
+        A refused transition (unknown id, already terminal, wrong thread) never
+        changes ``status``: it is audited once as ``LEASE_REFUSED`` and raised.
+        """
+
+        lease_id = str(lease_id)
+        refusal_reason: str | None = None
+        error: LeaseError | None = None
+        released: Lease | None = None
+        with self._lease_cond:
+            lease = self._leases.get(lease_id)
+            if lease is None:
+                refusal_reason = "unknown_lease"
+                error = LeaseTransitionError(lease_id, "unknown lease id")
+            elif lease.status is not LeaseStatus.ACTIVE:
+                refusal_reason = "already_released"
+                error = LeaseTransitionError(
+                    lease_id, f"lease is already {LeaseStatus(lease.status).value}"
+                )
+            elif self._lease_owner != threading.get_ident():
+                refusal_reason = "not_held"
+                error = LeaseNotHeldError(lease_id, "lease is held by another thread")
+            else:
+                released = replace(lease, status=LeaseStatus.RECLAIMED)
+                self._leases[lease_id] = released
+                self._active_lease = None
+                self._lease_owner = None
+                self._prune_lease_history()
+                self._lease_cond.notify_all()
+        if error is not None:
+            self._report(
+                LEASE_REFUSED,
+                self._leases.get(lease_id) or self._placeholder_lease(lease_id),
+                reason=refusal_reason,
+            )
+            raise error
+        assert released is not None
+        self._report(LEASE_RELEASED, released, reason="released")
+        return released
+
+    def _reap_stale_leases(self, now: float | None = None) -> ReapReport:
+        """Move every expired ``ACTIVE`` lease to ``RECLAIMED`` (REQ-03).
+
+        One pass under the lease condition: ``ACTIVE`` + ``now > expires_at``
+        -> ``EXPIRED`` (``ttl_elapsed``) -> ``RECLAIMED`` (``stale``). The
+        compare-and-set happens inside one critical section, so a reaper racing
+        a legitimate release can never double-emit a terminal event; a lease
+        that is already terminal (an already-completed cycle) is counted in
+        ``skipped`` and produces no audit line at all.
+        """
+
+        expired_leases: list[Lease] = []
+        reclaimed_leases: list[Lease] = []
+        skipped = 0
+        with self._lease_cond:
+            at = self._clock() if now is None else float(now)
+            for lease_id, lease in list(self._leases.items()):
+                if not lease.is_expired(at):
+                    skipped += 1
+                    continue
+                expired = replace(lease, status=LeaseStatus.EXPIRED)
+                self._leases[lease_id] = expired
+                expired_leases.append(expired)
+                if self._active_lease is not None and self._active_lease.lease_id == lease_id:
+                    self._active_lease = None
+                    self._lease_owner = None
+                reclaimed = replace(expired, status=LeaseStatus.RECLAIMED)
+                self._leases[lease_id] = reclaimed
+                reclaimed_leases.append(reclaimed)
+            self._prune_lease_history()
+            self._lease_cond.notify_all()
+        # INV-LEASE-4: audit writes and memory maintenance run outside both locks.
+        for expired, reclaimed in zip(expired_leases, reclaimed_leases):
+            self._report(LEASE_EXPIRED, expired, reason="ttl_elapsed")
+            self._report(LEASE_RECLAIMED, reclaimed, reason="stale")
+        if reclaimed_leases and self._memory is not None:
+            self._prune_memory(self._memory)
+        return ReapReport(
+            at=at,
+            reaped=[lease.lease_id for lease in reclaimed_leases],
+            skipped=skipped,
+        )
+
+    def lease_snapshot(self) -> list[dict]:
+        """Read-only view of the lease registry; performs no I/O (DOD-12)."""
+
+        with self._lease_lock:
+            return [lease.to_dict() for lease in self._leases.values()]
+
+    def _require_active_lease(self) -> Lease:
+        """Return the lease this thread holds, else refuse the body (REQ-04)."""
+
+        with self._lease_lock:
+            lease = self._active_lease
+            owner = self._lease_owner
+        if lease is None or lease.status is not LeaseStatus.ACTIVE:
+            raise LeaseNotHeldError(None, "cycle body entered without an active lease")
+        if owner != threading.get_ident():
+            raise LeaseNotHeldError(
+                lease.lease_id, "cycle body entered without an active lease"
+            )
+        return lease
+
+    def _next_cycle_id(self) -> str:
+        """The id of the cycle the body is about to run, as a stable preview."""
+
+        with self._lock:
+            return f"cycle-{self._cycles + 1}"
+
+    def _prune_lease_history(self) -> None:
+        """Drop the oldest terminal leases past ``LEASE_HISTORY_MAXLEN``.
+
+        Callers hold :attr:`_lease_cond`. The ``ACTIVE`` lease is never a
+        prune candidate, so bounded history (INV-LEASE-6) can never evict the
+        lease a cycle currently holds.
+        """
+
+        if len(self._leases) <= LEASE_HISTORY_MAXLEN:
+            return
+        for lease_id in list(self._leases):
+            if len(self._leases) <= LEASE_HISTORY_MAXLEN:
+                break
+            lease = self._leases[lease_id]
+            if lease.status is LeaseStatus.ACTIVE:
+                continue
+            del self._leases[lease_id]
+
+    def _report(
+        self,
+        event: str,
+        lease: Lease,
+        *,
+        reason: str | None = None,
+        extra: dict | None = None,
+    ) -> bool:
+        """Send one lease event to ``self.reporter`` (REQ-05); never raises."""
+
+        reporter = self.reporter
+        if reporter is None:  # pragma: no cover - defensive, default is set
+            return False
+        return reporter.record(event, lease, reason=reason, extra=extra)
+
+    @staticmethod
+    def _placeholder_lease(lease_id: str) -> Lease:
+        """Filler record for a refusal audit line about an unknown lease id."""
+
+        return Lease(
+            lease_id=str(lease_id),
+            cycle_id="",
+            acquired_at=0.0,
+            expires_at=0.0,
+            status=LeaseStatus.RECLAIMED,
+        )
+
     def run_cycle(self) -> CycleResult:
-        """Execute at most ``max_steps_per_cycle`` monitor steps."""
+        """Execute at most ``max_steps_per_cycle`` monitor steps.
+
+        The lease frame (REQ-04): after the framework idle check a lease is
+        acquired, the body runs under it, and the single ``finally`` releases
+        it on *every* exit path — success, body exception, timeout, or stop —
+        so a cycle can never leak its slot.
+        """
 
         self._cycle_done.clear()
+        lease: Lease | None = None
         try:
+            if not self._framework_idle():
+                # Read the counter under the same lock ``_next_cycle_id`` uses
+                # so the idle-gate report cannot tear against the acquire path.
+                with self._lock:
+                    current_cycle = self._cycles
+                return CycleResult(
+                    cycle=current_cycle,
+                    monitored=None,
+                    priority=None,
+                    preempted=None,
+                    steps=0,
+                )
+            lease = self.acquire_lease(self._next_cycle_id())
             return self._run_cycle_body()
         finally:
+            if lease is not None:
+                try:
+                    self.release_lease(lease.lease_id)
+                except LeaseError:
+                    # A refused transition is already audited; the exit path
+                    # must never mask the body's own outcome.
+                    pass
             self._cycle_done.set()
 
     # ------------------------------------------------------- wind-down (live)
@@ -590,6 +1049,9 @@ class MaintainerEngine:
                 self._write_runtime_markers()
                 if self.should_stop():
                     break
+                # REQ-04: reclaim an expired lease left by a stalled cycle, so
+                # the next acquire is not parked behind a dead holder.
+                self._reap_stale_leases()
                 with self._lock:
                     if self._state is EngineState.IDLE:
                         self._state = EngineState.SLEEPING
@@ -801,6 +1263,10 @@ class MaintainerEngine:
             return report
 
     def _run_cycle_body(self) -> CycleResult:
+        # REQ-04 enforcement point: no cycle body runs without a lease. A
+        # direct call (bypassing ``run_cycle``) is refused here.
+        lease = self._require_active_lease()
+        assert lease.status is LeaseStatus.ACTIVE
         steps = 0
         preempted_name: str | None = None
         monitored_name: str | None = None
@@ -977,10 +1443,15 @@ class MaintainerEngine:
                 pending[task.name] = effective_priority(
                     task, cycle=self._cycles, now=now, config=self._config
                 ).name
-            return {
-                "monitored": None if monitored is None else monitored.name,
-                "pending": pending,
-            }
+        # INV-LEASE-2: ``lease_snapshot()`` takes ``_lease_lock``, so it is
+        # built *after* ``self._lock`` is released — the lease lock is never
+        # acquired while the engine lock is held.
+        return {
+            "monitored": None if monitored is None else monitored.name,
+            "pending": pending,
+            # REQ-02 read surface: additive key, no watcher change needed.
+            "leases": self.lease_snapshot(),
+        }
 
     def fingerprint_state(self, now: float | None = None) -> dict[str, Any]:
         """Lock-protected copy of the per-fingerprint circuit registry."""
