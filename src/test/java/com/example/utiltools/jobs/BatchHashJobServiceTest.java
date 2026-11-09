@@ -4562,9 +4562,13 @@ class BatchHashJobServiceTest {
             assertThat(drainedEntries.get(0).state()).isEqualTo(JournalState.FAILED);
 
             // The worker was interrupted and ignored it; it continues hashing and then hits the fence.
+            // The interrupt is delivered asynchronously, so wait for it before releasing the gate:
+            // releasing first let the release win that race and the worker then left the latch loop
+            // without ever observing the interrupt (flaky zero count).
+            awaitInterrupts(crypto);
+            assertThat(crypto.interrupts()).isPositive();
             crypto.release("late");
             awaitExecutorTerminated(); // the pool terminates only once that worker has returned
-            assertThat(crypto.interrupts()).isPositive();
             assertThat(crypto.count("late")).isEqualTo(1);
 
             assertThat(service.getJob(accepted.jobId())).isEqualTo(afterDrain);
