@@ -301,10 +301,18 @@ def _run_memory_import(
         print(f"error: {error}", file=sys.stderr)
         return 1
 
+    parent = memory_path.parent
+    # Directories this run would create, deepest first, so a failed import does
+    # not leave a fresh state root behind.
+    missing: list[Path] = []
+    probe = parent
+    while not probe.exists() and probe != probe.parent:
+        missing.append(probe)
+        probe = probe.parent
     try:
-        memory_path.parent.mkdir(parents=True, exist_ok=True)
+        parent.mkdir(parents=True, exist_ok=True)
     except OSError as error:
-        print(f"error: cannot create {memory_path.parent}: {error}", file=sys.stderr)
+        print(f"error: cannot create {parent}: {error}", file=sys.stderr)
         return 1
 
     before = _memory_counts(memory_path)
@@ -328,6 +336,11 @@ def _run_memory_import(
         issue.startswith(("MEMORY_IMPORT_FAILED:", "MEMORY_CORRUPT:"))
         for issue in issues
     ):
+        for directory in missing:
+            try:
+                directory.rmdir()
+            except OSError:
+                break
         return 1
     return 0
 

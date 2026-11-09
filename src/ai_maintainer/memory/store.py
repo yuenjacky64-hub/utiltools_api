@@ -441,10 +441,15 @@ class MemoryStore:
                     )
                     continue
                 before = len(_collection_errors(store, name))
-                store._append(name, candidate)
-                if len(_collection_errors(store, name)) > before:
-                    with store._write_lock:
+                # Hold the lock across append + rollback: releasing it in
+                # between would let a peer cycle append and then be popped by
+                # position instead of the rejected candidate.
+                with store._write_lock:
+                    store._append(name, candidate)
+                    rejected = len(_collection_errors(store, name)) > before
+                    if rejected:
                         store._records[name].pop()
+                if rejected:
                     issues.append(
                         f"MEMORY_IMPORT_SKIPPED: would break {name} "
                         f"({_record_label(name, candidate)})"
