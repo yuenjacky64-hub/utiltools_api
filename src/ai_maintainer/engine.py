@@ -16,17 +16,33 @@ bodies run outside the lock, exactly like the monitor step body.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from ai_maintainer.memory.store import MemoryStore
 
 from ai_maintainer.config import MaintainerConfig
+from ai_maintainer.shutdown import (
+    CLEANUP_PERSIST_TASK_STATE,
+    CLEANUP_RELEASE_FILE_LOCKS,
+    CLEANUP_STOP_SCHEDULER,
+    CLEANUP_WRITE_SHUTDOWN_AUDIT,
+    PERSIST_SKIPPED_NO_STATE_ROOT,
+    SHUTDOWN_POLL_INTERVAL_SEC,
+    SHUTDOWN_STATE_SCHEMA,
+    EngineState,
+    ShutdownReport,
+    default_audit_path,
+    write_shutdown_audit,
+    write_shutdown_state,
+)
 from ai_maintainer.tasks.curriculum import (
     NON_TERMINAL,
     STALE_ELIGIBLE,
@@ -41,6 +57,7 @@ from ai_maintainer.tasks.curriculum import (
 
 __all__ = [
     "CycleResult",
+    "DEFAULT_CYCLE_INTERVAL_SEC",
     "FingerprintBucket",
     "FingerprintCircuitState",
     "MaintainerEngine",
@@ -48,6 +65,20 @@ __all__ = [
 ]
 
 EVENT_LOG_MAXLEN = 100
+DEFAULT_CYCLE_INTERVAL_SEC = 1.0
+
+# Wall-clock seam for the audit record (events keep using the monotonic clock).
+_wall_clock: Callable[[], float] = time.time
+
+
+def _release_quietly(lock: Any) -> bool:
+    """Best-effort ``lock.release()``; ``True`` on success (incl. "not held")."""
+
+    try:
+        lock.release()
+    except Exception:
+        return False
+    return True
 
 
 class FingerprintCircuitState(Enum):
@@ -136,6 +167,10 @@ class MaintainerEngine:
         probe: Callable[[str], bool] | None = None,
         signal_gate: Callable[[str], Any] | None = None,
         memory: "MemoryStore | None" = None,
+        sleep: Callable[[float], Any] | None = None,
+        state_root: "str | Path | None" = None,
+        shutdown_audit_path: "str | Path | None" = None,
+        role_resolver: Callable[[TaskSpec], str | None] | None = None,
     ) -> None:
         self._curriculum = curriculum
         self._config = config if config is not None else curriculum.config
@@ -154,12 +189,44 @@ class MaintainerEngine:
         self._last_cycle_issues: list[str] = []
         self._scheduler_thread: threading.Thread | None = None
         self._scheduler_stop = threading.Event()
+        # UTILTOOLS-73: graceful wind-down seams. ``_sleep`` is injected so the
+        # bounded wait is testable with a fake clock; ``_cycle_done`` is the
+        # checkpoint a wind-down waits on (set = no cycle in flight).
+        self._sleep: Callable[[float], Any] = sleep if sleep is not None else time.sleep
+        self._cycle_done = threading.Event()
+        self._cycle_done.set()
+        self._stop = threading.Event()
+        self._state = EngineState.IDLE
+        self._state_root: Path | None = (
+            Path(state_root) if state_root is not None else None
+        )
+        self._shutdown_audit_path: Path | None = (
+            Path(shutdown_audit_path) if shutdown_audit_path is not None else None
+        )
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_report: ShutdownReport | None = None
+        self._file_locks: dict[str, Any] = {}
+        self._active_roles: dict[str, str] = {}
+        self._role_resolver = role_resolver
 
     # ------------------------------------------------------------------ public
 
     @property
     def lock(self) -> threading.RLock:
         return self._lock
+
+    @property
+    def config(self) -> MaintainerConfig:
+        """The live config; ``self.config.max_shutdown_wait_sec`` is the bound."""
+
+        return self._config
+
+    @property
+    def file_locks(self) -> tuple[str, ...]:
+        """Keys of the still-tracked ``util.fs.file_lock`` instances."""
+
+        with self._lock:
+            return tuple(self._file_locks)
 
     @property
     def events(self) -> list[dict[str, Any]]:
@@ -197,6 +264,270 @@ class MaintainerEngine:
     def run_cycle(self) -> CycleResult:
         """Execute at most ``max_steps_per_cycle`` monitor steps."""
 
+        self._cycle_done.clear()
+        try:
+            return self._run_cycle_body()
+        finally:
+            self._cycle_done.set()
+
+    # ------------------------------------------------------- wind-down (live)
+
+    @property
+    def state(self) -> EngineState:
+        with self._lock:
+            return self._state
+
+    def is_shutting_down(self) -> bool:
+        with self._lock:
+            return self._state is EngineState.SHUTTING_DOWN
+
+    def request_stop(self) -> None:
+        """Publish the stop signal the cycle loop polls (idempotent)."""
+
+        with self._lock:
+            already = self._stop.is_set()
+            self._stop.set()
+            if not already:
+                self._events.append(
+                    {
+                        "event": "STOP_REQUESTED",
+                        "cycle": self._cycles,
+                        "state": self._state.value,
+                    }
+                )
+
+    def should_stop(self) -> bool:
+        """Has a wind-down been requested?"""
+
+        return self._stop.is_set()
+
+    def note_task_role(self, task: str, role: str) -> None:
+        """Remember which role is driving ``task`` (persisted on wind-down)."""
+
+        with self._lock:
+            self._active_roles[task] = str(role)
+
+    def register_file_lock(self, key: str, lock: Any) -> None:
+        """Track a ``util.fs.file_lock`` so a wind-down can release it."""
+
+        with self._lock:
+            previous = self._file_locks.get(key)
+            self._file_locks[key] = lock
+        if previous is not None and previous is not lock:
+            _release_quietly(previous)
+
+    def release_file_lock(self, key: str) -> bool:
+        """Release and forget one tracked lock (``False`` when untracked)."""
+
+        with self._lock:
+            lock = self._file_locks.pop(key, None)
+        if lock is None:
+            return False
+        if not _release_quietly(lock):
+            raise OSError(f"failed to release file lock {key!r}")
+        return True
+
+    def release_all_file_locks(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Drain the lock registry; returns ``(released_keys, failures)``.
+
+        Every key is popped *before* its ``release()`` call so a raising lock
+        can never be released twice by a later pass.
+        """
+
+        with self._lock:
+            tracked = list(self._file_locks.items())
+            self._file_locks.clear()
+        released: list[str] = []
+        failures: list[str] = []
+        for key, lock in tracked:
+            if _release_quietly(lock):
+                released.append(key)
+            else:
+                failures.append(key)
+        return tuple(released), tuple(failures)
+
+    def run_forever(self, interval_sec: float | None = None) -> ShutdownReport:
+        """Run cycles until ``request_stop()``, then wind down cleanly."""
+
+        interval = self._interval(interval_sec)
+        self._stop.clear()
+        with self._lock:
+            self._state = EngineState.IDLE
+        try:
+            while True:
+                if self.should_stop():
+                    break
+                with self._lock:
+                    if self._state is EngineState.STOPPED:
+                        self._state = EngineState.IDLE
+                    self._state = EngineState.RUNNING
+                    self._cycle_done.clear()
+                try:
+                    self.run_cycle()
+                finally:
+                    self._cycle_done.set()
+                    with self._lock:
+                        if self._state is EngineState.RUNNING:
+                            self._state = EngineState.IDLE
+                if self.should_stop():
+                    break
+                with self._lock:
+                    if self._state is EngineState.IDLE:
+                        self._state = EngineState.SLEEPING
+                self._pause(interval)
+        finally:
+            return self.shutdown()
+
+    def shutdown(self) -> ShutdownReport:
+        """Bounded, idempotent wind-down (INV-SHUT-1/2/3/4/5)."""
+
+        with self._shutdown_lock:
+            if self._shutdown_report is not None:
+                return self._shutdown_report
+            with self._lock:
+                self._state = EngineState.SHUTTING_DOWN
+                active = [
+                    task
+                    for task in self._curriculum.specs
+                    if task.state in (TaskState.RUNNING, TaskState.IN_PROGRESS)
+                ]
+                active_ids = tuple(task.name for task in active)
+                self._events.append(
+                    {
+                        "event": "SHUTTING_DOWN",
+                        "cycle": self._cycles,
+                        "active_task_ids": list(active_ids),
+                    }
+                )
+                started = self._clock()
+                deadline = started + float(self._config.max_shutdown_wait_sec)
+
+            # INV-SHUT-1: the wait loop holds no engine lock, so a cycle that is
+            # mid-commit can still acquire ``_lock`` and reach its break point.
+            timed_out = False
+            while not self._cycle_done.is_set():
+                remaining = deadline - self._clock()
+                if remaining <= 0.0:
+                    timed_out = True
+                    break
+                self._sleep(min(SHUTDOWN_POLL_INTERVAL_SEC, remaining))
+            waited_sec = max(0.0, self._clock() - started)
+
+            cleanup_steps: list[str] = []
+            failed_steps: list[str] = []
+            persisted: list[str] = []
+            persist_failures: list[str] = []
+            persist_skipped_reason: str | None = None
+
+            try:
+                self.stop_scheduler()
+            except Exception:
+                failed_steps.append(CLEANUP_STOP_SCHEDULER)
+            else:
+                cleanup_steps.append(CLEANUP_STOP_SCHEDULER)
+
+            if self._state_root is None:
+                persist_skipped_reason = PERSIST_SKIPPED_NO_STATE_ROOT
+            else:
+                for task in active:
+                    role, role_source = self._resolve_role(task)
+                    payload = {
+                        "schema": SHUTDOWN_STATE_SCHEMA,
+                        "task": task.name,
+                        "role": role,
+                        "role_source": role_source,
+                        "status": task.state.value,
+                        "progress": task.progress,
+                        "steps_required": task.steps_required,
+                        "timeline": {
+                            "cycle": self._cycles,
+                            "pending_since": task.pending_since,
+                            "last_progress_at": task.last_progress_at,
+                            "last_progress_age_sec": progress_age_sec(
+                                task, self._clock()
+                            ),
+                            "stale_since": task.stale_since,
+                            "preempted_count": task.preempted_count,
+                        },
+                        "elapsed_shutdown_wait_sec": waited_sec,
+                        "shutdown_started_at": started,
+                        "timed_out": timed_out,
+                        "cycle": self._cycles,
+                    }
+                    try:
+                        write_shutdown_state(
+                            self._state_root / task.name, self._state_root, payload
+                        )
+                    except (OSError, ValueError):
+                        persist_failures.append(task.name)
+                    else:
+                        persisted.append(task.name)
+                if persist_failures:
+                    failed_steps.append(CLEANUP_PERSIST_TASK_STATE)
+                else:
+                    cleanup_steps.append(CLEANUP_PERSIST_TASK_STATE)
+
+            released, lock_failures = self.release_all_file_locks()
+            if lock_failures:
+                failed_steps.append(CLEANUP_RELEASE_FILE_LOCKS)
+            else:
+                cleanup_steps.append(CLEANUP_RELEASE_FILE_LOCKS)
+
+            # The audit write is itself a cleanup step; it is queued before the
+            # record is built so the record can name it (DOD-09).
+            cleanup_steps.append(CLEANUP_WRITE_SHUTDOWN_AUDIT)
+            record = {
+                "schema": "maintainer-shutdown/v1",
+                "recorded_at": _wall_clock(),
+                "active_task_ids": list(active_ids),
+                "cleanup_steps": list(cleanup_steps),
+                "failed_steps": list(failed_steps),
+                "lock_release_failures": list(lock_failures),
+                "persisted_task_ids": list(persisted),
+                "persist_failures": list(persist_failures),
+                "persist_skipped_reason": persist_skipped_reason,
+                "released_lock_keys": list(released),
+                "timed_out": timed_out,
+                "waited_sec": waited_sec,
+                "max_shutdown_wait_sec": float(self._config.max_shutdown_wait_sec),
+                "engine_state": EngineState.STOPPED.value,
+            }
+            audit_path = self._shutdown_audit_path or default_audit_path()
+            audit_written = write_shutdown_audit(audit_path, record)
+            if not audit_written:  # pragma: no cover - depends on permissions
+                cleanup_steps.remove(CLEANUP_WRITE_SHUTDOWN_AUDIT)
+                failed_steps.append(CLEANUP_WRITE_SHUTDOWN_AUDIT)
+
+            with self._lock:
+                self._state = EngineState.STOPPED
+                self._events.append(
+                    {
+                        "event": "SHUTDOWN_COMPLETE",
+                        "cycle": self._cycles,
+                        "timed_out": timed_out,
+                        "waited_sec": waited_sec,
+                        "persisted_task_ids": list(persisted),
+                        "audit_written": audit_written,
+                    }
+                )
+            report = ShutdownReport(
+                state=EngineState.STOPPED,
+                timed_out=timed_out,
+                waited_sec=waited_sec,
+                active_task_ids=active_ids,
+                persisted_task_ids=tuple(persisted),
+                released_lock_keys=released,
+                cleanup_steps=tuple(cleanup_steps),
+                failed_steps=tuple(failed_steps),
+                lock_release_failures=lock_failures,
+                persist_skipped_reason=persist_skipped_reason,
+                audit_written=audit_written,
+                audit_path=str(audit_path),
+            )
+            self._shutdown_report = report
+            return report
+
+    def _run_cycle_body(self) -> CycleResult:
         steps = 0
         preempted_name: str | None = None
         monitored_name: str | None = None
@@ -575,6 +906,38 @@ class MaintainerEngine:
         """Body of one monitor step; intentionally a no-op seam for tests."""
 
         return None
+
+    def _pause(self, seconds: float) -> Any:
+        """Inter-cycle wait: return ``True`` early when a wind-down is requested."""
+
+        return self._stop.wait(seconds)
+
+    def _interval(self, interval_sec: float | None) -> float:
+        if interval_sec is None:
+            return DEFAULT_CYCLE_INTERVAL_SEC
+        if isinstance(interval_sec, bool) or not isinstance(interval_sec, (int, float)):
+            raise ValueError("interval_sec must be a finite float >= 0")
+        value = float(interval_sec)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("interval_sec must be a finite float >= 0")
+        return value
+
+    def _resolve_role(self, task: TaskSpec) -> tuple[str | None, str]:
+        """Role driving ``task``: observed value, or an explicit ``None``."""
+
+        with self._lock:
+            role = self._active_roles.get(task.name)
+        if role is not None:
+            return role, "engine"
+        resolver = self._role_resolver
+        if resolver is not None:
+            resolved = resolver(task)
+            if resolved is not None:
+                return str(resolved), "resolver"
+        spec_role = getattr(task, "role", None)
+        if spec_role is not None:
+            return str(spec_role), "spec"
+        return None, "unobserved"
 
     def _scheduler_loop(self, interval: float) -> None:
         while not self._scheduler_stop.wait(interval):
