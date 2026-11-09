@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -37,6 +38,9 @@ DEFAULT_MAX_FINGERPRINT_BUCKETS = 64
 DEFAULT_STALE_TIMEOUT_SEC = 300.0
 DEFAULT_STALE_RECOVERY_GRACE_SEC = 60.0
 
+# Upper bound a graceful wind-down waits for an in-flight cycle (clock units).
+DEFAULT_MAX_SHUTDOWN_WAIT_SEC = 300.0
+
 DEFAULT_PRIMARY_CLI: str | None = None
 DEFAULT_PRIMARY_MODEL: str | None = None
 DEFAULT_SECONDARY_CLI: str | None = None
@@ -49,6 +53,10 @@ FREE_MODEL_SUFFIX = ":free"
 
 MAINTAINER_ROOT_ENV = "MAINTAINER_ROOT"
 ENV_PREFIX = "MAINTAINER_"
+# Operator-facing spelling of the same layer (UTILTOOLS-73 DOD-03 names
+# ``AI_MAINTAINER_MAX_SHUTDOWN_WAIT_SEC``); ``ENV_PREFIX`` wins on a tie so the
+# long-standing convention keeps precedence.
+ENV_ALIAS_PREFIX = "AI_" + ENV_PREFIX
 CONFIG_JSON_NAME = "config.json"
 MUST_CONFIG_MODULE = "must_config"
 MUST_CONFIG_ATTRIBUTE = "MUST_CONFIG"
@@ -142,6 +150,7 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
             "blocked_backoff_max_sec",
             "stale_timeout_sec",
             "stale_recovery_grace_sec",
+            "max_shutdown_wait_sec",
         ):
             if isinstance(value, bool):
                 raise ValueError(f"{key} must be a number")
@@ -176,6 +185,10 @@ def _env_layer(env: Mapping[str, str]) -> dict[str, Any]:
         env_name = ENV_PREFIX + field.name.upper()
         if env_name in env:
             candidate[field.name] = env[env_name]
+            continue
+        alias_name = ENV_ALIAS_PREFIX + field.name.upper()
+        if alias_name in env:
+            candidate[field.name] = env[alias_name]
     return _coerce_mapping(candidate, "environment")
 
 
@@ -199,6 +212,7 @@ class MaintainerConfig:
     max_fingerprint_buckets: int = DEFAULT_MAX_FINGERPRINT_BUCKETS
     stale_timeout_sec: float = DEFAULT_STALE_TIMEOUT_SEC
     stale_recovery_grace_sec: float = DEFAULT_STALE_RECOVERY_GRACE_SEC
+    max_shutdown_wait_sec: float = DEFAULT_MAX_SHUTDOWN_WAIT_SEC
 
     def __post_init__(self) -> None:
         interval = self.prioritization_aging_interval_ms
@@ -260,6 +274,14 @@ class MaintainerConfig:
             or stale_grace < 0
         ):
             raise ValueError("stale_recovery_grace_sec must be >= 0")
+        shutdown_wait = self.max_shutdown_wait_sec
+        if (
+            isinstance(shutdown_wait, bool)
+            or not isinstance(shutdown_wait, (int, float))
+            or not math.isfinite(float(shutdown_wait))
+            or float(shutdown_wait) < 0.0
+        ):
+            raise ValueError("max_shutdown_wait_sec must be a finite float >= 0")
 
     @property
     def aging_threshold_seconds(self) -> float:

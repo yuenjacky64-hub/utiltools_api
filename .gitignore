@@ -41,3 +41,8 @@ recovery_journal.jsonl.tmp
 ### Maintainer memory document (runtime state, never source) - UTILTOOLS-72 REQ-02 ###
 maintainer_memory.json
 maintainer_memory.json.tmp
+
+### Graceful wind-down runtime state (never source) - UTILTOOLS-73 REQ-03 / REQ-05 ###
+data/maintainer_shutdown.log
+_shutdown_state.json
+_shutdown_state.json.tmp
