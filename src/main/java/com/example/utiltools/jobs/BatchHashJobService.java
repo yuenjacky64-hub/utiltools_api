@@ -214,10 +214,15 @@ public class BatchHashJobService {
      * dispatcher serves a client only while it is <em>not</em> in {@code servedThisRound}, so every
      * client with pending work is served exactly once per round and a client waits behind at most
      * {@code clients-with-queued-work - 1} dispatches. Both containers are guarded by
-     * {@link #dispatchLock}. The set is pruned wholesale when the round closes (once every client with
-     * a pending lane has been served) and again once nothing is queued or running, so the bookkeeping
-     * is bounded by the clients with queued work in the live round, never by the client population or
-     * by any per-client history (Plan §5).
+     * {@link #dispatchLock}. The set is pruned wholesale whenever the round closes, which happens both
+     * once every client with a pending lane has been served and as soon as the ring is empty (nothing
+     * queued at all, so no queued client can be starved by the marks); a long job keeping a worker busy
+     * therefore cannot accumulate one key per dispatch. The remaining case - a ring that never empties
+     * because one client keeps a lane non-empty while new clients stream in - is capped: once the set
+     * reaches {@code worker-count + queue-capacity} keys the round is closed as well, which restarts
+     * selection at the ring head (the longest-waiting client). The bookkeeping is therefore bounded by
+     * one key per unit of global capacity - never by the client population, by dispatch count or by any
+     * per-client history (Plan §5).
      */
     private final Map<String, Deque<LaneEntry>> lanes = new HashMap<>();
     private final Deque<String> laneOrder = new ArrayDeque<>();
@@ -849,7 +854,8 @@ public class BatchHashJobService {
      * Hands one admitted entry to the bounded executor. The capacity gate keeps
      * {@code reservedCapacity <= worker-count + queue-capacity}, so {@link
      * ThreadPoolExecutor.AbortPolicy} can only fire here if that invariant is broken; the backstop
-     * then puts the entry back at the tail of its own lane instead of losing the attempt.
+     * then puts the entry back at the tail of its own lane instead of losing the attempt - but only
+     * while that attempt is still dispatchable, see {@link #reEnqueue}.
      */
     private void handOff(LaneEntry entry) {
         try {
@@ -892,8 +898,29 @@ public class BatchHashJobService {
         }
     }
 
-    /** Re-appends a rejected hand-off at the tail of its own client's lane. */
+    /**
+     * Re-appends a rejected hand-off at the tail of its own client's lane, provided the attempt is
+     * still queued and still the live generation.
+     *
+     * <p>The backstop runs after {@link #attemptFinished()}, so a terminal writer (cancel, queue-wait
+     * deadline expiry, drain sweep) can have withdrawn the attempt in between. Those writers already
+     * returned its one capacity unit through the claim-once {@code quotaReserved} CAS, so re-appending
+     * would only put a no-op entry back into the lane and transiently inflate
+     * {@link #queuedJobsForClient}; such an attempt is therefore dropped instead. The status is read
+     * <em>before</em> {@code dispatchLock} is taken, because {@code job monitor -> dispatchLock} is the
+     * only lock order this class allows.</p>
+     */
     private void reEnqueue(LaneEntry entry) {
+        MutableJob job = entry.job();
+        boolean dispatchable;
+        synchronized (job) {
+            dispatchable = job.status == JobStatus.QUEUED && job.attempt == entry.generation();
+        }
+        if (!dispatchable) {
+            log.debug("batch-hash dispatch: dropped a rejected hand-off for an attempt that is no longer queued (job={})",
+                    job.jobId);
+            return; // terminal or superseded: its slot was released once by the terminal writer
+        }
         synchronized (dispatchLock) {
             if (shutdownRequested) {
                 return;
@@ -917,14 +944,36 @@ public class BatchHashJobService {
      * most one dispatch per round while any other client still has queued work, so the wait is
      * bounded by the number of clients with queued work - not by the depth of any lane and not by how
      * much service a client accumulated in earlier rounds.
+     *
+     * <p>Closing the round is the <em>only</em> reset, and it fires on both "no eligible client"
+     * exits: the saturated ring (every pending client was served) and the empty ring (nobody has work
+     * queued). The empty-ring close is what makes the retained set bounded by live work instead of by
+     * dispatch count: without it a long job keeping a worker busy would let the ring drain between
+     * submissions, and every such dispatch would leave one client key behind until the service went
+     * fully idle. The residual case is a ring that never empties - one client keeps a lane non-empty
+     * while new clients stream in - where the round stays open and marks accumulate for clients whose
+     * lanes already drained; so the set is additionally capped at {@code worker-count +
+     * queue-capacity} (one key per unit of live queued work) by closing the round when it is reached.
+     * Memory is therefore O(worker-count + queue-capacity) in all cases, never a function of the
+     * client population or of dispatch count, and a cap-triggered close can only restart the round
+     * from the ring head, so the starvation bound below still holds (REQ-01, Plan §5 Memory).</p>
      */
     private LaneEntry pollNextLocked() {
+        if (servedThisRound.size() >= dispatchCapacityLocked()) {
+            // Hard memory cap: a ring that never empties cannot grow the set past one key per unit of
+            // global worker+queue capacity. Closing here restarts the round at the ring head, so the
+            // longest-waiting client is still the first one served.
+            closeRoundLocked();
+        }
         String chosen = selectEligibleLocked();
         if (chosen == null) {
+            // The round barrier resets in both cases: everybody pending has been served (saturated
+            // ring), or nothing is queued at all (empty ring), where the close is vacuously fair
+            // because no client has work that these marks could starve.
+            closeRoundLocked();
             if (laneOrder.isEmpty()) {
                 return null; // nothing queued at all: the caller blocks until a lane refills
             }
-            closeRoundLocked(); // round barrier: everybody pending has been served in this round
             chosen = selectEligibleLocked();
             if (chosen == null) {
                 return null; // unreachable: a fresh round makes every pending client eligible
@@ -935,7 +984,10 @@ public class BatchHashJobService {
         servedThisRound.add(chosen);
         laneOrder.remove(chosen);
         if (lane.isEmpty()) {
-            forgetLaneLocked(chosen); // lane and ring slot go at once; the served mark goes at round close
+            // Lane and ring slot go at once; the served mark survives until this round closes, so a
+            // re-enqueue (retry, duplicate) from this client cannot buy it a second dispatch before the
+            // clients that were already waiting have had their turn (REQ-01, REQ-03).
+            forgetLaneLocked(chosen);
         } else {
             laneOrder.addLast(chosen); // the ring cursor advances to the next client
         }
@@ -943,12 +995,23 @@ public class BatchHashJobService {
     }
 
     /**
-     * Closes the current round: every client with a pending lane has been served, so the served marks
-     * are dropped ({@code servedThisRound} never outlives the round it describes) and the epoch ends
-     * with no residue. This is the only reset, so no counter can drift or wrap.
+     * Closes the current round: every client with a pending lane has been served (or nothing is
+     * queued), so the served marks are dropped and the epoch ends with no residue
+     * ({@code servedThisRound} never outlives the round it describes). This is the only reset, so no
+     * counter can drift or wrap, and the set is bounded by the clients with queued work in the live
+     * round rather than by dispatch count or the client population.
      */
     private void closeRoundLocked() {
         servedThisRound.clear();
+    }
+
+    /**
+     * Upper bound on the number of served marks a round may retain: one per unit of live global
+     * capacity ({@code worker-count + queue-capacity}), because that is the most attempts that can be
+     * queued or running at any instant. Caller must hold {@link #dispatchLock}.
+     */
+    private int dispatchCapacityLocked() {
+        return workerCount + queueCapacity;
     }
 
     /**
@@ -1591,14 +1654,21 @@ public class BatchHashJobService {
      * Terminalizes the service: in-flight work gets a bounded grace window, everything still
      * non-terminal afterwards is failed with {@link #JOB_SHUTDOWN}.
      *
-     * <p>Two phases. Phase one calls {@link ThreadPoolExecutor#shutdown()}, so queued work still
-     * runs while {@link #submit} and {@link #retry} are refused through their existing
-     * {@link RejectedExecutionException} rollback, and waits up to the configured grace window for
-     * the pool to terminate. Phase two interrupts whatever is still running and sweeps the registry.
-     * The sweep fails only {@code QUEUED}/{@code RUNNING} jobs, keeps their attempt number and their
-     * checkpoint, and closes each open audit entry exactly once, so a worker that ignores
-     * interruption and returns later writes nothing: the existing status/attempt fence rejects it.
-     * </p>
+     * <p>Two phases. Phase one first ends the fair-admission dispatcher
+     * ({@link #stopDispatcher()}): the drain flag is set and every pending lane entry is dropped under
+     * {@link #dispatchLock}, so from that moment no attempt can be dispatched and {@link #submit} and
+     * {@link #retry} are refused by the lane gate in {@link #enqueue}, rolling back through the same
+     * queue-full path a saturated admission uses ({@link JobQueueFullException}) - not through
+     * {@link RejectedExecutionException}, which remains only the pool's unreachable backstop. Because
+     * the lanes are already empty, the {@link ThreadPoolExecutor#shutdown()} that follows admits no new
+     * work: it only lets the attempts that were <em>already</em> handed off - at most
+     * {@code worker-count} of them - finish inside the configured grace window. Jobs that were still
+     * queued in a lane are consequently never executed; the sweep below settles them
+     * {@link #JOB_SHUTDOWN}. Phase two interrupts whatever is still running
+     * ({@link ThreadPoolExecutor#shutdownNow()}) and sweeps the registry. The sweep fails only
+     * {@code QUEUED}/{@code RUNNING} jobs, keeps their attempt number and their checkpoint, and closes
+     * each open audit entry exactly once, so a worker that ignores interruption and returns later
+     * writes nothing: the existing status/attempt fence rejects it.</p>
      *
      * <p>Idempotent by construction rather than by flag: a second call re-runs no-op
      * {@code shutdown()}/{@code shutdownNow()} and finds no non-terminal job, so it adds no attempt,
@@ -1611,7 +1681,9 @@ public class BatchHashJobService {
             // handed off, every pending lane is dropped, and submit/retry are refused through the
             // existing queue-full rollback, so the sweep below settles exactly the rows still present.
             stopDispatcher();
-            executor.shutdown(); // phase 1: queued work still runs, new work is refused
+            // Nothing can be admitted any more (the lanes are gone), so this only waits for the
+            // attempts already handed off; jobs that were queued in a lane are settled by the sweep.
+            executor.shutdown();
             boolean terminated = awaitTerminationBounded(shutdownGraceSeconds);
             List<Runnable> discarded = executor.shutdownNow(); // phase 2: interrupt what is still running
             int failed = failNonTerminalJobs(JOB_SHUTDOWN);

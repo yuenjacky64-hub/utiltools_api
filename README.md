@@ -1870,8 +1870,16 @@ order, admitting one queued attempt at a time to the bounded executor
   a client that fills its quota cannot drain its own lane ahead of others. A queued client
   waits behind at most `clients-with-queued-work - 1` dispatches, never behind a lane's depth,
   and the bound does not depend on per-client service history: nothing is accumulated across
-  rounds (the set is cleared at every round close, and again whenever the service goes idle),
-  so a client served heavily in earlier rounds starts each new round on equal footing. A lane
+  rounds, so a client served heavily in earlier rounds starts each new round on equal footing.
+  The set has exactly one reset, the round close, and a round closes both when every queued
+  client has been served and when the ring runs empty (nothing is queued at all); because that
+  second close fires as soon as the lanes drain, a long job holding a worker busy cannot
+  accumulate one retained key per dispatch. A ring that never empties (one client keeps a lane
+  non-empty while new clients stream in) is capped in the same spirit: once the set reaches
+  `worker-count + queue-capacity` keys the round is closed too, restarting selection at the ring
+  head — the longest-waiting client — so the extra dispatch a served client may get there never
+  overtakes a client that has been queued longer. The set therefore never holds more keys than
+  there are units of global capacity, whatever the client population or churn. A lane
   that re-enqueues work it already had (retry, duplicate) does not become eligible a second
   time in the same round, so it cannot jump ahead either. One lane draining completely at a
   time still happens only when all other lanes are empty.
@@ -1890,6 +1898,15 @@ Retries and duplicates stay fair and single-counted: a retried `FAILED` attempt 
 the **submitting client's own lane at its tail** (it never jumps ahead of other clients'
 queued work and never escapes to another quota bucket), and a duplicate idempotency key
 returns the existing snapshot without consuming a second slot or a second lane entry.
+
+Termination follows the same gate. The drain closes the dispatcher first — it sets the stop
+flag and drops every pending lane entry — so no attempt queued in a lane is ever executed
+afterwards; the sweep fails those `QUEUED` jobs with `JOB_SHUTDOWN` (attempt number and
+checkpoint preserved for a retry). Only the attempts already handed off (at most
+`worker-count`) get the grace window, and what is still running at its end is interrupted.
+`submit` and `retry` after the drain are refused by the closed lanes through the very same
+queue-full rollback described above (`429 JOB_QUEUE_FULL`, no residue), so the executor's
+`RejectedExecutionException` stays an unreachable backstop rather than an error path.
 
 The fairness state stays observable through the existing surface without new response fields:
 the per-client counter map `activeJobsByClient` (in-flight slots held by every known client —

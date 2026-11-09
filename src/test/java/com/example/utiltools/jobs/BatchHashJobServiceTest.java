@@ -4590,9 +4590,9 @@ class BatchHashJobServiceTest {
 
     /**
      * DOD-02 / REQ-02 / REQ-04: once the drain has returned, both submission and retry reach the
-     * dead pool and are refused through the pre-existing {@code RejectedExecutionException}
-     * rollback — no new error path — leaving no job row, no attempt row, no audit row and no
-     * reserved quota slot behind.
+     * closed lanes and are refused through the pre-existing queue-full rollback (the drain sets the
+     * lane gate, so {@code RejectedExecutionException} is never reached) — no new error path —
+     * leaving no job row, no attempt row, no audit row and no reserved quota slot behind.
      */
     @Test
     @DisplayName("drain - submission and retry are refused after the drain and leave no residue")
