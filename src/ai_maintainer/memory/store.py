@@ -33,7 +33,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Collection, Mapping
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 from ai_maintainer.consistency import (
     validate_bug_fix_integrity,
@@ -72,6 +72,28 @@ _BRIEF_FIELDS: dict[str, tuple[str, ...]] = {
     "runs": ("task_id",),
     "bug_fixes": ("git_commit",),
     "learnings": ("at",),
+}
+
+#: REQ-03 required fields per collection; ``runs`` is ordering-only.
+_VALIDATE_REQUIRED: dict[str, tuple[str, ...]] = {
+    "bug_fixes": ("task_id", "git_commit"),
+    "learnings": ("text",),
+}
+
+#: REQ-03 error code per collection for :data:`_VALIDATE_REQUIRED`.
+_VALIDATE_REQUIRED_CODES: dict[str, str] = {
+    "bug_fixes": "BUG_FIX_MISSING_FIELD",
+    "learnings": "LEARNING_MISSING_FIELD",
+}
+
+#: REQ-03 ``component``; this repo labels a fix with ``summary`` (ASM-01).
+_BUG_FIX_LABEL_FIELDS = ("component", "summary")
+
+#: REQ-04 duplicate error code per collection (its brief key is above).
+_DUPLICATE_CODES: dict[str, str] = {
+    "runs": "RUN_DUPLICATE_TASK_ID",
+    "bug_fixes": "BUG_FIX_DUPLICATE_GIT_COMMIT",
+    "learnings": "LEARNING_DUPLICATE",
 }
 
 
@@ -142,6 +164,105 @@ def _record_label(name: str, record: Mapping[str, Any]) -> str:
         if value is not None:
             return f"{field_name}={value!r}"
     return "no key field"
+
+
+def _non_blank(value: Any) -> bool:
+    """``True`` when ``value`` is a string with non-whitespace content."""
+
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _validate_runs(records: Sequence[Any]) -> list[str]:
+    """REQ-03 ordering check for ``runs`` (oldest first), plus ``at`` presence."""
+
+    errors: list[str] = []
+    previous: tuple[int, tuple[int, float, int]] | None = None
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            errors.append(
+                f"RUN_MISSING_FIELD: runs[{index}] is not a mapping "
+                f"({type(record).__name__})"
+            )
+            continue
+        order = _timestamp_order((index, record))
+        if order[0] == 0:
+            errors.append(f"MEMORY_ORDER: runs[{index}].at is missing")
+            continue
+        if previous is not None and order < previous[1]:
+            errors.append(
+                f"MEMORY_ORDER: runs[{index}].at {order[1]!r} sorts before "
+                f"runs[{previous[0]}].at {previous[1][1]!r}"
+            )
+        previous = (index, order)
+    return errors
+
+
+def _validate_required(name: str, records: Sequence[Any], code: str) -> list[str]:
+    """REQ-03 ``code``: every required field of every record must be non-blank."""
+
+    errors: list[str] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            errors.append(
+                f"{code}: {name}[{index}] is not a mapping "
+                f"({type(record).__name__})"
+            )
+            continue
+        for field_name in _VALIDATE_REQUIRED[name]:
+            if _non_blank(record.get(field_name)):
+                continue
+            errors.append(
+                f"{code}: {name}[{index}].{field_name} is missing"
+            )
+        if name == "bug_fixes" and not any(
+            _non_blank(record.get(field_name))
+            for field_name in _BUG_FIX_LABEL_FIELDS
+        ):
+            errors.append(
+                f"{code}: {name}[{index}].component is missing"
+            )
+    return errors
+
+
+def _validate_duplicates(name: str, records: Sequence[Any]) -> list[str]:
+    """REQ-04 ``_DUPLICATE_CODES[name]``: repeated key values, naming both indices."""
+
+    code = _DUPLICATE_CODES[name]
+    brief = set(_BRIEF_FIELDS.get(name, ()))
+    fields = [
+        (field_name, kind)
+        for field_name, kind in _DEDUPE_FIELDS.get(name, ())
+        if field_name in brief
+    ]
+    errors: list[str] = []
+    seen: dict[tuple[str, str], int] = {}
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            continue
+        for field_name, kind in fields:
+            key = _dedupe_key(kind, record.get(field_name))
+            if key is None:
+                continue
+            pair = (field_name, key)
+            first = seen.get(pair)
+            if first is not None:
+                errors.append(
+                    f"{code}: {name}[{index}].{field_name} {key!r} repeats "
+                    f"{name}[{first}]"
+                )
+                continue
+            seen[pair] = index
+    return errors
+
+
+def _validate_limits(
+    name: str, records: Sequence[Any], limit: int | None
+) -> list[str]:
+    """MEMORY_OVER_LIMIT: ``limit`` (when given) is a count of records."""
+
+    if limit is None or limit < 0 or len(records) <= limit:
+        return []
+    return [f"MEMORY_OVER_LIMIT: {name} has {len(records)} records, limit is {limit}"]
 
 
 def _collection_errors(store: "MemoryStore", name: str) -> list[str]:
@@ -331,6 +452,46 @@ class MemoryStore:
         """The issues found by the last :meth:`save` / :meth:`load`."""
 
         return list(self._issues)
+
+    def validate(
+        self,
+        *,
+        max_runs: int | None = None,
+        max_bug_fixes: int | None = None,
+        max_learnings: int | None = None,
+    ) -> list[str]:
+        """Report every integrity problem with the document; ``[]`` when clean.
+
+        Read-only: neither the in-memory records nor the file on disk change.
+        A document that failed to load returns its recorded issues instead of
+        ``[]`` ("unknown" is never "valid"), then runs ordering (REQ-03), the
+        required fields of ``bug_fixes``/``learnings`` (REQ-03), the duplicate
+        brief keys (REQ-04) and finally the optional count limits (REQ-06).
+        """
+
+        if not self._loaded_ok:
+            return list(self._issues)
+        limits = {
+            "runs": max_runs,
+            "bug_fixes": max_bug_fixes,
+            "learnings": max_learnings,
+        }
+        with self._write_lock:
+            snapshot = self.records()
+        errors: list[str] = []
+        for name in _COLLECTIONS:
+            records = snapshot[name]
+            if name == "runs":
+                errors.extend(_validate_runs(records))
+                continue
+            errors.extend(
+                _validate_required(name, records, _VALIDATE_REQUIRED_CODES[name])
+            )
+        for name in _COLLECTIONS:
+            errors.extend(_validate_duplicates(name, snapshot[name]))
+        for name in _COLLECTIONS:
+            errors.extend(_validate_limits(name, snapshot[name], limits[name]))
+        return errors
 
     def export_memory(self, path: str | Path | None = None) -> dict[str, Any]:
         """Return a restorable snapshot of this document, optionally written out.
