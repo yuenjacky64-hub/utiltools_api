@@ -13,6 +13,12 @@ from ai_maintainer.memory.store import (
     MEMORY_DOC_NAME,
     MEMORY_DOC_VERSION,
     MemoryStore,
+    atomic_write_text,
 )
 
-__all__ = ["MEMORY_DOC_NAME", "MEMORY_DOC_VERSION", "MemoryStore"]
+__all__ = [
+    "MEMORY_DOC_NAME",
+    "MEMORY_DOC_VERSION",
+    "MemoryStore",
+    "atomic_write_text",
+]

@@ -29,6 +29,7 @@ import argparse
 import math
 import os
 import signal
+import stat
 import sys
 import time
 from pathlib import Path
@@ -45,6 +46,8 @@ from ai_maintainer.engine import (  # noqa: E402  (import after sys.path bootstr
     RUNTIME_PID_FILE,
 )
 from ai_maintainer.shutdown import SHUTDOWN_POLL_INTERVAL_SEC  # noqa: E402
+from ai_maintainer.config import MaintainerConfig  # noqa: E402
+from ai_maintainer.memory import MEMORY_DOC_NAME, MemoryStore  # noqa: E402
 
 
 def _repo_root() -> Path:
@@ -175,6 +178,191 @@ def _run_stop(
     return 1
 
 
+def _memory_path(
+    *,
+    config_path: str | None,
+    maintainer_root: str | None,
+    state_root: str | None,
+) -> Path | None:
+    """``<state_root>/maintainer_memory.json``, or ``None`` when unresolvable."""
+
+    if state_root:
+        return Path(state_root).expanduser() / MEMORY_DOC_NAME
+    values = checks.resolve_layer_values(
+        config_path=config_path, maintainer_root=maintainer_root
+    )
+    root = checks.resolve_state_root(checks.resolve_path_fields(values))
+    if root is None:
+        return None
+    return root / MEMORY_DOC_NAME
+
+
+def _memory_counts(memory_path: Path) -> dict[str, int]:
+    """Record counts per collection; a missing document counts as zero."""
+
+    document = MemoryStore.load(memory_path).records()
+    return {
+        name: len(document[name])
+        for name in ("runs", "bug_fixes", "learnings")
+    }
+
+
+def _run_memory_export(
+    target: str,
+    *,
+    config_path: str | None,
+    maintainer_root: str | None,
+    state_root: str | None,
+) -> int:
+    """Snapshot the memory document to ``target`` and report one count line."""
+
+    out = Path(target).expanduser()
+    if out.is_symlink():
+        print(f"error: export path is a symlink: {out}", file=sys.stderr)
+        return 1
+    if out.is_dir():
+        print(f"error: export path is a directory: {out}", file=sys.stderr)
+        return 1
+    parent = out.parent
+    if not parent.is_dir():
+        print(f"error: export directory does not exist: {parent}", file=sys.stderr)
+        return 1
+    if not os.access(parent, os.W_OK):
+        print(f"error: export directory is not writable: {parent}", file=sys.stderr)
+        return 1
+
+    memory_path = _memory_path(
+        config_path=config_path,
+        maintainer_root=maintainer_root,
+        state_root=state_root,
+    )
+    if memory_path is None:
+        print("error: no state root configured", file=sys.stderr)
+        return 1
+
+    try:
+        document = MemoryStore.load(memory_path).export_memory(out)
+    except (OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(
+        f"exported memory to {out}: runs={len(document['runs'])} "
+        f"bug_fixes={len(document['bug_fixes'])} "
+        f"learnings={len(document['learnings'])}"
+    )
+    return 0
+
+
+def _run_memory_import(
+    source: str,
+    *,
+    config_path: str | None,
+    maintainer_root: str | None,
+    state_root: str | None,
+) -> int:
+    """Merge ``source`` into the live memory document and report the outcome."""
+
+    incoming = Path(source).expanduser()
+    try:
+        info = os.lstat(incoming)
+    except OSError:
+        print(f"error: import source does not exist: {incoming}", file=sys.stderr)
+        return 1
+    if not stat.S_ISREG(info.st_mode):
+        print(
+            f"error: import source is not a regular file: {incoming}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        with open(incoming, "rb"):
+            pass
+    except OSError:
+        print(f"error: import source is not readable: {incoming}", file=sys.stderr)
+        return 1
+
+    memory_path = _memory_path(
+        config_path=config_path,
+        maintainer_root=maintainer_root,
+        state_root=state_root,
+    )
+    if memory_path is None:
+        print("error: no state root configured", file=sys.stderr)
+        return 1
+
+    try:
+        config = MaintainerConfig.load(
+            config_path=config_path, maintainer_root=maintainer_root
+        )
+    except FileNotFoundError:
+        print(f"error: config path does not exist: {config_path}", file=sys.stderr)
+        return 1
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    parent = memory_path.parent
+    # Directories this run would create, deepest first, so a failed import does
+    # not leave a fresh state root behind.
+    missing: list[Path] = []
+    probe = parent
+    while not probe.exists() and probe != probe.parent:
+        missing.append(probe)
+        probe = probe.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        print(f"error: cannot create {parent}: {error}", file=sys.stderr)
+        return 1
+
+    before = _memory_counts(memory_path)
+    issues = MemoryStore.import_memory(
+        incoming,
+        path=memory_path,
+        max_runs=config.memory_max_runs,
+        max_bug_fixes=config.memory_max_bug_fixes,
+        max_learnings=config.memory_max_learnings,
+    )
+    after = _memory_counts(memory_path)
+    print(
+        f"imported memory from {incoming}: "
+        f"runs+{max(0, after['runs'] - before['runs'])} "
+        f"bug_fixes+{max(0, after['bug_fixes'] - before['bug_fixes'])} "
+        f"learnings+{max(0, after['learnings'] - before['learnings'])}"
+    )
+    for issue in issues:
+        print(issue, file=sys.stderr)
+    if any(
+        issue.startswith(("MEMORY_IMPORT_FAILED:", "MEMORY_CORRUPT:"))
+        for issue in issues
+    ):
+        for directory in missing:
+            try:
+                directory.rmdir()
+            except OSError:
+                break
+        return 1
+    return 0
+
+
+def _run_memory(args: argparse.Namespace) -> int:
+    """Dispatch the ``memory`` subcommand to its export or import half."""
+
+    if args.export_memory:
+        return _run_memory_export(
+            args.export_memory,
+            config_path=args.config,
+            maintainer_root=args.maintainer_root,
+            state_root=args.state_root,
+        )
+    return _run_memory_import(
+        args.import_memory,
+        config_path=args.config,
+        maintainer_root=args.maintainer_root,
+        state_root=args.state_root,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level parser with the peer subcommands."""
 
@@ -269,6 +457,54 @@ def build_parser() -> argparse.ArgumentParser:
         dest="timeout",
         help="seconds to wait for the markers to disappear (default: 10.0)",
     )
+
+    memory_parser = subparsers.add_parser(
+        "memory",
+        help="export or import the maintainer memory document",
+        description=(
+            "Memory backup and restore. --export-memory PATH writes a "
+            "restorable snapshot of <state_root>/maintainer_memory.json; "
+            "--import-memory PATH merges a snapshot back into it, skipping "
+            "records that already exist and pruning to the configured limits. "
+            "Exits 0 when clean and 1 on a path, parse or merge failure."
+        ),
+    )
+    memory_group = memory_parser.add_mutually_exclusive_group(required=True)
+    memory_group.add_argument(
+        "--export-memory",
+        default=None,
+        metavar="PATH",
+        dest="export_memory",
+        help="write a snapshot of the memory document to PATH",
+    )
+    memory_group.add_argument(
+        "--import-memory",
+        default=None,
+        metavar="PATH",
+        dest="import_memory",
+        help="merge the memory snapshot at PATH into the live document",
+    )
+    memory_parser.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        dest="config",
+        help="config.json to read (default: MAINTAINER_CONFIG, else the root)",
+    )
+    memory_parser.add_argument(
+        "--maintainer-root",
+        default=None,
+        metavar="PATH",
+        dest="maintainer_root",
+        help="maintainer root to read (default: MAINTAINER_ROOT, else repo root)",
+    )
+    memory_parser.add_argument(
+        "--state-root",
+        default=None,
+        metavar="PATH",
+        dest="state_root",
+        help="directory holding the memory document (default: resolved data dir)",
+    )
     return parser
 
 
@@ -301,6 +537,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             state_root=args.state_root,
             timeout=args.timeout,
         )
+
+    if args.command == "memory":
+        return _run_memory(args)
 
     parser.print_help(sys.stderr)  # pragma: no cover - unreachable with required=
     return 2
