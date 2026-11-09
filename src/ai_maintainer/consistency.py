@@ -49,6 +49,7 @@ import os
 import threading
 import time
 from collections import deque
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -90,6 +91,13 @@ __all__ = [
     "resolve_roots",
     "run_startup_recovery",
     "state_for_token",
+    # Maintainer-memory record validators (UTILTOOLS-72 REQ-01).
+    "ERROR_CODES",
+    "validate_bug_fix_integrity",
+    "validate_learning_dedup",
+    "validate_memory_document",
+    "validate_memory_records",
+    "validate_run_integrity",
 ]
 
 SIGNAL_FILE = checks.SIGNAL_FILE
@@ -1182,3 +1190,175 @@ def run_startup_recovery(
         roots if roots is not None else resolve_roots(), audit=audit, clock=clock
     )
     return service.recover_all()
+
+
+# --------------------------------------------------------------------------- #
+# Maintainer-memory record validators (UTILTOOLS-72 REQ-01)
+# Additive half: the service above repairs the task *signal* store; these read
+# the memory document, report what is wrong and repair nothing. Each returns
+# ``list[str]`` of ``CODE: detail`` lines from :data:`ERROR_CODES`.
+# --------------------------------------------------------------------------- #
+
+ERROR_CODES = (
+    "MEMORY_CORRUPT",
+    "RUN_DUPLICATE_RUN_ID",
+    "RUN_MISSING_FIELD",
+    "BUG_FIX_DUPLICATE_FIX_ID",
+    "BUG_FIX_ORPHAN_TASK",
+    "LEARNING_DUPLICATE",
+    "LEARNING_MISSING_FIELD",
+)
+
+
+def _records_in(value: Any) -> list[Any] | None:
+    """``value`` as a list of records, or ``None`` when it holds none (no raise)."""
+
+    if isinstance(value, (str, bytes, bytearray, Mapping)):
+        return None
+    return list(value) if isinstance(value, Sequence) else None
+
+
+def _duplicate_ids(records: list[Any], field: str, code: str, label: str) -> list[str]:
+    errors: list[str] = []
+    seen: dict[str, int] = {}
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            continue
+        value = record.get(field)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        key = value.strip()
+        if key in seen:
+            errors.append(
+                f"{code}: {label}[{index}].{field} {key!r} repeats {label}[{seen[key]}]"
+            )
+        else:
+            seen[key] = index
+    return errors
+
+
+def validate_run_integrity(runs: Sequence[Any]) -> list[str]:
+    """Validate ``runs[]``: repeated ``run_id``, then missing run fields."""
+
+    records = _records_in(runs)
+    if records is None:
+        return []
+
+    errors = _duplicate_ids(records, "run_id", "RUN_DUPLICATE_RUN_ID", "runs")
+    for index, run in enumerate(records):
+        if not isinstance(run, Mapping):
+            error = f"runs[{index}] is not a mapping ({type(run).__name__})"
+            errors.append(f"RUN_MISSING_FIELD: {error}")
+            continue
+        for field_name in ("run_id", "task_id", "state"):
+            value = run.get(field_name)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"RUN_MISSING_FIELD: runs[{index}].{field_name} is missing")
+    return errors
+
+
+def validate_bug_fix_integrity(
+    bug_fixes: Sequence[Any], *, known_task_ids: Collection[str] | None = None
+) -> list[str]:
+    """Validate ``bug_fixes[]``: repeated ``fix_id``, then orphaned ``task_id``.
+
+    ``known_task_ids=None`` skips the orphan check.
+    """
+
+    records = _records_in(bug_fixes)
+    if records is None:
+        return []
+
+    errors = _duplicate_ids(records, "fix_id", "BUG_FIX_DUPLICATE_FIX_ID", "bug_fixes")
+    if known_task_ids is None:
+        return errors
+
+    known = {str(task_id).strip() for task_id in known_task_ids}
+    for index, fix in enumerate(records):
+        if not isinstance(fix, Mapping):
+            continue
+        task_id = fix.get("task_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            errors.append(f"BUG_FIX_ORPHAN_TASK: bug_fixes[{index}] has no task_id")
+        elif task_id.strip() not in known:
+            error = f"bug_fixes[{index}].task_id {task_id.strip()!r} is not a known task"
+            errors.append(f"BUG_FIX_ORPHAN_TASK: {error}")
+    return errors
+
+
+def validate_learning_dedup(learnings: Sequence[Any]) -> list[str]:
+    """Validate ``learnings[]``: duplicate normalised ``text``/id, missing text."""
+
+    records = _records_in(learnings)
+    if records is None:
+        return []
+
+    errors: list[str] = []
+    seen_text: dict[str, int] = {}
+    seen_id: dict[str, int] = {}
+    for index, learning in enumerate(records):
+        if not isinstance(learning, Mapping):
+            error = f"learnings[{index}] is not a mapping ({type(learning).__name__})"
+            errors.append(f"LEARNING_MISSING_FIELD: {error}")
+            continue
+        text = learning.get("text")
+        text_key = " ".join(text.split()).casefold() if isinstance(text, str) else ""
+        learning_id = learning.get("learning_id")
+        id_key = learning_id.strip() if isinstance(learning_id, str) else ""
+
+        duplicate = False
+        if text_key:
+            if text_key in seen_text:
+                first = seen_text[text_key]
+                errors.append(
+                    f"LEARNING_DUPLICATE: learnings[{index}].text repeats learnings[{first}]"
+                )
+                duplicate = True
+            else:
+                seen_text[text_key] = index
+        if id_key and id_key in seen_id and not duplicate:
+            errors.append(
+                f"LEARNING_DUPLICATE: learnings[{index}].learning_id {id_key!r} "
+                f"repeats learnings[{seen_id[id_key]}]"
+            )
+        elif id_key and id_key not in seen_id:
+            seen_id[id_key] = index
+        if not text_key:
+            errors.append(f"LEARNING_MISSING_FIELD: learnings[{index}].text is missing")
+
+    return errors
+
+
+def validate_memory_document(document: Any) -> list[str]:
+    """Validate the document envelope: root mapping, ``version 1``, list fields."""
+
+    if not isinstance(document, Mapping):
+        error = f"document root must be a mapping ({type(document).__name__})"
+        return [f"MEMORY_CORRUPT: {error}"]
+
+    errors: list[str] = []
+    version = document.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        errors.append(f"MEMORY_CORRUPT: unsupported document version {version!r}")
+    for name in ("runs", "bug_fixes", "learnings"):
+        value = document.get(name)
+        if not isinstance(value, list):
+            errors.append(f"MEMORY_CORRUPT: {name} must be a list ({type(value).__name__})")
+    return errors
+
+
+def validate_memory_records(
+    records: Mapping[str, Any], *, known_task_ids: Collection[str] | None = None
+) -> list[str]:
+    """Run every check over ``records`` in error-code order; envelope first.
+
+    Shared by ``MemoryStore._save()`` and ``MaintainerEngine._finish_cycle()``;
+    a corrupt envelope short-circuits the record checks.
+    """
+
+    envelope = validate_memory_document(records)
+    if envelope:
+        return envelope
+    return validate_run_integrity(records["runs"]) + validate_bug_fix_integrity(
+        records["bug_fixes"], known_task_ids=known_task_ids
+    ) + validate_learning_dedup(records["learnings"])
