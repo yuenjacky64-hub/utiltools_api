@@ -51,3 +51,9 @@ maintainer.pid
 maintainer.pid.tmp
 maintainer.heartbeat
 maintainer.heartbeat.tmp
+
+### Execution-lease audit log (runtime state, never source) - UTILTOOLS-78 REQ-05 ###
+data/maintainer_leases.log
+data/maintainer_leases.log.tmp
+maintainer_leases.log
+maintainer_leases.log.tmp
