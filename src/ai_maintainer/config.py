@@ -41,6 +41,10 @@ DEFAULT_STALE_RECOVERY_GRACE_SEC = 60.0
 # Upper bound a graceful wind-down waits for an in-flight cycle (clock units).
 DEFAULT_MAX_SHUTDOWN_WAIT_SEC = 300.0
 
+# How many maintainer cycles may run at once (UTILTOOLS-77 REQ-01). ``1``
+# restores the historical one-at-a-time admission.
+DEFAULT_MAX_CONCURRENT_CYCLES = 2
+
 DEFAULT_PRIMARY_CLI: str | None = None
 DEFAULT_PRIMARY_MODEL: str | None = None
 DEFAULT_SECONDARY_CLI: str | None = None
@@ -149,6 +153,7 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
             "max_steps_per_cycle",
             "fingerprint_quarantine_threshold",
             "max_fingerprint_buckets",
+            "max_concurrent_cycles",
         ):
             if isinstance(value, bool):
                 raise ValueError(f"{key} must be an integer")
@@ -240,6 +245,7 @@ class MaintainerConfig:
     stale_timeout_sec: float = DEFAULT_STALE_TIMEOUT_SEC
     stale_recovery_grace_sec: float = DEFAULT_STALE_RECOVERY_GRACE_SEC
     max_shutdown_wait_sec: float = DEFAULT_MAX_SHUTDOWN_WAIT_SEC
+    max_concurrent_cycles: int = DEFAULT_MAX_CONCURRENT_CYCLES
 
     # Path knobs (see ``CONFIG_PATH_FIELDS``). Stored as trimmed ``str | None`` so
     # the single ``Path(...)``/``expanduser()`` conversion site lives in
@@ -296,6 +302,9 @@ class MaintainerConfig:
         buckets = self.max_fingerprint_buckets
         if not isinstance(buckets, int) or isinstance(buckets, bool) or buckets < 1:
             raise ValueError("max_fingerprint_buckets must be >= 1")
+        concurrent = self.max_concurrent_cycles
+        if not isinstance(concurrent, int) or isinstance(concurrent, bool) or concurrent < 1:
+            raise ValueError("max_concurrent_cycles must be >= 1")
         stale_timeout = self.stale_timeout_sec
         if (
             isinstance(stale_timeout, bool)
