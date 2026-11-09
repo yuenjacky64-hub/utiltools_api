@@ -25,6 +25,7 @@ public enum OperationType {
     JSON_TO_NDJSON(true),
     JSON_FROM_NDJSON(true),
     JSON_DIFF(true),
+    JSON_POINTER(true),
     TEXT_TRANSFORM(true),
     TEXT_STATS(true),
     TEXT_REPLACE(true),

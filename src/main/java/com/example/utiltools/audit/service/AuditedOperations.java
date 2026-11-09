@@ -38,6 +38,8 @@ import com.example.utiltools.json.dto.JsonFromNdjsonRequest;
 import com.example.utiltools.json.dto.JsonFromNdjsonResponse;
 import com.example.utiltools.json.dto.JsonMergePatchRequest;
 import com.example.utiltools.json.dto.JsonMergePatchResponse;
+import com.example.utiltools.json.dto.JsonPointerRequest;
+import com.example.utiltools.json.dto.JsonPointerResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonUnflattenRequest;
 import com.example.utiltools.json.dto.JsonUnflattenResponse;
@@ -189,6 +191,10 @@ public class AuditedOperations {
         return record(OperationType.JSON_DIFF, request, () -> jsonService.diff(request));
     }
 
+    public JsonPointerResponse pointer(JsonPointerRequest request) {
+        return record(OperationType.JSON_POINTER, request, () -> jsonService.pointer(request));
+    }
+
     public TextTransformResponse transform(TextTransformRequest request) {
         return record(OperationType.TEXT_TRANSFORM, request, () -> textService.transform(request));
     }
@@ -229,6 +235,7 @@ public class AuditedOperations {
             case JSON_TO_NDJSON -> jsonService.toNdjson((JsonToNdjsonRequest) request);
             case JSON_FROM_NDJSON -> jsonService.fromNdjson((JsonFromNdjsonRequest) request);
             case JSON_DIFF -> jsonService.diff((JsonDiffRequest) request);
+            case JSON_POINTER -> jsonService.pointer((JsonPointerRequest) request);
             case TEXT_TRANSFORM -> textService.transform((TextTransformRequest) request);
             case TEXT_STATS -> textService.stats((TextStatsRequest) request);
             case TEXT_REPLACE -> textService.replace((TextReplaceRequest) request);

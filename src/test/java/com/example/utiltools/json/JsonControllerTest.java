@@ -1156,6 +1156,161 @@ class JsonControllerTest {
                 .andExpect(jsonPath("$.message").value(containsString("records must not exceed 10000")));
     }
 
+    @Test
+    @DisplayName("POST /api/v1/utils/json/pointer - should resolve a node and journal JSON_POINTER")
+    void shouldResolveJsonPointer() throws Exception {
+        String body = requestBody("json", "{\"a\":{\"b\":[1,{\"c\":\"x\"}]},\"a/b\":{\"~key\":7}}",
+                "pointer", "/a/b/1/c");
+
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("JSON pointer resolved successfully"))
+                .andExpect(jsonPath("$.data.pointer").value("/a/b/1/c"))
+                .andExpect(jsonPath("$.data.found").value(true))
+                .andExpect(jsonPath("$.data.value").value("x"))
+                .andExpect(jsonPath("$.data.valueType").value("STRING"))
+                .andExpect(jsonPath("$.requestId").exists());
+
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "{\"a\":1}", "pointer", "/a")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.value").value(1))
+                .andExpect(jsonPath("$.data.valueType").value("NUMBER"));
+
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "{\"a\":true}", "pointer", "/a")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.value").value(true))
+                .andExpect(jsonPath("$.data.valueType").value("BOOLEAN"));
+
+        // Escaping and the empty (whole document) pointer.
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "{\"a/b\":{\"~key\":7}}", "pointer", "/a~1b/~0key")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.value").value(7));
+
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "{\"a\":null}", "pointer", "")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.found").value(true))
+                .andExpect(jsonPath("$.data.valueType").value("OBJECT"));
+
+        String entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[?(@.operation == 'JSON_POINTER')]").exists())
+                .andReturn().getResponse().getContentAsString();
+        String entryId = entryIdOf(entries, "JSON_POINTER");
+        for (JsonNode entry : new ObjectMapper().readTree(entries).path("data")) {
+            if (entryId.equals(entry.path("id").asText())) {
+                assertThat(entry.path("state").asText()).isEqualTo("SUCCEEDED");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/pointer - absent member is 200 with found=false")
+    void shouldReturnNotFoundFlagForAbsentPointerTarget() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "{\"a\":[1]}", "pointer", "/a/5")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.found").value(false))
+                .andExpect(jsonPath("$.data.value").doesNotExist())
+                .andExpect(jsonPath("$.data.valueType").doesNotExist())
+                .andExpect(jsonPath("$.requestId").exists());
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/pointer - should return 400 for malformed and unbounded pointers")
+    void shouldRejectBadJsonPointer() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "{\"a\":1}", "pointer", "a/b")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message", containsString("Malformed JSON Pointer")))
+                .andExpect(jsonPath("$.requestId").exists());
+
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "{\"a\":1}", "pointer", "/a~2b")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "{\"s\":\"x\"}", "pointer", "/s/x")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message", containsString("scalar")));
+
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "{}", "pointer", "/" + "a".repeat(1024))))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message", containsString("1024 characters")));
+
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "{}", "pointer", "/a".repeat(65))))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message", containsString("64 segments")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/pointer - should reject a null pointer")
+    void shouldRejectNullPointer() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"json\": \"{}\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]", containsString("pointer must not be null")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/json/pointer - journalled as JSON_POINTER and replay VERIFIED")
+    void shouldJournalJsonPointerAndReplayVerified() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/json/pointer")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(requestBody("json", "{\"a\":{\"b\":[1,2,3]}}", "pointer", "/a/b/2")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.value").value(3));
+
+        String entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        String entryId = entryIdOf(entries, "JSON_POINTER");
+        int entryCount = new ObjectMapper().readTree(entries).path("data").size();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", entryId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.result.value").value(3))
+                .andExpect(jsonPath("$.data.result.valueType").value("NUMBER"));
+
+        JsonNode afterEntries = new ObjectMapper()
+                .readTree(mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                        .andExpect(status().isOk())
+                        .andReturn().getResponse().getContentAsString())
+                .path("data");
+        assertThat(afterEntries.size()).isEqualTo(entryCount);
+        for (JsonNode entry : afterEntries) {
+            if (entryId.equals(entry.path("id").asText())) {
+                assertThat(entry.path("operation").asText()).isEqualTo("JSON_POINTER");
+                assertThat(entry.path("state").asText()).isEqualTo("SUCCEEDED");
+            }
+        }
+    }
+
     private static String requestBody(String field, String value) throws Exception {
         return new ObjectMapper().createObjectNode().put(field, value).toString();
     }
