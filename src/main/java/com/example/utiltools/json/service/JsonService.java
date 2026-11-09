@@ -34,6 +34,7 @@ import com.example.utiltools.json.exception.JsonPatchRollbackException;
 import com.example.utiltools.resilience.AuditTrail;
 import com.example.utiltools.resilience.CircuitBreaker;
 import com.example.utiltools.resilience.CircuitBreakerConfig;
+import com.example.utiltools.resilience.CircuitBreakerOpenException;
 import com.fasterxml.jackson.core.JsonLocation;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.PrettyPrinter;
@@ -91,16 +92,23 @@ public class JsonService {
 
     private final ObjectMapper objectMapper;
     private final CircuitBreaker circuitBreaker;
+    private final JsonQueryFallbackCache fallbackCache;
 
     public JsonService(ObjectMapper objectMapper) {
         this(objectMapper, new CircuitBreaker("json-query", CircuitBreakerConfig.defaults(),
                 new AuditTrail(DEFAULT_AUDIT_CAPACITY), Clock.systemUTC()));
     }
 
-    @Autowired
     public JsonService(ObjectMapper objectMapper, CircuitBreaker circuitBreaker) {
+        this(objectMapper, circuitBreaker, JsonQueryFallbackCache.defaults());
+    }
+
+    @Autowired
+    public JsonService(ObjectMapper objectMapper, CircuitBreaker circuitBreaker,
+                       JsonQueryFallbackCache fallbackCache) {
         this.objectMapper = objectMapper;
         this.circuitBreaker = circuitBreaker;
+        this.fallbackCache = fallbackCache;
     }
 
     public JsonFormatResponse format(JsonFormatRequest request) {
@@ -171,7 +179,44 @@ public class JsonService {
     }
 
     public JsonQueryResponse query(JsonQueryRequest request) {
-        return circuitBreaker.execute(() -> queryInternal(request));
+        JsonQueryResponse live;
+        try {
+            live = circuitBreaker.execute(() -> queryInternal(request));
+        } catch (CircuitBreakerOpenException open) {
+            if (request == null || !request.staleFallbackRequested()) {
+                throw open;
+            }
+            // Degraded path: a pure read of a side structure. No breaker call, no counter change,
+            // no cooldown or probe-lease movement — the rethrown exception is the same instance.
+            return serveFallbackQuietly(request).orElseThrow(() -> open);
+        }
+        rememberQuietly(request, live);
+        return live;
+    }
+
+    /**
+     * Best effort: a cache fault must never turn a successful live query into a failure.
+     */
+    private void rememberQuietly(JsonQueryRequest request, JsonQueryResponse live) {
+        if (request == null) {
+            return;
+        }
+        try {
+            fallbackCache.remember(request.json(), request.jsonPath(), live);
+        } catch (RuntimeException ignored) {
+            // the cache is an optimisation, never a new failure mode
+        }
+    }
+
+    /**
+     * Best effort: a cache fault must never mask the original {@code CIRCUIT_OPEN} exception.
+     */
+    private Optional<JsonQueryResponse> serveFallbackQuietly(JsonQueryRequest request) {
+        try {
+            return fallbackCache.serve(request.json(), request.jsonPath());
+        } catch (RuntimeException ignored) {
+            return Optional.empty();
+        }
     }
 
     private JsonQueryResponse queryInternal(JsonQueryRequest request) {
