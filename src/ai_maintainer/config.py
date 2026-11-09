@@ -343,9 +343,13 @@ class MaintainerConfig:
         field is emitted, the first failing rule winning in this fixed order:
 
         * ``<field>: not configured`` - required field is ``None`` or blank
+        * ``<field>: path could not be expanded: <text>`` - ``expanduser()`` failed
         * ``<field>: path is not absolute: <path>``
         * ``<field>: not a directory: <path>``
         * ``<field>: not accessible: <path>`` - ``os.R_OK | os.X_OK`` fails
+
+        Every filesystem or proxy call sits behind a guard, so the method is
+        total: for any field content it returns a ``list[str]`` and never raises.
 
         ``<path>`` echoes the configured spelling with ``~`` expanded, never
         ``Path.resolve()``-d, so the message matches what the operator wrote.
@@ -359,8 +363,15 @@ class MaintainerConfig:
                 if name in REQUIRED_CONFIG_PATH_FIELDS:
                     issues.append(f"{name}: not configured")
                 continue
-            path = Path(text).expanduser()
-            if not path.is_absolute():
+            # INV-7: expanduser() is INSIDE the guard -- "~baduser/x" raises
+            # RuntimeError, which no OSError-only handler catches.
+            try:
+                path = Path(text).expanduser()
+                absolute = path.is_absolute()
+            except (OSError, RuntimeError, ValueError):
+                issues.append(f"{name}: path could not be expanded: {text}")
+                continue
+            if not absolute:
                 issues.append(f"{name}: path is not absolute: {path}")
                 continue
             try:
@@ -405,4 +416,8 @@ class MaintainerConfig:
             merged.update(load_config_file(file_path))
         merged.update(_env_layer(os.environ if env is None else env))
         merged.update(_coerce_mapping(overrides, "overrides"))
+        # INV-5: the resolved root is the weakest layer -- an explicit
+        # ``config.json`` key, ``MAINTAINER_MAINTAINER_ROOT`` or a keyword
+        # override all win, so ``validate()`` sees the root the caller selected.
+        merged.setdefault("maintainer_root", str(root))
         return cls(**merged)

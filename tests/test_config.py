@@ -71,7 +71,8 @@ def test_load_without_config_json_falls_back_to_must_config(
 
     monkeypatch.setattr(config_module, "_load_must_config", lambda: {})
     defaults = MaintainerConfig.load(maintainer_root=tmp_path, env={})
-    assert defaults == MaintainerConfig()
+    # INV-5: load() records the resolved root; every non-path field stays default.
+    assert defaults == MaintainerConfig(maintainer_root=str(tmp_path))
 
 
 def test_explicit_config_path_beats_autodetected(

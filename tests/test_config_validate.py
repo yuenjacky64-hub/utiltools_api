@@ -143,7 +143,6 @@ def test_load_then_validate_returns_list_without_raising(
 
     assert isinstance(issues, list)
     assert issues == [
-        "maintainer_root: not configured",
         "ai_team_root: not configured",
         "default_project_root: not configured",
     ]
@@ -163,9 +162,14 @@ def test_path_fields_exist_with_self_attribute_access(
 
     loaded = MaintainerConfig.load(maintainer_root=tmp_path, env={})
 
-    # ``load()`` leaves unset path knobs at ``None`` (no defaulting), which is
-    # what lets ``validate()`` distinguish "unset" from "configured but broken".
-    assert loaded.maintainer_root is None
+    # ``load()`` records the resolved root as the weakest layer (INV-5), which
+    # is what lets ``validate()`` check the root the caller selected; the other
+    # four knobs stay ``None`` so "unset" stays distinguishable from "broken".
+    assert loaded.maintainer_root == str(tmp_path)
+    assert loaded.ai_team_root is None
+    assert loaded.default_project_root is None
+    assert loaded.data_dir is None
+    assert loaded.reports_dir is None
     assert issubclass(type(loaded), MaintainerConfig)
     assert REQUIRED_CONFIG_PATH_FIELDS == (
         "maintainer_root",
@@ -188,3 +192,42 @@ def test_config_json_accepts_path_keys(tmp_path: Path, empty_must_config: None) 
     for name in CONFIG_PATH_FIELDS:
         assert getattr(config, name) == payload[name]
     assert config.validate() == []
+
+
+# --- DOD-09 / REQ-01 -------------------------------------------------------
+
+
+def test_load_records_resolved_root_as_weakest_layer(
+    tmp_path: Path, empty_must_config: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MAINTAINER_MAINTAINER_ROOT", str(tmp_path / "env-root"))
+    config = MaintainerConfig.load(maintainer_root=tmp_path, env=dict(os.environ))
+
+    # env beats the fallback layer (INV-5)
+    assert config.maintainer_root == str(tmp_path / "env-root")
+
+    monkeypatch.delenv("MAINTAINER_MAINTAINER_ROOT")
+    assert (
+        MaintainerConfig.load(maintainer_root=tmp_path, env={}).maintainer_root
+        == str(tmp_path)
+    )
+
+
+# --- DOD-10 / REQ-01, REQ-02 ----------------------------------------------
+
+
+def test_validate_never_raises_on_hostile_paths() -> None:
+    for raw in (
+        "~utiltools75-no-such-user/x",
+        "/tmp/\x00evil",
+        "/" + "a" * 5000,
+        "   ",
+        "relative/path",
+    ):
+        issues = MaintainerConfig(maintainer_root=raw).validate()
+        assert isinstance(issues, list)
+        assert all(isinstance(item, str) for item in issues)
+
+    assert "path could not be expanded: " in MaintainerConfig(
+        maintainer_root="~utiltools75-no-such-user/x"
+    ).validate()[0]
