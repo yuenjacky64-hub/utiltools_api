@@ -627,3 +627,353 @@ def test_cli_help_lists_the_memory_subcommand(tmp_path: Path) -> None:
     assert memory_help.returncode == 0
     assert "--export-memory" in memory_help.stdout
     assert "--import-memory" in memory_help.stdout
+
+
+# --- REQ-01/03/04/06: MemoryStore.validate() -------------------------------
+
+
+def _labelled_bug_fix(
+    commit: str, task_id: str, at: float, *, component: str | None = None
+) -> dict[str, object]:
+    """Bug fix carrying ``component`` only when asked (ASM-01)."""
+
+    record = _bug_fix(commit, task_id, at)
+    if component is not None:
+        record.pop("summary", None)
+        record["component"] = component
+    return record
+
+
+def test_validate_accepts_a_valid_document(tmp_path: Path) -> None:
+    """DOD-01: a clean document returns ``[]`` and writes nothing."""
+
+    path = _seed(tmp_path / "state")
+    store = MemoryStore.load(path)
+    assert store.validate() == []
+    assert store.validate(max_runs=50, max_bug_fixes=50, max_learnings=50) == []
+
+
+def test_validate_flags_unsorted_runs(tmp_path: Path) -> None:
+    """DOD-04: newest-first runs are reported once per inversion with indices."""
+
+    path = _write_document(
+        tmp_path / "state",
+        _document(runs=[_run("T2", "OK", 30.0), _run("T1", "OK", 10.0)]),
+    )
+    errors = MemoryStore.load(path).validate()
+    assert len(errors) == 1
+    assert errors[0].startswith("MEMORY_ORDER: runs[1].at ")
+    assert "runs[0].at" in errors[0]
+
+
+def test_validate_flags_missing_run_timestamp(tmp_path: Path) -> None:
+    """DOD-09: a run without ``at`` is reported as missing."""
+
+    broken = _run("T2", "OK", 0.0)
+    broken.pop("at")
+    path = _write_document(
+        tmp_path / "state",
+        _document(runs=[_run("T1", "OK", 10.0), broken]),
+    )
+    errors = MemoryStore.load(path).validate()
+    assert "MEMORY_ORDER: runs[1].at is missing" in errors
+
+
+def test_validate_flags_missing_bug_fix_fields(tmp_path: Path) -> None:
+    """DOD-02: blank ``task_id``/``git_commit`` are reported per record."""
+
+    broken = _bug_fix("abc1234", "T1", 11.0)
+    broken["task_id"] = "   "
+    broken["git_commit"] = ""
+    path = _write_document(tmp_path / "state", _document(bug_fixes=[broken]))
+    errors = MemoryStore.load(path).validate()
+    assert "BUG_FIX_MISSING_FIELD: bug_fixes[0].task_id is missing" in errors
+    assert "BUG_FIX_MISSING_FIELD: bug_fixes[0].git_commit is missing" in errors
+
+
+def test_validate_accepts_component_and_summary_labels(tmp_path: Path) -> None:
+    """DOD-05: ``component`` or ``summary`` satisfies the label rule."""
+
+    path = _write_document(
+        tmp_path / "state",
+        _document(bug_fixes=[_labelled_bug_fix("abc1234", "T1", 11.0, component="mem")]),
+    )
+    assert MemoryStore.load(path).validate() == []
+
+    bare = _bug_fix("abc1234", "T1", 11.0)
+    bare.pop("summary")
+    path = _write_document(tmp_path / "state", _document(bug_fixes=[bare]))
+    errors = MemoryStore.load(path).validate()
+    assert "BUG_FIX_MISSING_FIELD: bug_fixes[0].component is missing" in errors
+
+
+def test_validate_flags_empty_learning_text(tmp_path: Path) -> None:
+    """DOD-06: blank and whitespace-only lesson text are reported."""
+
+    path = _write_document(
+        tmp_path / "state",
+        _document(learnings=[_learning("L1", "", 12.0)]),
+    )
+    errors = MemoryStore.load(path).validate()
+    assert "LEARNING_MISSING_FIELD: learnings[0].text is missing" in errors
+
+    path = _write_document(
+        tmp_path / "state",
+        _document(learnings=[_learning("L1", "   ", 12.0)]),
+    )
+    errors = MemoryStore.load(path).validate()
+    assert "LEARNING_MISSING_FIELD: learnings[0].text is missing" in errors
+
+
+def test_validate_flags_duplicate_brief_keys(tmp_path: Path) -> None:
+    """DOD-07: duplicates by ``task_id``/``git_commit``/``at`` name both indices."""
+
+    document = _document(
+            runs=[_run("T1", "OK", 10.0), _run("T1", "FAILED", 20.0)],
+            bug_fixes=[
+                _labelled_bug_fix("abc1234", "T1", 11.0, component="mem"),
+                _labelled_bug_fix("abc1234", "T2", 12.0, component="mem"),
+            ],
+            learnings=[
+                _learning("L1", "prefer atomic writes", 13.0),
+                _learning("L2", "prune before save", 13.0),
+            ],
+    )
+    # Distinct identity ids: only the REQ-04 brief keys repeat.
+    for index, name in enumerate(("run_id", "fix_id")):
+        document["runs"][index][name] = f"r{index}"
+    document["bug_fixes"][0]["fix_id"] = "f0"
+    document["bug_fixes"][1]["fix_id"] = "f1"
+    path = _write_document(tmp_path / "state", document)
+    errors = MemoryStore.load(path).validate()
+    assert any(
+        error.startswith("RUN_DUPLICATE_TASK_ID: runs[1].task_id")
+        and error.endswith("runs[0]")
+        for error in errors
+    )
+    assert any(
+        error.startswith("BUG_FIX_DUPLICATE_GIT_COMMIT: bug_fixes[1].git_commit")
+        and error.endswith("bug_fixes[0]")
+        for error in errors
+    )
+    assert any(
+        error.startswith("LEARNING_DUPLICATE: learnings[1].at")
+        and error.endswith("learnings[0]")
+        for error in errors
+    )
+
+
+def test_validate_reports_corrupt_document_as_errors(tmp_path: Path) -> None:
+    """DOD-12: a corrupt document is never reported as valid."""
+
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    (state / MEMORY_DOC_NAME).write_text("{not json", encoding="utf-8")
+    errors = MemoryStore.load(state / MEMORY_DOC_NAME).validate()
+    assert errors
+    assert any(error.startswith("MEMORY_CORRUPT:") for error in errors)
+
+
+def test_validate_enforces_config_limits(tmp_path: Path) -> None:
+    """DOD-10: over-limit collections are reported; ``None`` stays silent."""
+
+    path = _write_document(
+        tmp_path / "state",
+        _document(runs=[_run("T1", "OK", 10.0), _run("T2", "OK", 20.0)]),
+    )
+    store = MemoryStore.load(path)
+    assert store.validate() == []
+    assert store.validate(max_runs=5) == []
+    errors = store.validate(max_runs=1, max_bug_fixes=0)
+    assert "MEMORY_OVER_LIMIT: runs has 2 records, limit is 1" in errors
+    assert not any("bug_fixes" in error for error in errors)
+
+
+def test_validate_does_not_mutate_or_write(tmp_path: Path) -> None:
+    """DOD-11: records and file bytes are identical before/after."""
+
+    path = _write_document(
+        tmp_path / "state",
+        _document(
+            runs=[_run("T2", "OK", 30.0), _run("T1", "OK", 10.0)],
+            learnings=[_learning("L1", "prefer atomic writes", 12.0)],
+        ),
+    )
+    before_bytes = path.read_bytes()
+    store = MemoryStore.load(path)
+    before_records = store.records()
+    assert store.validate(max_runs=1) != []
+    assert store.records() == before_records
+    assert path.read_bytes() == before_bytes
+
+
+def test_cli_validate_memory_reports_valid_document(tmp_path: Path) -> None:
+    """DOD-03: one success line, exit 0."""
+
+    root = tmp_path
+    state = root / "state"
+    _seed(state)
+    config = _config(root)
+    result = _cli(
+        [
+            "memory",
+            "--validate-memory",
+            "--state-root",
+            str(state),
+            "--config",
+            str(config),
+            "--maintainer-root",
+            str(root),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == (
+        f"memory is valid: runs=1 bug_fixes=1 learnings=1 "
+        f"({state / MEMORY_DOC_NAME})"
+    )
+
+
+def test_cli_validate_memory_reports_errors_and_exits_1(tmp_path: Path) -> None:
+    """DOD-08: ``error: N validation problem(s)`` header, per-error lines, exit 1."""
+
+    root = tmp_path
+    state = root / "state"
+    _write_document(
+        state,
+        _document(runs=[_run("T2", "OK", 30.0), _run("T1", "OK", 10.0)]),
+    )
+    config = _config(root)
+    result = _cli(
+        [
+            "memory",
+            "--validate-memory",
+            "--state-root",
+            str(state),
+            "--config",
+            str(config),
+            "--maintainer-root",
+            str(root),
+        ]
+    )
+    assert result.returncode == 1, result.stdout
+    assert result.stdout == ""
+    assert (
+        f"error: 1 validation problem(s) in {state / MEMORY_DOC_NAME}"
+        in result.stderr
+    )
+    assert "MEMORY_ORDER: runs[1].at" in result.stderr
+    assert "runs[0].at" in result.stderr
+
+
+def test_cli_validate_memory_without_config_skips_limits(tmp_path: Path) -> None:
+    """DOD-13: ``--state-root`` alone is enough; limits skipped with a warning."""
+
+    state = tmp_path / "state"
+    _seed(state)
+    empty = tmp_path / "no-config"
+    empty.mkdir()
+    result = _cli(
+        [
+            "memory",
+            "--validate-memory",
+            "--state-root",
+            str(state),
+            "--maintainer-root",
+            str(empty),
+        ]
+    )
+    assert result.returncode == 0, result.stderr
+    assert "warning: memory limits not checked" in result.stderr
+    assert "memory is valid: runs=1 bug_fixes=1 learnings=1" in result.stdout
+
+
+# --- F1/F2/F3: validate() totality over untrusted timestamps ----------------
+
+
+def test_validate_flags_unorderable_run_timestamps(tmp_path: Path) -> None:
+    """F1/F2: an oversized or ``NaN`` ``at`` is reported, never raised."""
+
+    path = _write_document(
+        tmp_path / "state",
+        _document(runs=[_run("T1", "OK", 10.0), _run("T2", "OK", 10**400)]),
+    )
+    errors = MemoryStore.load(path).validate()
+    assert "MEMORY_ORDER: runs[1].at is missing" in errors
+
+    path = _write_document(
+        tmp_path / "state",
+        _document(runs=[_run("T1", "OK", 10.0), _run("T2", "OK", float("nan"))]),
+    )
+    errors = MemoryStore.load(path).validate()
+    assert "MEMORY_ORDER: runs[1].at is missing" in errors
+
+
+def test_validate_tolerates_unorderable_learning_timestamps(
+    tmp_path: Path,
+) -> None:
+    """F1: an oversized lesson ``at`` cannot raise out of the dedupe pass."""
+
+    huge = 10**400
+    path = _write_document(
+        tmp_path / "state",
+        _document(
+            learnings=[_learning("L1", "prefer atomic writes", huge) for _ in range(1)]
+            + [_learning("L2", "prune before save", huge)]
+        ),
+    )
+    errors = MemoryStore.load(path).validate()
+    # An unplaceable timestamp carries no duplicate key, so it is never merged.
+    assert not any(error.startswith("LEARNING_DUPLICATE") for error in errors)
+
+
+def test_validate_duplicate_lesson_line_renders_bare_timestamp(
+    tmp_path: Path,
+) -> None:
+    """F3: Plan §4.1 step 6 pins the bare timestamp, not a quoted string."""
+
+    path = _write_document(
+        tmp_path / "state",
+        _document(
+            learnings=[
+                _learning("L1", "prefer atomic writes", 13.0),
+                _learning("L2", "prune before save", 13.0),
+            ],
+        ),
+    )
+    errors = MemoryStore.load(path).validate()
+    assert (
+        "LEARNING_DUPLICATE: learnings[1].at 13.0 repeats learnings[0]" in errors
+    )
+
+
+def test_cli_validate_memory_reports_unorderable_timestamp(
+    tmp_path: Path,
+) -> None:
+    """F1: the CLI renders a report for an oversized ``at``, not a traceback."""
+
+    root = tmp_path
+    state = root / "state"
+    _write_document(
+        state,
+        _document(runs=[_run("T1", "OK", 10.0), _run("T2", "OK", 10**400)]),
+    )
+    config = _config(root)
+    result = _cli(
+        [
+            "memory",
+            "--validate-memory",
+            "--state-root",
+            str(state),
+            "--config",
+            str(config),
+            "--maintainer-root",
+            str(root),
+        ]
+    )
+    assert result.returncode == 1, result.stdout
+    assert "Traceback" not in result.stderr
+    assert (
+        f"error: 1 validation problem(s) in {state / MEMORY_DOC_NAME}"
+        in result.stderr
+    )
+    assert "MEMORY_ORDER: runs[1].at is missing" in result.stderr
