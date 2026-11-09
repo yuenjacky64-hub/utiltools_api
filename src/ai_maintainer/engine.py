@@ -21,7 +21,10 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
+    from ai_maintainer.memory.store import MemoryStore
 
 from ai_maintainer.config import MaintainerConfig
 from ai_maintainer.tasks.curriculum import (
@@ -132,6 +135,7 @@ class MaintainerEngine:
         clock: Callable[[], float] = time.monotonic,
         probe: Callable[[str], bool] | None = None,
         signal_gate: Callable[[str], Any] | None = None,
+        memory: "MemoryStore | None" = None,
     ) -> None:
         self._curriculum = curriculum
         self._config = config if config is not None else curriculum.config
@@ -144,6 +148,10 @@ class MaintainerEngine:
         self._task_fingerprint: dict[str, str] = {}
         self._probe = probe
         self._signal_gate = signal_gate
+        # UTILTOOLS-72 REQ-03: injected memory store (``None`` disables it) and
+        # the issues its last consistency check found.
+        self._memory = memory
+        self._last_cycle_issues: list[str] = []
         self._scheduler_thread: threading.Thread | None = None
         self._scheduler_stop = threading.Event()
 
@@ -175,6 +183,16 @@ class MaintainerEngine:
 
         with self._lock:
             self._signal_gate = gate
+
+    def install_memory(self, memory: "MemoryStore | None") -> None:
+        """Install the REQ-03 memory store (``None`` uninstalls it).
+
+        Same seam as ``install_signal_gate()``: the API layer builds the engine
+        before the state root is known, and tests inject a ``tmp_path`` store.
+        """
+
+        with self._lock:
+            self._memory = memory
 
     def run_cycle(self) -> CycleResult:
         """Execute at most ``max_steps_per_cycle`` monitor steps."""
@@ -264,6 +282,10 @@ class MaintainerEngine:
                     self._record_cycle_outcome("PROGRESS", task, cycle=cycle)
             steps += 1
 
+        # REQ-03: every memory record is now updated, so validate the store and
+        # persist it before the cycle report is built. Never raises.
+        self._finish_cycle(cycle)
+
         return CycleResult(
             cycle=cycle,
             monitored=monitored_name,
@@ -271,6 +293,44 @@ class MaintainerEngine:
             preempted=preempted_name,
             steps=steps,
         )
+
+    def _finish_cycle(self, cycle: int) -> list[str]:
+        """Validate and persist the memory records at the end of a cycle.
+
+        Called by ``run_cycle()`` after every ``_record_cycle_outcome()`` call
+        and before the ``CycleResult`` report is built, so the report always
+        describes a store that has already been checked (REQ-03). The known
+        task-id set is copied under ``_lock``; validation and the store write
+        run outside it, because they touch the file system. With no memory
+        store installed the engine behaves exactly as before.
+        """
+
+        with self._lock:
+            memory = self._memory
+            known_task_ids = {task.name for task in self._curriculum.specs}
+
+        if memory is None:
+            with self._lock:
+                self._last_cycle_issues = []
+            return []
+
+        try:
+            issues = list(memory.save(known_task_ids=known_task_ids))
+        except Exception as error:  # pragma: no cover - defensive
+            # Memory bookkeeping must never fail a cycle (REQ-03).
+            issues = [f"MEMORY_CORRUPT: memory save failed ({type(error).__name__})"]
+
+        with self._lock:
+            self._last_cycle_issues = list(issues)
+            self._events.append(
+                {
+                    "event": "CONSISTENCY",
+                    "kind": "CONSISTENCY",
+                    "cycle": cycle,
+                    "codes": list(issues),
+                }
+            )
+        return issues
 
     def snapshot(self) -> dict:
         """Lock-protected view of the monitored task and pending priorities."""

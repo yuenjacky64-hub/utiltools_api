@@ -37,3 +37,7 @@ build/
 .parent/recovery_journal.jsonl.tmp
 recovery_journal.jsonl
 recovery_journal.jsonl.tmp
+
+### Maintainer memory document (runtime state, never source) - UTILTOOLS-72 REQ-02 ###
+maintainer_memory.json
+maintainer_memory.json.tmp
