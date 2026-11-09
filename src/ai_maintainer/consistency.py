@@ -56,10 +56,13 @@ from typing import Any, Callable, Mapping
 from ai_maintainer import checks
 from ai_maintainer.audit import (
     PHASE_FAILED,
+    PHASE_PENDING,
     PHASE_REFUSED,
     PHASE_SUCCEEDED,
     AuditedOperations,
     OperationType,
+    entries_by_id,
+    read_journal,
 )
 from ai_maintainer.tasks.curriculum import TaskState
 
@@ -108,6 +111,19 @@ ACTION_NOOP = "NOOP"
 ACTION_ALIGN_TO_ARCHIVE = "ALIGN_TO_ARCHIVE"
 ACTION_ALIGN_SIGNAL_TO_PROGRESS = "ALIGN_SIGNAL_TO_PROGRESS"
 ACTION_REFUSED_MANUAL_OVERRIDE = "REFUSED_MANUAL_OVERRIDE"
+
+#: Journal reconciliation (REQ-01..REQ-04): the ``after{}`` key that marks a
+#: terminal line as produced by the reconciliation pass rather than by a live
+#: repair, plus its outcome vocabulary.
+JOURNAL_RECONCILIATION = "journal_reconciliation"
+RECONCILIATION_WRITE_CONFIRMED = "WRITE_CONFIRMED"
+RECONCILIATION_WRITE_NOT_APPLIED = "WRITE_NOT_APPLIED"
+RECONCILIATION_REFUSED = "REFUSED"
+
+#: Bound on the per-entry detail list in the reconciliation counters; counters
+#: themselves stay exact, so a journal with thousands of orphans cannot bloat
+#: the startup summary.
+RECONCILIATION_ENTRIES_LIMIT = 50
 
 REPORT_STORES = ("archive", "signal", "progress", "timeline")
 
@@ -398,15 +414,30 @@ class StoreRoots:
 
 
 def _read_signal(task_dir: Path) -> StoreReading:
+    return _read_signal_checked(task_dir)[0]
+
+
+def _read_signal_checked(task_dir: Path) -> tuple[StoreReading, bool]:
+    """``(reading, unreadable)`` for one slot's signal store.
+
+    Same evidence as :func:`_read_signal`, but distinguishes *absent* from
+    *unreadable*: a ``_signal.txt`` that exists yet cannot be opened (or is a
+    symlink that would lead outside the slot) is reported as ``unreadable`` so
+    a caller that must not guess -- the journal reconciliation pass -- can
+    refuse instead of asserting the file is gone.
+    """
+
     path = task_dir / SIGNAL_FILE
     try:
+        if path.is_symlink():
+            return StoreReading(), True
         if not path.is_file():
-            return StoreReading()
+            return StoreReading(), False
         with path.open(encoding="utf-8", errors="replace") as handle:
             head = _first_nonempty_line(handle.read(HEAD_LIMIT))
     except OSError:
-        return StoreReading()
-    return StoreReading(present=True, state=token_state(head), evidence=head)
+        return StoreReading(), True
+    return StoreReading(present=True, state=token_state(head), evidence=head), False
 
 
 def _read_progress(task_dir: Path) -> StoreReading:
@@ -647,6 +678,169 @@ def _reason_for(snapshot: TaskStoreSnapshot, default: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Journal reconciliation (REQ-01 .. REQ-04)
+# --------------------------------------------------------------------------- #
+
+
+def _reconcile_target_task(line: Mapping[str, Any], roots: StoreRoots) -> str | None:
+    """``task`` of a journal line, but only as one safe component (REQ-02).
+
+    A journal line is untrusted input (another process, a restored backup or a
+    hand-edited file can append anything), so the field is only accepted when
+    it is a non-empty string without separators, ``.``/``..`` or ``NUL`` *and*
+    the resolved slot still lives inside ``state_root``. Anything else returns
+    ``None`` and can at worst produce a ``REFUSED`` line — never a read outside
+    the state root, and never a store write (this pass writes only the journal).
+    """
+
+    task = line.get("task")
+    if not isinstance(task, str) or not task:
+        return None
+    if "\x00" in task or task in (".", ".."):
+        return None
+    if "/" in task or "\\" in task:
+        return None
+    for separator in (os.sep, os.altsep):
+        if separator and separator in task:
+            return None
+    state_root = roots.state_root
+    if state_root is None:
+        return None
+    task_dir = state_root / task
+    try:
+        if task_dir.is_symlink():
+            return None
+        resolved_root = state_root.resolve()
+        resolved = task_dir.resolve()
+    except OSError:
+        return None
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        return None
+    return task
+
+
+def _live_signal(roots: StoreRoots, task_id: str) -> tuple[bool, str | None, bool]:
+    """``(present, head, flagged)`` of the live ``_signal.txt`` for a journal line.
+
+    Read-only: :func:`_read_signal_checked` opens the file for reading and never
+    writes, and a missing file is absent evidence (``present is False``,
+    ``flagged is False``). A slot that turned into a symlink or escaped the root
+    after :func:`_reconcile_target_task` vetted it -- or a signal store that
+    exists but cannot be read -- is reported as ``flagged``: the pass never
+    obtained evidence, so plan §4a/§4b row 6 requires ``REFUSED``
+    (``reason="unreadable_store"``) rather than a positive
+    ``WRITE_NOT_APPLIED`` claim.
+    """
+
+    state_root = roots.state_root
+    if state_root is None:  # pragma: no cover - defensive
+        return False, None, True
+    task_dir = state_root / task_id
+    try:
+        if task_dir.is_symlink():
+            return False, None, True
+        resolved_root = state_root.resolve()
+        resolved = task_dir.resolve()
+    except OSError:
+        return False, None, True
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        return False, None, True
+    reading, unreadable = _read_signal_checked(task_dir)
+    return reading.present, reading.evidence, unreadable
+
+
+def _string_field(source: Mapping[str, Any] | None, key: str) -> str | None:
+    """One capped string field of a journal pre-image (non-strings are dropped)."""
+
+    if source is None:
+        return None
+    value = source.get(key)
+    return _cap(value) if isinstance(value, str) else None
+
+
+def _note(
+    counters: dict[str, Any],
+    entry_id: str,
+    outcome: str,
+    error: str | None = None,
+) -> None:
+    """Append one bounded per-entry detail line to the counters."""
+
+    entries = counters["entries"]
+    if len(entries) >= RECONCILIATION_ENTRIES_LIMIT:
+        counters["entries_truncated"] = True
+        return
+    entries.append({"entry_id": entry_id, "outcome": outcome, "error": error})
+
+
+def _resolve_orphan(
+    roots: StoreRoots, line: Mapping[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """Decide the missing terminal phase of one orphan ``PENDING`` line.
+
+    Pure: classifies against the PENDING pre-image and the *current* snapshot
+    only. The ordered checks are the plan's §4b table — the expected token
+    first, then the pre-image, then absence, then any third value. Row order
+    matters: a pre-image that already equals the expected token is
+    ``WRITE_CONFIRMED``, never ``WRITE_NOT_APPLIED``.
+    """
+
+    before = line.get("before")
+    before = before if isinstance(before, Mapping) else None
+    canonical = before.get("canonical") if before is not None else None
+    expected = token_for_state(canonical if isinstance(canonical, str) else None)
+    op = line.get("op")
+    op = op.value if isinstance(op, OperationType) else op
+    pre_head = _string_field(before, "signal_head")
+    # Plan §4b: every field copied into ``after`` is bounded by ``_cap``.
+    capped_canonical = _cap(canonical if isinstance(canonical, str) else None)
+    base = {
+        JOURNAL_RECONCILIATION: RECONCILIATION_REFUSED,
+        "signal_head": pre_head,
+        "expected_token": expected,
+        "canonical": capped_canonical,
+    }
+
+    if op != OperationType.CONSISTENCY_RECOVERY.value:
+        return PHASE_REFUSED, {**base, "reason": "unsupported_op"}
+    if before is None or not isinstance(canonical, str):
+        return PHASE_REFUSED, {**base, "reason": "malformed_before"}
+    if expected is None:
+        return PHASE_REFUSED, {**base, "reason": "no_writable_token"}
+
+    task = _reconcile_target_task(line, roots)
+    if task is None:
+        return PHASE_REFUSED, {**base, "reason": "invalid_task"}
+    present, head, flagged = _live_signal(roots, task)
+    if flagged:
+        # No evidence was obtained, so neither confirm nor deny the write.
+        return PHASE_REFUSED, {**base, "reason": "unreadable_store"}
+
+    canonical_source = _string_field(before, "canonical_source")
+    if head == expected:
+        return PHASE_SUCCEEDED, {
+            JOURNAL_RECONCILIATION: RECONCILIATION_WRITE_CONFIRMED,
+            "signal_head": head,
+            "expected_token": expected,
+            "canonical": capped_canonical,
+            "canonical_source": canonical_source,
+        }
+    not_applied = {
+        JOURNAL_RECONCILIATION: RECONCILIATION_WRITE_NOT_APPLIED,
+        "signal_head": head,
+        "signal_present": present,
+        "expected_token": expected,
+        "canonical": capped_canonical,
+        "canonical_source": canonical_source,
+    }
+    if present and head == pre_head:
+        return PHASE_FAILED, not_applied
+    if not present:
+        return PHASE_FAILED, {**not_applied, "reason": "signal_absent"}
+    return PHASE_REFUSED, {**base, "signal_head": head, "reason": "head_diverged"}
+
+
+# --------------------------------------------------------------------------- #
 # Service
 # --------------------------------------------------------------------------- #
 
@@ -738,6 +932,73 @@ class ConsistencyService:
 
     # ---------------------------------------------------------------- recovery
 
+    def reconcile_journal(self) -> dict[str, Any]:
+        """Terminalise every orphan ``PENDING`` group in ``recovery_journal.jsonl``.
+
+        A crash between a repair's ``PENDING`` line and its terminal line leaves
+        the journal claiming an operation is in flight forever. This pass reads
+        the journal under the service lock, resolves each orphan against the
+        *live* signal head through its pre-image (REQ-02) and appends the missing
+        terminal line with :meth:`AuditedOperations.append_terminal`.
+
+        Append-only and read-only otherwise (INV-JR-2): no store, archive, or
+        timeline byte is written, and no ``PENDING`` line is ever appended
+        (INV-JR-3). Terminal groups are skipped, so a second call reports
+        ``scanned_pending == reconciled == 0`` and appends nothing (INV-JR-4);
+        a journal path of ``None`` is a no-op. One failing entry is counted in
+        ``failed`` and never aborts the pass (INV-JR-5).
+
+        Returns ``{"journal", "scanned_pending", "confirmed", "not_applied",
+        "refused", "failed", "reconciled", "entries", "entries_truncated"}``.
+        The lock is in-process only: cross-process atomicity is not claimed, and
+        a duplicate terminal line from a racing process is harmless because the
+        last phase of the group is then terminal and no store write follows.
+        """
+
+        with self._lock:
+            journal_path = self._roots.journal_path
+            counters: dict[str, Any] = {
+                "journal": None if journal_path is None else str(journal_path),
+                "scanned_pending": 0,
+                "confirmed": 0,
+                "not_applied": 0,
+                "refused": 0,
+                "failed": 0,
+                "reconciled": 0,
+                "entries": [],
+                "entries_truncated": False,
+            }
+            if journal_path is None:
+                return counters
+            for entry_id, group in entries_by_id(read_journal(journal_path)).items():
+                last = group[-1]
+                if last.get("phase") != PHASE_PENDING:
+                    continue
+                counters["scanned_pending"] += 1
+                try:
+                    phase, after = _resolve_orphan(self._roots, last)
+                    self._audit.append_terminal(last, phase, after)
+                except OSError as error:
+                    counters["failed"] += 1
+                    _note(counters, entry_id, "journal_write_failed", type(error).__name__)
+                    continue
+                except Exception as error:  # pragma: no cover - defensive
+                    counters["failed"] += 1
+                    _note(counters, entry_id, "reconcile_error", type(error).__name__)
+                    continue
+                counters[
+                    {
+                        PHASE_SUCCEEDED: "confirmed",
+                        PHASE_FAILED: "not_applied",
+                        PHASE_REFUSED: "refused",
+                    }[phase]
+                ] += 1
+                _note(counters, entry_id, after[JOURNAL_RECONCILIATION], None)
+            counters["reconciled"] = (
+                counters["confirmed"] + counters["not_applied"] + counters["refused"]
+            )
+            return counters
+
     def recover_all(self) -> dict[str, Any]:
         """Repair every inconsistent task; return the startup-job summary."""
 
@@ -750,9 +1011,28 @@ class ConsistencyService:
             "journal": None
             if self._roots.journal_path is None
             else str(self._roots.journal_path),
+            "journal_reconciliation": None,
             "tasks": [],
         }
         with self._lock:
+            # REQ-03: reconcile torn journal pairs strictly *before* the scan, so
+            # the PENDING lines this run writes are never mistaken for orphans.
+            try:
+                summary["journal_reconciliation"] = self.reconcile_journal()
+            except Exception as error:  # pragma: no cover - defensive
+                summary["journal_reconciliation"] = {
+                    "journal": summary["journal"],
+                    "scanned_pending": 0,
+                    "confirmed": 0,
+                    "not_applied": 0,
+                    "refused": 0,
+                    "failed": 1,
+                    "reconciled": 0,
+                    "entries": [
+                        {"outcome": "reconcile_error", "error": type(error).__name__}
+                    ],
+                    "entries_truncated": False,
+                }
             for task_id in _known_task_ids(self._roots):
                 summary["scanned"] += 1
                 try:
@@ -891,8 +1171,11 @@ def run_startup_recovery(
 
     Called once from :func:`ai_maintainer.api.serve` without arguments. Returns
     ``{"scanned", "inconsistent", "recovered", "refused", "failed", "journal",
-    "tasks"}``; the job never raises — an unreadable store is skipped and a
-    failed write leaves a ``FAILED`` journal line plus the untouched store.
+    "journal_reconciliation", "tasks"}``; the job never raises — an unreadable
+    store is skipped, a failed write leaves a ``FAILED`` journal line plus the
+    untouched store, and ``journal_reconciliation`` carries the torn-pair
+    counters (``scanned_pending``, ``confirmed``, ``not_applied``, ``refused``,
+    ``failed``) of the pass that ran before the scan.
     """
 
     service = ConsistencyService(
