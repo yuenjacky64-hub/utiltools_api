@@ -25,13 +25,14 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.PriorityQueue;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -56,10 +57,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * to the pool by the submitting thread: it is appended to the FIFO lane of its normalized client key
  * and a single dispatcher thread hands attempts over in round-robin order across the clients that have
  * queued work, so one client can never occupy both workers plus the whole queue while other clients
- * wait. Dispatch is virtual-time round robin: the client with the fewest dispatches so far is served
- * next, so while several clients have queued work no client is dispatched twice before every other
- * client with queued work has been dispatched once, i.e. a client waits behind at most
- * {@code (clients-with-queued-work - 1)} dispatches, however deep any single lane grows. Fairness
+ * wait. Dispatch is a <em>round barrier</em> round robin: the dispatcher walks the ring of clients with
+ * queued work, serving each at most once per round, and only opens the next round when no client with a
+ * pending lane is still unserved in the current one. Because a client that enqueues mid-round joins that
+ * round at the tail of the ring (its cursor starts at "not yet served"), the guarantee is structural:
+ * while several clients have queued work, no client is dispatched twice before every other client with
+ * queued work has been dispatched once, so a client waits behind at most
+ * {@code (clients-with-queued-work - 1)} dispatches, however deep any single lane grows and whatever the
+ * dispatch history of the clients involved. Fairness
  * changes <em>order only</em>: the global bound stays {@code worker-count + queue-capacity} accepted
  * (queued or running) attempts, the per-client quota, idempotency, cancellation, retry, deadline and
  * retention semantics are untouched, and a submission that would exceed the global bound is still
@@ -205,17 +210,18 @@ public class BatchHashJobService {
     /**
      * Fair-admission state (REQ-01). {@code lanes} holds the FIFO of queued attempts per normalized
      * client key, {@code laneOrder} is the dispatch ring over the clients that currently have queued
-     * work, and {@code laneSequence} is each client's virtual-time counter (dispatches served, one
-     * per hand-off). The dispatcher always serves the ring client with the <em>lowest</em> counter, so
-     * a client that has just been served is served again only after every other client with queued
-     * work has caught up: a client waits behind at most {@code clients-with-queued-work - 1}
-     * dispatches. All three are guarded by {@link #dispatchLock}; the ring entry and the lane are
-     * dropped as soon as the lane drains, and the counters are cleared once nothing is queued or
-     * running, so an idle service costs nothing.
+     * work, and {@code servedThisRound} is the set of clients already served in the current round. The
+     * dispatcher serves a client only while it is <em>not</em> in {@code servedThisRound}, so every
+     * client with pending work is served exactly once per round and a client waits behind at most
+     * {@code clients-with-queued-work - 1} dispatches. Both containers are guarded by
+     * {@link #dispatchLock}. The set is pruned wholesale when the round closes (once every client with
+     * a pending lane has been served) and again once nothing is queued or running, so the bookkeeping
+     * is bounded by the clients with queued work in the live round, never by the client population or
+     * by any per-client history (Plan §5).
      */
     private final Map<String, Deque<LaneEntry>> lanes = new HashMap<>();
     private final Deque<String> laneOrder = new ArrayDeque<>();
-    private final Map<String, Long> laneSequence = new HashMap<>();
+    private final Set<String> servedThisRound = new HashSet<>();
 
     /**
      * Attempts handed to the pool and not yet finished, guarded by {@link #dispatchLock}. The
@@ -613,6 +619,18 @@ public class BatchHashJobService {
         }
     }
 
+    /**
+     * Accepted (queued or running) attempts currently holding a global capacity unit — the counter
+     * behind the {@code worker-count + queue-capacity} gate. Package-private test observability only:
+     * it lets the rollback tests prove a rejected submission returns the counter to its pre-submission
+     * value (no leaked increment), and it has no production caller.
+     */
+    int reservedCapacityForTests() {
+        synchronized (registryLock) {
+            return reservedCapacity;
+        }
+    }
+
     private static String normalizeClientKey(String clientKey) {
         return (clientKey == null || clientKey.isBlank()) ? ClientKeyResolver.UNKNOWN_CLIENT : clientKey;
     }
@@ -706,10 +724,10 @@ public class BatchHashJobService {
             if (lane == null) {
                 lane = new ArrayDeque<>();
                 lanes.put(job.clientKey, lane);
-                // The virtual-time counter is NOT reset when a lane drains: a client that just got a
-                // dispatch keeps its (higher) counter, so its next queued attempt still queues behind
-                // every client whose counter is lower (REQ-01, REQ-03).
-                laneSequence.putIfAbsent(job.clientKey, 0L);
+                // A client joins the ring at the tail. If it was already served in the live round its
+                // membership in servedThisRound is kept, so a re-enqueue (retry, duplicate) cannot buy
+                // it a second dispatch before the other clients with queued work have had their turn
+                // (REQ-01, REQ-03).
                 laneOrder.addLast(job.clientKey);
             } else if (!laneOrder.contains(job.clientKey)) {
                 // Defensive: the ring entry is kept while the lane is non-empty, so this cannot fire.
@@ -737,10 +755,20 @@ public class BatchHashJobService {
             }
             lane.removeIf(entry -> entry.job() == job && entry.generation() == generation);
             if (lane.isEmpty()) {
-                lanes.remove(job.clientKey);
-                laneOrder.remove(job.clientKey);
+                forgetLaneLocked(job.clientKey);
             }
         }
+    }
+
+    /**
+     * Drops a client's lane once nothing is pending for it: the lane and its ring slot, so the queue
+     * bookkeeping is bounded by "clients with queued work", never "clients ever seen". Its
+     * {@code servedThisRound} membership, if any, is dropped when the round closes (Plan §5). Caller
+     * must hold {@code dispatchLock}.
+     */
+    private void forgetLaneLocked(String clientKey) {
+        lanes.remove(clientKey);
+        laneOrder.remove(clientKey);
     }
 
     /** Drops every pending entry; used by the drain, whose sweep then settles the affected rows. */
@@ -749,7 +777,7 @@ public class BatchHashJobService {
             shutdownRequested = true;
             lanes.clear();
             laneOrder.clear();
-            laneSequence.clear();
+            servedThisRound.clear();
             dispatchedInFlight = 0;
             dispatchLock.notifyAll();
         }
@@ -795,7 +823,9 @@ public class BatchHashJobService {
                         return;
                     }
                     if (dispatchedInFlight == 0 && laneOrder.isEmpty()) {
-                        laneSequence.clear(); // nothing queued and nothing running: forget all cursors
+                        // Nothing queued and nothing running: forget the round bookkeeping, so an
+                        // idle service costs nothing and no per-client state outlives the round.
+                        servedThisRound.clear();
                     }
                     try {
                         dispatchLock.wait();
@@ -872,7 +902,6 @@ public class BatchHashJobService {
             if (lane == null) {
                 lane = new ArrayDeque<>();
                 lanes.put(entry.job().clientKey, lane);
-                laneSequence.putIfAbsent(entry.job().clientKey, 0L);
                 laneOrder.addLast(entry.job().clientKey);
             }
             lane.addLast(entry);
@@ -881,48 +910,62 @@ public class BatchHashJobService {
     }
 
     /**
-     * Selects and removes the next entry to dispatch, implementing the virtual-time rule that bounds
-     * starvation (REQ-01): the client with the fewest dispatches so far (lowest counter) wins, and a
-     * dispatch increments only that client's counter, so no client can receive a second dispatch while
-     * another client with queued work has served strictly fewer.
+     * Selects and removes the next entry to dispatch, implementing the round barrier that bounds
+     * starvation (REQ-01, Plan §4.2): a client is eligible only while its key is absent from
+     * {@code servedThisRound}; when no client is eligible the round is closed (the set is pruned),
+     * which makes every client with a pending lane eligible again. A client therefore receives at
+     * most one dispatch per round while any other client still has queued work, so the wait is
+     * bounded by the number of clients with queued work - not by the depth of any lane and not by how
+     * much service a client accumulated in earlier rounds.
      */
     private LaneEntry pollNextLocked() {
         String chosen = selectEligibleLocked();
         if (chosen == null) {
-            return null;
+            if (laneOrder.isEmpty()) {
+                return null; // nothing queued at all: the caller blocks until a lane refills
+            }
+            closeRoundLocked(); // round barrier: everybody pending has been served in this round
+            chosen = selectEligibleLocked();
+            if (chosen == null) {
+                return null; // unreachable: a fresh round makes every pending client eligible
+            }
         }
         Deque<LaneEntry> lane = lanes.get(chosen);
         LaneEntry entry = lane.pollFirst();
-        laneSequence.merge(chosen, 1L, Long::sum);
+        servedThisRound.add(chosen);
         laneOrder.remove(chosen);
         if (lane.isEmpty()) {
-            lanes.remove(chosen);
+            forgetLaneLocked(chosen); // lane and ring slot go at once; the served mark goes at round close
         } else {
-            laneOrder.addLast(chosen); // the cursor advances to the next client
+            laneOrder.addLast(chosen); // the ring cursor advances to the next client
         }
         return entry;
     }
 
-    /** The ring client with pending work and the lowest dispatch counter (ties: ring order). */
+    /**
+     * Closes the current round: every client with a pending lane has been served, so the served marks
+     * are dropped ({@code servedThisRound} never outlives the round it describes) and the epoch ends
+     * with no residue. This is the only reset, so no counter can drift or wrap.
+     */
+    private void closeRoundLocked() {
+        servedThisRound.clear();
+    }
+
+    /**
+     * The first client from the head of {@code laneOrder} that still has pending work and has not been
+     * served in the current round, or {@code null} when the round is complete.
+     */
     private String selectEligibleLocked() {
-        String chosen = null;
-        long chosenSequence = Long.MAX_VALUE;
-        Iterator<String> cursor = laneOrder.iterator();
-        while (cursor.hasNext()) {
-            String client = cursor.next();
+        for (String client : laneOrder) {
             Deque<LaneEntry> lane = lanes.get(client);
             if (lane == null || lane.isEmpty()) {
-                cursor.remove(); // a drained lane never keeps a ring slot
-                lanes.remove(client);
-                continue;
+                continue; // defensive: a drained lane is pruned by the writers that drain it
             }
-            long sequence = laneSequence.getOrDefault(client, 0L);
-            if (sequence < chosenSequence) {
-                chosen = client;
-                chosenSequence = sequence;
+            if (!servedThisRound.contains(client)) {
+                return client;
             }
         }
-        return chosen;
+        return null;
     }
 
     /** One queued attempt: the job reference plus the generation that fences a superseded attempt. */

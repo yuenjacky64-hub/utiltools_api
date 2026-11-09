@@ -1860,10 +1860,21 @@ per-client quota resolve, and a single dispatcher thread drains the lanes in **r
 order, admitting one queued attempt at a time to the bounded executor
 (`worker-count` running + `queue-capacity` slots). Two guarantees follow:
 
-- **Bounded starvation.** While two or more clients hold runnable queued work, no client may
-  be admitted a second time before every other queued client has been admitted once — a
-  client that fills its quota cannot keep draining its own lane ahead of others. One lane
-  draining completely at a time still happens only when all other lanes are empty.
+- **Bounded starvation (round barrier).** The dispatcher keeps the set of clients it has
+  already served in the *current round*. A client is eligible only while its key is **absent**
+  from that set, so each client is admitted at most once per round; as soon as no still-queued
+  client is eligible the dispatcher closes the round by clearing the set, and every queued
+  client becomes eligible again. Consequence, stated exactly: while two or more clients hold
+  runnable queued work, no client is admitted a second time before every other queued client
+  has been admitted once, however deep its own lane is and however long it has been waiting —
+  a client that fills its quota cannot drain its own lane ahead of others. A queued client
+  waits behind at most `clients-with-queued-work - 1` dispatches, never behind a lane's depth,
+  and the bound does not depend on per-client service history: nothing is accumulated across
+  rounds (the set is cleared at every round close, and again whenever the service goes idle),
+  so a client served heavily in earlier rounds starts each new round on equal footing. A lane
+  that re-enqueues work it already had (retry, duplicate) does not become eligible a second
+  time in the same round, so it cannot jump ahead either. One lane draining completely at a
+  time still happens only when all other lanes are empty.
 - **Global bounds unchanged.** The dispatcher admits nothing while `running + in-flight
   lanes == worker-count + queue-capacity`; nothing is pre-admitted, and the executor's
   `AbortPolicy` remains only a backstop — the capacity check itself is what rejects.

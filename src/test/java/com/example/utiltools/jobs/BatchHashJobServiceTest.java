@@ -180,9 +180,9 @@ class BatchHashJobServiceTest {
         assertThat(crypto.awaitEntered("a2")).isTrue();
 
         // Three more of alice's jobs sit behind her lane, plus one queued for bob.
-        service.submit(new BatchHashRequest("SHA-256", List.of("a3"), null, null), "alice");
-        service.submit(new BatchHashRequest("SHA-256", List.of("a4"), null, null), "alice");
-        service.submit(new BatchHashRequest("SHA-256", List.of("a5"), null, null), "alice");
+        BatchHashJobResponse a3 = service.submit(new BatchHashRequest("SHA-256", List.of("a3"), null, null), "alice");
+        BatchHashJobResponse a4 = service.submit(new BatchHashRequest("SHA-256", List.of("a4"), null, null), "alice");
+        BatchHashJobResponse a5 = service.submit(new BatchHashRequest("SHA-256", List.of("a5"), null, null), "alice");
         BatchHashJobResponse b1 = service.submit(new BatchHashRequest("SHA-256", List.of("b"), null, null), "bob");
 
         // Freeing one worker must admit bob's job before any of alice's queued jobs.
@@ -192,7 +192,7 @@ class BatchHashJobServiceTest {
         crypto.unblock("a2");
         crypto.unblock("b");
 
-        for (BatchHashJobResponse job : List.of(a1, a2, b1)) {
+        for (BatchHashJobResponse job : List.of(a1, a2, a3, a4, a5, b1)) {
             assertThat(awaitStatus(job.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
         }
         assertThat(service.queuedJobsForClient("alice")).isZero();
@@ -224,6 +224,46 @@ class BatchHashJobServiceTest {
     }
 
     @Test
+    @DisplayName("fair admission - a client with a long service history still gets its turn before a deeper lane")
+    void shouldNotLetADeeperLaneJumpAheadOfAPreviouslyServedClient() throws Exception {
+        OrderingCryptoService crypto = new OrderingCryptoService("a4", "a5");
+        service = new BatchHashJobService(crypto, 1, 8, 300, 4);
+
+        // alice is served three times on her own before bob exists at all: any accumulated
+        // per-client service counter therefore diverges sharply in alice's disfavour.
+        for (String item : List.of("a1", "a2", "a3")) {
+            BatchHashJobResponse historical = service.submit(new BatchHashRequest("SHA-256", List.of(item), null, null), "alice");
+            awaitStatus(historical.jobId(), JobStatus.COMPLETED);
+        }
+
+        // Now park the single worker inside a fourth alice job and queue a shallow alice lane
+        // (one more job) behind a deeper bob lane (three jobs).
+        BatchHashJobResponse a4 = service.submit(new BatchHashRequest("SHA-256", List.of("a4"), null, null), "alice");
+        assertThat(crypto.awaitEntered("a4")).isTrue();
+        BatchHashJobResponse a5 = service.submit(new BatchHashRequest("SHA-256", List.of("a5"), null, null), "alice");
+        List<BatchHashJobResponse> bobJobs = new ArrayList<>();
+        for (String item : List.of("b1", "b2", "b3")) {
+            bobJobs.add(service.submit(new BatchHashRequest("SHA-256", List.of(item), null, null), "bob"));
+        }
+        assertThat(service.queuedJobsForClient("bob")).isEqualTo(3);
+
+        crypto.unblock("a4");
+        awaitStatus(a4.jobId(), JobStatus.COMPLETED);
+
+        // Round barrier: bob is served once in the new round and then alice's turn comes back, so
+        // bob's deeper lane cannot consume her turn even though her service history is longer.
+        assertThat(crypto.awaitEntered("a5")).isTrue();
+        assertThat(crypto.entriesBefore("a5")).containsExactly("a1", "a2", "a3", "a4", "b1");
+        crypto.unblock("a5");
+        awaitStatus(a5.jobId(), JobStatus.COMPLETED);
+        for (BatchHashJobResponse bobJob : bobJobs) {
+            awaitStatus(bobJob.jobId(), JobStatus.COMPLETED);
+        }
+        assertThat(service.queuedJobsForClient("alice")).isZero();
+        assertThat(service.queuedJobsForClient("bob")).isZero();
+    }
+
+    @Test
     @DisplayName("fair admission - a submission over global capacity is rejected and rolled back with no residue")
     void shouldRejectAndRollbackCleanlyWhenGlobalCapacityFullAcrossClients() throws Exception {
         OrderingCryptoService crypto = new OrderingCryptoService("a", "b", "c");
@@ -236,12 +276,16 @@ class BatchHashJobServiceTest {
 
         Set<String> registeredBefore = registryKeys("jobs");
         assertThat(registeredBefore).containsExactlyInAnyOrder(a.jobId(), b.jobId(), c.jobId());
+        int admittedBefore = service.reservedCapacityForTests(); // 1 running + 2 queued = full
 
         // A fourth submission from a new client exceeds worker + queue capacity: rejected, rolled back.
         assertThatThrownBy(() -> service.submit(new BatchHashRequest("SHA-256", List.of("d"), null, "dave-key"), "dave"))
                 .isInstanceOf(JobQueueFullException.class);
         assertThat(registryKeys("jobs")).isEqualTo(registeredBefore);
         assertThat(registryKeys("idempotencyIndex")).doesNotContain("dave-key");
+        assertThat(service.reservedCapacityForTests())
+                .as("the rejected submission released its global capacity unit")
+                .isEqualTo(admittedBefore);
         assertThat(service.activeJobsForClient("dave")).isZero();
         assertThat(service.queuedJobsForClient("dave")).isZero();
 
@@ -2443,11 +2487,6 @@ class BatchHashJobServiceTest {
                 + "; last observed status=" + service.getJob(jobId).status());
     }
 
-    /**
-     * Hashing stub for the retry tests: one designated item fails its first {@code failures} hashes
-     * (a transient fault) and, optionally, another designated item blocks the worker on latches so a
-     * job can be observed in QUEUED / RUNNING. Every other item delegates to real hashing.
-     */
     /**
      * Hashing stub for the fair-admission tests: records every item's entry into {@link #hash} in
      * order, lets one designated item fail its first N hashes (a transient fault that forces a
