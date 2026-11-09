@@ -392,11 +392,21 @@ def _run_memory_validate(
         max_bug_fixes = config.memory_max_bug_fixes
         max_learnings = config.memory_max_learnings
 
-    errors = MemoryStore.load(memory_path).validate(
-        max_runs=max_runs,
-        max_bug_fixes=max_bug_fixes,
-        max_learnings=max_learnings,
-    )
+    # INV-CLI-3: a validation failure of any kind is an ``error:`` line and
+    # exit 1, never a traceback - the document is untrusted input.
+    try:
+        errors = MemoryStore.load(memory_path).validate(
+            max_runs=max_runs,
+            max_bug_fixes=max_bug_fixes,
+            max_learnings=max_learnings,
+        )
+    except Exception as error:  # defensive: the report must always render
+        print(
+            f"error: memory validation failed "
+            f"({type(error).__name__}: {error})",
+            file=sys.stderr,
+        )
+        return 1
     if not errors:
         counts = _memory_counts(memory_path)
         print(

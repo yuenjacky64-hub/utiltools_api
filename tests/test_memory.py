@@ -885,3 +885,95 @@ def test_cli_validate_memory_without_config_skips_limits(tmp_path: Path) -> None
     assert result.returncode == 0, result.stderr
     assert "warning: memory limits not checked" in result.stderr
     assert "memory is valid: runs=1 bug_fixes=1 learnings=1" in result.stdout
+
+
+# --- F1/F2/F3: validate() totality over untrusted timestamps ----------------
+
+
+def test_validate_flags_unorderable_run_timestamps(tmp_path: Path) -> None:
+    """F1/F2: an oversized or ``NaN`` ``at`` is reported, never raised."""
+
+    path = _write_document(
+        tmp_path / "state",
+        _document(runs=[_run("T1", "OK", 10.0), _run("T2", "OK", 10**400)]),
+    )
+    errors = MemoryStore.load(path).validate()
+    assert "MEMORY_ORDER: runs[1].at is missing" in errors
+
+    path = _write_document(
+        tmp_path / "state",
+        _document(runs=[_run("T1", "OK", 10.0), _run("T2", "OK", float("nan"))]),
+    )
+    errors = MemoryStore.load(path).validate()
+    assert "MEMORY_ORDER: runs[1].at is missing" in errors
+
+
+def test_validate_tolerates_unorderable_learning_timestamps(
+    tmp_path: Path,
+) -> None:
+    """F1: an oversized lesson ``at`` cannot raise out of the dedupe pass."""
+
+    huge = 10**400
+    path = _write_document(
+        tmp_path / "state",
+        _document(
+            learnings=[_learning("L1", "prefer atomic writes", huge) for _ in range(1)]
+            + [_learning("L2", "prune before save", huge)]
+        ),
+    )
+    errors = MemoryStore.load(path).validate()
+    # An unplaceable timestamp carries no duplicate key, so it is never merged.
+    assert not any(error.startswith("LEARNING_DUPLICATE") for error in errors)
+
+
+def test_validate_duplicate_lesson_line_renders_bare_timestamp(
+    tmp_path: Path,
+) -> None:
+    """F3: Plan §4.1 step 6 pins the bare timestamp, not a quoted string."""
+
+    path = _write_document(
+        tmp_path / "state",
+        _document(
+            learnings=[
+                _learning("L1", "prefer atomic writes", 13.0),
+                _learning("L2", "prune before save", 13.0),
+            ],
+        ),
+    )
+    errors = MemoryStore.load(path).validate()
+    assert (
+        "LEARNING_DUPLICATE: learnings[1].at 13.0 repeats learnings[0]" in errors
+    )
+
+
+def test_cli_validate_memory_reports_unorderable_timestamp(
+    tmp_path: Path,
+) -> None:
+    """F1: the CLI renders a report for an oversized ``at``, not a traceback."""
+
+    root = tmp_path
+    state = root / "state"
+    _write_document(
+        state,
+        _document(runs=[_run("T1", "OK", 10.0), _run("T2", "OK", 10**400)]),
+    )
+    config = _config(root)
+    result = _cli(
+        [
+            "memory",
+            "--validate-memory",
+            "--state-root",
+            str(state),
+            "--config",
+            str(config),
+            "--maintainer-root",
+            str(root),
+        ]
+    )
+    assert result.returncode == 1, result.stdout
+    assert "Traceback" not in result.stderr
+    assert (
+        f"error: 1 validation problem(s) in {state / MEMORY_DOC_NAME}"
+        in result.stderr
+    )
+    assert "MEMORY_ORDER: runs[1].at is missing" in result.stderr

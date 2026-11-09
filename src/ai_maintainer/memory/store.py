@@ -28,6 +28,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
 import stat
 import threading
@@ -106,28 +107,49 @@ def _corrupt_label(issues: Collection[str]) -> str:
     return f"MEMORY_CORRUPT: {first}"
 
 
+def _finite_timestamp(value: Any) -> float | None:
+    """``value`` as a finite ``float``, or ``None`` when it is not one.
+
+    JSON admits integers far beyond ``float``'s range (``float()`` raises
+    ``OverflowError``) and the non-finite literals ``NaN``/``Infinity``
+    (``math.isfinite`` is ``False``). Both are unplaceable in time, so they are
+    treated as a missing timestamp instead of escaping as an exception: every
+    helper over an untrusted record stays total (INV-VAL-1).
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError, TypeError):  # oversized int / exotic float
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
 def _timestamp_order(item: tuple[int, Any]) -> tuple[int, float, int]:
     """Sort key for a ``(index, record)`` pair: ascending ``at``, newest last.
 
-    A record whose ``at`` is missing or not a real number sorts before every
-    numeric one; the index keeps the sort stable so the live order is never
-    rewritten by a tie.
+    A record whose ``at`` is missing, not a real number, or not a finite
+    ``float`` sorts before every orderable one; the index keeps the sort stable
+    so the live order is never rewritten by a tie.
     """
 
     index, record = item
     value = record.get("at") if isinstance(record, Mapping) else None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    number = _finite_timestamp(value)
+    if number is None:
         return (0, 0.0, index)
-    return (1, float(value), index)
+    return (1, number, index)
 
 
 def _dedupe_key(kind: str, value: Any) -> str | None:
     """Normalise one dedupe field; ``None`` when the record does not carry it."""
 
     if kind == "timestamp":
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        return repr(float(value))
+        number = _finite_timestamp(value)
+        return None if number is None else repr(number)
     if not isinstance(value, str):
         return None
     if kind == "lesson_text":
@@ -246,8 +268,11 @@ def _validate_duplicates(name: str, records: Sequence[Any]) -> list[str]:
             pair = (field_name, key)
             first = seen.get(pair)
             if first is not None:
+                # Plan §4.1 step 6 pins a bare timestamp (``12.0``) but a
+                # quoted string key (``'T1'``).
+                rendered = key if kind == "timestamp" else repr(key)
                 errors.append(
-                    f"{code}: {name}[{index}].{field_name} {key!r} repeats "
+                    f"{code}: {name}[{index}].{field_name} {rendered} repeats "
                     f"{name}[{first}]"
                 )
                 continue
