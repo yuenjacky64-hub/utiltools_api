@@ -1852,6 +1852,41 @@ utiltools.jobs.max-retained-jobs=1000
 | `utiltools.jobs.max-active-jobs-per-client` | `20` | Ceiling on one client's concurrent **non-terminal** jobs (`QUEUED`, `RUNNING` or `CANCELLING`), keyed by the same identity the rate limiter resolves (see [G](#g-rate-limiting-interaction-explicit-decision)); one more submission answers `429 JOB_QUOTA_EXCEEDED` with `limit` and `activeJobs` in `details`. A slot is released as each job reaches `COMPLETED`, `FAILED` or `CANCELLED` — a `DELETE` on a `RUNNING` job records the cancellation without releasing the slot, which is released once by the terminal `CANCELLED` write. Values below `1` fail startup. Set it at or above `worker-count + queue-capacity` to restore pre-quota (unbounded per client) admission |
 | `utiltools.jobs.max-retained-jobs` | `1000` | Hard cap on retained **terminal** rows (`COMPLETED`, `FAILED`, `CANCELLED`) in the in-memory registry, enforced together with `retention-seconds`: once the cap is exceeded the oldest terminal job by `completedAt` is unregistered (with its idempotency key) so a fast submit/complete churn cannot grow the registry without bound. `QUEUED`, `RUNNING` and `CANCELLING` rows are never evicted, so the registry stays at or below `max-retained-jobs + worker-count + queue-capacity` rows. Values below `1` fail startup |
 
+#### F. Fair per-client queue admission (bounded starvation)
+
+Accepted jobs are **not** handed straight to the worker pool. Each submission first joins a
+per-client FIFO *lane* keyed by the same normalized client identity the rate limiter and the
+per-client quota resolve, and a single dispatcher thread drains the lanes in **round-robin**
+order, admitting one queued attempt at a time to the bounded executor
+(`worker-count` running + `queue-capacity` slots). Two guarantees follow:
+
+- **Bounded starvation.** While two or more clients hold runnable queued work, no client may
+  be admitted a second time before every other queued client has been admitted once — a
+  client that fills its quota cannot keep draining its own lane ahead of others. One lane
+  draining completely at a time still happens only when all other lanes are empty.
+- **Global bounds unchanged.** The dispatcher admits nothing while `running + in-flight
+  lanes == worker-count + queue-capacity`; nothing is pre-admitted, and the executor's
+  `AbortPolicy` remains only a backstop — the capacity check itself is what rejects.
+
+Queue-full rollback is unchanged in shape: a submission that cannot hold a slot throws
+`JobQueueFullException` (`429 JOB_QUEUE_FULL`), and the rejection is one atomic no-op to
+world state — the job row and its idempotency mapping are removed, the attempt correlation
+and client-quota reservation are released exactly once, and the rejected idempotency key
+can be reused immediately. Removing a queued job (cancellation, deadline expiry, eviction)
+releases its one global slot exactly once; a job removed from its lane is never executed.
+
+Retries and duplicates stay fair and single-counted: a retried `FAILED` attempt re-enters
+the **submitting client's own lane at its tail** (it never jumps ahead of other clients'
+queued work and never escapes to another quota bucket), and a duplicate idempotency key
+returns the existing snapshot without consuming a second slot or a second lane entry.
+
+The fairness state stays observable through the existing surface without new response fields:
+the per-client counter map `activeJobsByClient` (in-flight slots held by every known client —
+queued or running) already feeds the `429 JOB_QUOTA_EXCEEDED` details, the service tracks each
+client's queued lane depth (`queuedJobsForClient`), and the `dispatchedInFlight` admission
+counter serializes round-robin order in the dispatcher. No `BatchHashJobResponse` field or
+controller endpoint changed.
+
 #### G. Rate limiting interaction (explicit decision)
 
 All six jobs endpoints live under `/api/v1/utils/**`, so they are **not exempt** from `RateLimitFilter`

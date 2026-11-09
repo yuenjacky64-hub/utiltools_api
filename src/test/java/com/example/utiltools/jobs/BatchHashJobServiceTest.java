@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
@@ -159,6 +160,165 @@ class BatchHashJobServiceTest {
         assertThat(retriedCompleted.results()).hasSize(1);
         assertThat(retriedCompleted.idempotencyKey()).isEqualTo("retry-key");
         assertThat(registryKeys("idempotencyIndex")).contains("retry-key");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Per-client fair admission (UTILTOOLS-65): round-robin lanes, rollback at saturation,
+    // cancel/drain slot release, and retry re-queue without lane bypass.
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("fair admission - with another client queued, its job dispatches before the busy client's next")
+    void shouldPreferOtherClientWhenAllLanesHaveWork() throws Exception {
+        OrderingCryptoService crypto = new OrderingCryptoService("a1", "a2", "b");
+        service = new BatchHashJobService(crypto, 2, 8, 300, 3);
+
+        // Both workers park inside client alice's first two jobs.
+        BatchHashJobResponse a1 = service.submit(new BatchHashRequest("SHA-256", List.of("a1"), null, null), "alice");
+        assertThat(crypto.awaitEntered("a1")).isTrue();
+        BatchHashJobResponse a2 = service.submit(new BatchHashRequest("SHA-256", List.of("a2"), null, null), "alice");
+        assertThat(crypto.awaitEntered("a2")).isTrue();
+
+        // Three more of alice's jobs sit behind her lane, plus one queued for bob.
+        service.submit(new BatchHashRequest("SHA-256", List.of("a3"), null, null), "alice");
+        service.submit(new BatchHashRequest("SHA-256", List.of("a4"), null, null), "alice");
+        service.submit(new BatchHashRequest("SHA-256", List.of("a5"), null, null), "alice");
+        BatchHashJobResponse b1 = service.submit(new BatchHashRequest("SHA-256", List.of("b"), null, null), "bob");
+
+        // Freeing one worker must admit bob's job before any of alice's queued jobs.
+        crypto.unblock("a1");
+        assertThat(crypto.awaitEntered("b")).isTrue();
+        assertThat(crypto.entriesBefore("b")).containsExactly("a1", "a2");
+        crypto.unblock("a2");
+        crypto.unblock("b");
+
+        for (BatchHashJobResponse job : List.of(a1, a2, b1)) {
+            assertThat(awaitStatus(job.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+        }
+        assertThat(service.queuedJobsForClient("alice")).isZero();
+        assertThat(service.queuedJobsForClient("bob")).isZero();
+    }
+
+    @Test
+    @DisplayName("fair admission - three queued clients interleave instead of draining one lane")
+    void shouldInterleaveThreeClientsRoundRobin() throws Exception {
+        OrderingCryptoService crypto = new OrderingCryptoService("a1");
+        service = new BatchHashJobService(crypto, 1, 5, 300, 3);
+
+        // The single worker parks inside alice's job; one queued job per other client, one more for alice.
+        BatchHashJobResponse a1 = service.submit(new BatchHashRequest("SHA-256", List.of("a1"), null, null), "alice");
+        assertThat(crypto.awaitEntered("a1")).isTrue();
+        BatchHashJobResponse b1 = service.submit(new BatchHashRequest("SHA-256", List.of("b"), null, null), "bob");
+        BatchHashJobResponse c1 = service.submit(new BatchHashRequest("SHA-256", List.of("c"), null, null), "carol");
+        BatchHashJobResponse a2 = service.submit(new BatchHashRequest("SHA-256", List.of("a2"), null, null), "alice");
+
+        crypto.unblock("a1");
+        awaitStatus(a1.jobId(), JobStatus.COMPLETED);
+        awaitStatus(a2.jobId(), JobStatus.COMPLETED);
+
+        // a2's hash may have entered only after both b and c had: no lane was drained before the others.
+        assertThat(crypto.entriesBefore("a2")).containsExactlyInAnyOrder("a1", "b", "c");
+        assertThat(awaitStatus(b1.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+        assertThat(awaitStatus(c1.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+        assertThat(crypto.count("a2")).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("fair admission - a submission over global capacity is rejected and rolled back with no residue")
+    void shouldRejectAndRollbackCleanlyWhenGlobalCapacityFullAcrossClients() throws Exception {
+        OrderingCryptoService crypto = new OrderingCryptoService("a", "b", "c");
+        service = new BatchHashJobService(crypto, 1, 2, 300, 3); // capacity = 1 worker + 2 queue slots
+
+        BatchHashJobResponse a = service.submit(new BatchHashRequest("SHA-256", List.of("a"), null, null), "alice");
+        BatchHashJobResponse b = service.submit(new BatchHashRequest("SHA-256", List.of("b"), null, null), "bob");
+        BatchHashJobResponse c = service.submit(new BatchHashRequest("SHA-256", List.of("c"), null, null), "carol");
+        assertThat(crypto.awaitEntered("a")).isTrue(); // a owns the worker; b and c hold the queue slots
+
+        Set<String> registeredBefore = registryKeys("jobs");
+        assertThat(registeredBefore).containsExactlyInAnyOrder(a.jobId(), b.jobId(), c.jobId());
+
+        // A fourth submission from a new client exceeds worker + queue capacity: rejected, rolled back.
+        assertThatThrownBy(() -> service.submit(new BatchHashRequest("SHA-256", List.of("d"), null, "dave-key"), "dave"))
+                .isInstanceOf(JobQueueFullException.class);
+        assertThat(registryKeys("jobs")).isEqualTo(registeredBefore);
+        assertThat(registryKeys("idempotencyIndex")).doesNotContain("dave-key");
+        assertThat(service.activeJobsForClient("dave")).isZero();
+        assertThat(service.queuedJobsForClient("dave")).isZero();
+
+        // After the drain the rejected key is reusable as a brand-new job.
+        crypto.unblock("a");
+        crypto.unblock("b");
+        crypto.unblock("c");
+        awaitStatus(a.jobId(), JobStatus.COMPLETED);
+        awaitStatus(b.jobId(), JobStatus.COMPLETED);
+        awaitStatus(c.jobId(), JobStatus.COMPLETED);
+
+        BatchHashJobResponse d = service.submit(new BatchHashRequest("SHA-256", List.of("d"), null, "dave-key"), "dave");
+        assertThat(d.jobId()).isNotIn(a.jobId(), b.jobId(), c.jobId());
+        assertThat(awaitStatus(d.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("fair admission - cancelling a queued job releases its slot exactly once and it never runs")
+    void shouldReleaseSlotOnceAndNeverRunAJobRemovedFromItsLane() throws Exception {
+        OrderingCryptoService crypto = new OrderingCryptoService("a");
+        service = new BatchHashJobService(crypto, 1, 5, 300, 3);
+
+        // The worker parks inside alice's first job; two more of her jobs queue behind the lane.
+        BatchHashJobResponse a1 = service.submit(new BatchHashRequest("SHA-256", List.of("a"), null, null), "alice");
+        assertThat(crypto.awaitEntered("a")).isTrue();
+        BatchHashJobResponse a2 = service.submit(new BatchHashRequest("SHA-256", List.of("a2"), null, null), "alice");
+        BatchHashJobResponse a3 = service.submit(new BatchHashRequest("SHA-256", List.of("a3"), null, null), "alice");
+        assertThat(service.activeJobsForClient("alice")).isEqualTo(3);
+        assertThat(service.queuedJobsForClient("alice")).isEqualTo(2);
+
+        BatchHashJobResponse cancelled = service.cancel(a2.jobId());
+        assertThat(cancelled.status()).isEqualTo(JobStatus.CANCELLED);
+        // One release, no double: the running and the remaining queued job still hold their slots.
+        assertThat(service.activeJobsForClient("alice")).isEqualTo(2);
+
+        crypto.unblock("a");
+        awaitStatus(a1.jobId(), JobStatus.COMPLETED);
+        assertThat(awaitStatus(a3.jobId(), JobStatus.COMPLETED).results()).hasSize(1);
+        assertThat(crypto.count("a2")).isZero(); // the cancelled job never entered the worker
+        assertThat(service.activeJobsForClient("alice")).isZero();
+        assertThat(service.queuedJobsForClient("alice")).isZero();
+    }
+
+    @Test
+    @DisplayName("fair admission - a retry re-enters its own lane without jumping other clients' queues")
+    void shouldRequeueRetryIntoOwnClientLaneWithoutBypassingOthers() throws Exception {
+        OrderingCryptoService crypto = new OrderingCryptoService("blocked", "c");
+        crypto.failOnce("flaky", 1);
+        service = new BatchHashJobService(crypto, 1, 5, 300, 3);
+
+        // bob's gated job owns the only worker; alice's flaky job and carol's gated job queue in their lanes.
+        BatchHashJobResponse b1 = service.submit(new BatchHashRequest("SHA-256", List.of("blocked"), null, null), "bob");
+        assertThat(crypto.awaitEntered("blocked")).isTrue();
+        BatchHashJobResponse a1 = service.submit(new BatchHashRequest("SHA-256", List.of("flaky"), null, null), "alice");
+        BatchHashJobResponse c1 = service.submit(new BatchHashRequest("SHA-256", List.of("c"), null, null), "carol");
+
+        crypto.unblock("blocked");
+        awaitStatus(b1.jobId(), JobStatus.COMPLETED);
+        // flaky's first attempt ran and failed the job; carol's c is now parked on its gate.
+        BatchHashJobResponse failed = awaitStatus(a1.jobId(), JobStatus.FAILED);
+        assertThat(failed.error()).contains("transient");
+        assertThat(crypto.awaitEntered("c")).isTrue();
+
+        // The explicit retry re-enters alice's lane behind carol's queued work, not ahead of it.
+        BatchHashJobResponse requeued = service.retry(a1.jobId());
+        assertThat(requeued.attempt()).isEqualTo(2);
+        assertThat(crypto.count("flaky")).isEqualTo(1); // the retried generation has not run yet
+        assertThat(crypto.entriesBefore("c")).containsExactly("blocked", "flaky");
+
+        crypto.unblock("c");
+        awaitStatus(c1.jobId(), JobStatus.COMPLETED);
+        BatchHashJobResponse completed = awaitStatus(a1.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.attempt()).isEqualTo(2);
+        assertThat(crypto.count("flaky")).isEqualTo(2);
+        assertThat(crypto.count("c")).isEqualTo(1);
+        assertThat(service.queuedJobsForClient("alice")).isZero();
+        assertThat(service.queuedJobsForClient("carol")).isZero();
     }
 
     @Test
@@ -2288,6 +2448,82 @@ class BatchHashJobServiceTest {
      * (a transient fault) and, optionally, another designated item blocks the worker on latches so a
      * job can be observed in QUEUED / RUNNING. Every other item delegates to real hashing.
      */
+    /**
+     * Hashing stub for the fair-admission tests: records every item's entry into {@link #hash} in
+     * order, lets one designated item fail its first N hashes (a transient fault that forces a
+     * retry), and can gate any designated item on its own latch so a worker can be held
+     * deterministically. Every other item delegates to real hashing.
+     */
+    private static final class OrderingCryptoService extends CryptoService {
+
+        private final Map<String, Gate> gates = new ConcurrentHashMap<>();
+        private final Map<String, AtomicInteger> remainingFailures = new ConcurrentHashMap<>();
+        private final Map<String, AtomicInteger> invocations = new ConcurrentHashMap<>();
+        private final ConcurrentLinkedQueue<String> entryOrder = new ConcurrentLinkedQueue<>();
+
+        OrderingCryptoService(String... gatedItems) {
+            for (String item : gatedItems) {
+                gates.put(item, new Gate());
+            }
+        }
+
+        /** The next {@code times} hashes of {@code item} throw a transient failure. */
+        void failOnce(String item, int times) {
+            remainingFailures.put(item, new AtomicInteger(times));
+        }
+
+        @Override
+        public HashResponse hash(HashRequest request) {
+            String content = request.content();
+            invocations.computeIfAbsent(content, c -> new AtomicInteger()).incrementAndGet();
+            entryOrder.add(content);
+            AtomicInteger remaining = remainingFailures.get(content);
+            if (remaining != null && remaining.getAndUpdate(n -> n > 0 ? n - 1 : 0) > 0) {
+                throw new IllegalStateException("transient hashing failure for " + content);
+            }
+            Gate gate = gates.get(content);
+            if (gate != null) {
+                gate.entered.countDown();
+                try {
+                    gate.released.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return super.hash(request);
+        }
+
+        boolean awaitEntered(String item) throws Exception {
+            return gates.get(item).entered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+
+        void unblock(String item) {
+            gates.get(item).released.countDown();
+        }
+
+        int count(String item) {
+            AtomicInteger counter = invocations.get(item);
+            return counter == null ? 0 : counter.get();
+        }
+
+        /** Items whose hash started before the first entry of {@code item} (in entry order). */
+        List<String> entriesBefore(String item) {
+            List<String> before = new ArrayList<>();
+            for (String entry : entryOrder) {
+                if (entry.equals(item)) {
+                    break;
+                }
+                before.add(entry);
+            }
+            return before;
+        }
+
+        private static final class Gate {
+            private final CountDownLatch entered = new CountDownLatch(1);
+            private final CountDownLatch released = new CountDownLatch(1);
+        }
+    }
+
     /**
      * Hashing stub with per-item gates that <em>ignore interruption</em>: the worker parks on a latch
      * until {@link #release(String)} is called, deliberately swallowing the {@code InterruptedException}
