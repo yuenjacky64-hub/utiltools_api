@@ -1,6 +1,8 @@
 package com.example.utiltools.datetime;
 
 import com.example.utiltools.datetime.dto.CurrentTimeResponse;
+import com.example.utiltools.datetime.dto.DateTimeBusinessDaysRequest;
+import com.example.utiltools.datetime.dto.DateTimeBusinessDaysResponse;
 import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
@@ -16,8 +18,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -588,5 +592,150 @@ class DateTimeServiceTest {
                 new DateTimeDurationRequest("BOGUS", null, 1L, null)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Unsupported action");
+    }
+
+    @Test
+    @DisplayName("Should add a business day by skipping the weekend")
+    void shouldMoveForwardSkippingWeekend() {
+        DateTimeBusinessDaysResponse response = dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-02T17:00:00Z", "UTC", 1, null, null));
+
+        assertThat(response.isoUtc()).isEqualTo("2026-01-05T17:00:00Z");
+        assertThat(response.epochSeconds()).isEqualTo(1767632400L);
+        assertThat(response.epochMillis()).isEqualTo(1767632400000L);
+        assertThat(response.targetTimeZone()).isEqualTo("UTC");
+        assertThat(response.formattedTarget()).isEqualTo("2026-01-05T17:00:00Z");
+        assertThat(response.appliedAmount()).isEqualTo(1);
+        assertThat(response.skippedWeekendDays()).isEqualTo(2);
+        assertThat(response.skippedHolidayDays()).isZero();
+    }
+
+    @Test
+    @DisplayName("Should skip holidays, count a weekend holiday only as a weekend skip and deduplicate")
+    void shouldSkipHolidaysAndCountWeekendHolidayAsWeekend() {
+        // 2026-01-02T17:00:00Z is a Friday; the next Monday 2026-01-05 is a holiday, so the result
+        // moves to Tuesday 2026-01-06 while the weekend still accounts for two skips.
+        DateTimeBusinessDaysResponse withMondayHoliday = dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-02T17:00:00Z", "UTC", 1, null, List.of("2026-01-05")));
+
+        assertThat(withMondayHoliday.isoUtc()).isEqualTo("2026-01-06T17:00:00Z");
+        assertThat(withMondayHoliday.skippedWeekendDays()).isEqualTo(2);
+        assertThat(withMondayHoliday.skippedHolidayDays()).isEqualTo(1);
+        assertThat(withMondayHoliday.appliedAmount()).isEqualTo(1);
+
+        // A holiday that falls on a Saturday (2026-01-03) must not increment the holiday counter.
+        DateTimeBusinessDaysResponse withWeekendHoliday = dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-02T17:00:00Z", "UTC", 1, null, List.of("2026-01-03")));
+
+        assertThat(withWeekendHoliday.isoUtc()).isEqualTo("2026-01-05T17:00:00Z");
+        assertThat(withWeekendHoliday.skippedWeekendDays()).isEqualTo(2);
+        assertThat(withWeekendHoliday.skippedHolidayDays()).isZero();
+
+        // Duplicate holiday entries collapse into one calendar date.
+        DateTimeBusinessDaysResponse withDuplicateHoliday = dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-02T17:00:00Z", "UTC", 1, null,
+                        List.of("2026-01-05", "2026-01-05")));
+
+        assertThat(withDuplicateHoliday.isoUtc()).isEqualTo("2026-01-06T17:00:00Z");
+        assertThat(withDuplicateHoliday.skippedHolidayDays()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("Should move backward over a weekend and return the input unchanged for amount 0")
+    void shouldMoveBackwardAndReturnInputForZeroAmount() {
+        DateTimeBusinessDaysResponse backward = dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-05T17:00:00Z", "UTC", -1, null, null));
+
+        assertThat(backward.isoUtc()).isEqualTo("2026-01-02T17:00:00Z");
+        assertThat(backward.appliedAmount()).isEqualTo(-1);
+        assertThat(backward.skippedWeekendDays()).isEqualTo(2);
+        assertThat(backward.skippedHolidayDays()).isZero();
+
+        DateTimeBusinessDaysResponse zero = dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-05T17:00:00Z", "UTC", 0, null, List.of("2026-01-05")));
+
+        assertThat(zero.isoUtc()).isEqualTo("2026-01-05T17:00:00Z");
+        assertThat(zero.epochSeconds()).isEqualTo(Instant.parse("2026-01-05T17:00:00Z").getEpochSecond());
+        assertThat(zero.appliedAmount()).isZero();
+        assertThat(zero.skippedWeekendDays()).isZero();
+        assertThat(zero.skippedHolidayDays()).isZero();
+    }
+
+    @Test
+    @DisplayName("Should preserve the local wall clock across the DST spring-forward transition")
+    void shouldPreserveWallClockAcrossDstSpringForward() {
+        // Friday 2026-03-06 09:00 EST (UTC-5); the next business day is Monday 2026-03-09, already EDT (UTC-4).
+        DateTimeBusinessDaysResponse response = dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-03-06T09:00:00-05:00", "America/New_York", 1, null, null));
+
+        assertThat(response.isoUtc()).isEqualTo("2026-03-09T13:00:00Z");
+        assertThat(response.epochMillis()).isEqualTo(1773061200000L);
+        assertThat(response.formattedTarget()).isEqualTo("2026-03-09T09:00:00-04:00");
+        assertThat(response.targetTimeZone()).isEqualTo("America/New_York");
+        assertThat(response.skippedWeekendDays()).isEqualTo(2);
+
+        DateTimeBusinessDaysResponse custom = dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-03-06T09:00:00-05:00", "America/New_York", 1,
+                        "yyyy-MM-dd HH:mm:ss", null));
+        assertThat(custom.formattedTarget()).isEqualTo("2026-03-09 09:00:00");
+    }
+
+    @Test
+    @DisplayName("Should accept the +-10000 bound without spinning beyond the scan cap")
+    void shouldAcceptTheMaximumAmount() {
+        DateTimeBusinessDaysResponse response = dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-02T17:00:00Z", "UTC", 10000, null, null));
+
+        assertThat(response.appliedAmount()).isEqualTo(10000);
+        assertThat(response.skippedWeekendDays()).isPositive();
+        assertThat(Instant.parse(response.isoUtc())).isAfter(Instant.parse("2026-01-02T17:00:00Z"));
+    }
+
+    @Test
+    @DisplayName("Should reject invalid business-day requests with IllegalArgumentException")
+    void shouldRejectInvalidBusinessDayRequests() {
+        assertThatThrownBy(() -> dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("  ", "UTC", 1, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("input datetime or timestamp is required");
+
+        assertThatThrownBy(() -> dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-02T17:00:00Z", "UTC", null, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("amount is required");
+
+        assertThatThrownBy(() -> dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-02T17:00:00Z", "UTC", 10001, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("amount must be between -10000 and 10000");
+
+        assertThatThrownBy(() -> dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-02T17:00:00Z", "Invalid/Zone", 1, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unknown or invalid timezone");
+
+        assertThatThrownBy(() -> dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-02T17:00:00Z", "UTC", 1, null, List.of(" "))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("holiday entries must not be blank");
+
+        assertThatThrownBy(() -> dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-02T17:00:00Z", "UTC", 1, null, List.of("05/01/2026"))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid holiday date");
+
+        assertThatThrownBy(() -> dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("not-a-date", "UTC", 1, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unable to parse input datetime");
+
+        List<String> tooManyHolidays = new ArrayList<>();
+        for (int i = 0; i < 367; i++) {
+            tooManyHolidays.add("2026-01-05");
+        }
+        assertThatThrownBy(() -> dateTimeService.businessDays(
+                new DateTimeBusinessDaysRequest("2026-01-02T17:00:00Z", "UTC", 1, null, tooManyHolidays)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("holidays must contain at most 366 entries");
     }
 }
