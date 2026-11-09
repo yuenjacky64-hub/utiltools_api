@@ -187,7 +187,7 @@ def test_cancel_task_terminates_running_cycle(tmp_path: Path) -> None:
     assert payload["reason"] == report.reason
 
 
-def test_cancel_task_times_out_when_the_step_hangs(tmp_path: Path) -> None:
+def test_cancel_task_times_out_when_step_blocks(tmp_path: Path) -> None:
     """DOD-02: a hung step that ignores the flag stops the wait at the bound."""
 
     release = threading.Event()
@@ -284,31 +284,21 @@ def test_run_cycle_breaks_early_when_stop_requested_mid_cycle(
     assert engine.should_stop() is True
 
 
-def test_run_forever_honours_stop_and_clears_markers(tmp_path: Path) -> None:
-    """DOD-03/DOD-06: run_forever breaks after the stopping cycle, logs the
-    reason via STOP_HONOURED, and stops without waiting a further full
-    interval; the markers written while running are removed on the stop."""
+def _stop_after_second_cycle(
+    tmp_path: Path, cfg: MaintainerConfig, clock: FrozenClock, sleeper: FakeSleeper
+) -> MaintainerEngine:
+    """Engine that requests a stop between cycle 2 and its sleep."""
 
-    clock = FrozenClock()
-    sleeper = FakeSleeper(clock)
-    cfg = MaintainerConfig(max_steps_per_cycle=1, max_shutdown_wait_sec=5.0)
     curriculum = TaskCurriculum(specs=[_spec("task-a")], config=cfg, clock=clock)
-    pid_seen = False
-    heartbeat_seen = False
 
     class StopAfterSecondCycle(MaintainerEngine):
         def run_cycle(self) -> CycleResult:
-            nonlocal pid_seen, heartbeat_seen
             result = super().run_cycle()
-            pid_seen |= self.pid_file is not None and self.pid_file.exists()
-            heartbeat_seen |= (
-                self.heartbeat_file is not None and self.heartbeat_file.exists()
-            )
             if self._cycles >= 2:
                 self.request_stop("operator-stop")
             return result
 
-    engine = StopAfterSecondCycle(
+    return StopAfterSecondCycle(
         curriculum,
         config=cfg,
         clock=clock,
@@ -317,26 +307,34 @@ def test_run_forever_honours_stop_and_clears_markers(tmp_path: Path) -> None:
         shutdown_audit_path=tmp_path / "data" / "maintainer_shutdown.log",
     )
 
+
+def test_request_stop_breaks_run_forever_within_interval(tmp_path: Path) -> None:
+    """DOD-05: the loop breaks after the stopping cycle instead of paying a
+    further full interval, and lands in STOPPED (INV-STOP-LATENCY-1)."""
+
+    clock = FrozenClock()
+    cfg = MaintainerConfig(max_steps_per_cycle=1, max_shutdown_wait_sec=5.0)
+    engine = _stop_after_second_cycle(tmp_path, cfg, clock, FakeSleeper(clock))
+
     started = time.monotonic()
     report = engine.run_forever(interval_sec=1.0)
     elapsed = time.monotonic() - started
 
-    assert pid_seen is True
-    assert heartbeat_seen is True
-    # The stop lands between cycles: the loop breaks before paying a second
-    # full interval, so only the one inter-cycle wait is spent
-    # (INV-STOP-LATENCY-1).
     assert engine._cycles == 2
     assert elapsed < 2.0
     assert report.state is EngineState.STOPPED
     assert engine.state is EngineState.STOPPED
 
-    markers = tmp_path / "state"
-    assert not (markers / RUNTIME_PID_FILE).exists()
-    assert not (markers / (RUNTIME_PID_FILE + ".tmp")).exists()
-    assert not (markers / RUNTIME_HEARTBEAT_FILE).exists()
-    assert not (markers / (RUNTIME_HEARTBEAT_FILE + ".tmp")).exists()
-    assert CLEANUP_CLEAR_RUNTIME_MARKERS in report.cleanup_steps
+
+def test_run_forever_logs_shutdown_reason(tmp_path: Path) -> None:
+    """DOD-05: exactly one STOP_HONOURED carries the operator's reason and the
+    audit record shows the wind-down ran."""
+
+    clock = FrozenClock()
+    cfg = MaintainerConfig(max_steps_per_cycle=1, max_shutdown_wait_sec=5.0)
+    engine = _stop_after_second_cycle(tmp_path, cfg, clock, FakeSleeper(clock))
+
+    report = engine.run_forever(interval_sec=1.0)
 
     stop_events = _events_named(engine, "STOP_HONOURED")
     assert len(stop_events) == 1
@@ -345,6 +343,128 @@ def test_run_forever_honours_stop_and_clears_markers(tmp_path: Path) -> None:
     record = _audit_lines(tmp_path / "data" / "maintainer_shutdown.log")[-1]
     assert record["runtime_markers_cleared"] is True
     assert CLEANUP_CLEAR_RUNTIME_MARKERS in record["cleanup_steps"]
+    assert CLEANUP_CLEAR_RUNTIME_MARKERS in report.cleanup_steps
+
+
+def test_runtime_markers_removed_after_stop(tmp_path: Path) -> None:
+    """DOD-03/DOD-06: the pid/heartbeat markers really are written while the
+    loop runs, so the removal assertions below are not vacuous."""
+
+    clock = FrozenClock()
+    cfg = MaintainerConfig(max_steps_per_cycle=1, max_shutdown_wait_sec=5.0)
+    curriculum = TaskCurriculum(specs=[_spec("task-a")], config=cfg, clock=clock)
+    markers = tmp_path / "state"
+    pid_seen = False
+    heartbeat_seen = False
+
+    class MarkerProbe(MaintainerEngine):
+        def run_cycle(self) -> CycleResult:
+            nonlocal pid_seen, heartbeat_seen
+            result = super().run_cycle()
+            pid_seen |= self.pid_file is not None and self.pid_file.exists()
+            heartbeat_seen |= (
+                self.heartbeat_file is not None and self.heartbeat_file.exists()
+            )
+            # ``run_forever`` clears the stop flag at entry, so the request has
+            # to come from inside the loop (one cycle only).
+            self.request_stop("operator-stop")
+            return result
+
+    engine = MarkerProbe(
+        curriculum,
+        config=cfg,
+        clock=clock,
+        sleep=FakeSleeper(clock),
+        state_root=markers,
+        shutdown_audit_path=tmp_path / "data" / "maintainer_shutdown.log",
+    )
+    report = engine.run_forever(interval_sec=1.0)
+
+    assert pid_seen is True
+    assert heartbeat_seen is True
+    assert report.state is EngineState.STOPPED
+    assert not (markers / RUNTIME_PID_FILE).exists()
+    assert not (markers / (RUNTIME_PID_FILE + ".tmp")).exists()
+    assert not (markers / RUNTIME_HEARTBEAT_FILE).exists()
+    assert not (markers / (RUNTIME_HEARTBEAT_FILE + ".tmp")).exists()
+
+
+def test_second_run_forever_leaves_no_markers(tmp_path: Path) -> None:
+    """SHOULD_FIX (review v1): a second ``run_forever()`` publishes markers at
+    entry while ``shutdown()`` returns its cached report without re-running the
+    cleanup, so the loop's own exit path must clear them — asserted
+    non-vacuously, since the markers are observed to exist mid-cycle."""
+
+    clock = FrozenClock()
+    cfg = MaintainerConfig(max_steps_per_cycle=1, max_shutdown_wait_sec=5.0)
+    curriculum = TaskCurriculum(specs=[_spec("task-a")], config=cfg, clock=clock)
+    markers = tmp_path / "state"
+
+    class SecondLoopProbe(MaintainerEngine):
+        loops = 0
+        second_loop_markers = False
+
+        def run_cycle(self) -> CycleResult:
+            result = super().run_cycle()
+            self.loops += 1
+            if self.loops == 2:
+                self.second_loop_markers = bool(
+                    self.pid_file is not None
+                    and self.pid_file.exists()
+                    and self.heartbeat_file is not None
+                    and self.heartbeat_file.exists()
+                )
+            # ``run_forever`` clears the stop flag at entry, so each loop needs
+            # its own request.
+            self.request_stop("loop-done")
+            return result
+
+    engine = SecondLoopProbe(
+        curriculum,
+        config=cfg,
+        clock=clock,
+        sleep=FakeSleeper(clock),
+        state_root=markers,
+        shutdown_audit_path=tmp_path / "data" / "maintainer_shutdown.log",
+    )
+
+    first = engine.run_forever(interval_sec=1.0)
+    assert first.state is EngineState.STOPPED
+    assert not (markers / RUNTIME_PID_FILE).exists()
+
+    second = engine.run_forever(interval_sec=1.0)
+
+    assert engine.loops == 2
+    assert engine.second_loop_markers is True  # markers really were republished
+    assert second is first  # ``shutdown()`` served the cached report ...
+    assert second.state is EngineState.STOPPED
+    # ... so the loop's exit path had to do the clearing itself.
+    assert not (markers / RUNTIME_PID_FILE).exists()
+    assert not (markers / (RUNTIME_PID_FILE + ".tmp")).exists()
+    assert not (markers / RUNTIME_HEARTBEAT_FILE).exists()
+    assert not (markers / (RUNTIME_HEARTBEAT_FILE + ".tmp")).exists()
+
+
+def test_runtime_markers_removed_on_natural_completion(tmp_path: Path) -> None:
+    """DOD-06: a wind-down with no stop request (``shutdown()`` after the last
+    cycle) also removes markers that were present — non-vacuously, since the
+    test writes them first and asserts they exist before the wind-down."""
+
+    markers = tmp_path / "state"
+    engine = _engine(tmp_path, [_spec("task-a")], state_root=markers)
+    engine._write_runtime_markers()
+
+    pid_path = markers / RUNTIME_PID_FILE
+    heartbeat_path = markers / RUNTIME_HEARTBEAT_FILE
+    assert pid_path.exists()
+    assert heartbeat_path.exists()
+
+    report = engine.shutdown()
+
+    assert report.state is EngineState.STOPPED
+    assert report.timed_out is False
+    assert not pid_path.exists()
+    assert not heartbeat_path.exists()
 
 
 def test_cancel_task_then_stop_reaches_stopped_cleanly(tmp_path: Path) -> None:
@@ -368,9 +488,10 @@ def test_cancel_task_then_stop_reaches_stopped_cleanly(tmp_path: Path) -> None:
 # ------------------------------------------------------- REQ-03 cleanup/prune
 
 
-def test_shutdown_prunes_memory_store_to_configured_maxima(tmp_path: Path) -> None:
-    """DOD-04: shutdown trims the memory document to the three configured
-    maxima and names the drop counts in the audit record."""
+def test_memory_pruned_after_cycle_and_on_shutdown(tmp_path: Path) -> None:
+    """DOD-07 (INV-PRUNE-1/2/3/4): both the per-cycle trim and the wind-down
+    trim are visible in ``maintainer_memory.json`` itself, not just in the
+    in-process store, and the audit record names the drops."""
 
     path = tmp_path / "maintainer_memory.json"
     store = MemoryStore(path)
@@ -386,6 +507,7 @@ def test_shutdown_prunes_memory_store_to_configured_maxima(tmp_path: Path) -> No
         memory_max_runs=2,
         memory_max_bug_fixes=1,
         memory_max_learnings=2,
+        max_steps_per_cycle=1,
         max_shutdown_wait_sec=0.5,
     )
     engine = _engine(
@@ -396,15 +518,41 @@ def test_shutdown_prunes_memory_store_to_configured_maxima(tmp_path: Path) -> No
         state_root=tmp_path / "state",
     )
 
+    # --- per-cycle trim reaches the document ------------------------------
+    engine.run_cycle()
+    after_cycle = json.loads(path.read_text(encoding="utf-8"))
+    assert len(after_cycle["runs"]) == 2
+    assert len(after_cycle["bug_fixes"]) == 1
+    assert len(after_cycle["learnings"]) == 2
+
+    # --- grow the document again, then trim it in the wind-down -----------
+    for index in range(3):
+        store.add_run(
+            {"run_id": f"r{10 + index}", "task_id": "task-a", "state": "COMPLETED"}
+        )
+    for index in range(2):
+        store.add_bug_fix({"fix_id": f"f{10 + index}", "task_id": "task-a", "summary": "s"})
+    for index in range(2):
+        store.add_learning({"learning_id": f"l{10 + index}", "text": f"note {index}"})
+    store.save(known_task_ids={"task-a"})
+    grown = json.loads(path.read_text(encoding="utf-8"))
+    assert len(grown["runs"]) == 5  # precondition: the document is over the cap
+
     engine.request_stop()
     report = engine.shutdown()
 
     assert CLEANUP_PRUNE_MEMORY in report.cleanup_steps
     record = _audit_lines(tmp_path / "data" / "maintainer_shutdown.log")[-1]
     assert record["memory_dropped"] == {"runs": 3, "bug_fixes": 2, "learnings": 2}
+
+    # The persisted document — not merely the in-memory store — is trimmed.
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert len(persisted["runs"]) == 2
+    assert len(persisted["bug_fixes"]) == 1
+    assert len(persisted["learnings"]) == 2
+    # ``prune()`` keeps the newest entries, so the surviving pair is r11/r12.
+    assert [item["run_id"] for item in persisted["runs"]] == ["r11", "r12"]
     assert len(store.records()["runs"]) == 2
-    assert len(store.records()["bug_fixes"]) == 1
-    assert len(store.records()["learnings"]) == 2
 
 
 def test_run_cycle_persists_pruned_memory_document(tmp_path: Path) -> None:
@@ -434,7 +582,7 @@ def test_run_cycle_persists_pruned_memory_document(tmp_path: Path) -> None:
     assert [record["run_id"] for record in reloaded["runs"]] == ["r4", "r5", "r6"]
 
 
-def test_shutdown_prunes_stale_task_slots(tmp_path: Path) -> None:
+def test_stale_task_slot_tmp_pruned_on_shutdown(tmp_path: Path) -> None:
     """DOD-04: stale slots are dropped, committed state and live slots survive."""
 
     root = tmp_path / "state"

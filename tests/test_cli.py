@@ -399,6 +399,38 @@ def test_stop_rejects_invalid_pid_file(tmp_path: Path) -> None:
     assert (state_root / "maintainer.pid").exists()
 
 
+def test_stop_rejects_non_finite_timeout(tmp_path: Path) -> None:
+    """SHOULD_FIX F4: ``--timeout inf``/``nan`` is refused by the parser, so the
+    marker poll can never become an unbounded wait (engine parity: ValueError)."""
+
+    state_root = tmp_path / "data"
+    state_root.mkdir()
+
+    for bad in ("inf", "-inf", "nan"):
+        # ``=`` form: argparse would otherwise read ``-inf`` as an option flag.
+        result = _run_cli(
+            ["stop", "--state-root", str(state_root), f"--timeout={bad}"], _base_env()
+        )
+        assert result.returncode == 2, (bad, result.stdout, result.stderr)
+        assert "timeout must be a finite number of seconds" in result.stderr
+
+
+def test_stop_reports_overflowing_pid_without_traceback(tmp_path: Path) -> None:
+    """SHOULD_FIX F5: a 26-digit pid file fails ``os.kill`` with OverflowError;
+    the CLI reports the malformed file and exits 1 instead of crashing."""
+
+    state_root = tmp_path / "data"
+    state_root.mkdir()
+    (state_root / "maintainer.pid").write_text("1" * 26 + "\n", encoding="utf-8")
+
+    result = _run_cli(["stop", "--state-root", str(state_root)], _base_env())
+
+    assert result.returncode == 1
+    assert "invalid maintainer pid file" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert (state_root / "maintainer.pid").exists()
+
+
 def test_stop_is_a_no_op_without_a_pid_file(tmp_path: Path) -> None:
     """Nothing running means nothing to clean up: exit 0, no state mutated."""
 

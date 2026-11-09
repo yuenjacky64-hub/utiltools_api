@@ -26,6 +26,7 @@ The repo ships no ``pyproject.toml``/``setup.py``, so ``<repo>/src`` is put on
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import signal
 import sys
@@ -73,10 +74,44 @@ def _unlink_markers(state_root: Path) -> None:
             pass
 
 
+def _finite_timeout(raw: str) -> float:
+    """argparse type: a finite, non-negative wait, like the engine's own bound.
+
+    ``float("inf")``/``float("nan")`` used to reach the marker poll and turn it
+    into an unbounded (``inf``) or instant (``nan``) wait, so the CLI enforces
+    the same rule the engine applies to ``max_shutdown_wait_sec``.
+    """
+
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"invalid float value: {raw!r}") from None
+    if not math.isfinite(value) or value < 0.0:
+        raise argparse.ArgumentTypeError(
+            f"timeout must be a finite number of seconds >= 0, got {raw!r}"
+        )
+    return value
+
+
 def _run_stop(
     *, maintainer_root: str | None, state_root: str | None, timeout: float
 ) -> int:
     """Signal the daemon (or clear a dead pid's markers) and report one line."""
+
+    # Defence in depth for callers that bypass ``build_parser()``: an
+    # unbounded wait here would hang the operator tool (SHOULD_FIX F4).
+    try:
+        wait_sec = float(timeout)
+    except (TypeError, ValueError):
+        print(f"invalid --timeout: {timeout!r}", file=sys.stderr)
+        return 1
+    if not math.isfinite(wait_sec) or wait_sec < 0.0:
+        print(
+            f"invalid --timeout {timeout!r}: must be a finite number of "
+            "seconds >= 0",
+            file=sys.stderr,
+        )
+        return 1
 
     root = Path(maintainer_root) if maintainer_root else _repo_root()
     markers_root = Path(state_root) if state_root else root / "data"
@@ -106,6 +141,11 @@ def _run_stop(
     except PermissionError:
         print(f"cannot probe maintainer pid {pid}: permission denied", file=sys.stderr)
         return 1
+    except OverflowError:
+        # A >2**31 pid passes ``int()`` and ``pid <= 1`` but cannot be a real
+        # pid; report the malformed file instead of a traceback (SHOULD_FIX F5).
+        print(f"invalid maintainer pid file: {pid_path}", file=sys.stderr)
+        return 1
 
     try:
         os.kill(pid, signal.SIGTERM)
@@ -116,8 +156,11 @@ def _run_stop(
     except PermissionError:
         print(f"cannot signal maintainer pid {pid}: permission denied", file=sys.stderr)
         return 1
+    except OverflowError:
+        print(f"invalid maintainer pid file: {pid_path}", file=sys.stderr)
+        return 1
 
-    deadline = time.monotonic() + max(0.0, float(timeout))
+    deadline = time.monotonic() + wait_sec
     while time.monotonic() < deadline:
         if not pid_path.exists():
             print(f"maintainer stopped (pid {pid})")
@@ -128,7 +171,7 @@ def _run_stop(
         print(f"maintainer stopped (pid {pid})")
         return 0
 
-    print(f"stop timed out after {timeout}s (pid {pid})", file=sys.stderr)
+    print(f"stop timed out after {wait_sec}s (pid {pid})", file=sys.stderr)
     return 1
 
 
@@ -220,7 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stop_parser.add_argument(
         "--timeout",
-        type=float,
+        type=_finite_timeout,
         default=10.0,
         metavar="SEC",
         dest="timeout",

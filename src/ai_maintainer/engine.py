@@ -598,7 +598,15 @@ class MaintainerEngine:
                 self._pause(interval)
         finally:
             self._log_stop_reason()
-            return self.shutdown()
+            report = self.shutdown()
+            # INV-MARK-4 / DOD-03: the markers are published at entry, but
+            # ``shutdown()`` is idempotent and returns its cached report on a
+            # second ``run_forever()`` without re-running the marker cleanup.
+            # Clearing here (a no-op when ``shutdown()`` already did it) keeps
+            # the loop's exit free of stale ``maintainer.pid``/heartbeat files
+            # no matter how many times it is entered.
+            self._clear_runtime_markers()
+            return report
 
     def shutdown(self) -> ShutdownReport:
         """Bounded, idempotent wind-down (INV-SHUT-1/2/3/4/5)."""
@@ -708,10 +716,23 @@ class MaintainerEngine:
             memory_dropped = {"runs": 0, "bug_fixes": 0, "learnings": 0}
             memory = self._memory
             if memory is not None:
+                with self._lock:
+                    known_task_ids = {task.name for task in self._curriculum.specs}
+                # INV-PRUNE-1/4: ``prune()`` only mutates the in-process store,
+                # so the wind-down must persist right after it — otherwise the
+                # document on disk keeps every record while the audit line
+                # below advertises drops it never wrote (REQ-03/DOD-07).
                 memory_dropped, prune_issue = self._prune_memory(memory)
-                if prune_issue is None:
+                save_error: Exception | None = None
+                try:
+                    memory.save(known_task_ids=known_task_ids)
+                except Exception as error:  # pragma: no cover - defensive
+                    save_error = error
+                if prune_issue is None and save_error is None:
                     cleanup_steps.append(CLEANUP_PRUNE_MEMORY)
                 else:
+                    # Never raise from bookkeeping: an unpersisted trim is a
+                    # failed cleanup step, exactly like a failed prune.
                     failed_steps.append(CLEANUP_PRUNE_MEMORY)
 
             # INV-MARK-4: marker removal is a cleanup step, so a failure shows
