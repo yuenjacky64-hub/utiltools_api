@@ -1165,7 +1165,16 @@ read-only by `GET /api/v1/utils/resilience` and driven by hand with `POST /api/v
     "probeInFlight": true,
     "probeLeaseExpiresAt": "2026-01-01T00:00:40Z",
     "auditCapacity": 1024,
-    "audit": []
+    "audit": [],
+    "fallbackCache": {
+      "hits": 0,
+      "misses": 3,
+      "expired": 0,
+      "evictions": 0,
+      "size": 1,
+      "ttlMillis": 60000,
+      "maxEntries": 256
+    }
   },
   "message": "Resilience state retrieved",
   "timestamp": "2026-01-01T00:00:31Z"
@@ -1176,6 +1185,7 @@ read-only by `GET /api/v1/utils/resilience` and driven by hand with `POST /api/v
 | :--- | :--- |
 | `probeInFlight` | `true` while a `HALF_OPEN` probe claim is held and its lease has not expired |
 | `probeLeaseExpiresAt` | Deadline of that claim (`null` when the breaker holds no claim) |
+| `fallbackCache` | Last-known-good cache snapshot: `hits`, `misses`, `expired`, `evictions`, live `size`, and the configured `ttlMillis` / `maxEntries`. `misses` counts every opt-in lookup that found nothing usable, including expired entries |
 
 Recovery: while a probe lease is live a concurrent caller is refused with `503` `CIRCUIT_OPEN` and reason
 `probe already in flight`. Once the lease expires the claim is superseded — the superseded generation can no
@@ -1187,8 +1197,78 @@ ignored — and the next admitted caller claims a fresh generation. The schedule
 | :--- | :--- | :--- |
 | `utiltools.resilience.probe-lease-seconds` | `10` | Lifetime of a `HALF_OPEN` probe claim before it may be superseded |
 | `utiltools.resilience.probe-reaper-interval-ms` | `5000` | Fixed delay between scheduled sweeps that release expired leases |
+| `utiltools.resilience.fallback-cache-ttl-ms` | `60000` | Age after which a last-known-good fallback entry is expired and no longer served |
+| `utiltools.resilience.fallback-cache-max-entries` | `256` | Hard cap on cached fallback entries; the oldest entry is evicted first |
+| `utiltools.resilience.fallback-cache-sweep-interval-ms` | `30000` | Fixed delay between scheduled sweeps that drop expired fallback entries |
 
-> **Scope note:** breaker state, the probe claim and the audit trail are in-process and reset on restart.
+#### J. Last-known-good fallback for circuit-broken JSON queries
+
+`POST /api/v1/utils/json/query` fails closed with `503` `CIRCUIT_OPEN` while the breaker is `OPEN`. A
+caller that would rather receive a clearly marked stale answer can opt in:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/json/query \
+  -H 'Content-Type: application/json' \
+  -d '{"json": "{\"items\": [10, 20, 30]}", "jsonPath": "$.items[1]", "allowStaleFallback": true}'
+```
+```json
+{
+  "success": true,
+  "message": "JSON query executed successfully",
+  "data": {
+    "jsonPath": "$.items[1]",
+    "result": 20,
+    "staleFallback": true,
+    "cachedAt": "2026-01-01T00:00:05Z",
+    "cacheAgeMillis": 1500
+  },
+  "timestamp": "2026-01-01T00:00:06.5Z"
+}
+```
+
+`allowStaleFallback` is absent/false by default, and a **live** result keeps the exact pre-existing
+shape apart from the three additive `null` fields (`staleFallback`, `cachedAt`, `cacheAgeMillis` are
+populated only when a cached result is served).
+
+**Contract:**
+
+| Case | Result |
+| :--- | :--- |
+| Breaker `CLOSED` | Live evaluation; the successful result is cached before it is returned |
+| Breaker `OPEN`, `allowStaleFallback: true`, fresh entry for the same `json` + `jsonPath` | `200` with the cached payload plus `staleFallback: true`, the original `cachedAt` and the computed `cacheAgeMillis` |
+| Breaker `OPEN`, no entry (never seen, or a different `json`/`jsonPath` pair) | `503` `CIRCUIT_OPEN` — the original exception, unchanged |
+| Breaker `OPEN`, entry older than `utiltools.resilience.fallback-cache-ttl-ms` | `503` `CIRCUIT_OPEN`; the expired entry is dropped and counted as `expired` |
+| Breaker `OPEN`, `allowStaleFallback` absent/false | `503` `CIRCUIT_OPEN`; the cache is not even consulted |
+
+**Properties:**
+
+| Property | Default | Purpose |
+| :--- | :--- | :--- |
+| `utiltools.resilience.fallback-cache-ttl-ms` | `60000` | Age after which a cached answer is stale and no longer served |
+| `utiltools.resilience.fallback-cache-max-entries` | `256` | Hard entry cap; the oldest entry is evicted first |
+| `utiltools.resilience.fallback-cache-sweep-interval-ms` | `30000` | Fixed delay between scheduled sweeps that drop expired entries |
+
+**Guarantees and limits:**
+
+- **Keys are content-derived.** An entry is keyed by the SHA-256 digest of the normalized `json` +
+  `jsonPath` pair, so only a byte-identical request can read it. A different caller therefore sees
+  another caller's *body* only when it submitted the identical deterministic query — but the cache
+  is not caller-partitioned, so treat it as a shared, content-addressed cache, not a per-tenant one.
+- **The fallback never touches the breaker.** Serving a stale answer makes no breaker call, changes
+  no counter, does not extend or shorten the cooldown, and does not claim or release the `HALF_OPEN`
+  probe lease — the `GET /api/v1/utils/resilience` snapshot is identical before and after, except for
+  the `fallbackCache` counters.
+- **Only live successes are cached.** A failed live query leaves the previously cached value intact,
+  and a fallback response is never written back, so a stale answer can never become the new
+  last-known-good.
+- **Best effort.** A cache write or lookup fault is swallowed: it never turns a successful live query
+  into an error and never masks the original `CIRCUIT_OPEN` exception.
+- **Non-replayable audit.** An opt-in call is journalled as `JSON_QUERY_FALLBACK`, which is
+  non-deterministic: replaying it answers `409` `REPLAY_CONFLICT` (`NON_DETERMINISTIC`). A journalled
+  `JSON_QUERY` entry replays with the opt-in flag stripped, so a replay can never serve stale data.
+- **Bounded by count, not bytes.** The entry cap bounds the number of cached answers, not their size;
+  size `fallback-cache-max-entries` against the largest result slices you query.
+- **In-process.** The cache dies with the JVM: no restart persistence, no cross-instance sharing.
 
 ---
 
@@ -1200,6 +1280,9 @@ All sixteen journalled utility operations — `datetime/convert`, `datetime/diff
 hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
 can be verified against the original outcome without ever mutating the original entry.
 `GET /api/v1/utils/datetime/timezones` is read-only catalogue metadata and is not journalled.
+An opt-in JSON query (`allowStaleFallback: true`) is journalled as `JSON_QUERY_FALLBACK` rather than
+`JSON_QUERY`: that type is non-deterministic, because the stored answer may be a cached last-known-good
+result, so it is rejected for replay with `NON_DETERMINISTIC`.
 
 **Lifecycle:** `PENDING` on entry → `SUCCEEDED` with the response DTO, or `FAILED` with an
 `errorCode` (`BAD_REQUEST` / `INTERNAL_SERVER_ERROR`). Only `PENDING → SUCCEEDED` and
@@ -2254,7 +2337,7 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`CryptoServiceTest`**: Standard hashing vectors, HMAC calculations, Base64 encode/decode, URL percent-encoding across `COMPONENT`/`PATH`/`FORM` (round-trip, mode-specific `+`, malformed escape and undecodable UTF-8 rejection), UUID v4 generation, UUIDv7 fixed-clock vector, `version=V4|V7` parsing, clock-regression monotonicity, and an 8-thread x 10000 duplicate-free concurrency invariant.
 - **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `crypto/url` encode/decode, 400 `BAD_REQUEST` vs `VALIDATION_ERROR`, and `CRYPTO_URL` journal/replay (`VERIFIED`), including `version=V4|V7` selection, compact UUIDv7, and the 400 unified envelope for an unknown `version`.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries, six-op patch success, rollback to byte-identical original, missing paths, malformed pointers, `-` append, dry runs, input-not-mutated.
-- **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, and empty-`operations` validation rejection.
+- **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, empty-`operations` validation rejection, and the stale-fallback envelopes: an opt-in request served from the cache with `staleFallback`/`cachedAt`/`cacheAgeMillis` on an `OPEN` breaker, plus the unchanged `503` `CIRCUIT_OPEN` envelope for a miss, a different `jsonPath` and a non-opt-in caller.
 - **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`), sentence-case idempotence and `[.!?]`-run boundaries, diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points; plus replace coverage: `$n` group expansion, literal metacharacters, `all=false` first-match-only, case-insensitive matching, no-match results, invalid-regex rejection, code-point `length`, every request constraint bound, and the 1000000-character result bound.
 - **`TextControllerTest`**: Text endpoints MockMvc suite, including the snake-case and sentence-case transform envelopes, diacritic slugging, `400 BAD_REQUEST` for an unknown operation, `400 VALIDATION_ERROR` for blank text, and a `TEXT_TRANSFORM` entry listed by `/audit/entries` and replayed as `VERIFIED`; a replace envelope with `$n` groups, `400 BAD_REQUEST` for an invalid regex (journalled `TEXT_REPLACE`/`FAILED`), `400 VALIDATION_ERROR` for blank text, an absent `replacement` and an oversized `pattern`, and a `TEXT_REPLACE` entry listed by `/audit/entries` and replayed as `VERIFIED`.
 - **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, key/payload fingerprint conflict detection (changed items, reordered items, changed algorithm or `secretKey`), 8-thread different-payload races, identical-key/identical-payload retries that mint no second execution, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff. Retry coverage: transient failure then a successful retry (`attempt` 2, attempt-1 `FAILED` entry retained), `RUNNING`/`COMPLETED`/`CANCELLED` conflicts that leave the snapshot unchanged, attempt exhaustion at `maxAttempts`, stale-worker fencing (a superseded generation writes nothing after a retry), and queue-rejection rollback that leaves the job `FAILED` with an unconsumed attempt while a later retry succeeds. Checkpoint coverage: a transient failure at a chosen item reports `completedItems` equal to the hashes that succeeded, leaves `results` absent and does not reach later items; the retry rehashes only the suffix (per-item invocation counts) and publishes the full batch in input order with `resumedFrom` on the second attempt; a stale worker from a reaped or superseded generation cannot advance or overwrite the checkpoint (replaying `executeAttempt` leaves the snapshot identical); a `429 QUEUE_FULL` retry restores the exact pre-retry `FAILED` snapshot including attempt, `completedItems` and the checkpoint; the journal descriptor and outcome carry `resumedFrom`/`completedItems` but never items or `secretKey`; and a cancelled job exposes no checkpoint results.
@@ -2268,6 +2351,8 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`ResilienceControllerTest`**: MockMvc coverage of `GET /api/v1/utils/resilience` (`probeInFlight` / `probeLeaseExpiresAt` in the payload) and of `POST /api/v1/utils/resilience/probe` with the unified envelope.
 - **`AuditTrailTest`**: Bounded audit ring buffer ordering and capacity-eviction behaviour.
 - **`JsonQueryCircuitOpenTest`**: End-to-end proof that an `OPEN` breaker maps to a `503` `CIRCUIT_OPEN` envelope on `/api/v1/utils/json/query`.
+- **`JsonQueryFallbackCacheTest`**: Clock-driven unit coverage of the last-known-good cache — key normalization and SHA-256 collision-free separation of `json`/`jsonPath` pairs, `remember`/`serve` round-trip, TTL expiry on a mutable `Clock`, oldest-first eviction under `max-entries`, the scheduled sweep, and the bounded hit/miss/expired/eviction counters.
+- **`JsonQueryStaleFallbackTest`**: Service-level fallback proof — a warmed cache plus an `OPEN` breaker returns the cached result with `staleFallback=true`, the original `cachedAt` and a correct `cacheAgeMillis` while breaker state, counters and `resetAt` stay byte-identical; a miss, an expired TTL entry, a different `jsonPath` and `allowStaleFallback=false` all still raise the original `CIRCUIT_OPEN`; a live failure keeps the previous cached value; a fallback is never re-inserted; and an opt-in call appends a non-deterministic `JSON_QUERY_FALLBACK` entry that is rejected for replay with `NON_DETERMINISTIC`.
 - **`UtiltoolsApiApplicationTests`**: Spring ApplicationContext loading verification.
 
 ---
