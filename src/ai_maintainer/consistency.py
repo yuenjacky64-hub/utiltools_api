@@ -414,15 +414,30 @@ class StoreRoots:
 
 
 def _read_signal(task_dir: Path) -> StoreReading:
+    return _read_signal_checked(task_dir)[0]
+
+
+def _read_signal_checked(task_dir: Path) -> tuple[StoreReading, bool]:
+    """``(reading, unreadable)`` for one slot's signal store.
+
+    Same evidence as :func:`_read_signal`, but distinguishes *absent* from
+    *unreadable*: a ``_signal.txt`` that exists yet cannot be opened (or is a
+    symlink that would lead outside the slot) is reported as ``unreadable`` so
+    a caller that must not guess -- the journal reconciliation pass -- can
+    refuse instead of asserting the file is gone.
+    """
+
     path = task_dir / SIGNAL_FILE
     try:
+        if path.is_symlink():
+            return StoreReading(), True
         if not path.is_file():
-            return StoreReading()
+            return StoreReading(), False
         with path.open(encoding="utf-8", errors="replace") as handle:
             head = _first_nonempty_line(handle.read(HEAD_LIMIT))
     except OSError:
-        return StoreReading()
-    return StoreReading(present=True, state=token_state(head), evidence=head)
+        return StoreReading(), True
+    return StoreReading(present=True, state=token_state(head), evidence=head), False
 
 
 def _read_progress(task_dir: Path) -> StoreReading:
@@ -704,30 +719,34 @@ def _reconcile_target_task(line: Mapping[str, Any], roots: StoreRoots) -> str | 
     return task
 
 
-def _live_signal(roots: StoreRoots, task_id: str) -> tuple[bool, str | None]:
-    """``(present, head)`` of the live ``_signal.txt`` for a journal line.
+def _live_signal(roots: StoreRoots, task_id: str) -> tuple[bool, str | None, bool]:
+    """``(present, head, flagged)`` of the live ``_signal.txt`` for a journal line.
 
-    Read-only: :func:`_read_signal` opens the file for reading and never writes,
-    and a missing file is absent evidence. A slot that turned into a symlink or
-    escaped the root after :func:`_reconcile_target_task` vetted it is treated
-    as absent, so an unsafe slot can only ever be refused, never followed.
+    Read-only: :func:`_read_signal_checked` opens the file for reading and never
+    writes, and a missing file is absent evidence (``present is False``,
+    ``flagged is False``). A slot that turned into a symlink or escaped the root
+    after :func:`_reconcile_target_task` vetted it -- or a signal store that
+    exists but cannot be read -- is reported as ``flagged``: the pass never
+    obtained evidence, so plan §4a/§4b row 6 requires ``REFUSED``
+    (``reason="unreadable_store"``) rather than a positive
+    ``WRITE_NOT_APPLIED`` claim.
     """
 
     state_root = roots.state_root
     if state_root is None:  # pragma: no cover - defensive
-        return False, None
+        return False, None, True
     task_dir = state_root / task_id
     try:
         if task_dir.is_symlink():
-            return False, None
+            return False, None, True
         resolved_root = state_root.resolve()
         resolved = task_dir.resolve()
     except OSError:
-        return False, None
+        return False, None, True
     if resolved != resolved_root and resolved_root not in resolved.parents:
-        return False, None
-    reading = _read_signal(task_dir)
-    return reading.present, reading.evidence
+        return False, None, True
+    reading, unreadable = _read_signal_checked(task_dir)
+    return reading.present, reading.evidence, unreadable
 
 
 def _string_field(source: Mapping[str, Any] | None, key: str) -> str | None:
@@ -773,11 +792,13 @@ def _resolve_orphan(
     op = line.get("op")
     op = op.value if isinstance(op, OperationType) else op
     pre_head = _string_field(before, "signal_head")
+    # Plan §4b: every field copied into ``after`` is bounded by ``_cap``.
+    capped_canonical = _cap(canonical if isinstance(canonical, str) else None)
     base = {
         JOURNAL_RECONCILIATION: RECONCILIATION_REFUSED,
         "signal_head": pre_head,
         "expected_token": expected,
-        "canonical": _cap(canonical if isinstance(canonical, str) else None),
+        "canonical": capped_canonical,
     }
 
     if op != OperationType.CONSISTENCY_RECOVERY.value:
@@ -790,7 +811,10 @@ def _resolve_orphan(
     task = _reconcile_target_task(line, roots)
     if task is None:
         return PHASE_REFUSED, {**base, "reason": "invalid_task"}
-    present, head = _live_signal(roots, task)
+    present, head, flagged = _live_signal(roots, task)
+    if flagged:
+        # No evidence was obtained, so neither confirm nor deny the write.
+        return PHASE_REFUSED, {**base, "reason": "unreadable_store"}
 
     canonical_source = _string_field(before, "canonical_source")
     if head == expected:
@@ -798,7 +822,7 @@ def _resolve_orphan(
             JOURNAL_RECONCILIATION: RECONCILIATION_WRITE_CONFIRMED,
             "signal_head": head,
             "expected_token": expected,
-            "canonical": canonical,
+            "canonical": capped_canonical,
             "canonical_source": canonical_source,
         }
     not_applied = {
@@ -806,7 +830,7 @@ def _resolve_orphan(
         "signal_head": head,
         "signal_present": present,
         "expected_token": expected,
-        "canonical": canonical,
+        "canonical": capped_canonical,
         "canonical_source": canonical_source,
     }
     if present and head == pre_head:

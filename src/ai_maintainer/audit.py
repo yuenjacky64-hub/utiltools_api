@@ -229,7 +229,14 @@ def read_journal(path: str | Path) -> list[dict[str, Any]]:
 
 
 def entries_by_id(entries: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Group journal lines by ``entry_id``, preserving file order."""
+    """Group journal lines by ``entry_id``, preserving file order.
+
+    Lines without a string ``entry_id`` are skipped: a pair can only be matched
+    by that key, so an id-less line is not a torn pair any consumer can close.
+    Residual (NIT-01): such an orphan ``PENDING`` stays in flight forever rather
+    than being terminalised with a synthesised id -- deliberate, because writing
+    an id the writer never emitted would forge a pair that was never opened.
+    """
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for entry in entries:

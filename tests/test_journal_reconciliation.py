@@ -348,6 +348,60 @@ def test_untrusted_journal_lines_are_refused_not_followed(roots, service):
     assert (task_dir(roots) / SIGNAL_FILE).read_text(encoding="utf-8").strip() == "Running 1"
 
 
+def test_symlinked_signal_is_refused_not_called_absent(roots, service, tmp_path):
+    """An unsafe slot yields no evidence, so the pass refuses instead of denying.
+
+    Plan §4a/§4b row 6: folding "I could not read it" into "it is gone" would
+    append a positive ``WRITE_NOT_APPLIED`` claim about a store never observed.
+    """
+
+    drift(roots)
+    entry_id = torn_pending(service)
+    outside = tmp_path / "outside_signal.txt"
+    outside.write_text("Running 1\n", encoding="utf-8")
+    signal = task_dir(roots) / SIGNAL_FILE
+    signal.unlink()
+    signal.symlink_to(outside)
+
+    counters = service.reconcile_journal()
+
+    assert counters["refused"] == 1
+    assert counters["not_applied"] == 0
+    assert counters["confirmed"] == 0
+    terminal = group_of(roots, entry_id)[-1]
+    assert terminal["phase"] == PHASE_REFUSED
+    assert terminal["after"]["reason"] == "unreadable_store"
+    # Never followed: the link target is untouched and still linked.
+    assert signal.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "Running 1\n"
+
+
+def test_unreadable_signal_is_refused_not_called_absent(roots, service, monkeypatch):
+    """An ``OSError`` on the signal read is refusals, not a ``WRITE_NOT_APPLIED``."""
+
+    drift(roots)
+    entry_id = torn_pending(service)
+    real_open = Path.open
+    signal = task_dir(roots) / SIGNAL_FILE
+
+    def deny(self, *args, **kwargs):
+        if self == signal:
+            raise PermissionError("denied")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny)
+
+    counters = service.reconcile_journal()
+
+    assert counters["refused"] == 1
+    assert counters["not_applied"] == 0
+    terminal = group_of(roots, entry_id)[-1]
+    assert terminal["phase"] == PHASE_REFUSED
+    assert terminal["after"]["reason"] == "unreadable_store"
+    monkeypatch.undo()
+    assert signal.read_text(encoding="utf-8").strip() == "Running 1"
+
+
 # --------------------------------------------------------------------------- #
 # DOD-05: one failing append is counted and isolated
 # --------------------------------------------------------------------------- #
