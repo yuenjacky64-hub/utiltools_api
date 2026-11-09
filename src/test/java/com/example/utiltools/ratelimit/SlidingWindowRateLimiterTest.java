@@ -15,6 +15,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @DisplayName("SlidingWindowRateLimiter")
 class SlidingWindowRateLimiterTest {
@@ -414,6 +415,169 @@ class SlidingWindowRateLimiterTest {
         clock.advance(Duration.ofMillis(60_000L));
         assertThat(limiter.peek("client").remaining()).isEqualTo(3L);
         assertThat(limiter.trackedClients()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("weighted admission sequence respects the budget and restores it after the window")
+    void weightedAdmissionSequenceRespectsBudget() {
+        SlidingWindowRateLimiter limiter = limiter(10, 1000L, 100);
+
+        SlidingWindowRateLimiter.Admission first = limiter.tryAcquire("client", 6);
+        assertThat(first.allowed()).isTrue();
+        assertThat(first.limit()).isEqualTo(10L);
+        assertThat(first.remaining()).isEqualTo(4L);
+
+        // 6 + 5 > 10: denied, and the denial leaves the window untouched.
+        SlidingWindowRateLimiter.Admission denied = limiter.tryAcquire("client", 5);
+        assertThat(denied.allowed()).isFalse();
+        assertThat(denied.limit()).isEqualTo(10L);
+        assertThat(denied.remaining()).isZero();
+        assertThat(denied.retryAfterSeconds()).isGreaterThanOrEqualTo(1L);
+        assertThat(limiter.peek("client").remaining()).isEqualTo(4L);
+
+        // 6 + 4 == 10 fits exactly.
+        SlidingWindowRateLimiter.Admission exact = limiter.tryAcquire("client", 4);
+        assertThat(exact.allowed()).isTrue();
+        assertThat(exact.remaining()).isZero();
+
+        assertThat(limiter.tryAcquire("client", 1).allowed()).isFalse();
+        assertThat(limiter.peek("client").remaining()).isZero();
+
+        clock.advance(Duration.ofMillis(1000L));
+        assertThat(limiter.peek("client").remaining()).isEqualTo(10L);
+        SlidingWindowRateLimiter.Admission refilled = limiter.tryAcquire("client", 10);
+        assertThat(refilled.allowed()).isTrue();
+        assertThat(refilled.remaining()).isZero();
+    }
+
+    @Test
+    @DisplayName("concurrent weighted admission admits exactly six of forty and never oversubscribes")
+    void concurrentWeightedAdmissionAdmitsExactlySixOfForty() throws Exception {
+        int limit = 20;
+        int cost = 3;
+        int threads = 40;
+        SlidingWindowRateLimiter limiter = limiter(limit, 60_000L, 100);
+
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threads);
+        AtomicInteger allowed = new AtomicInteger();
+        AtomicInteger charged = new AtomicInteger();
+        AtomicInteger negativeRemaining = new AtomicInteger();
+
+        for (int i = 0; i < threads; i++) {
+            pool.execute(() -> {
+                try {
+                    start.await();
+                    SlidingWindowRateLimiter.Admission admission = limiter.tryAcquire("weighted", cost);
+                    if (admission.allowed()) {
+                        allowed.incrementAndGet();
+                        charged.addAndGet(cost);
+                    }
+                    if (admission.remaining() < 0) {
+                        negativeRemaining.incrementAndGet();
+                    }
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+
+        start.countDown();
+        assertThat(done.await(30, TimeUnit.SECONDS)).isTrue();
+        pool.shutdownNow();
+
+        assertThat(allowed.get()).isEqualTo(6);
+        assertThat(charged.get()).isLessThanOrEqualTo(limit);
+        assertThat(negativeRemaining.get()).isZero();
+        assertThat(limiter.peek("weighted").remaining()).isEqualTo(limit - charged.get());
+    }
+
+    @Test
+    @DisplayName("a cost above the whole budget is denied without creating a bucket")
+    void costAboveBudgetIsDeniedWithoutBucket() {
+        SlidingWindowRateLimiter limiter = limiter(10, 1000L, 100);
+
+        SlidingWindowRateLimiter.Admission denied = limiter.tryAcquire("client", 11);
+
+        assertThat(denied.allowed()).isFalse();
+        assertThat(denied.limit()).isEqualTo(10L);
+        assertThat(denied.remaining()).isZero();
+        assertThat(denied.retryAfterSeconds()).isGreaterThanOrEqualTo(1L);
+        assertThat(limiter.trackedClients()).isZero();
+        assertThat(limiter.peek("client").remaining()).isEqualTo(10L);
+    }
+
+    @Test
+    @DisplayName("cleanup never evicts a bucket holding live weighted charge")
+    void cleanupNeverEvictsBucketWithLiveWeightedCharge() {
+        SlidingWindowRateLimiter limiter = limiter(10, 1000L, 100);
+        assertThat(limiter.tryAcquire("busy", 5).remaining()).isEqualTo(5L);
+
+        // In-window weighted charge: neither the idle sweep nor a new key may drop the bucket.
+        clock.advance(Duration.ofMillis(500L));
+        assertThat(limiter.evictIdleBuckets()).isZero();
+        assertThat(limiter.trackedClients()).isEqualTo(1);
+        assertThat(limiter.peek("busy").remaining()).isEqualTo(5L);
+
+        clock.advance(Duration.ofMillis(1000L));
+        // The charge has left the window but the bucket is not idle for two windows yet.
+        assertThat(limiter.evictIdleBuckets()).isZero();
+        assertThat(limiter.peek("busy").remaining()).isEqualTo(10L);
+
+        clock.advance(Duration.ofMillis(1001L));
+        assertThat(limiter.evictIdleBuckets()).isEqualTo(1);
+        assertThat(limiter.trackedClients()).isZero();
+
+        // Cap eviction follows the same rule: an active bucket is not a victim.
+        SlidingWindowRateLimiter capped = limiter(10, 1000L, 1);
+        assertThat(capped.tryAcquire("busy", 5).allowed()).isTrue();
+        SlidingWindowRateLimiter.Admission newcomer = capped.tryAcquire("other", 1);
+        assertThat(newcomer.allowed()).isFalse();
+        assertThat(capped.trackedClients()).isEqualTo(1);
+        assertThat(capped.peek("busy").remaining()).isEqualTo(5L);
+
+        clock.advance(Duration.ofMillis(1000L));
+        assertThat(capped.tryAcquire("other", 1).allowed()).isTrue();
+        assertThat(capped.trackedClients()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("peek reports weighted remaining without consuming budget or inserting a bucket")
+    void peekReportsWeightedRemainingWithoutConsuming() {
+        SlidingWindowRateLimiter limiter = limiter(10, 60_000L, 100);
+
+        assertThat(limiter.tryAcquire("client", 6).remaining()).isEqualTo(4L);
+        for (int i = 0; i < 10; i++) {
+            SlidingWindowRateLimiter.Admission peeked = limiter.peek("client");
+            assertThat(peeked.limit()).isEqualTo(10L);
+            assertThat(peeked.remaining()).isEqualTo(4L);
+            assertThat(peeked.allowed()).isTrue();
+        }
+        assertThat(limiter.trackedClients()).isEqualTo(1);
+
+        assertThat(limiter.tryAcquire("client", 5).allowed()).isFalse();
+        assertThat(limiter.peek("client").remaining()).isEqualTo(4L);
+
+        // A read for an untracked key must not create a bucket either.
+        assertThat(limiter.peek("ghost").remaining()).isEqualTo(10L);
+        assertThat(limiter.trackedClients()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("a cost below one is rejected as a programming error")
+    void costBelowOneIsRejected() {
+        SlidingWindowRateLimiter limiter = limiter(10, 1000L, 100);
+
+        assertThatThrownBy(() -> limiter.tryAcquire("client", 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("cost");
+        assertThatThrownBy(() -> limiter.tryAcquire("client", -3))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("cost");
+        assertThat(limiter.trackedClients()).isZero();
     }
 
     private static long ceilSeconds(long millis) {

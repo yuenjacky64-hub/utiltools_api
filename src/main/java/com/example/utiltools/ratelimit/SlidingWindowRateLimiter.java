@@ -15,6 +15,14 @@ import org.springframework.stereotype.Component;
  * bucket lock, so a caller can never observe (or create) more than the configured number of
  * admissions inside {@code [now - windowMs, now]}. A denied call mutates nothing.</p>
  *
+ * <p>Admission is weighted: each admitted request charges at least one unit (see
+ * {@link RouteCostResolver}) and the bucket keeps that cost beside its timestamp together with a
+ * running weighted sum (invariant IW-1). A request is admitted only while
+ * {@code weightedSum + cost <= requests-per-window} (IW-2), evaluated and recorded in the same
+ * bucket-lock critical section, so the ring never needs more than {@code requests-per-window} slots
+ * (IW-4) and concurrent requests cannot oversubscribe the budget. A cost larger than the whole
+ * budget is refused before any bucket is created (IW-5).</p>
+ *
  * <p>Tracked keys are hard-bounded by {@code max-tracked-clients}: a new key evicts the oldest
  * bucket whose last event already left the window, and is rejected without insertion when every
  * tracked bucket is active.</p>
@@ -43,10 +51,10 @@ public class SlidingWindowRateLimiter {
      * Outcome of one admission attempt.
      *
      * @param allowed           whether the request may proceed
-     * @param limit             configured budget for the window
-     * @param remaining         admitted requests still available in the window ({@code >= 0})
-     * @param retryAfterSeconds seconds to wait before the oldest in-window admission expires
-     *                          ({@code 0} when allowed, always {@code >= 1} when denied)
+     * @param limit             configured weighted budget for the window
+     * @param remaining         weighted units still available in the window ({@code >= 0})
+     * @param retryAfterSeconds seconds to wait before enough weighted charge expires for the caller's
+     *                          next request to fit ({@code 0} when allowed, {@code >= 1} when denied)
      * @param resetEpochSeconds epoch second at which the window frees up again
      */
     public record Admission(boolean allowed, long limit, long remaining,
@@ -64,16 +72,44 @@ public class SlidingWindowRateLimiter {
     }
 
     /**
-     * Attempts to admit one request for {@code clientKey}. The only write path of the limiter.
+     * Attempts to admit one request for {@code clientKey} at the unit cost of one.
      *
      * @param clientKey client identity; {@code null}/blank is normalised to {@code "unknown"}
      * @return the admission outcome, never {@code null}
      */
     public Admission tryAcquire(String clientKey) {
+        return tryAcquire(clientKey, 1);
+    }
+
+    /**
+     * Attempts to admit one request for {@code clientKey} charged {@code cost} units. The only
+     * write path of the limiter.
+     *
+     * <p>A request is admitted only while the weighted sum of the costs still inside the trailing
+     * window plus {@code cost} stays within the budget. A denial records nothing, so the caller can
+     * retry once {@link Admission#retryAfterSeconds()} elapses.</p>
+     *
+     * @param clientKey client identity; {@code null}/blank is normalised to {@code "unknown"}
+     * @param cost      weighted units to charge, must be {@code >= 1}
+     * @return the admission outcome, never {@code null}
+     * @throws IllegalArgumentException when {@code cost < 1}
+     */
+    public Admission tryAcquire(String clientKey, int cost) {
+        if (cost < 1) {
+            throw new IllegalArgumentException("cost must be >= 1, was " + cost);
+        }
         long limit = properties.requestsPerWindow();
         long windowMs = properties.windowMs();
         if (!properties.enabled()) {
             return new Admission(true, limit, limit, 0L, 0L);
+        }
+        if (cost > limit) {
+            // IW-5: refuse before registerBucket, so a request that can never be admitted never
+            // occupies a max-tracked-clients slot.
+            long now = clock.millis();
+            return new Admission(false, limit, 0L,
+                    Math.max(1L, ceilDiv(windowMs, 1000L)),
+                    ceilDiv(now + windowMs, 1000L));
         }
 
         String key = normaliseKey(clientKey);
@@ -103,16 +139,16 @@ public class SlidingWindowRateLimiter {
                 long effectiveNow = Math.max(now, bucket.lastEventMillis);
                 purgeExpired(bucket, effectiveNow, windowMs);
 
-                if (bucket.size >= limit) {
-                    long resetAt = bucket.timestamps[bucket.start] + windowMs;
+                if (bucket.weightedSum + cost > limit) {
+                    long resetAt = earliestFreeingMillis(bucket, cost, limit, windowMs);
                     return new Admission(false, limit, 0L,
                             Math.max(1L, ceilDiv(resetAt - effectiveNow, 1000L)),
                             ceilDiv(resetAt, 1000L));
                 }
 
-                record(bucket, effectiveNow);
+                record(bucket, effectiveNow, cost);
                 bucket.lastEventMillis = effectiveNow;
-                long remaining = Math.max(0L, limit - bucket.size);
+                long remaining = Math.max(0L, limit - bucket.weightedSum);
                 long resetAt = bucket.timestamps[bucket.start] + windowMs;
                 return new Admission(true, limit, remaining, 0L, ceilDiv(resetAt, 1000L));
             } finally {
@@ -122,7 +158,7 @@ public class SlidingWindowRateLimiter {
 
         // Unreachable for any real clock: repeated eviction of a bucket that had no in-window event
         // loses no admission, so the fail-open branch keeps a live client from being penalised.
-        return new Admission(true, limit, Math.max(0L, limit - 1L), 0L, ceilDiv(now + windowMs, 1000L));
+        return new Admission(true, limit, Math.max(0L, limit - cost), 0L, ceilDiv(now + windowMs, 1000L));
     }
 
     /**
@@ -134,6 +170,10 @@ public class SlidingWindowRateLimiter {
      * shrink a client's budget, consume the {@code max-tracked-clients} allowance, nor keep an
      * idle bucket alive against the eviction passes. It takes only the per-bucket lock, so the
      * documented {@code mapLock} → bucket-lock order is untouched.</p>
+     *
+     * <p>The reported {@code remaining} is weighted (the sum of the in-window costs, not their
+     * count) and is derived from the same suffix the admission path purges, never from
+     * {@code weightedSum}, which is only authoritative right after a purge.</p>
      *
      * @param clientKey client identity; {@code null}/blank is normalised to {@code "unknown"}
      * @return the current state, never {@code null}; {@code allowed} is {@code true} exactly when
@@ -171,25 +211,27 @@ public class SlidingWindowRateLimiter {
                 int capacity = bucket.timestamps.length;
                 int inWindow = 0;
                 long oldestInWindow = 0L;
+                long weightedInWindow = 0L;
                 // Entries are recorded in non-decreasing time order, so the in-window set is a
                 // suffix: walk newest first and stop at the first expired entry.
                 for (int i = 0; i < bucket.size; i++) {
-                    long timestamp = bucket.timestamps[
-                            Math.floorMod(bucket.start + bucket.size - 1 - i, capacity)];
+                    int slot = Math.floorMod(bucket.start + bucket.size - 1 - i, capacity);
+                    long timestamp = bucket.timestamps[slot];
                     if (timestamp <= boundary) {
                         break;
                     }
                     inWindow++;
+                    weightedInWindow += bucket.costs[slot];
                     oldestInWindow = timestamp;
                 }
 
-                if (inWindow >= limit) {
+                if (weightedInWindow >= limit) {
                     long resetAtMillis = oldestInWindow + windowMs;
                     return new Admission(false, limit, 0L,
                             Math.max(1L, ceilDiv(resetAtMillis - effectiveNow, 1000L)),
                             ceilDiv(resetAtMillis, 1000L));
                 }
-                long remaining = Math.max(0L, limit - inWindow);
+                long remaining = Math.max(0L, limit - weightedInWindow);
                 long resetAtMillis = inWindow == 0 ? effectiveNow + windowMs : oldestInWindow + windowMs;
                 return new Admission(true, limit, remaining, 0L, ceilDiv(resetAtMillis, 1000L));
             } finally {
@@ -222,8 +264,12 @@ public class SlidingWindowRateLimiter {
                 bucket.lock.lock();
                 try {
                     // I6: the idle decision and the removal share one bucket-lock critical section,
-                    // so no admission can record an in-window event in between.
+                    // so no admission can record an in-window event in between. Purging first makes
+                    // weightedSum authoritative (IW-1), so a bucket that still holds weighted charge
+                    // is never evicted.
+                    purgeExpired(bucket, Math.max(now, bucket.lastEventMillis), properties.windowMs());
                     if (bucket.lastEventMillis <= idleThreshold
+                            && bucket.weightedSum == 0L
                             && buckets.remove(entry.getKey(), bucket)) {
                         removed++;
                     }
@@ -292,7 +338,8 @@ public class SlidingWindowRateLimiter {
      * lock, so a bucket that recorded an event in between is never evicted.
      */
     private boolean removeOldestExpiredBucketLocked(long now) {
-        long expiredThreshold = now - properties.windowMs();
+        long windowMs = properties.windowMs();
+        long expiredThreshold = now - windowMs;
         String oldestKey = null;
         Bucket oldestBucket = null;
         long oldestLastEvent = Long.MAX_VALUE;
@@ -300,8 +347,11 @@ public class SlidingWindowRateLimiter {
             Bucket bucket = entry.getValue();
             bucket.lock.lock();
             try {
+                purgeExpired(bucket, Math.max(now, bucket.lastEventMillis), windowMs);
                 long lastEvent = bucket.lastEventMillis;
-                if (lastEvent <= expiredThreshold && lastEvent < oldestLastEvent) {
+                if (lastEvent <= expiredThreshold
+                        && bucket.weightedSum == 0L
+                        && lastEvent < oldestLastEvent) {
                     oldestLastEvent = lastEvent;
                     oldestKey = entry.getKey();
                     oldestBucket = bucket;
@@ -316,7 +366,8 @@ public class SlidingWindowRateLimiter {
         oldestBucket.lock.lock();
         try {
             // Re-validate under the bucket lock: an admission may have landed after the sample.
-            if (oldestBucket.lastEventMillis > expiredThreshold) {
+            purgeExpired(oldestBucket, Math.max(now, oldestBucket.lastEventMillis), windowMs);
+            if (oldestBucket.lastEventMillis > expiredThreshold || oldestBucket.weightedSum != 0L) {
                 return false;
             }
             return buckets.remove(oldestKey, oldestBucket);
@@ -329,15 +380,40 @@ public class SlidingWindowRateLimiter {
         long boundary = now - windowMs;
         int capacity = bucket.timestamps.length;
         while (bucket.size > 0 && bucket.timestamps[bucket.start] <= boundary) {
+            // IW-1: subtract exactly the cost of the entry that leaves the window.
+            bucket.weightedSum -= bucket.costs[bucket.start];
             bucket.start = (bucket.start + 1) % capacity;
             bucket.size--;
         }
     }
 
-    private static void record(Bucket bucket, long timestamp) {
+    private static void record(Bucket bucket, long timestamp, int cost) {
         int capacity = bucket.timestamps.length;
-        bucket.timestamps[(bucket.start + bucket.size) % capacity] = timestamp;
+        int slot = (bucket.start + bucket.size) % capacity;
+        bucket.timestamps[slot] = timestamp;
+        bucket.costs[slot] = cost;
         bucket.size++;
+        bucket.weightedSum += cost;
+    }
+
+    /**
+     * Earliest instant at which an admission of {@code cost} units fits the budget again: walks the
+     * ring FIFO and accumulates the costs of the entries that will expire. Bounded by the ring size
+     * and used only on the deny path. Falls back to the oldest entry's expiry when no single entry
+     * frees enough, which keeps the advertised retry optimistic rather than wrong.
+     */
+    private static long earliestFreeingMillis(Bucket bucket, int cost, long limit, long windowMs) {
+        long needed = bucket.weightedSum + cost - limit;
+        long freed = 0L;
+        int capacity = bucket.timestamps.length;
+        for (int i = 0; i < bucket.size; i++) {
+            int slot = (bucket.start + i) % capacity;
+            freed += bucket.costs[slot];
+            if (freed >= needed) {
+                return bucket.timestamps[slot] + windowMs;
+            }
+        }
+        return bucket.timestamps[bucket.start] + windowMs;
     }
 
     private static String normaliseKey(String clientKey) {
@@ -351,17 +427,20 @@ public class SlidingWindowRateLimiter {
         return -Math.floorDiv(-dividend, divisor);
     }
 
-    /** Per-client ring buffer of in-window admission timestamps. */
+    /** Per-client ring buffer of in-window admission timestamps and the cost each one charged. */
     private static final class Bucket {
 
         private final ReentrantLock lock = new ReentrantLock();
         private final long[] timestamps;
+        private final int[] costs;
         private int start;
         private int size;
+        private long weightedSum;
         private volatile long lastEventMillis;
 
         private Bucket(int capacity) {
             this.timestamps = new long[capacity];
+            this.costs = new int[capacity];
         }
     }
 }

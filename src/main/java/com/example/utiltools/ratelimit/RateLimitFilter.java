@@ -22,6 +22,10 @@ import org.springframework.web.filter.OncePerRequestFilter;
  * <p>Registered only through a {@code FilterRegistrationBean} (never as a scanned {@code Filter}
  * bean) so MVC slices and the application keep exactly one registration, ordered before Spring
  * MVC dispatch. A rejected request never reaches the filter chain.</p>
+ *
+ * <p>Each request is charged the cost resolved once by {@link RouteCostResolver}: the resolved cost
+ * is written to {@code X-RateLimit-Cost} and carried into the limiter, so
+ * {@code X-RateLimit-Remaining} is the caller's weighted budget after the admission.</p>
  */
 public class RateLimitFilter extends OncePerRequestFilter {
 
@@ -32,12 +36,14 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
     private final SlidingWindowRateLimiter limiter;
     private final RateLimitProperties properties;
+    private final RouteCostResolver costResolver;
     private final ObjectMapper objectMapper;
 
     public RateLimitFilter(SlidingWindowRateLimiter limiter, RateLimitProperties properties,
-                           ObjectMapper objectMapper) {
+                           RouteCostResolver costResolver, ObjectMapper objectMapper) {
         this.limiter = limiter;
         this.properties = properties;
+        this.costResolver = costResolver;
         this.objectMapper = objectMapper;
     }
 
@@ -58,8 +64,12 @@ public class RateLimitFilter extends OncePerRequestFilter {
         }
 
         SlidingWindowRateLimiter.Admission admission;
+        int cost;
         try {
-            admission = limiter.tryAcquire(resolveClientKey(request));
+            // One resolve per request; resolution and admission share the fail-open path so a
+            // throwing resolver cannot take the utility endpoints down either.
+            cost = costResolver.resolve(request.getMethod(), request.getRequestURI());
+            admission = limiter.tryAcquire(resolveClientKey(request), cost);
         } catch (RuntimeException ex) {
             // Totality: a broken limiter must never take the nine utility endpoints down.
             log.warn("rate limiter failed, failing open: {}", ex.toString());
@@ -70,12 +80,13 @@ public class RateLimitFilter extends OncePerRequestFilter {
         response.setHeader(RateLimitHeaders.LIMIT, Long.toString(admission.limit()));
         response.setHeader(RateLimitHeaders.REMAINING, Long.toString(Math.max(0L, admission.remaining())));
         response.setHeader(RateLimitHeaders.RESET, Long.toString(admission.resetEpochSeconds()));
+        response.setHeader(RateLimitHeaders.COST, Integer.toString(cost));
 
         if (admission.allowed()) {
             chain.doFilter(request, response);
             return;
         }
-        reject(response, admission);
+        reject(response, admission, cost);
     }
 
     private String resolveClientKey(HttpServletRequest request) {
@@ -84,9 +95,11 @@ public class RateLimitFilter extends OncePerRequestFilter {
         return ClientKeyResolver.resolve(request, properties);
     }
 
-    private void reject(HttpServletResponse response, SlidingWindowRateLimiter.Admission admission)
+    private void reject(HttpServletResponse response, SlidingWindowRateLimiter.Admission admission,
+                        int cost)
             throws IOException {
         Map<String, Object> details = new LinkedHashMap<>();
+        details.put("cost", cost);
         details.put("retryAfterSeconds", admission.retryAfterSeconds());
         details.put("limit", admission.limit());
         details.put("windowMs", properties.windowMs());

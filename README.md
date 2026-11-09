@@ -106,6 +106,8 @@ utiltools_api/
     │   │   │   └── dto/
     │   │   └── ratelimit/                     # Cross-cutting request budget
     │   │       ├── RateLimitProperties.java   # utiltools.ratelimit.* bindings
+    │   │       ├── RateLimitCostProperties.java# utiltools.ratelimit.costs.* bindings
+    │   │       ├── RouteCostResolver.java     # method + URI -> weighted cost
     │   │       ├── SlidingWindowRateLimiter.java# Clock-driven, thread-safe limiter
     │   │       ├── RateLimitFilter.java       # Servlet filter -> 429 RATE_LIMITED
     │   │       └── RateLimitConfig.java       # FilterRegistrationBean + scheduler
@@ -2079,9 +2081,25 @@ It is deliberately bounded (default `20`, ceiling `100`) and not paginated — f
 
 Every `/api/v1/utils/**` request passes through `RateLimitFilter` before Spring MVC. A
 `SlidingWindowRateLimiter` keeps a fixed-size per-client ring buffer (`long[requests-per-window]`) of
-admitted timestamps and admits a call only while fewer than `requests-per-window` of them fall inside
-the trailing `window-ms` window. Admission is atomic per client, so concurrent requests can never
-exceed the budget.
+admitted timestamps, each paired with the weighted cost it charged, and admits a call only while the
+sum of the costs still inside the trailing `window-ms` window plus the request's own cost stays
+within `requests-per-window`. Admission is atomic per client, so concurrent requests can never
+exceed the budget, whichever costs they carry.
+
+Admission is weighted rather than unit-valued: `RouteCostResolver` maps the request method plus URI
+to a positive integer cost, resolved **once** per request, so the endpoints that buy disproportionate
+worker or CPU capacity are charged accordingly.
+
+| Route | Cost |
+| :--- | :--- |
+| `POST /api/v1/utils/audit/verify` | `5` (`utiltools.ratelimit.costs.audit-verify`) |
+| `POST /api/v1/utils/jobs/hash` | `3` (`utiltools.ratelimit.costs.job-submit`) |
+| `POST /api/v1/utils/json/query` | `2` (`utiltools.ratelimit.costs.json-query`) |
+| every other route (job polling, retry, cancel, audit reads, …) | `1` (`utiltools.ratelimit.costs.default`) |
+
+The approximate spelling of a costed route is normalised before the lookup (percent-decoded, matrix
+parameters and query string stripped, one trailing slash dropped), so a costed route cannot be
+reached for the default cost by writing it differently.
 
 Rejected requests receive HTTP `429` with the unified envelope and never reach a controller:
 
@@ -2090,7 +2108,7 @@ Rejected requests receive HTTP `429` with the unified envelope and never reach a
   "success": false,
   "message": "Rate limit exceeded",
   "error": "RATE_LIMITED",
-  "details": { "retryAfterSeconds": 42 },
+  "details": { "cost": 5, "retryAfterSeconds": 42, "limit": 60, "windowMs": 60000 },
   "timestamp": "2026-10-31T00:50:00Z"
 }
 ```
@@ -2100,14 +2118,19 @@ Response headers on every `/api/v1/utils/*` call (allowed or rejected):
 | Header | Meaning |
 | :--- | :--- |
 | `Retry-After` | Seconds until a slot frees (rejections only) |
-| `X-RateLimit-Limit` | Configured `requests-per-window` |
-| `X-RateLimit-Remaining` | Slots left to this client in the current window |
+| `X-RateLimit-Limit` | Configured `requests-per-window` (the weighted budget) |
+| `X-RateLimit-Remaining` | Weighted units left to this client in the current window (`0` on denial) |
 | `X-RateLimit-Reset` | Seconds until the oldest admitted event leaves the window |
+| `X-RateLimit-Cost` | Weighted units this request charged (admitted and rejected) |
 
 A rejected request consumes no capacity, so a retry when `Retry-After` elapses succeeds. Idle
 client buckets are evicted by a `@Scheduled` cleanup pass, and `max-tracked-clients` bounds the map:
 the oldest idle bucket is dropped first, and once every tracked bucket is active an unseen client is
 rejected with the same `429 RATE_LIMITED` response instead of being inserted.
+
+`GET /api/v1/utils/rate-limit/status` reports the same weighted `limit`/`remaining`/`resetAt` values
+the filter would use, but its peek path never inserts a bucket and never consumes a second
+admission: the response body's `remaining` is therefore the value after the request's own charge.
 
 ### Configuration (`application.properties`)
 
@@ -2119,6 +2142,12 @@ rejected with the same `429 RATE_LIMITED` response instead of being inserted.
 | `utiltools.ratelimit.cleanup-interval-ms` | `30000` | Fixed delay between idle-bucket cleanup passes |
 | `utiltools.ratelimit.max-tracked-clients` | `10000` | Hard cap on tracked client keys (bounds memory) |
 | `utiltools.ratelimit.trust-forwarded-header` | `false` | Use the first well-formed `X-Forwarded-For` entry as the client key |
+| `utiltools.ratelimit.costs.default` | `1` | Weighted cost of any route without a specific entry (must be `>= 1`) |
+| `utiltools.ratelimit.costs.audit-verify` | `5` | Weighted cost of `POST /api/v1/utils/audit/verify` |
+| `utiltools.ratelimit.costs.job-submit` | `3` | Weighted cost of `POST /api/v1/utils/jobs/hash` |
+| `utiltools.ratelimit.costs.json-query` | `2` | Weighted cost of `POST /api/v1/utils/json/query` |
+
+Setting all four `utiltools.ratelimit.costs.*` values to `1` restores unit-valued accounting.
 
 > **Scope note:** state is in-process only. `N` replicas of this service provide `N ×
 > requests-per-window` aggregate capacity, and limits are not shared across instances. Distributed
