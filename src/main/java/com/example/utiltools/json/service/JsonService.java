@@ -18,6 +18,8 @@ import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonPatchOperation;
 import com.example.utiltools.json.dto.JsonPatchRequest;
 import com.example.utiltools.json.dto.JsonPatchResponse;
+import com.example.utiltools.json.dto.JsonPointerRequest;
+import com.example.utiltools.json.dto.JsonPointerResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonToCsvRequest;
@@ -71,6 +73,10 @@ public class JsonService {
     private static final int MAX_SEPARATOR_LENGTH = 8;
     /** Deepest accepted path: 64 keys joined by the separator. */
     static final int MAX_DEPTH = 64;
+    /** Longest accepted RFC 6901 pointer, checked before tokenisation. */
+    static final int MAX_POINTER_LENGTH = 1024;
+    /** Deepest accepted RFC 6901 pointer: 64 reference tokens. */
+    static final int MAX_POINTER_SEGMENTS = 64;
     /** Most leaves a flatten response, or keys a flat document, may carry. */
     static final int MAX_KEYS = 10000;
     /** Most cells (rows x columns) one CSV conversion may emit or import. */
@@ -703,6 +709,76 @@ public class JsonService {
     }
 
     /**
+     * Resolves a single RFC 6901 JSON Pointer against the supplied document.
+     *
+     * <p>The pointer grammar is the one {@code json/patch} already uses ({@link #parsePointer}): split on
+     * {@code /}, unescape {@code ~1} to {@code /} then {@code ~0} to {@code ~}, and treat the empty
+     * pointer as the whole document. The lookup is bounded before any traversal (at most
+     * {@value #MAX_POINTER_LENGTH} characters and {@value #MAX_POINTER_SEGMENTS} reference tokens), so
+     * the walk costs at most 64 object/array steps. A member or in-range index that does not exist is an
+     * honest {@code found=false} result, while a malformed pointer or a walk that would step through a
+     * scalar is rejected with {@link IllegalArgumentException} ({@code 400 BAD_REQUEST}) rather than
+     * being reported as not-found. The document is parsed and read only; nothing is mutated, so replay
+     * of the same request yields the same response.</p>
+     */
+    public JsonPointerResponse pointer(JsonPointerRequest request) {
+        JsonNode document = parseTree(request.json());
+        String pointer = request.pointer();
+        if (pointer.length() > MAX_POINTER_LENGTH) {
+            throw new IllegalArgumentException(
+                    "JSON pointer must not exceed " + MAX_POINTER_LENGTH + " characters");
+        }
+        List<String> tokens;
+        try {
+            tokens = parsePointer(pointer);
+        } catch (PatchFailure e) {
+            throw new IllegalArgumentException(e.getMessage(), e);
+        }
+        if (tokens.size() > MAX_POINTER_SEGMENTS) {
+            throw new IllegalArgumentException(
+                    "JSON pointer must not exceed " + MAX_POINTER_SEGMENTS + " segments");
+        }
+
+        JsonNode current = document;
+        StringBuilder traversed = new StringBuilder();
+        for (String token : tokens) {
+            if (!(current instanceof ObjectNode) && !(current instanceof ArrayNode)) {
+                throw new IllegalArgumentException(
+                        "Cannot traverse through a scalar value at '" + traversed + "'");
+            }
+            JsonNode next = pointerChild(current, token);
+            if (next == null) {
+                return new JsonPointerResponse(pointer, false, null, null);
+            }
+            current = next;
+            traversed.append('/').append(token.replace("~", "~0").replace("/", "~1"));
+        }
+        return new JsonPointerResponse(pointer, true, current, current.getNodeType().name());
+    }
+
+    /**
+     * One read-only pointer step. Object members are plain lookups; an array token must be an RFC 6901
+     * index, and an index at or beyond the array size is a missing target rather than an error.
+     */
+    private JsonNode pointerChild(JsonNode node, String token) {
+        if (node instanceof ObjectNode objectNode) {
+            return objectNode.get(token);
+        }
+        ArrayNode arrayNode = (ArrayNode) node;
+        int index;
+        try {
+            index = PatchDocument.parseIndex(token, arrayNode.size(), false);
+        } catch (PatchFailure e) {
+            if (e.getMessage().startsWith("Invalid array index")) {
+                throw new IllegalArgumentException(e.getMessage(), e);
+            }
+            // A syntactically valid index past the end of the array: the target is absent.
+            return null;
+        }
+        return index >= arrayNode.size() ? null : arrayNode.get(index);
+    }
+
+    /**
      * Compares two JSON documents and reports the structural difference at every nesting level.
      *
      * <p>Objects are compared member by member (so member order is not a change), arrays position by
@@ -1059,6 +1135,31 @@ public class JsonService {
         return node.deepCopy();
     }
 
+    /** RFC 6901 pointer parsing with {@code ~1 -> /} then {@code ~0 -> ~} unescaping. */
+    private static List<String> parsePointer(String pointer) {
+        if (pointer == null) {
+            throw new PatchFailure("Malformed JSON Pointer: pointer must not be null or blank");
+        }
+        if (pointer.isEmpty()) {
+            return List.of();
+        }
+        if (pointer.isBlank()) {
+            throw new PatchFailure("Malformed JSON Pointer: pointer must not be null or blank");
+        }
+        if (!pointer.startsWith("/")) {
+            throw new PatchFailure("Malformed JSON Pointer: " + pointer);
+        }
+        String[] raw = pointer.substring(1).split("/", -1);
+        List<String> tokens = new ArrayList<>(raw.length);
+        for (String token : raw) {
+            if (token.matches(".*~(?![01]).*")) {
+                throw new PatchFailure("Malformed JSON Pointer: " + pointer);
+            }
+            tokens.add(token.replace("~1", "/").replace("~0", "~"));
+        }
+        return tokens;
+    }
+
     /** Working copy holder: a {@link JsonNode} reference cannot be reassigned from a helper. */
     private static final class PatchDocument {
 
@@ -1268,32 +1369,7 @@ public class JsonService {
             throw new PatchFailure("Missing path: " + pointer);
         }
 
-        /** RFC 6901 pointer parsing with {@code ~1 -> /} then {@code ~0 -> ~} unescaping. */
-        private static List<String> parsePointer(String pointer) {
-            if (pointer == null) {
-                throw new PatchFailure("Malformed JSON Pointer: pointer must not be null or blank");
-            }
-            if (pointer.isEmpty()) {
-                return List.of();
-            }
-            if (pointer.isBlank()) {
-                throw new PatchFailure("Malformed JSON Pointer: pointer must not be null or blank");
-            }
-            if (!pointer.startsWith("/")) {
-                throw new PatchFailure("Malformed JSON Pointer: " + pointer);
-            }
-            String[] raw = pointer.substring(1).split("/", -1);
-            List<String> tokens = new ArrayList<>(raw.length);
-            for (String token : raw) {
-                if (token.matches(".*~(?![01]).*")) {
-                    throw new PatchFailure("Malformed JSON Pointer: " + pointer);
-                }
-                tokens.add(token.replace("~1", "/").replace("~0", "~"));
-            }
-            return tokens;
-        }
-
-        private static int parseIndex(String token, int size, boolean allowAppend) {
+        static int parseIndex(String token, int size, boolean allowAppend) {
             if ("-".equals(token)) {
                 if (allowAppend) {
                     return size;

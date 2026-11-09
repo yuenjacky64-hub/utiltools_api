@@ -17,6 +17,8 @@ import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonPatchOperation;
 import com.example.utiltools.json.dto.JsonPatchResponse;
 import com.example.utiltools.json.dto.JsonPatchRequest;
+import com.example.utiltools.json.dto.JsonPointerRequest;
+import com.example.utiltools.json.dto.JsonPointerResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonToCsvRequest;
@@ -1639,6 +1641,114 @@ class JsonServiceTest {
                     .extracting(ConstraintViolation::getMessage)
                     .containsExactly("ndjson content must be at most 1000000 characters");
         }
+    }
+
+    // ------------------------------------------------------------------ json/pointer
+
+    private static final String POINTER_DOC =
+            "{\"a\":{\"b\":[10,{\"c\":true}]},\"a/b\":{\"~key\":\"esc\"},\"n\":null,\"s\":\"str\"}";
+
+    @Test
+    @DisplayName("pointer - should resolve object members, array indexes and the root document")
+    void shouldResolveJsonPointer() {
+        assertThat(jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "/a/b/0")))
+                .extracting(JsonPointerResponse::found, r -> r.value().asInt(), JsonPointerResponse::valueType)
+                .containsExactly(true, 10, "NUMBER");
+
+        JsonPointerResponse object = jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "/a/b/1"));
+        assertThat(object.found()).isTrue();
+        assertThat(object.valueType()).isEqualTo("OBJECT");
+        assertThat(object.pointer()).isEqualTo("/a/b/1");
+
+        assertThat(jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "/a")).valueType())
+                .isEqualTo("OBJECT");
+        assertThat(jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "/a/b")).valueType())
+                .isEqualTo("ARRAY");
+        assertThat(jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "/s")).valueType())
+                .isEqualTo("STRING");
+        assertThat(jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "/a/b/1/c")).valueType())
+                .isEqualTo("BOOLEAN");
+        assertThat(jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "/n")).valueType())
+                .isEqualTo("NULL");
+
+        JsonPointerResponse root = jsonService.pointer(new JsonPointerRequest(POINTER_DOC, ""));
+        assertThat(root.found()).isTrue();
+        assertThat(root.pointer()).isEmpty();
+        assertThat(root.valueType()).isEqualTo("OBJECT");
+        assertThat(root.value().path("s").asText()).isEqualTo("str");
+    }
+
+    @Test
+    @DisplayName("pointer - should resolve escaped ~1 to / and ~0 to ~ tokens")
+    void shouldResolveEscapedPointerTokens() {
+        JsonPointerResponse quoted = jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "/a~1b/~0key"));
+        assertThat(quoted.found()).isTrue();
+        assertThat(quoted.value().asText()).isEqualTo("esc");
+        assertThat(quoted.valueType()).isEqualTo("STRING");
+    }
+
+    @Test
+    @DisplayName("pointer - should report an absent member or index as found=false")
+    void shouldReportMissingPointerTarget() {
+        JsonPointerResponse missing = jsonService.pointer(
+                new JsonPointerRequest(POINTER_DOC, "/a/missing"));
+        assertThat(missing.found()).isFalse();
+        assertThat(missing.value()).isNull();
+        assertThat(missing.valueType()).isNull();
+
+        JsonPointerResponse outOfRange = jsonService.pointer(
+                new JsonPointerRequest(POINTER_DOC, "/a/b/9"));
+        assertThat(outOfRange.found()).isFalse();
+        assertThat(outOfRange.value()).isNull();
+    }
+
+    @Test
+    @DisplayName("pointer - should reject malformed pointers with 400 BAD_REQUEST")
+    void shouldRejectMalformedJsonPointer() {
+        assertThatThrownBy(() -> jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "a/b")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Malformed JSON Pointer");
+        assertThatThrownBy(() -> jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "/a~2b")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Malformed JSON Pointer");
+        assertThatThrownBy(() -> jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "/a~")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Malformed JSON Pointer");
+        assertThatThrownBy(() -> jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "   ")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Malformed JSON Pointer");
+    }
+
+    @Test
+    @DisplayName("pointer - should reject traversal through a scalar with 400 BAD_REQUEST")
+    void shouldRejectScalarTraversal() {
+        assertThatThrownBy(() -> jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "/s/x")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Cannot traverse through a scalar");
+        assertThatThrownBy(() -> jsonService.pointer(new JsonPointerRequest(POINTER_DOC, "/n/x")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Cannot traverse through a scalar");
+    }
+
+    @Test
+    @DisplayName("pointer - should reject a pointer longer than 1024 characters")
+    void shouldRejectOversizedPointer() {
+        String tooLong = "/" + "a".repeat(1024);
+        assertThatThrownBy(() -> jsonService.pointer(new JsonPointerRequest(POINTER_DOC, tooLong)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("JSON pointer must not exceed 1024 characters");
+    }
+
+    @Test
+    @DisplayName("pointer - should reject a pointer deeper than 64 segments")
+    void shouldRejectTooDeepPointer() {
+        String tooDeep = "/a".repeat(65);
+        assertThatThrownBy(() -> jsonService.pointer(new JsonPointerRequest(POINTER_DOC, tooDeep)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("JSON pointer must not exceed 64 segments");
+
+        String atLimit = "/a".repeat(64);
+        assertThat(jsonService.pointer(new JsonPointerRequest("{}", atLimit)).found()).isFalse();
     }
 
     private static final int MAX_KEYS = 10000;

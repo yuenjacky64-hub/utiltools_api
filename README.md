@@ -154,6 +154,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/from-ndjson` | Import NDJSON / JSON Lines into a JSON array: blank lines and CRLF tolerated, errors name the 1-based line number, 10000-record bound, journalled as `JSON_FROM_NDJSON` |
 | `POST` | `/api/v1/utils/json/csv-to-json` | Import CSV into a JSON array of objects with an optional `delimiter` and optional `headerMapping` header renames; first record supplies the keys, malformed CSV returns 400; journalled as `JSON_CSV_TO_JSON` |
 | `POST` | `/api/v1/utils/json/diff` | Compare two JSON documents and report `added`, `removed` and `changed` paths (with old/new values and a pinned `summary`) at any nesting level, journalled as `JSON_DIFF` |
+| `POST` | `/api/v1/utils/json/pointer` | Resolve one RFC 6901 JSON Pointer (`/a/b/0`, `~1` = `/`, `~0` = `~`, `""` = whole document) and report the addressed node with its `valueType`, journalled as `JSON_POINTER` |
 | `POST` | `/api/v1/utils/text/transform` | Apply a deterministic case/format operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`) to a string |
 | `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
 | `POST` | `/api/v1/utils/text/replace` | Replace every (or, with `all=false`, the first) occurrence of a literal or regex `pattern`, reporting `replacements`, `changed` and code-point `length` |
@@ -1057,7 +1058,52 @@ deterministic, so the same request is replay-stable.
 required` / `jsonB content is required`); a document nested deeper than 64 object levels is rejected with
 `jsonA depth must not exceed 64`, and more than 10000 changes is rejected as well - both **HTTP 400**.
 
-#### G. CSV to JSON (header-driven import)
+#### G. Resolve an RFC 6901 JSON Pointer
+
+`POST /api/v1/utils/json/pointer` dereferences a single JSON Pointer against a document string. The pointer grammar
+is the RFC 6901 one that `json/patch` already uses: tokens are split on `/`, `~1` decodes to `/` **before** `~0` to
+`~`, and the empty pointer `""` addresses the whole document. The journalled operation is `json/pointer`
+(`JSON_POINTER`), so the call appears in the audit journal with `SUCCEEDED` state and replays as `VERIFIED`.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/json/pointer \
+  -H "Content-Type: application/json" \
+  -d '{
+    "json": "{\"a/b\":{\"~key\":[1,2,3]}}",
+    "pointer": "/a~1b/~0key/1"
+  }'
+```
+
+**Response (200):**
+
+```json
+{
+  "success": true,
+  "message": "JSON pointer resolved successfully",
+  "data": {
+    "pointer": "/a~1b/~0key/1",
+    "found": true,
+    "value": 2,
+    "valueType": "NUMBER"
+  },
+  "timestamp": "2026-11-09T05:20:11.412885Z",
+  "requestId": "5d0f1c8a-4b12-4c6d-9a37-1f2b0f6f1c33"
+}
+```
+
+`valueType` is one of `OBJECT`, `ARRAY`, `STRING`, `NUMBER`, `BOOLEAN`, `NULL` - the same naming as `json/validate`.
+`pointer` is echoed back verbatim, including `""` for a whole-document lookup. When the addressed member or in-range
+index does not exist the call still succeeds with `found: false`, `value: null` and `valueType: null`.
+
+**Errors:** `json` that is not parseable returns **HTTP 400** `BAD_REQUEST` (`Invalid JSON content ...`); a blank
+`json` or a missing `pointer` returns **HTTP 400** `VALIDATION_ERROR`; a pointer that does not start with `/`, that
+carries a malformed escape (`~2`, trailing `~`), or whose array token is not an RFC 6901 index (`abc`, `-`, `01`)
+returns **HTTP 400** `BAD_REQUEST` (`Malformed JSON Pointer ...` / `Invalid array index ...`). The lookup is bounded:
+a pointer longer than 1024 characters is rejected with `JSON pointer must not exceed 1024 characters`, more than 64
+segments with `JSON pointer must not exceed 64 segments`, and walking *through* a scalar (`/s/x` where `/s` is a
+string) is a **HTTP 400** `Cannot traverse through a scalar value at '/s'` rather than a misleading `found: false`.
+
+#### H. CSV to JSON (header-driven import)
 
 `POST /api/v1/utils/json/csv-to-json` imports CSV text into a JSON array of objects. `csvContent` is the CSV text,
 `delimiter` is optional and defaults to comma (a single character, `\t` or a literal tab for TSV), and
@@ -1099,7 +1145,7 @@ all return **HTTP 400** `BAD_REQUEST` with the parser message; blank `csvContent
 `VALIDATION_ERROR` (`csvContent is required`) and a two-character delimiter returns
 `delimiter must be a single character`.
 
-#### H. Circuit breaker & probe lease recovery
+#### I. Circuit breaker & probe lease recovery
 
 The JSONPath query path runs behind a single `CLOSED` / `OPEN` / `HALF_OPEN` circuit breaker, exposed
 read-only by `GET /api/v1/utils/resilience` and driven by hand with `POST /api/v1/utils/resilience/probe`.
@@ -1145,9 +1191,9 @@ ignored — and the next admitted caller claims a fresh generation. The schedule
 
 ## 🧾 Operation Journal & Replay Verification
 
-All fifteen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+All sixteen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
 `datetime/shift`, `crypto/hash`, `crypto/base64`, `crypto/url`, `crypto/uuid`, `json/format`, `json/validate`,
-`json/query`, `json/merge-patch`, `text/transform`, `text/stats`, `text/replace` — are recorded in a **bounded in-memory journal** so a failed
+`json/query`, `json/merge-patch`, `json/pointer`, `text/transform`, `text/stats`, `text/replace` — are recorded in a **bounded in-memory journal** so a failed
 hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
 can be verified against the original outcome without ever mutating the original entry.
 `GET /api/v1/utils/datetime/timezones` is read-only catalogue metadata and is not journalled.

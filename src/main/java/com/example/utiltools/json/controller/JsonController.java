@@ -18,6 +18,8 @@ import com.example.utiltools.json.dto.JsonMergePatchRequest;
 import com.example.utiltools.json.dto.JsonMergePatchResponse;
 import com.example.utiltools.json.dto.JsonPatchRequest;
 import com.example.utiltools.json.dto.JsonPatchResponse;
+import com.example.utiltools.json.dto.JsonPointerRequest;
+import com.example.utiltools.json.dto.JsonPointerResponse;
 import com.example.utiltools.json.dto.JsonQueryRequest;
 import com.example.utiltools.json.dto.JsonQueryResponse;
 import com.example.utiltools.json.dto.JsonToCsvRequest;
@@ -113,6 +115,20 @@ public class JsonController {
                 ? "JSON patch validated (dry run)"
                 : "JSON patch applied successfully";
         return ApiResponse.success(result, message);
+    }
+
+    @PostMapping("/pointer")
+    @Operation(summary = "Resolve an RFC 6901 JSON Pointer",
+            description = "Resolves a single RFC 6901 JSON Pointer against the supplied document and returns the "
+                    + "addressed node. The empty pointer \"\" addresses the whole document; otherwise the pointer "
+                    + "must start with '/' and use ~1 for '/' and ~0 for '~'. found=false with value=null and "
+                    + "valueType=null means the member or array index does not exist, while valueType is one of "
+                    + "OBJECT, ARRAY, STRING, NUMBER, BOOLEAN or NULL when found is true. A malformed pointer, one "
+                    + "longer than 1024 characters, one deeper than 64 segments, or a walk that would step through "
+                    + "a scalar value returns 400 BAD_REQUEST.")
+    public ApiResponse<JsonPointerResponse> pointer(@Valid @RequestBody JsonPointerRequest request) {
+        JsonPointerResponse result = auditedOperations.pointer(request);
+        return ApiResponse.success(result, "JSON pointer resolved successfully");
     }
 
     @PostMapping("/to-csv")
