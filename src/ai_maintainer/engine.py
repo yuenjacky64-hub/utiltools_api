@@ -28,6 +28,13 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from ai_maintainer.memory.store import MemoryStore
 
+from ai_maintainer.concurrency import (
+    CycleAdmissionGate,
+    CycleSnapshot,
+    current_heartbeat,
+    read_heartbeat,
+    write_heartbeat,
+)
 from ai_maintainer.config import MaintainerConfig
 from ai_maintainer.shutdown import (
     CLEANUP_PERSIST_TASK_STATE,
@@ -46,6 +53,7 @@ from ai_maintainer.shutdown import (
 from ai_maintainer.tasks.curriculum import (
     NON_TERMINAL,
     STALE_ELIGIBLE,
+    Difficulty,
     TaskCurriculum,
     TaskSpec,
     TaskState,
@@ -79,6 +87,30 @@ def _release_quietly(lock: Any) -> bool:
     except Exception:
         return False
     return True
+
+
+def _record_delta(
+    before: Mapping[str, Any], after: Mapping[str, Any]
+) -> int:
+    """How many records ``before`` carries that ``after`` no longer has.
+
+    Used only for the ``SNAPSHOT_RESTORED`` audit count (REQ-02): it compares
+    record by record so a restore that happens to keep a peer's identical
+    record is not reported as a removal. Both mappings are the three-collection
+    shape ``MemoryStore.snapshot_records()`` returns.
+    """
+
+    removed = 0
+    for name, records in before.items():
+        kept = list(after.get(name) or [])
+        for record in records or []:
+            for index, candidate in enumerate(kept):
+                if candidate == record:
+                    kept.pop(index)
+                    break
+            else:
+                removed += 1
+    return removed
 
 
 class FingerprintCircuitState(Enum):
@@ -145,6 +177,13 @@ class CycleResult:
     priority: str | None
     preempted: str | None
     steps: int
+    # UTILTOOLS-77: trailing defaulted fields, so the historical positional
+    # construction keeps working. ``admitted`` is ``False`` only when the cycle
+    # observed a stop signal while waiting for a concurrency slot;
+    # ``memory_cycle`` is the cycle id its records were stamped with (``None``
+    # with no store installed).
+    admitted: bool = True
+    memory_cycle: int | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -153,7 +192,26 @@ class CycleResult:
             "priority": self.priority,
             "preempted": self.preempted,
             "steps": self.steps,
+            "admitted": self.admitted,
+            "memory_cycle": self.memory_cycle,
         }
+
+
+@dataclass
+class _CycleContext:
+    """One admitted cycle's registry entry (UTILTOOLS-77 REQ-05).
+
+    Every field is written under the engine ``_lock``; ``difficulty`` is the
+    admission peek that ordered this cycle against its peers and ``task`` is the
+    name of the task its slot last adopted (kept after the slot is retired so
+    ``snapshot()`` can still attribute the cycle).
+    """
+
+    cycle: int
+    difficulty: int
+    task: str | None = None
+    thread: int | None = None
+    admitted_at: float = 0.0
 
 
 class MaintainerEngine:
@@ -171,12 +229,21 @@ class MaintainerEngine:
         state_root: "str | Path | None" = None,
         shutdown_audit_path: "str | Path | None" = None,
         role_resolver: Callable[[TaskSpec], str | None] | None = None,
+        gate: CycleAdmissionGate | None = None,
+        watcher: Any | None = None,
+        heartbeat_path: "str | Path | None" = None,
     ) -> None:
         self._curriculum = curriculum
         self._config = config if config is not None else curriculum.config
         self._clock = clock
         self._lock = threading.RLock()
-        self._monitored: TaskSpec | None = None
+        # UTILTOOLS-77 REQ-05: the monitored slot is per cycle, so two
+        # overlapping cycles cannot retire or preempt each other's task. The
+        # ``_monitored`` property keeps the legacy single-cycle view intact.
+        self._monitored_by_cycle: dict[int, TaskSpec] = {}
+        self._cycle_contexts: dict[int, _CycleContext] = {}
+        self._cycle_active_ids: dict[int, tuple[str, ...]] = {}
+        self._active_cycles = 0
         self._events: deque[dict[str, Any]] = deque(maxlen=EVENT_LOG_MAXLEN)
         self._cycles = 0
         self._buckets: dict[str, FingerprintBucket] = {}
@@ -208,6 +275,20 @@ class MaintainerEngine:
         self._file_locks: dict[str, Any] = {}
         self._active_roles: dict[str, str] = {}
         self._role_resolver = role_resolver
+        # UTILTOOLS-77 REQ-01/REQ-02: slot-counted admission, plus the two
+        # read-only seams a cycle snapshots (the watcher view and the
+        # caller-supplied heartbeat document).
+        self._gate = gate if gate is not None else CycleAdmissionGate(
+            self._config.max_concurrent_cycles,
+            sleep=self._sleep,
+            enforce_priority=lambda: bool(
+                self._config.priority_preemption_enabled
+            ),
+        )
+        self._watcher = watcher
+        self._heartbeat_path: Path | None = (
+            Path(heartbeat_path) if heartbeat_path is not None else None
+        )
 
     # ------------------------------------------------------------------ public
 
@@ -262,13 +343,217 @@ class MaintainerEngine:
             self._memory = memory
 
     def run_cycle(self) -> CycleResult:
-        """Execute at most ``max_steps_per_cycle`` monitor steps."""
+        """Execute at most ``max_steps_per_cycle`` monitor steps.
 
-        self._cycle_done.clear()
+        UTILTOOLS-77: a cycle first takes a concurrency slot from the admission
+        gate (bounded by ``max_concurrent_cycles``), then snapshots the shared
+        state it could leak into a peer, runs the body, and restores the
+        snapshot on completion *and* on failure. The slot is released in the
+        same ``finally`` that records the cycle as no longer active, so a
+        crash cannot strand a slot.
+        """
+
+        difficulty = self._admission_difficulty()
+        token = self._gate.acquire(
+            difficulty, self._cycles + 1, should_stop=self.should_stop
+        )
+        if token is None:
+            # A stop was published while queued: report a skipped cycle
+            # instead of running one nobody asked for.
+            with self._lock:
+                cycle = self._cycles + 1
+                self._events.append(
+                    {
+                        "event": "CYCLE_SKIPPED",
+                        "cycle": cycle,
+                        "reason": "STOP_REQUESTED",
+                        "difficulty": Difficulty.parse(difficulty).name,
+                    }
+                )
+            return CycleResult(
+                cycle=cycle,
+                monitored=None,
+                priority=None,
+                preempted=None,
+                steps=0,
+                admitted=False,
+            )
+
+        snapshot = self._capture_snapshot(cycle=None, difficulty=difficulty)
+        registered = self._register_cycle(difficulty, snapshot)
+        committed = False
         try:
-            return self._run_cycle_body()
+            result = self._run_cycle_body(cycle=registered)
+            committed = True
+            return result
         finally:
-            self._cycle_done.set()
+            self._restore_snapshot(snapshot, trusted_cycle=registered,
+                                   committed=committed)
+            self._deregister_cycle(registered)
+            self._gate.release(token)
+
+    # ------------------------------------------------- concurrency plumbing
+
+    def _admission_difficulty(self) -> Difficulty:
+        """Difficulty of the next task this cycle would pick (admission peek).
+
+        Read-only: the selection uses a throwaway skip set and the curriculum
+        is untouched, so the peek cannot change what the body later selects.
+        The hardest candidate wins, so a queued cycle is admitted with the
+        weight of the work it is about to do (REQ-03).
+        """
+
+        with self._lock:
+            now = self._clock()
+            try:
+                candidate = self._select_next_task(now, set())
+            except Exception:  # pragma: no cover - defensive
+                return Difficulty.EASY
+            if candidate is None:
+                return Difficulty.EASY
+            try:
+                return Difficulty.parse(candidate.difficulty)
+            except (AttributeError, ValueError):  # pragma: no cover - defensive
+                return Difficulty.EASY
+
+    def _capture_snapshot(
+        self, *, cycle: int | None, difficulty: Difficulty
+    ) -> CycleSnapshot:
+        """Capture the state a cycle must not leak into a peer (REQ-02)."""
+
+        with self._lock:
+            memory = self._memory
+            watcher = self._watcher
+            heartbeat_path = self._heartbeat_path
+        records: dict[str, list[Any]] = {}
+        if memory is not None:
+            try:
+                records = memory.snapshot_records()
+            except Exception:  # pragma: no cover - defensive
+                records = {}
+        active_ids: tuple[str, ...] = ()
+        if watcher is not None:
+            try:
+                active_ids = tuple(
+                    str(item) for item in getattr(watcher, "active_task_ids", ())
+                )
+            except Exception:  # pragma: no cover - defensive
+                active_ids = ()
+        return CycleSnapshot(
+            cycle=-1 if cycle is None else int(cycle),
+            records=records,
+            active_task_ids=active_ids,
+            heartbeat=read_heartbeat(heartbeat_path),
+            admitted_at=self._clock(),
+        )
+
+    def _restore_snapshot(
+        self,
+        snapshot: CycleSnapshot,
+        *,
+        trusted_cycle: int,
+        committed: bool,
+    ) -> None:
+        """Restore ``snapshot`` after a cycle, whatever its outcome (REQ-02).
+
+        Two modes, chosen under the lock by how many cycles are still active:
+
+        ``exact``
+            no peer cycle is running, so the store is put back exactly as it was
+            captured - unless the cycle committed, in which case its own records
+            are the legitimate product of the cycle and are kept.
+        ``cycle-scoped``
+            peers are running, so only the records stamped with *this* cycle are
+            removed (and only when it did not commit): a peer's records are
+            never touched, which is what keeps overlapping cycles from
+            corrupting each other.
+        """
+
+        with self._lock:
+            memory = self._memory
+            peers = self._active_cycles - 1
+            self._cycle_active_ids[trusted_cycle] = tuple(
+                snapshot.active_task_ids
+            )
+        mode = "exact" if peers <= 0 else "cycle-scoped"
+        removed = 0
+        if memory is not None:
+            try:
+                if mode == "exact":
+                    if not committed:
+                        before = memory.snapshot_records()
+                        removed = _record_delta(before, snapshot.records)
+                        memory.restore_records(snapshot.records)
+                elif not committed:
+                    removed = memory.drop_records(cycle=trusted_cycle)
+            except Exception:  # pragma: no cover - defensive
+                removed = removed or 0
+        if snapshot.heartbeat is not None:
+            path, data = snapshot.heartbeat
+            if data is not None and current_heartbeat(path) != data:
+                write_heartbeat(path, data)
+        if snapshot.records or snapshot.heartbeat is not None or removed:
+            with self._lock:
+                self._events.append(
+                    {
+                        "event": "SNAPSHOT_RESTORED",
+                        "cycle": trusted_cycle,
+                        "mode": mode,
+                        "committed": bool(committed),
+                        "removed": int(removed),
+                    }
+                )
+
+    def _register_cycle(
+        self, difficulty: Difficulty, snapshot: CycleSnapshot
+    ) -> int:
+        """Enter the cycle in the registry and retire the "all idle" latch."""
+
+        with self._lock:
+            self._cycles += 1
+            cycle = self._cycles
+            self._cycle_contexts[cycle] = _CycleContext(
+                cycle=cycle,
+                difficulty=int(Difficulty.parse(difficulty)),
+                thread=threading.get_ident(),
+                admitted_at=snapshot.admitted_at,
+            )
+            self._active_cycles += 1
+            self._cycle_done.clear()
+        return cycle
+
+    def _deregister_cycle(self, cycle: int) -> None:
+        """Leave the registry; the latch drops when the last cycle leaves."""
+
+        with self._lock:
+            self._cycle_contexts.pop(cycle, None)
+            self._monitored_by_cycle.pop(cycle, None)
+            self._cycle_active_ids.pop(cycle, None)
+            self._active_cycles = max(0, self._active_cycles - 1)
+            if self._active_cycles == 0:
+                self._cycle_done.set()
+
+    def _sync_cycle_done(self) -> None:
+        """Re-derive the idle latch from the active-cycle count (REQ-04)."""
+
+        with self._lock:
+            if self._active_cycles == 0:
+                self._cycle_done.set()
+            else:
+                self._cycle_done.clear()
+
+    @property
+    def active_cycles(self) -> int:
+        """How many cycle bodies are in flight right now (REQ-05)."""
+
+        with self._lock:
+            return self._active_cycles
+
+    def cycle_task_ids(self, cycle: int) -> tuple[str, ...]:
+        """Watcher task IDs captured for ``cycle`` (empty when unknown)."""
+
+        with self._lock:
+            return tuple(self._cycle_active_ids.get(int(cycle), ()))
 
     # ------------------------------------------------------- wind-down (live)
 
@@ -527,7 +812,15 @@ class MaintainerEngine:
             self._shutdown_report = report
             return report
 
-    def _run_cycle_body(self) -> CycleResult:
+    def _run_cycle_body(self, cycle: int | None = None) -> CycleResult:
+        """The cycle body itself; ``cycle`` is the id ``run_cycle()`` registered.
+
+        UTILTOOLS-77 REQ-05: the monitored slot is per cycle, so this body reads
+        and writes ``_monitored_by_cycle[cycle]`` instead of one shared slot.
+        A caller that passes no ``cycle`` gets a fresh registration, which keeps
+        the historical single-cycle call shape working.
+        """
+
         steps = 0
         preempted_name: str | None = None
         monitored_name: str | None = None
@@ -535,8 +828,9 @@ class MaintainerEngine:
         reported_skips: set[str] = set()
 
         with self._lock:
-            self._cycles += 1
-            cycle = self._cycles
+            if cycle is None:
+                self._cycles += 1
+                cycle = self._cycles
             # Poll-tick half of the stale-task state machine: refresh every
             # active task's progress age and warn (``STALE_TASK``) on a
             # breach. Recovery is the sweep thread's job, never the tick's.
@@ -545,34 +839,37 @@ class MaintainerEngine:
         while steps < self._config.max_steps_per_cycle:
             with self._lock:
                 now = self._clock()
-                if self._monitored is not None and (
-                    self._monitored.state not in NON_TERMINAL
-                ):
-                    self._monitored = None
+                mine = self._monitored_by_cycle.get(cycle)
+                if mine is not None and mine.state not in NON_TERMINAL:
+                    self._monitored_by_cycle.pop(cycle, None)
+                    mine = None
                 incoming = self._select_next_task(now, reported_skips)
-                if self._monitored is None:
+                if mine is None:
                     if incoming is None:
                         break
                     if not self._admit(incoming):
                         reported_skips.add(incoming.name)
                         continue
-                    self._adopt(incoming)
+                    self._adopt(incoming, cycle=cycle)
                 elif (
                     incoming is not None
-                    and incoming is not self._monitored
-                    and self._should_preempt(incoming, self._monitored, now)
+                    and incoming is not mine
+                    and self._should_preempt(incoming, mine, now)
                 ):
                     if not self._admit(incoming):
                         reported_skips.add(incoming.name)
                         continue
-                    previous = self._monitored
+                    previous = mine
                     self._preempt(incoming, previous, cycle=cycle)
                     preempted_name = previous.name
-                    self._adopt(incoming)
-                task = self._monitored
+                    self._adopt(incoming, cycle=cycle)
+                task = self._monitored_by_cycle.get(cycle)
                 if task is None:
                     break
                 monitored_name = task.name
+                context = self._cycle_contexts.get(cycle)
+                if context is not None:
+                    context.task = task.name
                 priority_name = effective_priority(
                     task, cycle=cycle, now=now, config=self._config
                 ).name
@@ -587,14 +884,14 @@ class MaintainerEngine:
                 error = exc
 
             with self._lock:
-                if self._monitored is not task:
+                if self._monitored_by_cycle.get(cycle) is not task:
                     # A concurrent cycle preempted or retired it: discard.
                     steps += 1
                     continue
                 if error is not None:
                     task.state = TaskState.FAILED
                     task.pending_since = None
-                    self._monitored = None
+                    self._monitored_by_cycle.pop(cycle, None)
                     self._record_cycle_outcome(
                         "BLOCKED", task, cycle=cycle, error=error
                     )
@@ -607,7 +904,7 @@ class MaintainerEngine:
                 if task.progress >= task.steps_required:
                     task.state = TaskState.COMPLETED
                     task.pending_since = None
-                    self._monitored = None
+                    self._monitored_by_cycle.pop(cycle, None)
                     self._record_cycle_outcome("COMPLETED", task, cycle=cycle)
                 else:
                     self._record_cycle_outcome("PROGRESS", task, cycle=cycle)
@@ -617,12 +914,16 @@ class MaintainerEngine:
         # persist it before the cycle report is built. Never raises.
         self._finish_cycle(cycle)
 
+        with self._lock:
+            memory_installed = self._memory is not None
         return CycleResult(
             cycle=cycle,
             monitored=monitored_name,
             priority=priority_name,
             preempted=preempted_name,
             steps=steps,
+            admitted=True,
+            memory_cycle=cycle if memory_installed else None,
         )
 
     def _finish_cycle(self, cycle: int) -> list[str]:
@@ -669,6 +970,10 @@ class MaintainerEngine:
         with self._lock:
             now = self._clock()
             monitored = self._monitored
+            monitored_by_cycle = {
+                str(slot): task.name
+                for slot, task in sorted(self._monitored_by_cycle.items())
+            }
             pending: dict[str, str] = {}
             for task in self._curriculum.specs:
                 if task.state not in NON_TERMINAL:
@@ -681,6 +986,8 @@ class MaintainerEngine:
                 ).name
             return {
                 "monitored": None if monitored is None else monitored.name,
+                "monitored_by_cycle": monitored_by_cycle,
+                "active_cycles": sorted(self._monitored_by_cycle),
                 "pending": pending,
             }
 
@@ -742,9 +1049,10 @@ class MaintainerEngine:
                 task.state = TaskState.FAILED
                 task.pending_since = None
                 task.last_progress_age_sec = age
-                if self._monitored is task:
-                    # Re-validate under the lock, like the step-commit path.
-                    self._monitored = None
+                for slot, bound in list(self._monitored_by_cycle.items()):
+                    if bound is task:
+                        # Re-validate under the lock, like the step-commit path.
+                        self._monitored_by_cycle.pop(slot, None)
                 self._events.append(
                     {
                         "event": "STALE_TASK_RECOVERED",
@@ -1180,14 +1488,37 @@ class MaintainerEngine:
 
         monitored.state = TaskState.PENDING
         monitored.preempted_count += 1
-        self._monitored = None
+        self._monitored_by_cycle.pop(cycle, None)
         self._events.append(
             {"event": "PREEMPTED", "task": monitored.name, "cycle": cycle}
         )
 
-    def _adopt(self, incoming: TaskSpec) -> None:
-        self._monitored = incoming
+    def _adopt(self, incoming: TaskSpec, *, cycle: int | None = None) -> None:
+        """Bind ``incoming`` to a cycle's monitored slot.
+
+        ``cycle`` defaults to the legacy single-cycle slot (``_cycles``) so the
+        historical call shape still works.
+        """
+
+        self._monitored_by_cycle[self._cycles if cycle is None else cycle] = incoming
         incoming.state = TaskState.IN_PROGRESS
         # A freshly adopted task starts fresh: it must not inherit the age of
         # an observation from before the preemption (INV-STALE-5).
         stamp_progress(incoming, self._clock())
+
+    @property
+    def _monitored(self) -> TaskSpec | None:
+        """Legacy single-cycle view over :attr:`_monitored_by_cycle`.
+
+        Ambiguity is reported honestly: exactly one distinct task across all
+        live cycle slots is *the* monitored task, several distinct tasks are
+        not collapsible and yield ``None``. Read-only on purpose - every write
+        path is cycle-scoped, so there is no correct global assignment.
+        """
+
+        seen: dict[int, TaskSpec] = {}
+        for task in self._monitored_by_cycle.values():
+            seen[id(task)] = task
+        if len(seen) == 1:
+            return next(iter(seen.values()))
+        return None
