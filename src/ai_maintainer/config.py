@@ -61,6 +61,19 @@ CONFIG_JSON_NAME = "config.json"
 MUST_CONFIG_MODULE = "must_config"
 MUST_CONFIG_ATTRIBUTE = "MUST_CONFIG"
 
+# Path knobs read by :meth:`MaintainerConfig.validate`. The ``*_CONFIG_PATH_FIELDS``
+# names are deliberately distinct from ``checks.PATH_FIELDS`` (which only lists the
+# three required roots) so a reader diffing the two modules is not misled.
+REQUIRED_CONFIG_PATH_FIELDS: tuple[str, ...] = (
+    "maintainer_root",
+    "ai_team_root",
+    "default_project_root",
+)
+OPTIONAL_CONFIG_PATH_FIELDS: tuple[str, ...] = ("data_dir", "reports_dir")
+CONFIG_PATH_FIELDS: tuple[str, ...] = (
+    REQUIRED_CONFIG_PATH_FIELDS + OPTIONAL_CONFIG_PATH_FIELDS
+)
+
 _TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 _FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
 
@@ -160,9 +173,23 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
                 raise ValueError(f"{key} must be a number") from exc
         elif key == "priority_preemption_enabled":
             coerced[key] = _coerce_bool(key, value)
+        elif key in CONFIG_PATH_FIELDS:
+            coerced[key] = _coerce_path_text(key, value)
         else:
             coerced[key] = value
     return coerced
+
+
+def _coerce_path_text(key: str, value: Any) -> str | None:
+    """Normalise a path layer value to a trimmed string, or ``None``."""
+
+    if value is None:
+        return None
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, str):
+        return value.strip() or None
+    raise ValueError(f"{key} must be a path string")
 
 
 def _coerce_bool(key: str, value: Any) -> bool:
@@ -213,6 +240,15 @@ class MaintainerConfig:
     stale_timeout_sec: float = DEFAULT_STALE_TIMEOUT_SEC
     stale_recovery_grace_sec: float = DEFAULT_STALE_RECOVERY_GRACE_SEC
     max_shutdown_wait_sec: float = DEFAULT_MAX_SHUTDOWN_WAIT_SEC
+
+    # Path knobs (see ``CONFIG_PATH_FIELDS``). Stored as trimmed ``str | None`` so
+    # the single ``Path(...)``/``expanduser()`` conversion site lives in
+    # :meth:`validate` and the frozen dataclass never needs ``object.__setattr__``.
+    maintainer_root: str | None = None
+    ai_team_root: str | None = None
+    default_project_root: str | None = None
+    data_dir: str | None = None
+    reports_dir: str | None = None
 
     def __post_init__(self) -> None:
         interval = self.prioritization_aging_interval_ms
@@ -288,6 +324,59 @@ class MaintainerConfig:
         """Aging threshold in the unit the clock reports (seconds)."""
 
         return self.prioritization_aging_interval_ms / 1000.0
+
+    def validate(self) -> list[str]:
+        """Return path issues for this configuration; ``[]`` when all paths are usable.
+
+        Pure read: inspects ``self`` only (no environment, no ``config.json``
+        reload, no directory creation), so the answer is deterministic and the
+        frozen instance is never mutated.
+
+        Required fields (``REQUIRED_CONFIG_PATH_FIELDS``: ``maintainer_root``,
+        ``ai_team_root``, ``default_project_root``) are reported when unset;
+        optional fields (``OPTIONAL_CONFIG_PATH_FIELDS``: ``data_dir``,
+        ``reports_dir``) are checked with the same rules when configured and
+        skipped when unset, mirroring ``checks.check_paths``' "not configured"
+        skip row.
+
+        Fields are visited in ``CONFIG_PATH_FIELDS`` order and one message per
+        field is emitted, the first failing rule winning in this fixed order:
+
+        * ``<field>: not configured`` - required field is ``None`` or blank
+        * ``<field>: path is not absolute: <path>``
+        * ``<field>: not a directory: <path>``
+        * ``<field>: not accessible: <path>`` - ``os.R_OK | os.X_OK`` fails
+
+        ``<path>`` echoes the configured spelling with ``~`` expanded, never
+        ``Path.resolve()``-d, so the message matches what the operator wrote.
+        """
+
+        issues: list[str] = []
+        for name in CONFIG_PATH_FIELDS:
+            raw = getattr(self, name)
+            text = None if raw is None else str(raw).strip()
+            if not text:
+                if name in REQUIRED_CONFIG_PATH_FIELDS:
+                    issues.append(f"{name}: not configured")
+                continue
+            path = Path(text).expanduser()
+            if not path.is_absolute():
+                issues.append(f"{name}: path is not absolute: {path}")
+                continue
+            try:
+                is_dir = path.is_dir()
+            except OSError:
+                is_dir = False
+            if not is_dir:
+                issues.append(f"{name}: not a directory: {path}")
+                continue
+            try:
+                usable = os.access(path, os.R_OK | os.X_OK)
+            except OSError:  # pragma: no cover - defensive
+                usable = False
+            if not usable:
+                issues.append(f"{name}: not accessible: {path}")
+        return issues
 
     @classmethod
     def load(
