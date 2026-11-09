@@ -206,15 +206,24 @@ def install_stop_handlers(
     engine: Any,
     signals: tuple[int, ...] = (signal.SIGINT, signal.SIGTERM),
 ) -> dict[int, Any]:
-    """Route the given signals to ``engine.request_stop()`` (opt-in).
+    """Route the given signals to the engine's stop flag (opt-in).
+
+    UTILTOOLS-80 §4.2: when the engine exposes a ``_handle_signal`` seam (the
+    lock-free, I/O-free flag setter), that handler is installed instead of the
+    ``request_stop()`` closure - a handler that takes the engine lock can block
+    behind a peer thread mid-commit. Engines without the seam keep the previous
+    behaviour, so the signature and return value are unchanged.
 
     Returns the previous handlers so a caller can restore them. Raises
     ``ValueError`` outside the main thread, exactly like ``signal.signal``.
     """
 
+    handler = getattr(engine, "_handle_signal", None)
+    if not callable(handler):
+        handler = _request_stop_handler(engine)
     previous: dict[int, Any] = {}
     for number in signals:
-        previous[number] = signal.signal(number, _request_stop_handler(engine))
+        previous[number] = signal.signal(number, handler)
     return previous
 
 
