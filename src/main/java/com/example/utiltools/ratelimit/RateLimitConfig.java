@@ -18,10 +18,11 @@ import org.springframework.scheduling.annotation.Scheduled;
 
 /**
  * Wires the rate limiter: the shared {@link Clock}, the single filter registration, and the
- * scheduled idle-bucket cleanup.
+ * scheduled idle-bucket cleanup. The per-route {@link RateLimitCostProperties} are enabled here so
+ * the {@link RouteCostResolver} bean and the filter registration see the same bound values.
  */
 @Configuration
-@EnableConfigurationProperties(RateLimitProperties.class)
+@EnableConfigurationProperties({RateLimitProperties.class, RateLimitCostProperties.class})
 @EnableScheduling
 public class RateLimitConfig {
 
@@ -45,9 +46,11 @@ public class RateLimitConfig {
 
     @Bean
     public FilterRegistrationBean<RateLimitFilter> rateLimitFilterRegistration(
-            SlidingWindowRateLimiter limiter, RateLimitProperties properties, ObjectMapper objectMapper) {
+            SlidingWindowRateLimiter limiter, RateLimitProperties properties,
+            RouteCostResolver costResolver, ObjectMapper objectMapper) {
         FilterRegistrationBean<RateLimitFilter> registration =
-                new FilterRegistrationBean<>(new RateLimitFilter(limiter, properties, objectMapper));
+                new FilterRegistrationBean<>(
+                        new RateLimitFilter(limiter, properties, costResolver, objectMapper));
         registration.addUrlPatterns("/api/v1/utils/*");
         registration.setOrder(RATE_LIMIT_FILTER_ORDER);
         registration.setName("rateLimitFilter");

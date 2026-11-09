@@ -2011,7 +2011,10 @@ class BatchHashJobServiceTest {
         assertThat(aboveBound.get()).isZero();
 
         // Quiesced: the key answers with a live row, and never with an unregistered id.
-        BatchHashJobResponse after = service.submit(duplicate);
+        // The churn thread's accepted jobs may still occupy the bounded queue right after
+        // shutdownNow (it only interrupts, it does not drain), so wait for capacity instead of
+        // assuming the queue is already empty.
+        BatchHashJobResponse after = submitEventually(duplicate);
         assertThat(service.getJob(after.jobId()).jobId()).isEqualTo(after.jobId());
         synchronized (registryLock()) {
             Set<String> rows = registryKeys("jobs");

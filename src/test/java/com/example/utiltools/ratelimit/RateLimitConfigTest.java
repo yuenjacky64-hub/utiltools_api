@@ -134,6 +134,60 @@ class RateLimitConfigTest {
     }
 
     @Test
+    @DisplayName("route costs bind with the documented defaults and are overridable")
+    void costPropertiesBindDefaultsAndOverrides() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(PropertiesOnlyConfig.class)
+                .run(ctx -> {
+                    RateLimitCostProperties costs = ctx.getBean(RateLimitCostProperties.class);
+                    assertThat(costs.defaultCost()).isEqualTo(1);
+                    assertThat(costs.auditVerifyCost()).isEqualTo(5);
+                    assertThat(costs.jobSubmitCost()).isEqualTo(3);
+                    assertThat(costs.jsonQueryCost()).isEqualTo(2);
+                });
+
+        new ApplicationContextRunner()
+                .withUserConfiguration(PropertiesOnlyConfig.class)
+                .withPropertyValues("utiltools.ratelimit.costs.audit-verify=7",
+                        "utiltools.ratelimit.costs.job-submit=4",
+                        "utiltools.ratelimit.costs.json-query=2",
+                        "utiltools.ratelimit.costs.default=1")
+                .run(ctx -> {
+                    RateLimitCostProperties costs = ctx.getBean(RateLimitCostProperties.class);
+                    assertThat(costs.auditVerifyCost()).isEqualTo(7);
+                    assertThat(costs.jobSubmitCost()).isEqualTo(4);
+                    assertThat(costs.jsonQueryCost()).isEqualTo(2);
+                    assertThat(costs.defaultCost()).isEqualTo(1);
+                    RouteCostResolver resolver = new RouteCostResolver(costs);
+                    assertThat(resolver.resolve("POST", RouteCostResolver.AUDIT_VERIFY_PATH)).isEqualTo(7);
+                });
+    }
+
+    @Test
+    @DisplayName("a non-positive route cost fails binding instead of surfacing at runtime")
+    void nonPositiveCostIsRejected() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(PropertiesOnlyConfig.class)
+                .withPropertyValues("utiltools.ratelimit.costs.json-query=0")
+                .run(ctx -> {
+                    assertThat(ctx).hasFailed();
+                    assertThat(ctx.getStartupFailure())
+                            .hasRootCauseInstanceOf(IllegalArgumentException.class)
+                            .hasStackTraceContaining("utiltools.ratelimit.costs.json-query");
+                });
+
+        new ApplicationContextRunner()
+                .withUserConfiguration(PropertiesOnlyConfig.class)
+                .withPropertyValues("utiltools.ratelimit.costs.default=0")
+                .run(ctx -> {
+                    assertThat(ctx).hasFailed();
+                    assertThat(ctx.getStartupFailure())
+                            .hasRootCauseInstanceOf(IllegalArgumentException.class)
+                            .hasStackTraceContaining("utiltools.ratelimit.costs.default");
+                });
+    }
+
+    @Test
     @DisplayName("a low max-tracked-clients binds through the context and bounds the real limiter")
     void configuredCapAppliesToRealLimiter() {
         new ApplicationContextRunner()
@@ -151,17 +205,22 @@ class RateLimitConfigTest {
     }
 
     @Configuration
-    @EnableConfigurationProperties(RateLimitProperties.class)
+    @EnableConfigurationProperties({RateLimitProperties.class, RateLimitCostProperties.class})
     static class PropertiesOnlyConfig {
     }
 
     @Configuration
-    @EnableConfigurationProperties(RateLimitProperties.class)
+    @EnableConfigurationProperties({RateLimitProperties.class, RateLimitCostProperties.class})
     static class LimiterSupport {
 
         @Bean
         SlidingWindowRateLimiter slidingWindowRateLimiter(RateLimitProperties properties) {
             return new SlidingWindowRateLimiter(properties, Clock.systemUTC());
+        }
+
+        @Bean
+        RouteCostResolver routeCostResolver(RateLimitCostProperties costs) {
+            return new RouteCostResolver(costs);
         }
 
         @Bean

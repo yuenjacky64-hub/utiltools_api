@@ -16,10 +16,12 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -36,10 +38,23 @@ class RateLimitFilterTest {
         return new RateLimitProperties(enabled, requestsPerWindow, 60_000L, 30_000L, 1_000, trustForwarded);
     }
 
+    /** The documented defaults: default 1, audit/verify 5, jobs/hash 3, json/query 2. */
+    private RouteCostResolver costResolver() {
+        return new RouteCostResolver(new RateLimitCostProperties(1, 5, 3, 2));
+    }
+
+    /** Client key the filter resolves for MockMvc's default remote address. */
+    private static final String CLIENT_KEY = "127.0.0.1";
+
     private MockMvc mockMvc(RateLimitProperties properties, ProbeController probe) {
         SlidingWindowRateLimiter limiter = new SlidingWindowRateLimiter(properties, clock);
+        return mockMvc(properties, limiter, costResolver(), probe);
+    }
+
+    private MockMvc mockMvc(RateLimitProperties properties, SlidingWindowRateLimiter limiter,
+                            RouteCostResolver resolver, ProbeController probe) {
         return MockMvcBuilders.standaloneSetup(probe)
-                .addFilters(new RateLimitFilter(limiter, properties, objectMapper))
+                .addFilters(new RateLimitFilter(limiter, properties, resolver, objectMapper))
                 .build();
     }
 
@@ -49,7 +64,8 @@ class RateLimitFilterTest {
      */
     private MockMvc statusMockMvc(RateLimitProperties properties, SlidingWindowRateLimiter limiter) {
         return MockMvcBuilders.standaloneSetup(new RateLimitStatusController(limiter, properties, clock))
-                .addFilters(new RequestIdFilter(), new RateLimitFilter(limiter, properties, objectMapper))
+                .addFilters(new RequestIdFilter(),
+                        new RateLimitFilter(limiter, properties, costResolver(), objectMapper))
                 .build();
     }
 
@@ -342,22 +358,177 @@ class RateLimitFilterTest {
     }
 
     @Test
-    @DisplayName("a limiter failure fails open instead of blocking traffic")
-    void limiterFailureDoesNotBlockTraffic() throws Exception {
+    @DisplayName("configured routes are charged their weight while unknown routes cost one")
+    void routeCostMappingChargesConfiguredWeights() throws Exception {
         ProbeController probe = new ProbeController();
+        MockMvc mockMvc = mockMvc(properties(true, 30, false), probe);
+
+        mockMvc.perform(post("/api/v1/utils/audit/verify"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-RateLimit-Limit", "30"))
+                .andExpect(header().string("X-RateLimit-Cost", "5"))
+                .andExpect(header().string("X-RateLimit-Remaining", "25"));
+
+        mockMvc.perform(post("/api/v1/utils/jobs/hash"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-RateLimit-Cost", "3"))
+                .andExpect(header().string("X-RateLimit-Remaining", "22"));
+
+        mockMvc.perform(post("/api/v1/utils/json/query"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-RateLimit-Cost", "2"))
+                .andExpect(header().string("X-RateLimit-Remaining", "20"));
+
+        // A route without a configured weight costs the default of 1.
+        mockMvc.perform(get("/api/v1/utils/probe"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-RateLimit-Cost", "1"))
+                .andExpect(header().string("X-RateLimit-Remaining", "19"));
+
+        assertThat(probe.invocations.get()).isEqualTo(4);
+    }
+
+    @Test
+    @DisplayName("an expensive route denial reports the cost, Retry-After and the weighted budget")
+    void expensiveRouteDenialReportsCostAndRetryAfter() throws Exception {
+        ProbeController probe = new ProbeController();
+        MockMvc mockMvc = mockMvc(properties(true, 5, false), probe);
+
+        mockMvc.perform(post("/api/v1/utils/audit/verify"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-RateLimit-Cost", "5"))
+                .andExpect(header().string("X-RateLimit-Remaining", "0"));
+        assertThat(probe.invocations.get()).isEqualTo(1);
+
+        String retryAfter = mockMvc.perform(post("/api/v1/utils/audit/verify"))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(header().string("X-RateLimit-Limit", "5"))
+                .andExpect(header().string("X-RateLimit-Remaining", "0"))
+                .andExpect(header().string("X-RateLimit-Cost", "5"))
+                .andExpect(header().exists("Retry-After"))
+                .andExpect(jsonPath("$.error").value("RATE_LIMITED"))
+                .andExpect(jsonPath("$.details.cost").value(5))
+                .andExpect(jsonPath("$.details.limit").value(5))
+                .andExpect(jsonPath("$.details.windowMs").value(60_000))
+                .andExpect(jsonPath("$.details.retryAfterSeconds")
+                        .value(org.hamcrest.Matchers.greaterThanOrEqualTo(1)))
+                .andReturn().getResponse().getHeader("Retry-After");
+
+        assertThat(Long.parseLong(retryAfter)).isGreaterThanOrEqualTo(1L);
+        // The denial recorded nothing, so the controller was never reached a second time.
+        assertThat(probe.invocations.get()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("a single cost above the whole budget is denied without creating a bucket")
+    void costAboveBudgetIsDeniedWithoutCreatingBucket() throws Exception {
+        ProbeController probe = new ProbeController();
+        RateLimitProperties properties = properties(true, 3, false);
+        SlidingWindowRateLimiter limiter = new SlidingWindowRateLimiter(properties, clock);
+        MockMvc mockMvc = mockMvc(properties, limiter, costResolver(), probe);
+
+        mockMvc.perform(post("/api/v1/utils/audit/verify"))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(header().string("X-RateLimit-Cost", "5"))
+                .andExpect(header().string("X-RateLimit-Remaining", "0"))
+                .andExpect(jsonPath("$.details.cost").value(5))
+                .andExpect(jsonPath("$.details.limit").value(3));
+
+        assertThat(limiter.trackedClients()).isZero();
+        assertThat(limiter.peek(CLIENT_KEY).remaining()).isEqualTo(3L);
+        assertThat(probe.invocations.get()).isZero();
+    }
+
+    @Test
+    @DisplayName("weighted headers and 429 details agree with the limiter state")
+    void weightedHeadersAnd429DetailsAgreeWithLimiterState() throws Exception {
+        ProbeController probe = new ProbeController();
+        RateLimitProperties properties = properties(true, 7, false);
+        SlidingWindowRateLimiter limiter = new SlidingWindowRateLimiter(properties, clock);
+        MockMvc mockMvc = mockMvc(properties, limiter, costResolver(), probe);
+
+        MockHttpServletResponse admitted = mockMvc.perform(post("/api/v1/utils/json/query"))
+                .andExpect(status().isOk())
+                .andReturn().getResponse();
+        assertThat(admitted.getHeader("X-RateLimit-Remaining"))
+                .isEqualTo(Long.toString(limiter.peek(CLIENT_KEY).remaining()));
+        assertThat(limiter.peek(CLIENT_KEY).remaining()).isEqualTo(5L);
+
+        mockMvc.perform(post("/api/v1/utils/audit/verify")).andExpect(status().isOk());
+        assertThat(limiter.peek(CLIENT_KEY).remaining()).isZero();
+
+        MockHttpServletResponse denied = mockMvc.perform(post("/api/v1/utils/audit/verify"))
+                .andExpect(status().isTooManyRequests())
+                .andReturn().getResponse();
+        JsonNode details = objectMapper.readTree(denied.getContentAsString()).get("details");
+        SlidingWindowRateLimiter.Admission peeked = limiter.peek(CLIENT_KEY);
+        assertThat(denied.getHeader("X-RateLimit-Limit"))
+                .isEqualTo(Long.toString(peeked.limit()));
+        assertThat(denied.getHeader("X-RateLimit-Remaining")).isEqualTo("0");
+        assertThat(details.get("limit").asLong()).isEqualTo(peeked.limit());
+        assertThat(details.get("cost").asInt()).isEqualTo(5);
+        // The denial left the window untouched.
+        assertThat(peeked.remaining()).isZero();
+        assertThat(limiter.trackedClients()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("status endpoint reports weighted remaining without a second admission")
+    void statusEndpointReportsWeightedRemainingWithoutCharging() throws Exception {
+        RateLimitProperties properties = properties(true, 10, false);
+        SlidingWindowRateLimiter limiter = new SlidingWindowRateLimiter(properties, clock);
+        MockMvc mvc = statusMockMvc(properties, limiter);
+
+        assertThat(limiter.tryAcquire(CLIENT_KEY, 6).remaining()).isEqualTo(4L);
+
+        mvc.perform(get(STATUS_PATH))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-RateLimit-Limit", "10"))
+                .andExpect(header().string("X-RateLimit-Remaining", "3"))
+                .andExpect(jsonPath("$.data.limit").value(10))
+                .andExpect(jsonPath("$.data.remaining").value(3))
+                .andExpect(jsonPath("$.data.allowed").value(true));
+
+        // One charge per request: the peek path added nothing on top of the filter's own unit.
+        assertThat(limiter.peek(CLIENT_KEY).remaining()).isEqualTo(3L);
+        assertThat(limiter.trackedClients()).isEqualTo(1);
+
+        mvc.perform(get(STATUS_PATH))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-RateLimit-Remaining", "2"))
+                .andExpect(jsonPath("$.data.remaining").value(2));
+    }
+
+    @Test
+    @DisplayName("a limiter or resolver failure fails open instead of blocking traffic")
+    void limiterAndResolverFailuresFailOpen() throws Exception {
         RateLimitProperties properties = properties(true, 5, false);
+
+        ProbeController limiterProbe = new ProbeController();
         SlidingWindowRateLimiter brokenLimiter = new SlidingWindowRateLimiter(properties, clock) {
             @Override
-            public Admission tryAcquire(String clientKey) {
+            public Admission tryAcquire(String clientKey, int cost) {
                 throw new IllegalStateException("boom");
             }
         };
-        MockMvc mockMvc = MockMvcBuilders.standaloneSetup(probe)
-                .addFilters(new RateLimitFilter(brokenLimiter, properties, objectMapper))
-                .build();
+        MockMvc limiterMvc = mockMvc(properties, brokenLimiter, costResolver(), limiterProbe);
 
-        mockMvc.perform(get("/api/v1/utils/probe")).andExpect(status().isOk());
-        assertThat(probe.invocations.get()).isEqualTo(1);
+        limiterMvc.perform(get("/api/v1/utils/probe")).andExpect(status().isOk());
+        assertThat(limiterProbe.invocations.get()).isEqualTo(1);
+
+        ProbeController resolverProbe = new ProbeController();
+        RouteCostResolver brokenResolver = new RouteCostResolver(new RateLimitCostProperties(1, 5, 3, 2)) {
+            @Override
+            public int resolve(String method, String uri) {
+                throw new IllegalStateException("boom");
+            }
+        };
+        SlidingWindowRateLimiter untouchedLimiter = new SlidingWindowRateLimiter(properties, clock);
+        MockMvc resolverMvc = mockMvc(properties, untouchedLimiter, brokenResolver, resolverProbe);
+
+        resolverMvc.perform(post("/api/v1/utils/audit/verify")).andExpect(status().isOk());
+        assertThat(resolverProbe.invocations.get()).isEqualTo(1);
+        assertThat(untouchedLimiter.trackedClients()).isZero();
     }
 
     @Test
@@ -389,6 +560,12 @@ class RateLimitFilterTest {
 
         @GetMapping({"/actuator/health", "/v3/api-docs", "/swagger-ui/index.html"})
         public ApiResponse<String> excluded() {
+            invocations.incrementAndGet();
+            return ApiResponse.success("ok");
+        }
+
+        @PostMapping({"/api/v1/utils/audit/verify", "/api/v1/utils/jobs/hash", "/api/v1/utils/json/query"})
+        public ApiResponse<String> costed() {
             invocations.incrementAndGet();
             return ApiResponse.success("ok");
         }
