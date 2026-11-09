@@ -34,7 +34,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 __all__ = [
     "PHASE_FAILED",
@@ -165,11 +165,40 @@ class AuditedOperations:
             return []
         return read_journal(self._journal_path)
 
+    def append_terminal(
+        self,
+        line: Mapping[str, Any],
+        phase: str,
+        after: Mapping[str, Any] | None = None,
+        *,
+        at: float | None = None,
+    ) -> dict[str, Any]:
+        """Append the missing terminal line of a torn pair, preserving the pre-image.
+
+        Copies ``line`` verbatim, overwrites only ``phase`` / ``after`` /
+        ``recorded_at``, appends it, and returns the payload that was written.
+        Raises ``OSError`` when the journal is unwritable; the caller counts it.
+        This is the only writer a reconciliation pass may use: it never appends
+        a ``PENDING`` line and never touches a store.
+        """
+
+        payload = dict(line)
+        payload["phase"] = phase
+        payload["after"] = dict(after or {})
+        payload["recorded_at"] = self._clock() if at is None else at
+        self._append_payload(payload)
+        return payload
+
     def _append(self, entry: AuditEntry) -> None:
+        self._append_payload(entry.to_dict())
+
+    def _append_payload(self, payload: Mapping[str, Any]) -> None:
+        """Single writer: serialise, flush, fsync; no-op when the path is None."""
+
         path = self._journal_path
         if path is None:
             return
-        blob = json.dumps(entry.to_dict(), ensure_ascii=False)
+        blob = json.dumps(dict(payload), ensure_ascii=False)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(blob + "\n")
@@ -200,7 +229,14 @@ def read_journal(path: str | Path) -> list[dict[str, Any]]:
 
 
 def entries_by_id(entries: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Group journal lines by ``entry_id``, preserving file order."""
+    """Group journal lines by ``entry_id``, preserving file order.
+
+    Lines without a string ``entry_id`` are skipped: a pair can only be matched
+    by that key, so an id-less line is not a torn pair any consumer can close.
+    Residual (NIT-01): such an orphan ``PENDING`` stays in flight forever rather
+    than being terminalised with a synthesised id -- deliberate, because writing
+    an id the writer never emitted would forge a pair that was never opened.
+    """
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for entry in entries:
