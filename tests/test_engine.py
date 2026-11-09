@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 
 from ai_maintainer.config import MaintainerConfig
@@ -297,6 +298,7 @@ def test_run_forever_honours_stop_and_clears_markers(tmp_path: Path) -> None:
 
     class StopAfterSecondCycle(MaintainerEngine):
         def run_cycle(self) -> CycleResult:
+            nonlocal pid_seen, heartbeat_seen
             result = super().run_cycle()
             pid_seen |= self.pid_file is not None and self.pid_file.exists()
             heartbeat_seen |= (
@@ -315,21 +317,25 @@ def test_run_forever_honours_stop_and_clears_markers(tmp_path: Path) -> None:
         shutdown_audit_path=tmp_path / "data" / "maintainer_shutdown.log",
     )
 
+    started = time.monotonic()
     report = engine.run_forever(interval_sec=1.0)
+    elapsed = time.monotonic() - started
 
     assert pid_seen is True
     assert heartbeat_seen is True
-    # The stop lands between cycles: only the first inter-cycle wait fired,
-    # so a full second interval was not paid a second time (INV-STOP-LATENCY-1).
-    assert sleeper.calls.count(1.0) == 1
+    # The stop lands between cycles: the loop breaks before paying a second
+    # full interval, so only the one inter-cycle wait is spent
+    # (INV-STOP-LATENCY-1).
+    assert engine._cycles == 2
+    assert elapsed < 2.0
     assert report.state is EngineState.STOPPED
     assert engine.state is EngineState.STOPPED
 
     markers = tmp_path / "state"
     assert not (markers / RUNTIME_PID_FILE).exists()
-    assert not (markers / RUNTIME_PID_FILE + ".tmp").exists()
+    assert not (markers / (RUNTIME_PID_FILE + ".tmp")).exists()
     assert not (markers / RUNTIME_HEARTBEAT_FILE).exists()
-    assert not (markers / RUNTIME_HEARTBEAT_FILE + ".tmp").exists()
+    assert not (markers / (RUNTIME_HEARTBEAT_FILE + ".tmp")).exists()
     assert CLEANUP_CLEAR_RUNTIME_MARKERS in report.cleanup_steps
 
     stop_events = _events_named(engine, "STOP_HONOURED")

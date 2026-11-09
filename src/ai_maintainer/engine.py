@@ -421,6 +421,16 @@ class MaintainerEngine:
 
         return self._cancel.is_set()
 
+    def _wind_down_requested(self) -> bool:
+        """Stop flag or cancel flag — the state behind :meth:`should_stop`.
+
+        Read without the public predicates so a cycle never invokes an
+        overridden ``should_stop()`` once per step; ``run_forever()`` stays the
+        single poller of the predicate.
+        """
+
+        return self._stop.is_set() or self.should_cancel()
+
     def cancel_task(
         self,
         timeout_sec: float | None = None,
@@ -786,8 +796,11 @@ class MaintainerEngine:
 
         while steps < self._config.max_steps_per_cycle:
             # REQ-02: a stop or cancel issued while the previous step was in
-            # flight is honoured here, before any new step starts.
-            if self.should_stop() or self.should_cancel():
+            # flight is honoured here, before any new step starts. The flags are
+            # read directly (they are what ``should_stop()`` reports) so the
+            # per-step check stays free of subclass hooks: ``run_forever()``
+            # stays the single poller of the public predicate.
+            if self._wind_down_requested():
                 break
             with self._lock:
                 now = self._clock()
@@ -825,7 +838,7 @@ class MaintainerEngine:
                 task.state = TaskState.RUNNING
                 next_progress = task.progress + 1
 
-            if self.should_stop() or self.should_cancel():
+            if self._wind_down_requested():
                 # No state mutation here: a cancel already parked the task in
                 # CANCELLED and a stop leaves it RUNNING so ``shutdown()`` can
                 # still persist it as active (INV-CANCEL-4 / REQ-03).
@@ -1283,6 +1296,10 @@ class MaintainerEngine:
     def _prune_memory(self, memory: Any) -> tuple[dict[str, int], str | None]:
         """Trim the store to the configured maxima (INV-PRUNE-3, never raises)."""
 
+        # A duck-typed store without ``prune`` has nothing to trim; that is not
+        # corruption, so it stays silent (keeps DOD-16 of the consistency plan).
+        if not callable(getattr(memory, "prune", None)):
+            return {"runs": 0, "bug_fixes": 0, "learnings": 0}, None
         try:
             dropped = memory.prune(
                 max_runs=self._config.memory_max_runs,
