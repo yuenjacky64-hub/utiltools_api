@@ -21,9 +21,11 @@ cycle with the engine it serves.
 
 from __future__ import annotations
 
+import os
+import stat
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -46,10 +48,16 @@ HEARTBEAT_READ_LIMIT = 65536
 
 @dataclass(frozen=True)
 class CycleSnapshot:
-    """One cycle's capture of the shared state it must not leak into a peer."""
+    """One cycle's capture of the shared state it must not leak into a peer.
+
+    ``records`` is ``None`` when the capture did not happen (no store installed
+    or ``snapshot_records()`` failed). ``None`` means *unknown*, never *empty*:
+    a restore of an unknown baseline is a no-op, so a failed capture can never
+    blank the operator's ``runs``/``bug_fixes``/``learnings``.
+    """
 
     cycle: int
-    records: dict[str, list[Any]] = field(default_factory=dict)
+    records: dict[str, list[Any]] | None = None
     active_task_ids: tuple[str, ...] = ()
     heartbeat: tuple[Path, bytes | None] | None = None
     admitted_at: float = 0.0
@@ -105,6 +113,12 @@ class CycleAdmissionGate:
         polls ``should_stop()`` on every wake-up (at most
         :data:`~ai_maintainer.shutdown.SHUTDOWN_POLL_INTERVAL_SEC` apart), so one
         ``request_stop()`` releases every waiter instead of stranding it.
+
+        The free-slot test runs *before* the stop poll on purpose: a cycle that
+        can be admitted immediately must not consult the stop flag at all, so a
+        stop published by a previous cycle cannot turn a later, uncontended
+        ``run_cycle()`` into a no-op (the pre-task single-cycle behaviour every
+        existing caller relies on).
         """
 
         level = Difficulty.parse(difficulty)
@@ -116,13 +130,13 @@ class CycleAdmissionGate:
             self._waiters.append((ticket, level, int(cycle)))
             try:
                 while True:
-                    if should_stop is not None and should_stop():
-                        return None
                     if len(self._active) < self._limit and self._is_head(ticket):
                         self._active[ticket] = int(cycle)
                         self._condition.notify_all()
                         return ticket
-                    self._condition.wait(SHUTDOWN_POLL_INTERVAL_SEC)
+                    if should_stop is not None and should_stop():
+                        return None
+                    self._wait_for_change(SHUTDOWN_POLL_INTERVAL_SEC)
             finally:
                 # Deregister on every exit path: admitted, stopped or raised.
                 self._waiters = [
@@ -155,7 +169,12 @@ class CycleAdmissionGate:
     # ----------------------------------------------------------------- private
 
     def _is_head(self, ticket: int) -> bool:
-        """May ``ticket`` take a free slot right now?"""
+        """May ``ticket`` take a free slot right now?
+
+        With priority enforcement on, a waiter yields to a strictly harder one;
+        equal difficulty is broken by the lower ticket, i.e. FIFO, so two
+        same-difficulty waiters cannot race past each other.
+        """
 
         mine = next(
             (level for candidate, level, _cycle in self._waiters if candidate == ticket),
@@ -167,9 +186,30 @@ class CycleAdmissionGate:
             # Operator opt-out: strict FIFO, the lowest live ticket wins.
             return min(candidate for candidate, _l, _c in self._waiters) == ticket
         for candidate, level, _cycle in self._waiters:
-            if candidate != ticket and level > mine:
+            if candidate == ticket:
+                continue
+            if level > mine or (level == mine and candidate < ticket):
                 return False
         return True
+
+    def _wait_for_change(self, timeout: float) -> None:
+        """Block until notified or ``timeout`` elapses.
+
+        The default path parks on the condition. When the engine injected its
+        own sleep seam (fake clocks in tests), the seam is used instead, with
+        the condition released around it so a ``release()`` is never delayed by
+        a sleeping waiter.
+        """
+
+        if self._sleep is time.sleep:
+            self._condition.wait(timeout)
+            return
+        self._condition.release()
+        try:
+            self._sleep(timeout)
+        finally:
+            self._condition.acquire()
+
 
 def read_heartbeat(path: Path | None) -> tuple[Path, bytes | None] | None:
     """Capture the raw heartbeat document for a snapshot (never raises).
@@ -177,32 +217,65 @@ def read_heartbeat(path: Path | None) -> tuple[Path, bytes | None] | None:
     Returns ``None`` when no heartbeat path was injected, so a caller that did
     not opt into heartbeat handling gets exactly the pre-task behavior: the
     engine never invents a heartbeat file.
+
+    This is the one read of an operator-writable file, so it carries the guards
+    Plan §5 mandates: only a **regular** file is read (a FIFO/socket would block
+    the cycle forever), the open is ``O_NOFOLLOW`` (a symlink swap is refused),
+    the read is bounded by :data:`HEARTBEAT_READ_LIMIT`, and an oversized
+    document is reported as *absent* rather than captured truncated - restoring
+    a clipped copy would corrupt the operator's file.
     """
 
     if path is None:
         return None
     target = Path(path)
     try:
-        with target.open("rb") as handle:
-            data = handle.read(HEARTBEAT_READ_LIMIT + 1)
-    except FileNotFoundError:
+        info = os.lstat(target)
+    except OSError:
         return (target, None)
+    if not stat.S_ISREG(info.st_mode):
+        return (target, None)
+    if info.st_size > HEARTBEAT_READ_LIMIT:
+        return (target, None)
+    try:
+        handle_fd = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return (target, None)
+    try:
+        with os.fdopen(handle_fd, "rb") as handle:
+            data = handle.read(HEARTBEAT_READ_LIMIT)
     except OSError:
         return (target, None)
     return (target, data)
 
 
 def write_heartbeat(path: Path, data: bytes) -> bool:
-    """Restore previously captured heartbeat bytes; ``False`` when it failed."""
+    """Restore previously captured heartbeat bytes; ``False`` when it failed.
+
+    The restore half of INV-CONC-5: it never creates a directory (the engine
+    must not invent paths), never follows a symlink at either end of the atomic
+    ``.tmp`` + ``os.replace`` swap, and leaves the file untouched on failure.
+    """
 
     target = Path(path)
+    temporary = target.with_name(target.name + ".tmp")
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(target.name + ".tmp")
-        with temporary.open("wb") as handle:
+        if target.is_symlink():
+            return False
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        handle_fd = os.open(temporary, flags, 0o644)
+        with os.fdopen(handle_fd, "wb") as handle:
             handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if target.is_symlink():  # narrow the swap window
+            raise OSError("heartbeat document is a symlink")
         temporary.replace(target)
     except OSError:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
         return False
     return True
 

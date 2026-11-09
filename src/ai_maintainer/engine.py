@@ -113,6 +113,21 @@ def _record_delta(
     return removed
 
 
+def _difficulty_name(value: int) -> str:
+    """Render a stored admission weight as its ``Difficulty`` name.
+
+    ``_CycleContext.difficulty`` keeps the plain int so the registry stays
+    comparable/sortable; ``snapshot()`` reports the enum name (``COMPLEX``,
+    ``HARD``, ...) because that is what an operator and the plan's
+    ``active_cycles`` rows speak (REQ-03).
+    """
+
+    try:
+        return Difficulty.parse(value).name
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return str(value)
+
+
 class FingerprintCircuitState(Enum):
     """Circuit state of one error fingerprint."""
 
@@ -241,6 +256,11 @@ class MaintainerEngine:
         # overlapping cycles cannot retire or preempt each other's task. The
         # ``_monitored`` property keeps the legacy single-cycle view intact.
         self._monitored_by_cycle: dict[int, TaskSpec] = {}
+        # The slot of the last cycle to finish alone is carried into the next
+        # cycle, so a single-cycle caller still sees the historical "the
+        # monitored task survives between cycles" behaviour (and can be
+        # preempted by a harder task in the following cycle).
+        self._carried_monitored: TaskSpec | None = None
         self._cycle_contexts: dict[int, _CycleContext] = {}
         self._cycle_active_ids: dict[int, tuple[str, ...]] = {}
         self._active_cycles = 0
@@ -351,20 +371,22 @@ class MaintainerEngine:
         snapshot on completion *and* on failure. The slot is released in the
         same ``finally`` that records the cycle as no longer active, so a
         crash cannot strand a slot.
+
+        The cycle id is allocated under ``_lock`` *before* the gate wait, so the
+        waiter label, the ``CYCLE_DEFERRED`` event and the eventual
+        ``CycleResult.cycle`` are one and the same number (REQ-05 attribution).
         """
 
+        cycle = self._allocate_cycle_id()
         difficulty = self._admission_difficulty()
-        token = self._gate.acquire(
-            difficulty, self._cycles + 1, should_stop=self.should_stop
-        )
+        token = self._gate.acquire(difficulty, cycle, should_stop=self.should_stop)
         if token is None:
-            # A stop was published while queued: report a skipped cycle
+            # A stop was published while queued: report a deferred cycle
             # instead of running one nobody asked for.
             with self._lock:
-                cycle = self._cycles + 1
                 self._events.append(
                     {
-                        "event": "CYCLE_SKIPPED",
+                        "event": "CYCLE_DEFERRED",
                         "cycle": cycle,
                         "reason": "STOP_REQUESTED",
                         "difficulty": Difficulty.parse(difficulty).name,
@@ -379,34 +401,44 @@ class MaintainerEngine:
                 admitted=False,
             )
 
-        snapshot = self._capture_snapshot(cycle=None, difficulty=difficulty)
-        registered = self._register_cycle(difficulty, snapshot)
+        snapshot = self._capture_snapshot(cycle=cycle, difficulty=difficulty)
+        self._register_cycle(cycle, difficulty, snapshot)
         committed = False
         try:
-            result = self._run_cycle_body(cycle=registered)
+            result = self._run_cycle_body(cycle=cycle)
             committed = True
             return result
         finally:
-            self._restore_snapshot(snapshot, trusted_cycle=registered,
-                                   committed=committed)
-            self._deregister_cycle(registered)
+            self._restore_snapshot(
+                snapshot, trusted_cycle=cycle, committed=committed
+            )
+            self._deregister_cycle(cycle)
             self._gate.release(token)
+
+    def _allocate_cycle_id(self) -> int:
+        """Reserve the next monotonic cycle id under ``_lock`` (REQ-05)."""
+
+        with self._lock:
+            self._cycles += 1
+            return self._cycles
 
     # ------------------------------------------------- concurrency plumbing
 
     def _admission_difficulty(self) -> Difficulty:
         """Difficulty of the next task this cycle would pick (admission peek).
 
-        Read-only: the selection uses a throwaway skip set and the curriculum
-        is untouched, so the peek cannot change what the body later selects.
-        The hardest candidate wins, so a queued cycle is admitted with the
-        weight of the work it is about to do (REQ-03).
+        Read-only (INV-CONC-6): the selection runs in ``peek_only`` mode, so it
+        stamps no ``pending_since`` and appends no ``FINGERPRINT_SKIPPED``
+        event - the peek happens *before* the cycle's snapshot, so any mutation
+        here would be invisible to the restore and would leak into a peer. The
+        hardest candidate wins, so a queued cycle is admitted with the weight of
+        the work it is about to do (REQ-03).
         """
 
         with self._lock:
             now = self._clock()
             try:
-                candidate = self._select_next_task(now, set())
+                candidate = self._select_next_task(now, None, peek_only=True)
             except Exception:  # pragma: no cover - defensive
                 return Difficulty.EASY
             if candidate is None:
@@ -419,18 +451,24 @@ class MaintainerEngine:
     def _capture_snapshot(
         self, *, cycle: int | None, difficulty: Difficulty
     ) -> CycleSnapshot:
-        """Capture the state a cycle must not leak into a peer (REQ-02)."""
+        """Capture the state a cycle must not leak into a peer (REQ-02).
+
+        A failed store capture is recorded as ``records=None`` ("unknown"), not
+        as an empty document: the restore half must be able to tell "the store
+        could not be read" from "the store was empty", otherwise a failed
+        capture would blank the whole memory document on restore (v2 finding 2).
+        """
 
         with self._lock:
             memory = self._memory
             watcher = self._watcher
             heartbeat_path = self._heartbeat_path
-        records: dict[str, list[Any]] = {}
+        records: dict[str, list[Any]] | None = None
         if memory is not None:
             try:
                 records = memory.snapshot_records()
             except Exception:  # pragma: no cover - defensive
-                records = {}
+                records = None
         active_ids: tuple[str, ...] = ()
         if watcher is not None:
             try:
@@ -467,67 +505,109 @@ class MaintainerEngine:
             removed (and only when it did not commit): a peer's records are
             never touched, which is what keeps overlapping cycles from
             corrupting each other.
+        The mode decision and the store mutation happen inside the **same**
+        ``_lock`` critical section, so a peer cannot register in a window where
+        the mode was chosen for "alone" but the store mutation runs with peers
+        live (v2 finding 6). Lock order is gate condition -> ``self._lock`` ->
+        store ``_write_lock``; nothing takes a store lock while holding the
+        engine lock's inverse, and the store never calls back into the engine.
         """
 
+        error: str | None = None
+        removed = 0
+        # Heartbeat capture is restored outside the lock (file I/O must not
+        # serialize peers); the store half is the part that needs atomicity.
         with self._lock:
             memory = self._memory
             peers = self._active_cycles - 1
-            self._cycle_active_ids[trusted_cycle] = tuple(
-                snapshot.active_task_ids
-            )
-        mode = "exact" if peers <= 0 else "cycle-scoped"
-        removed = 0
-        if memory is not None:
-            try:
-                if mode == "exact":
-                    if not committed:
+            mode = "exact" if peers <= 0 else "cycle-scoped"
+            if memory is not None and not committed:
+                if mode == "exact" and snapshot.records is None:
+                    # Capture failed: refuse to touch the store at all rather
+                    # than roll it back to "unknown" (v2 finding 2).
+                    error = "SNAPSHOT_UNAVAILABLE"
+                elif mode == "exact":
+                    try:
                         before = memory.snapshot_records()
                         removed = _record_delta(before, snapshot.records)
                         memory.restore_records(snapshot.records)
-                elif not committed:
-                    removed = memory.drop_records(cycle=trusted_cycle)
-            except Exception:  # pragma: no cover - defensive
-                removed = removed or 0
+                    except ValueError:
+                        error = "MALFORMED_SNAPSHOT"
+                    except Exception:  # pragma: no cover - defensive
+                        error = "RESTORE_FAILED"
+                else:
+                    try:
+                        removed = memory.drop_records(cycle=trusted_cycle)
+                    except Exception:  # pragma: no cover - defensive
+                        error = "RESTORE_FAILED"
+        heartbeat_result: bool | None = None
         if snapshot.heartbeat is not None:
             path, data = snapshot.heartbeat
             if data is not None and current_heartbeat(path) != data:
-                write_heartbeat(path, data)
-        if snapshot.records or snapshot.heartbeat is not None or removed:
+                heartbeat_result = write_heartbeat(path, data)
+        # Stay quiet when the restore was a no-op: an uncontended, committed
+        # cycle leaves the store exactly as captured, and emitting
+        # ``SNAPSHOT_RESTORED`` for it would append an event after the cycle's
+        # own CONSISTENCY event that existing callers assert on (v2 finding 1:
+        # no observable change for callers that run one cycle at a time).
+        if error is not None or removed or heartbeat_result is not None or mode != "exact":
             with self._lock:
                 self._events.append(
                     {
-                        "event": "SNAPSHOT_RESTORED",
+                        "event": (
+                            "SNAPSHOT_RESTORED"
+                            if error is None
+                            else "SNAPSHOT_RESTORE_FAILED"
+                        ),
                         "cycle": trusted_cycle,
                         "mode": mode,
                         "committed": bool(committed),
                         "removed": int(removed),
+                        "error": error,
+                        "heartbeat_restored": heartbeat_result,
                     }
                 )
 
     def _register_cycle(
-        self, difficulty: Difficulty, snapshot: CycleSnapshot
-    ) -> int:
-        """Enter the cycle in the registry and retire the "all idle" latch."""
+        self,
+        cycle: int,
+        difficulty: Difficulty,
+        snapshot: CycleSnapshot,
+    ) -> None:
+        """Enter the cycle in the registry under its pre-allocated id (REQ-05).
+
+        The id comes from :meth:`_allocate_cycle_id` *before* the gate wait, so
+        the waiter label, the cycle-scoped restore and ``CycleResult.cycle`` all
+        name the same cycle; registering never re-derives a second id.
+        """
 
         with self._lock:
-            self._cycles += 1
-            cycle = self._cycles
-            self._cycle_contexts[cycle] = _CycleContext(
-                cycle=cycle,
+            self._cycles = max(self._cycles, int(cycle))
+            # The next cycle inherits the slot of the last cycle that finished
+            # alone, so single-cycle callers keep the historical behaviour
+            # (preemption is evaluated against the still-monitored task). The
+            # adoption happens inside the body's first lock hold, never here,
+            # so a reader can never observe a carried task as monitored.
+            self._cycle_contexts[int(cycle)] = _CycleContext(
+                cycle=int(cycle),
                 difficulty=int(Difficulty.parse(difficulty)),
                 thread=threading.get_ident(),
                 admitted_at=snapshot.admitted_at,
             )
+            self._cycle_active_ids[int(cycle)] = tuple(snapshot.active_task_ids)
             self._active_cycles += 1
             self._cycle_done.clear()
-        return cycle
 
     def _deregister_cycle(self, cycle: int) -> None:
         """Leave the registry; the latch drops when the last cycle leaves."""
 
         with self._lock:
             self._cycle_contexts.pop(cycle, None)
-            self._monitored_by_cycle.pop(cycle, None)
+            monitored = self._monitored_by_cycle.pop(cycle, None)
+            if monitored is not None and self._active_cycles <= 1:
+                # Last cycle out hands its monitored task to the next cycle
+                # instead of dropping it (no peer can be using the slot).
+                self._carried_monitored = monitored
             self._cycle_active_ids.pop(cycle, None)
             self._active_cycles = max(0, self._active_cycles - 1)
             if self._active_cycles == 0:
@@ -840,6 +920,13 @@ class MaintainerEngine:
             with self._lock:
                 now = self._clock()
                 mine = self._monitored_by_cycle.get(cycle)
+                if (
+                    mine is None
+                    and self._carried_monitored is not None
+                    and self._active_cycles <= 1
+                ):
+                    mine = self._monitored_by_cycle[cycle] = self._carried_monitored
+                    self._carried_monitored = None
                 if mine is not None and mine.state not in NON_TERMINAL:
                     self._monitored_by_cycle.pop(cycle, None)
                     mine = None
@@ -965,7 +1052,18 @@ class MaintainerEngine:
         return issues
 
     def snapshot(self) -> dict:
-        """Lock-protected view of the monitored task and pending priorities."""
+        """Lock-protected view of the monitored tasks, admission and priorities.
+
+        ``active_cycles`` carries one row per live cycle - ``{cycle, task,
+        difficulty, admitted_at}`` - as Plan §4 requires, so an operator can
+        attribute a task to the cycle that holds it and see the admission
+        weight each cycle was ordered by (REQ-03/REQ-05). ``task`` is the name
+        the cycle's slot last adopted (kept after retirement); ``difficulty``
+        is the :class:`Difficulty` name of that cycle's admission peek.
+        ``admission`` is the gate's own read-only view (limit / active /
+        waiting), captured after the engine lock is released so the gate
+        condition is never nested inside the engine lock.
+        """
 
         with self._lock:
             now = self._clock()
@@ -974,9 +1072,26 @@ class MaintainerEngine:
                 str(slot): task.name
                 for slot, task in sorted(self._monitored_by_cycle.items())
             }
+            active_cycles = [
+                {
+                    "cycle": context.cycle,
+                    "task": context.task,
+                    "difficulty": _difficulty_name(context.difficulty),
+                    "admitted_at": context.admitted_at,
+                    "thread": context.thread,
+                }
+                for _slot, context in sorted(self._cycle_contexts.items())
+            ]
+            gate = self._gate
             pending: dict[str, str] = {}
             for task in self._curriculum.specs:
                 if task.state not in NON_TERMINAL:
+                    continue
+                if task.state in STALE_ELIGIBLE:
+                    # Held by a cycle, or in flight but retired by one: it is
+                    # not waiting for admission, so listing it as pending with
+                    # a high priority would misreport a lower-priority task as
+                    # starved (DOD-09).
                     continue
                 if monitored is not None and task is monitored:
                     continue
@@ -984,12 +1099,16 @@ class MaintainerEngine:
                 pending[task.name] = effective_priority(
                     task, cycle=self._cycles, now=now, config=self._config
                 ).name
-            return {
+            view = {
                 "monitored": None if monitored is None else monitored.name,
                 "monitored_by_cycle": monitored_by_cycle,
-                "active_cycles": sorted(self._monitored_by_cycle),
+                "active_cycles": active_cycles,
                 "pending": pending,
             }
+        # Gate state is read outside ``_lock``: the gate has its own condition
+        # and the documented lock order is gate -> engine, never the inverse.
+        view["admission"] = gate.state()
+        return view
 
     def fingerprint_state(self, now: float | None = None) -> dict[str, Any]:
         """Lock-protected copy of the per-fingerprint circuit registry."""
@@ -1424,18 +1543,33 @@ class MaintainerEngine:
         return False
 
     def _select_next_task(
-        self, now: float, reported_skips: set[str] | None = None
+        self,
+        now: float,
+        reported_skips: set[str] | None = None,
+        *,
+        peek_only: bool = False,
     ) -> TaskSpec | None:
         """Highest effective priority wins; ties break FIFO by insertion order.
 
         A task whose fingerprint is quarantined is neither adopted nor stepped;
         its ``FINGERPRINT_SKIPPED`` event is appended at most once per cycle.
+
+        ``peek_only=True`` makes the call side-effect free (INV-CONC-6): no
+        ``pending_since`` stamp and no event append. The admission peek in
+        :meth:`_admission_difficulty` runs before the cycle snapshot, so it must
+        not mutate anything the snapshot could fail to undo.
         """
 
         best: TaskSpec | None = None
         best_key: tuple[int, int] | None = None
+        # A task already held by a live cycle slot is not offered to another
+        # cycle: two overlapping cycles stepping one task would double-count
+        # its progress and emit two COMPLETED outcomes for it (REQ-05).
+        held = {id(task) for task in self._monitored_by_cycle.values()}
         for index, task in enumerate(self._curriculum.specs):
             if task.state not in NON_TERMINAL:
+                continue
+            if id(task) in held:
                 continue
             if reported_skips is not None and task.name in reported_skips:
                 # Signal-gate rejection: reported once, then skipped for the
@@ -1444,7 +1578,11 @@ class MaintainerEngine:
                 continue
             if self._is_fingerprint_quarantined(task, now):
                 fingerprint = self._task_fingerprint[task.name]
-                if reported_skips is not None and fingerprint not in reported_skips:
+                if (
+                    not peek_only
+                    and reported_skips is not None
+                    and fingerprint not in reported_skips
+                ):
                     reported_skips.add(fingerprint)
                     self._events.append(
                         {
@@ -1455,7 +1593,8 @@ class MaintainerEngine:
                         }
                     )
                 continue
-            stamp_pending_since(task, now)
+            if not peek_only:
+                stamp_pending_since(task, now)
             level = effective_priority(
                 task, cycle=self._cycles, now=now, config=self._config
             ).value
@@ -1514,11 +1653,25 @@ class MaintainerEngine:
         live cycle slots is *the* monitored task, several distinct tasks are
         not collapsible and yield ``None``. Read-only on purpose - every write
         path is cycle-scoped, so there is no correct global assignment.
+
+        While no cycle is running, the slot carried over from the last
+        single-cycle run is reported as long as the task is still in flight, so
+        a caller that runs one cycle at a time keeps the historical view (the
+        monitored task survives between cycles) and drops it once the task is
+        completed or fails.
         """
 
         seen: dict[int, TaskSpec] = {}
         for task in self._monitored_by_cycle.values():
             seen[id(task)] = task
+        carried = self._carried_monitored
+        if (
+            not seen
+            and self._active_cycles == 0
+            and carried is not None
+            and carried.state in NON_TERMINAL
+        ):
+            seen[id(carried)] = carried
         if len(seen) == 1:
             return next(iter(seen.values()))
         return None

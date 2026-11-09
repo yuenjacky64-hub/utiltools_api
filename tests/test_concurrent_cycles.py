@@ -27,6 +27,7 @@ from pathlib import Path
 from ai_maintainer.config import MaintainerConfig
 from ai_maintainer.concurrency import (
     CycleAdmissionGate,
+    CycleSnapshot,
     current_heartbeat,
     read_heartbeat,
     write_heartbeat,
@@ -51,6 +52,8 @@ def _make_engine(
     memory: MemoryStore | None = None,
     watcher: FakeWatcher | None = None,
     heartbeat: str | Path | None = None,
+    max_shutdown_wait: float = 5.0,
+    audit_path: str | Path | None = None,
 ) -> MaintainerEngine:
     """Build a lightweight engine for the admission / isolation seams.
 
@@ -61,6 +64,7 @@ def _make_engine(
     config = MaintainerConfig(
         max_concurrent_cycles=max_cycles,
         priority_preemption_enabled=priority,
+        max_shutdown_wait_sec=max_shutdown_wait,
     )
     curriculum = TaskCurriculum(specs=[])
     return MaintainerEngine(
@@ -69,6 +73,7 @@ def _make_engine(
         memory=memory,
         watcher=watcher,
         heartbeat_path=heartbeat,
+        shutdown_audit_path=audit_path,
     )
 
 
@@ -325,15 +330,50 @@ def test_engine_blocks_concurrent_cycle_when_slot_full(tmp_path: Path) -> None:
 
 
 def test_engine_request_stop_skips_queued_cycle(tmp_path: Path) -> None:
-    """After request_stop, run_cycle is skipped (admitted=False) without blocking."""
+    """A *queued* cycle observes request_stop and defers instead of blocking.
+
+    Scope of the stop signal (REQ-04, plan §5 "stop deregisters waiters"): it
+    releases cycles that are waiting for a slot. It must not touch the
+    uncontended path — see ``test_engine_uncontended_cycle_ignores_stale_stop``
+    for the pre-task behaviour DOD-09 pins.
+    """
+
+    engine = _make_engine(tmp_path, max_cycles=1)
+    holder = engine._gate.acquire(Difficulty.EASY, 99, should_stop=engine.should_stop)
+    assert holder is not None
+    try:
+        engine.request_stop()
+        result = engine.run_cycle()
+    finally:
+        engine._gate.release(holder)
+
+    assert result.admitted is False, "a queued cycle must not be admitted after stop"
+    assert result.steps == 0
+    assert result.cycle > 0, "the deferred cycle still reports its reserved id"
+    assert engine.active_cycles == 0
+    assert "CYCLE_DEFERRED" in [event["event"] for event in engine.events]
+
+
+def test_engine_uncontended_cycle_ignores_stale_stop(tmp_path: Path) -> None:
+    """A free slot is taken without ever consulting the stop flag (DOD-09).
+
+    ``tests/test_graceful_shutdown.py::test_cycle_after_shutdown_starts_cleanly``
+    pins this: a stop published by an earlier cycle must not turn a later,
+    uncontended ``run_cycle()`` into a no-op.
+    """
+
     engine = _make_engine(tmp_path, max_cycles=2)
     engine.request_stop()
+    polls: list[bool] = []
 
-    result = engine.run_cycle()
+    def should_stop() -> bool:
+        polls.append(True)
+        return True
 
-    assert result.admitted is False, "a stopped engine must not admit a new cycle"
-    assert result.steps == 0
-    assert engine.active_cycles == 0
+    token = engine._gate.acquire(Difficulty.EASY, 1, should_stop=should_stop)
+    assert token is not None, "a free slot must be granted before the stop poll"
+    assert polls == [], "the uncontended path must not poll should_stop()"
+    engine._gate.release(token)
 
 
 # ---------------------------------------------------------------------------
@@ -395,3 +435,128 @@ def test_heartbeat_round_trip(tmp_path: Path) -> None:
 
     # A None path means the caller did not opt into heartbeat handling.
     assert read_heartbeat(None) is None
+
+
+# ---------------------------------------------------------------------------
+# REQ-04 / DOD-06 (wind-down) and DOD-07 (lock release) — multi-cycle wind-down
+# ---------------------------------------------------------------------------
+
+
+class _CountingLock:
+    """Fake file lock recording how many times it was released."""
+
+    def __init__(self) -> None:
+        self.releases = 0
+
+    def release(self) -> None:
+        self.releases += 1
+
+
+def test_wind_down_waits_for_two_inflight_cycles(tmp_path: Path) -> None:
+    """The wind-down blocks until *both* registered cycles leave (DOD-06)."""
+
+    audit = tmp_path / "audit" / "maintainer.log"
+    engine = _make_engine(
+        tmp_path,
+        max_cycles=2,
+        max_shutdown_wait=5.0,
+        audit_path=audit,
+    )
+    engine._register_cycle(1, Difficulty.EASY, CycleSnapshot(cycle=1))
+    engine._register_cycle(2, Difficulty.COMPLEX, CycleSnapshot(cycle=2))
+    assert engine.active_cycles == 2
+
+    finished = threading.Event()
+    reports: list[object] = []
+
+    def wind_down() -> None:
+        reports.append(engine.shutdown())
+        finished.set()
+
+    thread = threading.Thread(target=wind_down)
+    thread.start()
+    thread.join(timeout=0.15)
+    assert not finished.is_set(), "the wind-down must wait for the two cycles"
+
+    engine._deregister_cycle(1)
+    thread.join(timeout=0.15)
+    assert not finished.is_set(), "one cycle is still in flight; keep waiting"
+
+    engine._deregister_cycle(2)
+    thread.join(timeout=5.0)
+    assert finished.is_set() and not thread.is_alive()
+    assert engine.active_cycles == 0
+
+    report = reports[0]
+    assert report.timed_out is False, "both cycles exited inside the budget"
+    assert report.audit_written is True
+    lines = [line for line in audit.read_text(encoding="utf-8").splitlines() if line]
+    assert len(lines) == 1, "one wind-down writes exactly one audit line"
+    assert engine.events[-1]["event"] == "SHUTDOWN_COMPLETE"
+
+
+def test_wind_down_releases_each_file_lock_once(tmp_path: Path) -> None:
+    """Every tracked lock is released exactly once, even across repeats (DOD-07)."""
+
+    engine = _make_engine(
+        tmp_path,
+        max_cycles=2,
+        audit_path=tmp_path / "maintainer.log",
+    )
+    first, second = _CountingLock(), _CountingLock()
+    engine.register_file_lock("task-a", first)
+    engine.register_file_lock("task-b", second)
+
+    report = engine.shutdown()
+    assert report.released_lock_keys == ("task-a", "task-b")
+    assert first.releases == 1 and second.releases == 1
+    assert engine.file_locks == ()
+
+    # Idempotent: the cached report is returned and nothing is released twice.
+    again = engine.shutdown()
+    assert again is report
+    assert first.releases == 1 and second.releases == 1
+
+
+def test_run_forever_multi_cycle_mode_writes_one_audit_line(tmp_path: Path) -> None:
+    """``run_forever`` with a peer cycle in flight still winds down once (DOD-06)."""
+
+    audit = tmp_path / "maintainer.log"
+    engine = _make_engine(
+        tmp_path,
+        max_cycles=2,
+        audit_path=audit,
+    )
+    peer_done = threading.Event()
+
+    def peer() -> None:
+        engine._register_cycle(90, Difficulty.HARD, CycleSnapshot(cycle=90))
+        peer_done.wait(5.0)
+        engine._deregister_cycle(90)
+
+    thread = threading.Thread(target=peer)
+    thread.start()
+    while engine.active_cycles != 1:
+        time.sleep(0.005)
+
+    real_run_cycle = engine.run_cycle
+    calls: list[int] = []
+
+    def one_cycle() -> object:
+        calls.append(1)
+        engine.request_stop()
+        peer_done.set()
+        return real_run_cycle()
+
+    engine.run_cycle = one_cycle  # type: ignore[method-assign]
+    report = engine.run_forever(interval_sec=0.0)
+    thread.join(timeout=5.0)
+
+    assert calls == [1], "the stop request ends the loop after one cycle"
+    assert report.timed_out is False
+    events = [event["event"] for event in engine.events]
+    assert events.count("SHUTTING_DOWN") == 1
+    assert events.count("SHUTDOWN_COMPLETE") == 1
+    lines = [line for line in audit.read_text(encoding="utf-8").splitlines() if line]
+    assert len(lines) == 1, "multi-cycle mode must not duplicate the audit line"
+    assert engine.active_cycles == 0

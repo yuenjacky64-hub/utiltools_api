@@ -46,3 +46,7 @@ maintainer_memory.json.tmp
 data/maintainer_shutdown.log
 _shutdown_state.json
 _shutdown_state.json.tmp
+
+### Concurrent cycle runtime state (never source) - UTILTOOLS-77 REQ-02 ###
+maintainer_heartbeat.json
+maintainer_heartbeat.json.tmp

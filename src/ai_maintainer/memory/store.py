@@ -213,12 +213,17 @@ class MemoryStore:
 
         Only the three known collections are read, and each must be a list -
         anything else raises ``ValueError`` so a corrupt snapshot cannot
-        silently blank the store. The next :meth:`save` persists the result.
+        silently blank the store. A *missing* collection is also an error
+        rather than an implicit empty list: "unknown" (a failed capture) must
+        never be indistinguishable from "was empty" (UTILTOOLS-77 v2 finding 2).
+        The next :meth:`save` persists the result.
         """
 
         restored: dict[str, list[Any]] = {}
         for name in _COLLECTIONS:
-            value = records.get(name, [])
+            if name not in records:
+                raise ValueError(f"restore_records: {name} is missing")
+            value = records[name]
             if not isinstance(value, list):
                 raise ValueError(f"restore_records: {name} is not a list")
             restored[name] = [
