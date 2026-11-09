@@ -319,6 +319,11 @@ class CycleResult:
     # observed before the cycle's first step; a cycle that committed anything
     # (or was refused by the idle gate) reports ``SUCCESS``.
     outcome: str = "SUCCESS"
+    # UTILTOOLS-80: which flag produced an ``INTERRUPTED`` outcome —
+    # ``"STOP"`` (``request_stop()``/signal) or ``"CANCEL"``
+    # (``cancel_task()``); ``None`` for ``SUCCESS``. Distinguishes a
+    # shutdown-limited cycle from an operator cancellation.
+    interrupted_by: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -330,6 +335,7 @@ class CycleResult:
             "admitted": self.admitted,
             "memory_cycle": self.memory_cycle,
             "outcome": self.outcome,
+            "interrupted_by": self.interrupted_by,
         }
 
 
@@ -617,6 +623,13 @@ class MaintainerEngine:
         # while it is held (INV-SHUT-7: ``_shutdown_lock`` is a plain Lock).
         self._graceful_lock = threading.Lock()
         self._graceful_report: ShutdownReport | None = None
+        # UTILTOOLS-80 REQ-03: number of repeated stop signals the wind-down
+        # absorbed while stamping/persisting/tearing down (see ``_shielded``).
+        self._shielded_interrupts = 0
+        # UTILTOOLS-80 NIT: deadline already spent by ``graceful_shutdown()``'s
+        # drain. ``shutdown()`` inherits it instead of opening a second full
+        # ``max_shutdown_wait_sec`` window on the same stuck cycle.
+        self._drain_deadline: float | None = None
         self._file_locks: dict[str, Any] = {}
         self._active_roles: dict[str, str] = {}
         self._role_resolver = role_resolver
@@ -1564,6 +1577,13 @@ class MaintainerEngine:
             self._state = EngineState.IDLE
             self._stop_signal = None
             self._stop_published = False
+        # UTILTOOLS-80 NIT: re-arm the wind-down memoization for this run, so a
+        # second ``run_forever()`` on the *same* instance re-stamps the heartbeat
+        # and re-persists the memory document instead of returning the previous
+        # run's report from :meth:`graceful_shutdown`. ``shutdown()`` keeps its
+        # own memoized report (INV-MARK-4); only the graceful wrapper re-arms.
+        with self._graceful_lock:
+            self._graceful_report = None
         # REQ-03 / INV-MARK-1: markers exist only with a state root, so an
         # in-process caller that passes none leaves the repo untouched.
         self._write_runtime_markers()
@@ -1604,22 +1624,38 @@ class MaintainerEngine:
                     break
                 self._pause(interval)
         finally:
-            if previous:
-                _restore_stop_handlers(previous)
-            # INV-SHUT-9: the handler only set the flag; the attributable
-            # ``SIGNAL_*`` reason is published here, in normal context, before
-            # the reason is logged and before the wind-down drains.
-            self._publish_signal_reason()
-            self._log_stop_reason()
-            report = self.graceful_shutdown()
-            # INV-MARK-4 / DOD-03: the markers are published at entry, but
-            # ``shutdown()`` is idempotent and returns its cached report on a
-            # second ``run_forever()`` without re-running the marker cleanup.
-            # Clearing here (a no-op when ``shutdown()`` already did it) keeps
-            # the loop's exit free of stale ``maintainer.pid``/heartbeat files
-            # no matter how many times it is entered.
-            self._clear_runtime_markers()
-            return report
+            # REQ-03 / INV-SHUT-9: the handler only set the flag; the
+            # attributable ``SIGNAL_*`` reason is published here, in normal
+            # context, before the reason is logged and before the wind-down
+            # drains.
+            #
+            # The engine's own handler stays installed for the *whole*
+            # wind-down: restoring ``previous`` first would hand the process
+            # back to the caller's (usually default) disposition, so a second
+            # SIGINT/SIGTERM during the drain - the impatient operator, a
+            # repeated ``systemctl stop`` - would raise ``KeyboardInterrupt``
+            # and abort the sequence before the heartbeat stamp, the memory
+            # ``_save()`` and the marker unlink, leaving exactly the stale
+            # ``maintainer.pid``/heartbeat and unpersisted memory REQ-03
+            # forbids. Plan §4.2 only requires the restore before
+            # ``run_forever()`` returns, so it moves into this inner
+            # ``finally``.
+            try:
+                self._publish_signal_reason()
+                self._log_stop_reason()
+                report = self.graceful_shutdown()
+                # INV-MARK-4 / DOD-03: the markers are published at entry, but
+                # ``shutdown()`` is idempotent and returns its cached report on
+                # a second ``run_forever()`` without re-running the marker
+                # cleanup. Clearing here (a no-op when ``shutdown()`` already
+                # did it) keeps the loop's exit free of stale
+                # ``maintainer.pid``/heartbeat files no matter how many times
+                # it is entered.
+                self._clear_runtime_markers()
+                return report
+            finally:
+                if previous:
+                    _restore_stop_handlers(previous)
 
     def graceful_shutdown(self, *, exit_process: bool = False) -> ShutdownReport:
         """Operator-facing wind-down: drain, stamp, persist, tear down.
@@ -1653,22 +1689,25 @@ class MaintainerEngine:
 
         # 3. Drain the review phase: the cycle finishes its current step and
         #    reaches its own break point instead of being truncated.
-        drain_timed_out = self._await_cycle_break_point(
-            self._clock() + float(self._config.max_shutdown_wait_sec)
-        )
+        drain_deadline = self._clock() + float(self._config.max_shutdown_wait_sec)
+        self._drain_deadline = drain_deadline
+        drain_timed_out = self._await_cycle_break_point(drain_deadline)
 
         # 4. Stamp the heartbeat with the terminal state (advisory, never raises).
-        heartbeat_stamped = self._write_final_heartbeat()
+        heartbeat_stamped = self._shielded(self._write_final_heartbeat)
 
         # 5. Persist the memory document (REQ-01's ``self.memory._save()``).
         memory = self.memory
         memory_issue_count = 0
         if memory is not None:
-            memory_issue_count = self._persist_memory(memory)
+            memory_issue_count = self._shielded(
+                lambda: self._persist_memory(memory)
+            )
 
         # 6. Teardown: one owner of the bounded wait, lock release, memory
         #    re-save, marker unlink and the SHUTDOWN audit line.
-        report = self.shutdown()
+        report = self._shielded(self.shutdown)
+        self._drain_deadline = None
 
         # 7. Memoize and record what the drain observed (the report itself is
         #    frozen and carries only ``shutdown()``'s own contract fields).
@@ -1682,6 +1721,7 @@ class MaintainerEngine:
                     "memory_persisted": memory is not None,
                     "memory_issue_count": memory_issue_count,
                     "reason": self._stop_reason,
+                    "repeated_signals_ignored": self._shielded_interrupts,
                 }
             )
         with self._graceful_lock:
@@ -1697,14 +1737,45 @@ class MaintainerEngine:
         cycle that is mid-commit can still acquire ``_lock`` and finish. Shared
         by :meth:`shutdown` and :meth:`graceful_shutdown` (the poll interval and
         the injected ``self._sleep`` seam are identical on both paths).
+
+        ``KeyboardInterrupt`` raised while polling is treated as a repeated stop
+        request, not as an abort: the wind-down is what stamps the terminal
+        heartbeat, persists the memory document and unlinks the runtime markers,
+        so letting an impatient second Ctrl-C unwind through here would leave
+        the stale state REQ-03 forbids. The wait stays bounded by ``deadline``.
         """
 
         while not self._cycle_done.is_set():
             remaining = deadline - self._clock()
             if remaining <= 0.0:
                 return True
-            self._sleep(min(SHUTDOWN_POLL_INTERVAL_SEC, remaining))
+            try:
+                self._sleep(min(SHUTDOWN_POLL_INTERVAL_SEC, remaining))
+            except KeyboardInterrupt:
+                continue
         return False
+
+    def _shielded(self, step: Callable[[], Any]) -> Any:
+        """Run a teardown step that a repeated stop signal must not abort.
+
+        UTILTOOLS-80 REQ-03 / Review v1 MUST_FIX: the handler installed by
+        :func:`install_stop_handlers` only sets the flag, so within
+        ``run_forever()`` a second SIGINT/SIGTERM is already harmless. This
+        shield covers the other entry points - a direct
+        ``graceful_shutdown()`` call, or a ``KeyboardInterrupt`` that lands
+        between the handler install and the loop - so the heartbeat stamp, the
+        memory ``_save()`` and the marker unlink are never skipped. Every step
+        it wraps is idempotent (atomic rewrite, memoized ``shutdown()``), so
+        re-running one after an interrupt is safe; each ignored interrupt is
+        counted and reported in the ``GRACEFUL_SHUTDOWN`` event.
+        """
+
+        while True:
+            try:
+                return step()
+            except KeyboardInterrupt:
+                self._shielded_interrupts += 1
+                continue
 
     def _persist_memory(self, memory: Any) -> int:
         """Write the memory document through the store; returns the issue count.
@@ -1751,6 +1822,13 @@ class MaintainerEngine:
                 )
                 started = self._clock()
                 deadline = started + float(self._config.max_shutdown_wait_sec)
+                inherited = self._drain_deadline
+                if inherited is not None:
+                    # UTILTOOLS-80 NIT: ``graceful_shutdown()`` already drained
+                    # this cycle against its own window, so the teardown wait
+                    # reuses what is left of that budget rather than doubling
+                    # worst-case stop latency on the stuck-cycle path.
+                    deadline = min(deadline, inherited)
 
             # INV-SHUT-1: the wait loop holds no engine lock, so a cycle that is
             # mid-commit can still acquire ``_lock`` and reach its break point.
@@ -2007,6 +2085,11 @@ class MaintainerEngine:
                 # No state mutation here: a cancel already parked the task in
                 # CANCELLED and a stop leaves it RUNNING so ``shutdown()`` can
                 # still persist it as active (INV-CANCEL-4 / REQ-03).
+                # UTILTOOLS-80 (plan §4.5): a wind-down observed *before* the
+                # first step ran is the one INTERRUPTED case here too, so a
+                # stop landing between the pre-step bookkeeping and
+                # ``_monitor_step()`` cannot report SUCCESS with ``steps == 0``.
+                interrupted = steps == 0
                 break
             # Monitor step body runs outside the lock.
             error: BaseException | None = None
@@ -2057,6 +2140,11 @@ class MaintainerEngine:
             admitted=True,
             memory_cycle=cycle if memory_installed else None,
             outcome="INTERRUPTED" if interrupted else "SUCCESS",
+            interrupted_by=(
+                ("STOP" if self._stop.is_set() else "CANCEL")
+                if interrupted
+                else None
+            ),
         )
 
     def _finish_cycle(self, cycle: int) -> list[str]:

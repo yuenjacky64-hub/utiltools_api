@@ -236,18 +236,8 @@ def test_in_flight_cycle_completes_before_teardown(tmp_path: Path) -> None:
 # ------------------------------------- REQ-02 / DOD-03..DOD-05: signal + outcome
 
 
-@pytest.mark.parametrize(
-    ("signum", "reason"),
-    [
-        (signal.SIGINT, "SIGNAL_SIGINT"),
-        (signal.SIGTERM, "SIGNAL_SIGTERM"),
-    ],
-)
-def test_signal_after_review_yields_success_outcome(
-    tmp_path: Path, signum: int, reason: str
-) -> None:
-    """DOD-03/DOD-04: SIGINT/SIGTERM route through ``_handle_signal``."""
-
+def _assert_signal_after_review(signum: int, reason: str, tmp_path: Path) -> None:
+    """Shared body for the two plan-named DOD-03/DOD-04 nodes (plan §8)."""
     class Signalling(MaintainerEngine):
         def _monitor_step(self, task: TaskSpec) -> None:
             self._handle_signal(signum, None)
@@ -266,6 +256,18 @@ def test_signal_after_review_yields_success_outcome(
     assert len(published) == 1
     assert published[0]["reason"] == reason
     assert engine.stop_reason == reason
+
+
+def test_sigint_after_review_yields_success_outcome(tmp_path: Path) -> None:
+    """DOD-03: SIGINT routes through ``_handle_signal`` (plan §8 node id)."""
+
+    _assert_signal_after_review(signal.SIGINT, "SIGNAL_SIGINT", tmp_path)
+
+
+def test_sigterm_after_review_yields_success_outcome(tmp_path: Path) -> None:
+    """DOD-04: SIGTERM routes the same way (plan §8 node id)."""
+
+    _assert_signal_after_review(signal.SIGTERM, "SIGNAL_SIGTERM", tmp_path)
 
 
 def test_stop_before_first_step_yields_interrupted(tmp_path: Path) -> None:
@@ -430,3 +432,146 @@ def test_exit_process_is_opt_in(tmp_path: Path) -> None:
         engine.graceful_shutdown(exit_process=True)
 
     assert excinfo.value.code == 0
+
+
+# --------------------------------- Review v1 findings: wind-down edge cases
+
+
+def test_stop_landing_after_bookkeeping_yields_interrupted(tmp_path: Path) -> None:
+    """Plan §4.5 / Review v1 NIT: the *second* wind-down check truncates too.
+
+    A stop published between the pre-step bookkeeping (under ``_lock``) and
+    ``_monitor_step()`` must not report ``SUCCESS`` with ``steps == 0``.
+    """
+
+    class StopsWhileSelecting(MaintainerEngine):
+        def _select_next_task(
+            self, now: float, reported_skips: set[str]
+        ) -> TaskSpec | None:
+            chosen = super()._select_next_task(now, reported_skips)
+            if chosen is not None and not self._stop.is_set():
+                # Set the flag directly: ``request_stop()`` takes ``_lock``,
+                # which this hook already holds.
+                self._stop.set()
+            return chosen
+
+    engine = _engine(tmp_path, [_spec("task-a")], cls=StopsWhileSelecting)
+
+    result = engine.run_cycle()
+
+    assert result.steps == 0
+    assert result.outcome == "INTERRUPTED"
+    assert result.interrupted_by == "STOP"
+
+
+def test_cancelled_cycle_is_distinguishable_from_stop(tmp_path: Path) -> None:
+    """Review v1 NIT: ``interrupted_by`` separates a cancel from a stop."""
+
+    class CancelsWhileSelecting(MaintainerEngine):
+        def _select_next_task(
+            self, now: float, reported_skips: set[str]
+        ) -> TaskSpec | None:
+            chosen = super()._select_next_task(now, reported_skips)
+            if chosen is not None and not self._cancel.is_set():
+                # ``cancel_task()`` takes ``_lock``, which this hook holds, so
+                # publish the cancel flag the way an in-flight cancel does.
+                self._cancel.set()
+            return chosen
+
+    engine = _engine(tmp_path, [_spec("task-a")], cls=CancelsWhileSelecting)
+
+    result = engine.run_cycle()
+
+    assert result.steps == 0
+    assert result.outcome == "INTERRUPTED"
+    assert result.interrupted_by == "CANCEL"
+    assert engine._stop.is_set() is False  # a cancel is not a stop
+
+
+def test_teardown_wait_inherits_drain_deadline(tmp_path: Path) -> None:
+    """Review v1 NIT: a stuck cycle is not waited on twice in full.
+
+    The drain in ``graceful_shutdown()`` and the teardown's own bounded wait
+    share one ``max_shutdown_wait_sec`` window, so worst-case stop latency does
+    not double on the failure path.
+    """
+
+    config = MaintainerConfig(max_shutdown_wait_sec=5.0)
+    engine = _engine(tmp_path, [_spec("task-a")], config=config)
+    sleeper = engine._sleep
+    assert isinstance(sleeper, FakeSleeper)
+    engine._cycle_done.clear()  # a cycle that never reaches its break point
+
+    report = engine.graceful_shutdown()
+
+    assert report.state is EngineState.STOPPED
+    assert sum(sleeper.calls) < 6.0  # one window, not two (~10s)
+    assert engine._drain_deadline is None
+    assert _events(engine, "GRACEFUL_SHUTDOWN")[0]["drain_timed_out"] is True
+
+
+def test_run_forever_rearms_the_graceful_report(tmp_path: Path) -> None:
+    """Review v1 NIT: a second ``run_forever()`` re-stamps, not replays."""
+
+    class StopsAfterOneCycle(MaintainerEngine):
+        def run_cycle(self) -> CycleResult:
+            result = super().run_cycle()
+            self.request_stop()
+            return result
+
+    store, memory_path = _memory(tmp_path)
+    recorder = Recorder(store)
+    store._save = recorder  # type: ignore[method-assign]
+    engine = _engine(tmp_path, [_spec("task-a")], cls=StopsAfterOneCycle)
+    engine.install_memory(store)
+
+    first = engine.run_forever(interval_sec=1.0)
+    calls_after_first = recorder.calls
+    events_after_first = len(_events(engine, "GRACEFUL_SHUTDOWN"))
+
+    second = engine.run_forever(interval_sec=1.0)
+
+    assert first.state is EngineState.STOPPED
+    assert second.state is EngineState.STOPPED
+    # The second wind-down ran the sequence again instead of replaying the memo:
+    # a fresh GRACEFUL_SHUTDOWN event and another memory ``_save()``.
+    assert len(_events(engine, "GRACEFUL_SHUTDOWN")) == events_after_first + 1
+    assert recorder.calls > calls_after_first
+    assert engine.heartbeat_file.exists() is False  # markers cleaned each run
+    document = json.loads(memory_path.read_text(encoding="utf-8"))
+    assert validate_memory_document(document) == []
+
+
+def test_interrupt_during_drain_does_not_abort_the_wind_down(
+    tmp_path: Path,
+) -> None:
+    """Review v1 MUST_FIX: a repeated stop during the drain aborts nothing.
+
+    The handler stays installed for the whole wind-down and the drain treats an
+    arriving ``KeyboardInterrupt`` as another stop request, so the heartbeat
+    stamp, the memory ``_save()`` and the marker unlink still happen.
+    """
+
+    store, memory_path = _memory(tmp_path)
+    engine = _engine(tmp_path, [_spec("task-a")])
+    engine.install_memory(store)
+    engine._cycle_done.clear()  # force the drain to poll
+    raised: list[bool] = []
+    original_sleep = engine._sleep
+
+    def impatient_sleep(seconds: float) -> None:
+        if not raised:
+            raised.append(True)
+            raise KeyboardInterrupt  # the second Ctrl-C, inside the drain
+        original_sleep(seconds)
+
+    engine._sleep = impatient_sleep  # type: ignore[assignment]
+
+    report = engine.graceful_shutdown()
+
+    assert raised  # the drain really was interrupted
+    assert report.state is EngineState.STOPPED
+    assert engine.heartbeat_file.exists() is False
+    assert engine.pid_file.exists() is False
+    assert memory_path.is_file()
+    assert validate_memory_document(json.loads(memory_path.read_text(encoding="utf-8"))) == []
