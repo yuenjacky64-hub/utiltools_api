@@ -345,9 +345,94 @@ def _run_memory_import(
     return 0
 
 
+def _run_memory_validate(
+    *,
+    config_path: str | None,
+    maintainer_root: str | None,
+    state_root: str | None,
+) -> int:
+    """Report the memory document's integrity problems (read-only)."""
+
+    memory_path = _memory_path(
+        config_path=config_path,
+        maintainer_root=maintainer_root,
+        state_root=state_root,
+    )
+    if memory_path is None:
+        print("error: no state root configured", file=sys.stderr)
+        return 1
+
+    # INV-CLI-2: a state root plus no config is enough to validate the
+    # document; only the count limits need ``config.json``.
+    limits_known = config_path is not None or maintainer_root is None or (
+        Path(maintainer_root).expanduser() / "config.json"
+    ).is_file()
+    max_runs: int | None = None
+    max_bug_fixes: int | None = None
+    max_learnings: int | None = None
+    try:
+        config = MaintainerConfig.load(
+            config_path=config_path, maintainer_root=maintainer_root
+        )
+    except FileNotFoundError:
+        print(
+            f"error: config path does not exist: {config_path}", file=sys.stderr
+        )
+        return 1
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    if not limits_known:
+        print(
+            "warning: memory limits not checked: no config.json found",
+            file=sys.stderr,
+        )
+    else:
+        max_runs = config.memory_max_runs
+        max_bug_fixes = config.memory_max_bug_fixes
+        max_learnings = config.memory_max_learnings
+
+    # INV-CLI-3: a validation failure of any kind is an ``error:`` line and
+    # exit 1, never a traceback - the document is untrusted input.
+    try:
+        errors = MemoryStore.load(memory_path).validate(
+            max_runs=max_runs,
+            max_bug_fixes=max_bug_fixes,
+            max_learnings=max_learnings,
+        )
+    except Exception as error:  # defensive: the report must always render
+        print(
+            f"error: memory validation failed "
+            f"({type(error).__name__}: {error})",
+            file=sys.stderr,
+        )
+        return 1
+    if not errors:
+        counts = _memory_counts(memory_path)
+        print(
+            f"memory is valid: runs={counts['runs']} "
+            f"bug_fixes={counts['bug_fixes']} learnings={counts['learnings']} "
+            f"({memory_path})"
+        )
+        return 0
+    print(
+        f"error: {len(errors)} validation problem(s) in {memory_path}",
+        file=sys.stderr,
+    )
+    for error in errors:
+        print(error, file=sys.stderr)
+    return 1
+
+
 def _run_memory(args: argparse.Namespace) -> int:
     """Dispatch the ``memory`` subcommand to its export or import half."""
 
+    if args.validate_memory:
+        return _run_memory_validate(
+            config_path=args.config,
+            maintainer_root=args.maintainer_root,
+            state_root=args.state_root,
+        )
     if args.export_memory:
         return _run_memory_export(
             args.export_memory,
@@ -483,6 +568,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         dest="import_memory",
         help="merge the memory snapshot at PATH into the live document",
+    )
+    memory_group.add_argument(
+        "--validate-memory",
+        action="store_true",
+        default=False,
+        dest="validate_memory",
+        help="report integrity problems in the memory document (exit 1 on errors)",
     )
     memory_parser.add_argument(
         "--config",
