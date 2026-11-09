@@ -353,3 +353,92 @@ def test_check_does_not_mutate_state(tmp_path: Path) -> None:
     assert after == before
     assert set(after) == set(before)
     assert checks.exit_code(results) == 0
+
+# --- ``cli.py stop`` (UTILTOOLS-76 REQ-06 / DOD-09) --------------------------
+
+
+def test_stop_removes_stale_markers(tmp_path: Path) -> None:
+    """A dead pid's markers are removed and the CLI exits 0 (DOD-09)."""
+
+    state_root = tmp_path / "data"
+    state_root.mkdir()
+    # ``subprocess.run`` has already reaped the child, so this pid is free.
+    probe = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_pid = probe.pid
+    probe.wait()
+
+    (state_root / "maintainer.pid").write_text(f"{dead_pid}\n", encoding="utf-8")
+    (state_root / "maintainer.pid.tmp").write_text("", encoding="utf-8")
+    (state_root / "maintainer.heartbeat").write_text("", encoding="utf-8")
+    (state_root / "maintainer.heartbeat.tmp").write_text("", encoding="utf-8")
+
+    result = _run_cli(
+        ["stop", "--maintainer-root", str(tmp_path), "--state-root", str(state_root)],
+        _base_env(),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"removed stale runtime markers for dead pid {dead_pid}" in result.stdout
+    assert not (state_root / "maintainer.pid").exists()
+    assert not (state_root / "maintainer.pid.tmp").exists()
+    assert not (state_root / "maintainer.heartbeat").exists()
+    assert not (state_root / "maintainer.heartbeat.tmp").exists()
+
+
+def test_stop_rejects_invalid_pid_file(tmp_path: Path) -> None:
+    """A non-integer pid file exits 1 and never signals anything (DOD-09)."""
+
+    state_root = tmp_path / "data"
+    state_root.mkdir()
+    (state_root / "maintainer.pid").write_text("not-a-pid\n", encoding="utf-8")
+
+    result = _run_cli(["stop", "--state-root", str(state_root)], _base_env())
+
+    assert result.returncode == 1
+    assert "invalid maintainer pid file" in result.stderr
+    assert (state_root / "maintainer.pid").exists()
+
+
+def test_stop_rejects_non_finite_timeout(tmp_path: Path) -> None:
+    """SHOULD_FIX F4: ``--timeout inf``/``nan`` is refused by the parser, so the
+    marker poll can never become an unbounded wait (engine parity: ValueError)."""
+
+    state_root = tmp_path / "data"
+    state_root.mkdir()
+
+    for bad in ("inf", "-inf", "nan"):
+        # ``=`` form: argparse would otherwise read ``-inf`` as an option flag.
+        result = _run_cli(
+            ["stop", "--state-root", str(state_root), f"--timeout={bad}"], _base_env()
+        )
+        assert result.returncode == 2, (bad, result.stdout, result.stderr)
+        assert "timeout must be a finite number of seconds" in result.stderr
+
+
+def test_stop_reports_overflowing_pid_without_traceback(tmp_path: Path) -> None:
+    """SHOULD_FIX F5: a 26-digit pid file fails ``os.kill`` with OverflowError;
+    the CLI reports the malformed file and exits 1 instead of crashing."""
+
+    state_root = tmp_path / "data"
+    state_root.mkdir()
+    (state_root / "maintainer.pid").write_text("1" * 26 + "\n", encoding="utf-8")
+
+    result = _run_cli(["stop", "--state-root", str(state_root)], _base_env())
+
+    assert result.returncode == 1
+    assert "invalid maintainer pid file" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert (state_root / "maintainer.pid").exists()
+
+
+def test_stop_is_a_no_op_without_a_pid_file(tmp_path: Path) -> None:
+    """Nothing running means nothing to clean up: exit 0, no state mutated."""
+
+    state_root = tmp_path / "data"
+    state_root.mkdir()
+
+    result = _run_cli(["stop", "--state-root", str(state_root)], _base_env())
+
+    assert result.returncode == 0
+    assert "maintainer not running" in result.stdout
+    assert list(state_root.iterdir()) == []
