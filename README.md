@@ -139,6 +139,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/datetime/diff` | Calculate duration & difference between two datetime points |
 | `POST` | `/api/v1/utils/datetime/shift` | Add or subtract a duration in a target IANA timezone (DST- and month-end-aware) |
 | `POST` | `/api/v1/utils/datetime/duration` | Parse an ISO-8601 duration into components and total seconds, or format signed seconds/nanos back to canonical ISO-8601 text |
+| `POST` | `/api/v1/utils/datetime/business-days` | Add or subtract a signed number of business days in a target IANA timezone, skipping weekends and an optional ISO `yyyy-MM-dd` holiday list (DST wall-clock preserving) |
 | `GET` | `/api/v1/utils/datetime/current` | Fetch current time in UTC and target timezone |
 | `GET` | `/api/v1/utils/datetime/timezones` | List IANA timezones with current UTC offsets, optionally filtered by `prefix` |
 | `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-256, SHA-512, MD5) or HMAC |

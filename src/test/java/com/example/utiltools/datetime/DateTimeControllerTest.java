@@ -720,4 +720,213 @@ class DateTimeControllerTest {
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
                 .andExpect(jsonPath("$.details", org.hamcrest.Matchers.hasItem("nanos must be between 0 and 999999999")));
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/business-days - skips the weekend and the holiday list")
+    void shouldCalculateBusinessDaysSkippingWeekendAndHolidays() throws Exception {
+        String weekend = """
+                {
+                    "input": "2026-01-02T17:00:00Z",
+                    "amount": 1
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/business-days")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(weekend))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Business days calculated successfully"))
+                .andExpect(jsonPath("$.data.isoUtc").value("2026-01-05T17:00:00Z"))
+                .andExpect(jsonPath("$.data.epochMillis").value(1767632400000L))
+                .andExpect(jsonPath("$.data.epochSeconds").value(1767632400L))
+                .andExpect(jsonPath("$.data.targetTimeZone").value("UTC"))
+                .andExpect(jsonPath("$.data.formattedTarget").value("2026-01-05T17:00:00Z"))
+                .andExpect(jsonPath("$.data.appliedAmount").value(1))
+                .andExpect(jsonPath("$.data.skippedWeekendDays").value(2))
+                .andExpect(jsonPath("$.data.skippedHolidayDays").value(0));
+
+        String withHolidays = """
+                {
+                    "input": "2026-01-02T17:00:00Z",
+                    "targetTimeZone": "UTC",
+                    "amount": 1,
+                    "customPattern": "yyyy-MM-dd",
+                    "holidays": ["2026-01-05", "2026-01-03", "2026-01-05"]
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/business-days")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(withHolidays))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.isoUtc").value("2026-01-06T17:00:00Z"))
+                .andExpect(jsonPath("$.data.formattedTarget").value("2026-01-06"))
+                .andExpect(jsonPath("$.data.skippedWeekendDays").value(2))
+                .andExpect(jsonPath("$.data.skippedHolidayDays").value(1));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/business-days - returns 400 for invalid requests")
+    void shouldRejectInvalidBusinessDaysRequests() throws Exception {
+        String blankInput = """
+                {
+                    "input": "   ",
+                    "amount": 1
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/business-days")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(blankInput))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]").value("input datetime or timestamp is required"));
+
+        String missingAmount = """
+                {
+                    "input": "2026-01-02T17:00:00Z"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/business-days")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(missingAmount))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]").value("amount is required"));
+
+        String amountTooLarge = """
+                {
+                    "input": "2026-01-02T17:00:00Z",
+                    "amount": 10001
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/business-days")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(amountTooLarge))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]").value("amount must be between -10000 and 10000"));
+
+        String amountTooSmall = """
+                {
+                    "input": "2026-01-02T17:00:00Z",
+                    "amount": -10001
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/business-days")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(amountTooSmall))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]").value("amount must be between -10000 and 10000"));
+
+        String unknownTimeZone = """
+                {
+                    "input": "2026-01-02T17:00:00Z",
+                    "targetTimeZone": "Invalid/Zone",
+                    "amount": 1
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/business-days")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(unknownTimeZone))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("Unknown or invalid timezone")));
+
+        String malformedHoliday = """
+                {
+                    "input": "2026-01-02T17:00:00Z",
+                    "amount": 1,
+                    "holidays": ["05/01/2026"]
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/business-days")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(malformedHoliday))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("Invalid holiday date")));
+
+        StringBuilder holidays = new StringBuilder();
+        for (int i = 0; i < 367; i++) {
+            if (i > 0) {
+                holidays.append(',');
+            }
+            holidays.append("\"2026-01-05\"");
+        }
+        String tooManyHolidays = """
+                {
+                    "input": "2026-01-02T17:00:00Z",
+                    "amount": 1,
+                    "holidays": [%s]
+                }
+                """.formatted(holidays);
+
+        mockMvc.perform(post("/api/v1/utils/datetime/business-days")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(tooManyHolidays))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details[0]").value("holidays must contain at most 366 entries"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/business-days - is journalled as DATETIME_BUSINESS_DAYS and replays identically")
+    void shouldJournalAndReplayBusinessDays() throws Exception {
+        String body = """
+                {
+                    "input": "2026-03-06T09:00:00-05:00",
+                    "targetTimeZone": "America/New_York",
+                    "amount": 1,
+                    "holidays": ["2026-03-09"]
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/business-days")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.isoUtc").value("2026-03-10T13:00:00Z"))
+                .andExpect(jsonPath("$.data.skippedHolidayDays").value(1));
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("DATETIME_BUSINESS_DAYS"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.isoUtc").value("2026-03-10T13:00:00Z"))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        JsonNode storedResult = entry.get("result");
+        AuditEntry before = auditJournal.find(id).orElseThrow();
+        Instant completedAt = before.completedAt();
+        assertThat(OperationType.DATETIME_BUSINESS_DAYS.isDeterministic()).isTrue();
+        assertThat(before.replayable()).isTrue();
+
+        MvcResult replay = mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("DATETIME_BUSINESS_DAYS"))
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"))
+                .andReturn();
+
+        JsonNode replayedResult = objectMapper.readTree(replay.getResponse().getContentAsString())
+                .get("data").get("result");
+        assertThat(replayedResult).isEqualTo(storedResult);
+
+        AuditEntry after = auditJournal.find(id).orElseThrow();
+        assertThat(after.operation()).isEqualTo(OperationType.DATETIME_BUSINESS_DAYS);
+        assertThat(after.completedAt()).isEqualTo(completedAt);
+        assertThat(after.result()).isEqualTo(before.result());
+    }
 }

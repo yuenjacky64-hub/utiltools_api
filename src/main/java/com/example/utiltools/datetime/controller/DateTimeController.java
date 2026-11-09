@@ -3,6 +3,8 @@ package com.example.utiltools.datetime.controller;
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.ApiResponse;
 import com.example.utiltools.datetime.dto.CurrentTimeResponse;
+import com.example.utiltools.datetime.dto.DateTimeBusinessDaysRequest;
+import com.example.utiltools.datetime.dto.DateTimeBusinessDaysResponse;
 import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
@@ -16,6 +18,7 @@ import com.example.utiltools.datetime.service.DateTimeService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -63,6 +66,19 @@ public class DateTimeController {
     public ApiResponse<DateTimeDurationResponse> duration(@Valid @RequestBody DateTimeDurationRequest request) {
         DateTimeDurationResponse result = auditedOperations.duration(request);
         return ApiResponse.success(result, "DateTime duration processed successfully");
+    }
+
+    @PostMapping("/business-days")
+    @Operation(summary = "Add or subtract business days",
+            description = "Steps a signed amount of business days (Saturdays and Sundays skipped) in "
+                    + "targetTimeZone, additionally skipping any date in the optional ISO yyyy-MM-dd "
+                    + "holidays list. Local wall-clock time is preserved across DST transitions. "
+                    + "amount is bounded to -10000..10000; amount 0 returns the input instant unchanged. "
+                    + "Weekend holidays count only as weekend skips.")
+    public ResponseEntity<ApiResponse<DateTimeBusinessDaysResponse>> businessDays(
+            @Valid @RequestBody DateTimeBusinessDaysRequest request) {
+        return ResponseEntity.ok(ApiResponse.success(
+                auditedOperations.businessDays(request), "Business days calculated successfully"));
     }
 
     @GetMapping("/current")

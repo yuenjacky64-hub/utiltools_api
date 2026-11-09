@@ -1,6 +1,8 @@
 package com.example.utiltools.datetime.service;
 
 import com.example.utiltools.datetime.dto.CurrentTimeResponse;
+import com.example.utiltools.datetime.dto.DateTimeBusinessDaysRequest;
+import com.example.utiltools.datetime.dto.DateTimeBusinessDaysResponse;
 import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
@@ -14,13 +16,17 @@ import com.example.utiltools.datetime.dto.TimeZoneListResponse;
 import org.springframework.stereotype.Service;
 
 import java.time.DateTimeException;
+import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -48,6 +54,15 @@ public class DateTimeService {
     /** Week/day/hour/minute/second ISO-8601 duration grammar; anchored and linear-time. */
     private static final Pattern ISO_DURATION = Pattern.compile(
             "^P(?:(\\d+)W)?(?:(\\d+)D)?(?:T(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+)(?:\\.(\\d+))?S)?)?$");
+
+    /** Bound on the signed business-day amount accepted by {@code businessDays}. */
+    private static final int MAX_BUSINESS_DAY_AMOUNT = 10_000;
+
+    /** Bound on caller-supplied holidays accepted by {@code businessDays}. */
+    private static final int MAX_HOLIDAY_ENTRIES = 366;
+
+    /** Hard cap on calendar days visited by the {@code businessDays} stepping loop. */
+    private static final int MAX_SCAN_DAYS = 40_000;
 
     /** Calendar-dependent year/month components in the date part (the {@code M} of {@code PT1M} is minutes). */
     private static final Pattern CALENDAR_UNIT = Pattern.compile("^P[^T]*\\d+(?:\\.\\d+)?[YM]");
@@ -121,6 +136,84 @@ public class DateTimeService {
                 format(shifted, request.customPattern()),
                 amount,
                 unit
+        );
+    }
+
+    /**
+     * Adds or subtracts a signed number of business days in a target timezone, skipping
+     * Saturdays, Sundays and any caller-supplied holiday date.
+     *
+     * <p>The cursor is a {@link ZonedDateTime} stepped with {@link ZonedDateTime#plusDays(long)},
+     * so the local wall-clock time is preserved across DST gaps/overlaps. Holidays are interpreted
+     * as calendar dates in the target zone. A holiday that falls on a weekend counts only as a
+     * weekend skip. The method is a pure function of its request: no clock, no ambient default
+     * zone and no mutable state, so a journalled call replays deterministically.</p>
+     */
+    public DateTimeBusinessDaysResponse businessDays(DateTimeBusinessDaysRequest request) {
+        if (request.input() == null || request.input().isBlank()) {
+            throw new IllegalArgumentException("input datetime or timestamp is required");
+        }
+
+        Integer requestedAmount = request.amount();
+        if (requestedAmount == null) {
+            throw new IllegalArgumentException("amount is required");
+        }
+        int amount = requestedAmount;
+        if (amount < -MAX_BUSINESS_DAY_AMOUNT || amount > MAX_BUSINESS_DAY_AMOUNT) {
+            throw new IllegalArgumentException("amount must be between -10000 and 10000");
+        }
+
+        ZoneId zoneId = parseZoneId(request.targetTimeZone());
+        Set<LocalDate> holidayDates = parseHolidays(request.holidays());
+
+        Instant instant;
+        try {
+            instant = parseInstant(request.input());
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Unable to parse input datetime: " + e.getMessage(), e);
+        }
+
+        ZonedDateTime cursor = instant.atZone(zoneId);
+        ZonedDateTime moved = cursor;
+        int remaining = Math.abs(amount);
+        int step = amount < 0 ? -1 : 1;
+        int weekendSkips = 0;
+        int holidaySkips = 0;
+        int scanned = 0;
+
+        while (remaining > 0) {
+            if (++scanned > MAX_SCAN_DAYS) {
+                throw new IllegalArgumentException("Business-day arithmetic out of range");
+            }
+            try {
+                moved = moved.plusDays(step);
+            } catch (DateTimeException | ArithmeticException e) {
+                throw new IllegalArgumentException("Business-day arithmetic out of range", e);
+            }
+            LocalDate date = moved.toLocalDate();
+            DayOfWeek dayOfWeek = date.getDayOfWeek();
+            if (dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY) {
+                weekendSkips++;
+                continue;
+            }
+            if (holidayDates.contains(date)) {
+                holidaySkips++;
+                continue;
+            }
+            remaining--;
+        }
+
+        Instant result = moved.toInstant();
+
+        return new DateTimeBusinessDaysResponse(
+                toEpochMillis(result, request.input()),
+                result.getEpochSecond(),
+                DateTimeFormatter.ISO_INSTANT.format(result),
+                zoneId.getId(),
+                format(moved, request.customPattern()),
+                amount,
+                weekendSkips,
+                holidaySkips
         );
     }
 
@@ -497,6 +590,34 @@ public class DateTimeService {
             return null;
         }
         return inputFormat.trim().toUpperCase(Locale.ROOT);
+    }
+
+    /**
+     * Parses the optional caller-supplied holiday list into a deduplicated set of ISO local dates.
+     * Duplicates collapse, ordering stays deterministic and every malformed entry is a 400.
+     */
+    private Set<LocalDate> parseHolidays(List<String> holidays) {
+        if (holidays == null || holidays.isEmpty()) {
+            return Set.of();
+        }
+        if (holidays.size() > MAX_HOLIDAY_ENTRIES) {
+            throw new IllegalArgumentException("holidays must contain at most 366 entries");
+        }
+
+        Set<LocalDate> dates = new LinkedHashSet<>();
+        for (String holiday : holidays) {
+            String trimmed = holiday == null ? "" : holiday.trim();
+            if (trimmed.isEmpty()) {
+                throw new IllegalArgumentException("holiday entries must not be blank");
+            }
+            try {
+                dates.add(LocalDate.parse(trimmed));
+            } catch (DateTimeParseException e) {
+                throw new IllegalArgumentException("Invalid holiday date: " + trimmed
+                        + ". Expected ISO-8601 local date (yyyy-MM-dd)", e);
+            }
+        }
+        return dates;
     }
 
     private ZoneId parseZoneId(String timeZoneStr) {
