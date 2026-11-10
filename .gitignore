@@ -63,3 +63,9 @@ maintainer_leases.log.tmp
 ### Concurrent cycle runtime state (never source) - UTILTOOLS-77 REQ-02 ###
 maintainer_heartbeat.json
 maintainer_heartbeat.json.tmp
+
+### Python bytecode / cache artifacts (never source) - UTILTOOLS-90 compliance gate fix ###
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
