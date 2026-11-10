@@ -24,6 +24,8 @@ class TextTransformRequestValidationTest {
     private static final String SUPPORTED_OPERATIONS_MESSAGE =
             "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE";
 
+    private static final String TEXT_TOO_LONG_MESSAGE = "text must be at most 1000000 characters";
+
     private static final String UPPER = "UPPER";
     private static final String LOWER = "LOWER";
     private static final String TITLE = "TITLE";
@@ -36,6 +38,32 @@ class TextTransformRequestValidationTest {
     /** Mirrors {@code TextService}'s {@code switch} labels: an accepted value must land on one of them. */
     private static final List<String> SWITCH_LABELS =
             List.of(UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE);
+
+    @Test
+    @DisplayName("text of exactly 1000000 characters passes @Size, 1000001 is rejected, null stays @NotBlank-only")
+    void shouldRejectTextLongerThanOneMillionCharacters() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+
+            Set<ConstraintViolation<TextTransformRequest>> tooLong =
+                    validator.validate(new TextTransformRequest("a".repeat(1_000_001), "UPPER"));
+
+            assertThat(tooLong).hasSize(1);
+            assertThat(tooLong).extracting(ConstraintViolation::getMessage)
+                    .containsExactly(TEXT_TOO_LONG_MESSAGE);
+            assertThat(tooLong).extracting(violation -> violation.getPropertyPath().toString())
+                    .containsExactly("text");
+
+            assertThat(validator.validate(new TextTransformRequest("a".repeat(1_000_000), "UPPER")))
+                    .as("@Size(max = 1000000) must accept a text of exactly 1000000 characters")
+                    .isEmpty();
+
+            assertThat(validator.validate(new TextTransformRequest(null, "UPPER")))
+                    .as("@Size ignores null, so @NotBlank stays the sole message")
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("text is required");
+        }
+    }
 
     @Test
     @DisplayName("an unsupported operation violates @Pattern with the exact supported-operations message")
