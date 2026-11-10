@@ -1275,9 +1275,10 @@ populated only when a cached result is served).
 
 ## 🧾 Operation Journal & Replay Verification
 
-All sixteen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+All seventeen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
 `datetime/shift`, `crypto/hash`, `crypto/base64`, `crypto/url`, `crypto/uuid`, `json/format`, `json/validate`,
-`json/query`, `json/merge-patch`, `json/pointer`, `text/transform`, `text/stats`, `text/replace` — are recorded in a **bounded in-memory journal** so a failed
+`json/query`, `json/merge-patch`, `json/pointer`, `text/transform`, `text/stats`, `text/replace`,
+`text/html-entities` — are recorded in a **bounded in-memory journal** so a failed
 hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
 can be verified against the original outcome without ever mutating the original entry.
 `GET /api/v1/utils/datetime/timezones` is read-only catalogue metadata and is not journalled.
@@ -1694,7 +1695,7 @@ curl -X POST http://localhost:8080/api/v1/utils/text/html-entities \
 | Field | Type | Required | Default | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
 | `action` | string | yes | — | `ENCODE` or `DECODE`, matched **case-insensitively** (`encode` works); anything else is a validation error |
-| `text` | string | yes | — | Input text, non-blank and at most 100000 characters |
+| `text` | string | yes | — | Input text, non-blank; there is no request-size cap, only the 1000000-character bound on `result` (see **Errors and bounds**) |
 
 | Response field | Definition |
 | :--- | :--- |
@@ -1716,7 +1717,12 @@ references (`&#NN;`, e.g. `&#65;` → `A`) and hexadecimal numeric references (`
 else is preserved **verbatim**, character for character: unknown named entities (`&nbsp;`, `&copy;`),
 malformed references (`&`, `&#;`, `&#x;`, `&#99999999;`, a missing semicolon such as `&#65`), and references
 to code points that are not valid Unicode scalar values (`&#0;`, surrogate halves such as `&#xD800;`, values
-above `U+10FFFF`) — no error, no substitution, no data loss. Numeric references may carry any number of leading zeros (`&#00065;` → `A`).
+above `U+10FFFF`) — no error, no substitution, no data loss. Numeric bodies are length-capped, not
+normalised: decimal bodies carry at most 7 digits and hexadecimal bodies at most 6, so `&#00065;` → `A`
+and `&#x000041;` → `A` decode, while a longer body such as `&#00000065;` is preserved verbatim.
+**DECODE inverts escaping; it does not sanitise.** The output is plain text with references resolved and
+is *less* safe to render than its input — `&lt;script&gt;` becomes `<script>`. Never use `DECODE` to
+clean untrusted markup; sanitise with a dedicated HTML sanitiser and treat the result as untrusted.
 
 **Round-trip.** `DECODE(ENCODE(text))` reproduces `text` exactly for any text, because every character the
 encoder emits is one the decoder understands.
