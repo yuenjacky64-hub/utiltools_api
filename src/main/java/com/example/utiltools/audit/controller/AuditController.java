@@ -25,7 +25,10 @@ import java.util.List;
 @RequestMapping("/api/v1/utils/audit")
 @Tag(name = "Audit Journal", description = "Bounded in-memory operation journal with request correlation and single-winner replay verification: "
         + "a replay claims the entry (IN_PROGRESS), records VERIFIED, MISMATCH or FAILED, and answers "
-        + "409 REPLAY_CONFLICT while another claim is live or when the caller's lease expired. "
+        + "409 REPLAY_CONFLICT while another claim is live or when the caller's claim was lost. A running "
+        + "replay renews its own claim under the journal lock every "
+        + "utiltools.audit.replay-heartbeat-seconds, so a long invocation outlives the lease instead of "
+        + "losing it; renewal is owner-fenced and never exposes the owner token. "
         + "POST /reaps runs one bounded manual reap pass (with dry-run preview and single-entry manual "
         + "reclaim) under the same lock as the scheduled reaper")
 public class AuditController {
@@ -58,10 +61,15 @@ public class AuditController {
             Claims the entry atomically (replay.state IN_PROGRESS with leaseExpiresAt), re-runs the
             deterministic SUCCEEDED operation, then records VERIFIED or MISMATCH — or FAILED with a
             bounded detail when the invocation throws. The original state, result and completedAt are
-            never altered. Answers 409 REPLAY_CONFLICT when another replay holds a live claim, when the
-            caller's claim was lost to lease expiry, or when the entry is not replayable; a crashed
-            replayer's IN_PROGRESS claim is taken over once utiltools.audit.replay-lease-seconds
-            elapses.""")
+            never altered. While the invocation runs, this owner renews its claim under the journal
+            lock every utiltools.audit.replay-heartbeat-seconds (default half of
+            utiltools.audit.replay-lease-seconds, minimum 1 second), so an operation that outlives the
+            lease still completes VERIFIED or MISMATCH and produces no REPLAY_LEASE_EXPIRED tombstone;
+            renewal stops in a finally block and a stale, terminal or expired claim is never extended.
+            Answers 409 REPLAY_CONFLICT when another replay holds a live claim, when the caller's claim
+            was lost, or when the entry is not replayable; a crashed replayer's IN_PROGRESS claim is
+            taken over once utiltools.audit.replay-lease-seconds elapses. Only leaseExpiresAt is
+            exposed on the replay record.""")
     public ApiResponse<AuditEntry> replay(@PathVariable String id) {
         return ApiResponse.success(replayService.replay(id), "Replay verification completed");
     }
@@ -72,7 +80,8 @@ public class AuditController {
                    + "newest SUCCEEDED entries and records VERIFIED / MISMATCH / FAILED per entry. Bounded: at most "
                    + "max-entries entries per call. Single-winner per entry: each entry is claimed through the same "
                    + "claimReplay lease as POST /entries/{id}/replay, so a live claim is reported SKIPPED with reason "
-                   + "LIVE_CLAIM and its lease is untouched, and a failed invocation is recorded FAILED without "
+                   + "LIVE_CLAIM and its lease is untouched, each claim is renewed by its owner while the invocation "
+                   + "runs (utiltools.audit.replay-heartbeat-seconds), and a failed invocation is recorded FAILED without "
                    + "aborting the sweep. Safe alongside the reaper and eviction: the sweep holds no journal lock while "
                    + "an operation runs, an entry evicted mid-sweep is reported SKIPPED with reason EVICTED, and the "
                    + "original state, result, completedAt, request and replayable flag are never rewritten.")

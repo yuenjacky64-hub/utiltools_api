@@ -628,6 +628,60 @@ public class AuditJournalService {
         }
     }
 
+    /**
+     * Renews the lease of the live claim on {@code id} for one more
+     * {@code utiltools.audit.replay-lease-seconds} window, but only for its current owner: the
+     * entry must exist, the replay must still be {@code IN_PROGRESS}, the token must be the one
+     * currently issued by {@link #claimReplay(String)} and the lease must not already have expired.
+     * A stale token, a missing entry, a terminal claim and an expired lease are all refused without
+     * mutating the journal, so a renewal can never resurrect a claim the reaper may already have
+     * rolled back.
+     *
+     * <p>Renewal and reaping both run under the journal lock and read the same
+     * {@code leaseExpiresAt}, so a renewal racing a {@code REPLAY_LEASE_EXPIRED} pass resolves to
+     * exactly one winner.</p>
+     *
+     * <p>Public so journal-level tests can assert the fence; production callers are
+     * {@link AuditReplayService} only.</p>
+     *
+     * @return the new {@code leaseExpiresAt}, or empty when the renewal was refused
+     */
+    public Optional<Instant> renewReplayLease(String id, String ownerToken) {
+        synchronized (lock) {
+            JournalRecord record = id == null ? null : entries.get(id);
+            if (record == null) {
+                return Optional.empty();
+            }
+            ReplayRecord current = record.replay;
+            if (current == null || current.state() != ReplayState.IN_PROGRESS) {
+                return Optional.empty();
+            }
+            if (ownerToken == null || !ownerToken.equals(record.replayOwnerToken)) {
+                return Optional.empty();
+            }
+            Instant now = Instant.now(clock);
+            // Same boundary as completeReplay and classify, so renewal and reap cannot disagree.
+            if (current.leaseExpiresAt() == null || !current.leaseExpiresAt().isAfter(now)) {
+                return Optional.empty();
+            }
+            Instant renewedUntil = now.plusSeconds(replayLeaseSeconds);
+            if (renewedUntil.isBefore(current.leaseExpiresAt())) {
+                // A renewal may extend a lease but never shorten it.
+                renewedUntil = current.leaseExpiresAt();
+            }
+            ReplayRecord renewed = new ReplayRecord(ReplayState.IN_PROGRESS, current.replayedAt(),
+                    "replay in progress", renewedUntil);
+            record.replay = renewed;
+            record.base = withReplay(record.base, renewed);
+            return Optional.of(renewedUntil);
+        }
+    }
+
+    /** The claim lease window, so the replay service can derive its heartbeat cadence. */
+    public long replayLeaseSeconds() {
+        return replayLeaseSeconds;
+    }
+
     /** Package-visible: only {@link AuditReplayService} may read the private original request. */
     Optional<Object> originalRequest(String id) {
         synchronized (lock) {
