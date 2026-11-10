@@ -11,6 +11,7 @@ import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
 import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
+import com.example.utiltools.datetime.dto.DateTimeWeekResponse;
 import com.example.utiltools.datetime.dto.TimeZoneInfo;
 import com.example.utiltools.datetime.dto.TimeZoneListResponse;
 import org.springframework.stereotype.Service;
@@ -25,6 +26,7 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.time.temporal.WeekFields;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -63,6 +65,12 @@ public class DateTimeService {
 
     /** Hard cap on calendar days visited by the {@code businessDays} stepping loop. */
     private static final int MAX_SCAN_DAYS = 40_000;
+
+    /** Bound on the untrusted {@code date} value echoed in a {@code week} error message. */
+    private static final int MAX_WEEK_DATE_ECHO = 64;
+
+    /** Expected input form named in every {@code week} validation message. */
+    private static final String EXPECTED_WEEK_DATE = "ISO-8601 local date (yyyy-MM-dd)";
 
     /** Calendar-dependent year/month components in the date part (the {@code M} of {@code PT1M} is minutes). */
     private static final Pattern CALENDAR_UNIT = Pattern.compile("^P[^T]*\\d+(?:\\.\\d+)?[YM]");
@@ -299,6 +307,25 @@ public class DateTimeService {
         }
 
         return new TimeZoneListResponse(applied, limit, total, entries);
+    }
+
+    /**
+     * Resolves the ISO-8601 week-based year and week of a calendar date.
+     *
+     * <p>Pure function: it reads no clock, default timezone or locale, relying only on
+     * {@link LocalDate} parsing, {@link WeekFields#ISO} and {@link DayOfWeek#name()}.
+     * Throws {@link IllegalArgumentException} for a null, blank or malformed date.
+     */
+    public DateTimeWeekResponse week(String date) {
+        LocalDate parsed = parseWeekDate(date);
+        DayOfWeek dayOfWeek = parsed.getDayOfWeek();
+        return new DateTimeWeekResponse(
+                parsed.toString(),
+                parsed.get(WeekFields.ISO.weekBasedYear()),
+                parsed.get(WeekFields.ISO.weekOfWeekBasedYear()),
+                dayOfWeek.name(),
+                parsed.getDayOfYear(),
+                dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY);
     }
 
     private DateTimeDurationResponse parseDuration(String input) {
@@ -618,6 +645,27 @@ public class DateTimeService {
             }
         }
         return dates;
+    }
+
+    /**
+     * Parses the untrusted {@code date} query value as an ISO local date, mapping every
+     * rejection to {@link IllegalArgumentException} so it surfaces as a 400, never a 500.
+     */
+    private LocalDate parseWeekDate(String date) {
+        String trimmed = date == null ? "" : date.trim();
+        if (trimmed.isEmpty()) {
+            throw new IllegalArgumentException("date is required: expected " + EXPECTED_WEEK_DATE);
+        }
+        try {
+            return LocalDate.parse(trimmed);
+        } catch (DateTimeException e) {
+            throw new IllegalArgumentException(
+                    "Invalid date: " + abbreviate(trimmed) + ". Expected " + EXPECTED_WEEK_DATE, e);
+        }
+    }
+
+    private String abbreviate(String value) {
+        return value.length() <= MAX_WEEK_DATE_ECHO ? value : value.substring(0, MAX_WEEK_DATE_ECHO);
     }
 
     private ZoneId parseZoneId(String timeZoneStr) {
