@@ -8,6 +8,8 @@ import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
+import com.example.utiltools.crypto.dto.JwtDecodeRequest;
+import com.example.utiltools.crypto.dto.JwtDecodeResponse;
 import com.example.utiltools.crypto.dto.UrlRequest;
 import com.example.utiltools.crypto.dto.UrlResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
@@ -23,7 +25,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/v1/utils/crypto")
-@Tag(name = "Crypto & Encoding Utility", description = "Endpoints for cryptographic hashing, HMAC signatures, Base32 encoding/decoding, Base64 encoding/decoding, URL percent-encoding/decoding, and UUID generation")
+@Tag(name = "Crypto & Encoding Utility", description = "Endpoints for cryptographic hashing, HMAC signatures, Base32 encoding/decoding, Base64 encoding/decoding, URL percent-encoding/decoding, decode-only JWT inspection, and UUID generation")
 public class CryptoController {
 
     private final AuditedOperations auditedOperations;
@@ -58,6 +60,17 @@ public class CryptoController {
     public ApiResponse<UrlResponse> url(@Valid @RequestBody UrlRequest request) {
         UrlResponse result = auditedOperations.url(request);
         return ApiResponse.success(result, "URL operation completed successfully");
+    }
+
+    @PostMapping("/jwt/decode")
+    @Operation(summary = "Decode a compact JWT without verifying it",
+            description = "Strict RFC 7519/7515 compact-token decoder: exactly three dot-separated base64url segments, "
+                    + "JSON-object header and payload, header.alg required and header.typ optional. Decode-only: the "
+                    + "signature is never verified and is reported only as signaturePresent/signatureBytes, so "
+                    + "verified is always false. The raw token and signature value are never echoed.")
+    public ApiResponse<JwtDecodeResponse> jwtDecode(@Valid @RequestBody JwtDecodeRequest request) {
+        JwtDecodeResponse result = auditedOperations.jwtDecode(request);
+        return ApiResponse.success(result, "JWT decoded successfully (signature not verified)");
     }
 
     @GetMapping("/uuid")

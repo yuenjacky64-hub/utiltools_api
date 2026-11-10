@@ -6,6 +6,8 @@ import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
+import com.example.utiltools.crypto.dto.JwtDecodeRequest;
+import com.example.utiltools.crypto.dto.JwtDecodeResponse;
 import com.example.utiltools.crypto.dto.UrlRequest;
 import com.example.utiltools.crypto.dto.UrlResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
@@ -14,11 +16,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -426,5 +430,175 @@ class CryptoServiceTest {
         assertThatThrownBy(() -> cryptoService.base32(new Base32Request("ROT13", "foobar")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Invalid action");
+    }
+    // --- JWT decode (decode-only) -------------------------------------------------------------
+
+    private static final String JWT_HEADER_SEGMENT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+    private static final String JWT_PAYLOAD_SEGMENT =
+            "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ";
+    private static final String JWT_SIGNATURE_SEGMENT = "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+    private static final String JWT_KNOWN_TOKEN =
+            JWT_HEADER_SEGMENT + "." + JWT_PAYLOAD_SEGMENT + "." + JWT_SIGNATURE_SEGMENT;
+
+    private static String base64Url(String text) {
+        return Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(text.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String base64Url(byte[] bytes) {
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    private static String compact(String header, String payload, String signature) {
+        return header + "." + payload + "." + signature;
+    }
+
+    @Test
+    @DisplayName("jwtDecode - should decode the known HS256 example without claiming verification")
+    void shouldDecodeKnownHs256Token() {
+        JwtDecodeResponse decoded = cryptoService.jwtDecode(new JwtDecodeRequest(JWT_KNOWN_TOKEN));
+
+        assertThat(decoded.algorithm()).isEqualTo("HS256");
+        assertThat(decoded.type()).isEqualTo("JWT");
+        assertThat(decoded.header().path("alg").asText()).isEqualTo("HS256");
+        assertThat(decoded.header().path("typ").asText()).isEqualTo("JWT");
+        assertThat(decoded.payload().path("sub").asText()).isEqualTo("1234567890");
+        assertThat(decoded.payload().path("name").asText()).isEqualTo("John Doe");
+        assertThat(decoded.payload().path("iat").asInt()).isEqualTo(1516239022);
+        assertThat(decoded.signaturePresent()).isTrue();
+        assertThat(decoded.signatureBytes()).isEqualTo(32);
+        assertThat(decoded.verified()).isFalse();
+    }
+
+    @Test
+    @DisplayName("jwtDecode - should accept unpadded base64url segments")
+    void shouldDecodeUnpaddedSegments() {
+        String header = base64Url("{\"alg\":\"HS512\",\"kid\":\"k1\"}");
+        String payload = base64Url("{\"sub\":\"42\"}");
+        String signature = base64Url(new byte[] {1, 2, 3});
+
+        JwtDecodeResponse decoded = cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(header, payload, signature)));
+
+        assertThat(header).doesNotContain("=");
+        assertThat(payload).doesNotContain("=");
+        assertThat(signature).doesNotContain("=");
+        assertThat(decoded.algorithm()).isEqualTo("HS512");
+        assertThat(decoded.type()).isNull();
+        assertThat(decoded.payload().path("sub").asText()).isEqualTo("42");
+        assertThat(decoded.signaturePresent()).isTrue();
+        assertThat(decoded.signatureBytes()).isEqualTo(3);
+        assertThat(decoded.verified()).isFalse();
+    }
+
+    @Test
+    @DisplayName("jwtDecode - should report an empty signature segment as absent with zero bytes")
+    void shouldReportEmptySignatureAsAbsent() {
+        JwtDecodeResponse decoded = cryptoService.jwtDecode(new JwtDecodeRequest(
+                compact(base64Url("{\"alg\":\"none\"}"), base64Url("{\"sub\":\"1\"}"), "")));
+
+        assertThat(decoded.algorithm()).isEqualTo("none");
+        assertThat(decoded.signaturePresent()).isFalse();
+        assertThat(decoded.signatureBytes()).isZero();
+        assertThat(decoded.verified()).isFalse();
+    }
+
+    @Test
+    @DisplayName("jwtDecode - should reject malformed compact tokens with a BAD_REQUEST-worthy message")
+    void shouldRejectMalformedCompactTokens() {
+        String header = base64Url("{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
+        String payload = base64Url("{\"sub\":\"1\"}");
+        String signature = base64Url(new byte[] {9, 9, 9});
+        String paddedHeader = Base64.getUrlEncoder().encodeToString("{\"alg\":\"HS256X\"}"
+                .getBytes(StandardCharsets.UTF_8));
+        String paddedPayload = Base64.getUrlEncoder().encodeToString("{\"sub\":\"1\"}"
+                .getBytes(StandardCharsets.UTF_8));
+        String paddedSignature = Base64.getUrlEncoder().encodeToString(new byte[] {1, 2});
+        String invalidUtf8 = base64Url(new byte[] {(byte) 0xC3, (byte) 0x28});
+
+        assertThatThrownBy(() -> cryptoService.jwtDecode(new JwtDecodeRequest(null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("token is required");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(new JwtDecodeRequest("   ")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("token is required");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(new JwtDecodeRequest("a".repeat(16385))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must not exceed 16384 characters");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(new JwtDecodeRequest("two.segments")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("exactly three dot-separated segments");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(header + "." + payload + "." + signature + ".extra")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("exactly three dot-separated segments");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact("", payload, signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("header segment must not be empty");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(header, "", signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("payload segment must not be empty");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(paddedHeader, payload, signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("header segment must not be base64url padded");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(header, paddedPayload, signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("payload segment must not be base64url padded");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(header, payload, paddedSignature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("signature segment must not be base64url padded");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact("abc+def", payload, signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("header segment is not valid unpadded base64url");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(header, "abcde", signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("payload segment is not valid unpadded base64url");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(header, payload, "a/b+c"))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("signature segment is not valid unpadded base64url");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(invalidUtf8, payload, signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("header segment is not valid UTF-8");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(header, invalidUtf8, signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("payload segment is not valid UTF-8");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(base64Url("[1,2]"), payload, signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("header must be a JSON object");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(header, base64Url("\"just-a-string\""), signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("payload must be a JSON object");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(base64Url("{\"alg\":\"HS256\"} true"), payload, signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("header must be a JSON object");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(base64Url("{\"typ\":\"JWT\"}"), payload, signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("header.alg is required");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(base64Url("{\"alg\":\"  \"}"), payload, signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("header.alg is required");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(base64Url("{\"alg\":256}"), payload, signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("header.alg is required");
+        assertThatThrownBy(() -> cryptoService.jwtDecode(
+                new JwtDecodeRequest(compact(base64Url("{\"alg\":\"HS256\",\"typ\":1}"), payload, signature))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("header.typ must be a string");
     }
 }

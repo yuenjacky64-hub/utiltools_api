@@ -10,6 +10,8 @@ import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
+import com.example.utiltools.crypto.dto.JwtDecodeRequest;
+import com.example.utiltools.crypto.dto.JwtDecodeResponse;
 import com.example.utiltools.crypto.dto.UrlRequest;
 import com.example.utiltools.crypto.dto.UrlResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
@@ -152,6 +154,10 @@ public class AuditedOperations {
                 () -> cryptoService.generateUuids(count, compact, version));
     }
 
+    public JwtDecodeResponse jwtDecode(JwtDecodeRequest request) {
+        return record(OperationType.CRYPTO_JWT_DECODE, request, () -> cryptoService.jwtDecode(request));
+    }
+
     public JsonFormatResponse format(JsonFormatRequest request) {
         return record(OperationType.JSON_FORMAT, request, () -> jsonService.format(request));
     }
@@ -246,6 +252,7 @@ public class AuditedOperations {
             case CRYPTO_URL -> cryptoService.url((UrlRequest) request);
             case CRYPTO_UUID -> cryptoService.generateUuids(intOf(request, "count"), booleanOf(request, "compact"),
                     stringOf(request, "version"));
+            case CRYPTO_JWT_DECODE -> cryptoService.jwtDecode((JwtDecodeRequest) request);
             case JSON_FORMAT -> jsonService.format((JsonFormatRequest) request);
             case JSON_VALIDATE -> jsonService.validate((JsonValidateRequest) request);
             // liveOnly() strips the opt-in flag: replaying a stored opt-in request must never serve

@@ -6,9 +6,15 @@ import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
+import com.example.utiltools.crypto.dto.JwtDecodeRequest;
+import com.example.utiltools.crypto.dto.JwtDecodeResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
 import com.example.utiltools.crypto.dto.UrlRequest;
 import com.example.utiltools.crypto.dto.UrlResponse;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
 
 import javax.crypto.Mac;
@@ -61,6 +67,13 @@ public class CryptoService {
     private static final long UUID_V7_VERSION_BITS = 0x7000L;
     private static final long UUID_V7_VARIANT_BITS = 0x8000000000000000L;
     private static final long NEVER_MINTED = -1L;
+
+    private static final int JWT_MAX_TOKEN_LENGTH = 16384;
+    private static final int JWT_SEGMENT_COUNT = 3;
+    private static final String JWT_SEGMENT_SEPARATOR_REGEX = "\\.";
+
+    private static final ObjectMapper JWT_MAPPER = new ObjectMapper()
+            .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
 
     private final Clock clock;
     private final AtomicLong counter = new AtomicLong(NEVER_MINTED);
@@ -410,5 +423,103 @@ public class CryptoService {
             case "MD5" -> "MD5";
             default -> throw new IllegalArgumentException("Unsupported hash algorithm: " + raw + ". Supported: SHA-256, SHA-512, SHA-1, MD5.");
         };
+    }
+
+    /**
+     * Decodes a compact JWS/JWT token without verifying its signature.
+     *
+     * <p>The token is parsed strictly: exactly three dot-separated segments, unpadded base64url
+     * for every segment, strict UTF-8, and JSON objects in both the header and the payload.
+     * Nothing about the signature is validated — the response always reports {@code verified=false}.
+     */
+    public JwtDecodeResponse jwtDecode(JwtDecodeRequest request) {
+        if (request == null || request.token() == null || request.token().isBlank()) {
+            throw new IllegalArgumentException("token is required");
+        }
+        if (request.token().length() > JWT_MAX_TOKEN_LENGTH) {
+            throw new IllegalArgumentException(
+                    "token must not exceed " + JWT_MAX_TOKEN_LENGTH + " characters");
+        }
+        String[] segments = request.token().split(JWT_SEGMENT_SEPARATOR_REGEX, -1);
+        if (segments.length != JWT_SEGMENT_COUNT) {
+            throw new IllegalArgumentException("JWT must have exactly three dot-separated segments");
+        }
+        String headerSegment = segments[0];
+        String payloadSegment = segments[1];
+        String signatureSegment = segments[2];
+        if (headerSegment.isEmpty()) {
+            throw new IllegalArgumentException("JWT header segment must not be empty");
+        }
+        if (payloadSegment.isEmpty()) {
+            throw new IllegalArgumentException("JWT payload segment must not be empty");
+        }
+        if (headerSegment.indexOf('=') >= 0) {
+            throw new IllegalArgumentException("JWT header segment must not be base64url padded");
+        }
+        if (payloadSegment.indexOf('=') >= 0) {
+            throw new IllegalArgumentException("JWT payload segment must not be base64url padded");
+        }
+        if (signatureSegment.indexOf('=') >= 0) {
+            throw new IllegalArgumentException("JWT signature segment must not be base64url padded");
+        }
+        byte[] headerBytes = decodeJwtSegment(headerSegment, "header");
+        byte[] payloadBytes = decodeJwtSegment(payloadSegment, "payload");
+        byte[] signatureBytes = signatureSegment.isEmpty()
+                ? new byte[0]
+                : decodeJwtSegment(signatureSegment, "signature");
+        String headerText = decodeJwtUtf8(headerBytes, "header");
+        String payloadText = decodeJwtUtf8(payloadBytes, "payload");
+        JsonNode header = parseJwtSegment(headerText, "header");
+        JsonNode payload = parseJwtSegment(payloadText, "payload");
+
+        JsonNode algorithmNode = header.get("alg");
+        if (algorithmNode == null || !algorithmNode.isTextual() || algorithmNode.asText().isBlank()) {
+            throw new IllegalArgumentException("JWT header.alg is required and must be a non-blank string");
+        }
+        JsonNode typeNode = header.get("typ");
+        if (typeNode != null && !typeNode.isTextual()) {
+            throw new IllegalArgumentException("JWT header.typ must be a string when present");
+        }
+        return new JwtDecodeResponse(
+                algorithmNode.asText(),
+                typeNode == null ? null : typeNode.asText(),
+                header,
+                payload,
+                !signatureSegment.isEmpty(),
+                signatureBytes.length,
+                false);
+    }
+
+    private byte[] decodeJwtSegment(String segment, String segmentName) {
+        try {
+            return Base64.getUrlDecoder().decode(segment);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException(
+                    "JWT " + segmentName + " segment is not valid unpadded base64url", e);
+        }
+    }
+
+    private String decodeJwtUtf8(byte[] bytes, String segmentName) {
+        CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT);
+        try {
+            return decoder.decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException e) {
+            throw new IllegalArgumentException("JWT " + segmentName + " segment is not valid UTF-8", e);
+        }
+    }
+
+    private JsonNode parseJwtSegment(String text, String segmentName) {
+        JsonNode node;
+        try {
+            node = JWT_MAPPER.readTree(text);
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException("JWT " + segmentName + " must be a JSON object", e);
+        }
+        if (node == null || !node.isObject()) {
+            throw new IllegalArgumentException("JWT " + segmentName + " must be a JSON object");
+        }
+        return node;
     }
 }
