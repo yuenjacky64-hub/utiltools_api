@@ -33,6 +33,7 @@ public enum OperationType {
     TEXT_TRANSFORM(true),
     TEXT_STATS(true),
     TEXT_REPLACE(true),
+    TEXT_HTML_ENTITIES(true),
     BATCH_HASH(false);
 
     private final boolean deterministic;

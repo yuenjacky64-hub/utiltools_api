@@ -2,6 +2,8 @@ package com.example.utiltools.text.controller;
 
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.ApiResponse;
+import com.example.utiltools.text.dto.TextHtmlEntitiesRequest;
+import com.example.utiltools.text.dto.TextHtmlEntitiesResponse;
 import com.example.utiltools.text.dto.TextReplaceRequest;
 import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
@@ -18,7 +20,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/v1/utils/text")
-@Tag(name = "Text Transformation & Statistics Utility", description = "Endpoints for deterministic case/format conversion, find-and-replace and text statistics")
+@Tag(name = "Text Transformation & Statistics Utility", description = "Endpoints for deterministic case/format conversion, find-and-replace, HTML entity coding and text statistics")
 public class TextController {
 
     private final AuditedOperations auditedOperations;
@@ -45,6 +47,17 @@ public class TextController {
                     + "Every call is journalled as TEXT_REPLACE and can be replayed.")
     public ApiResponse<TextReplaceResponse> replace(@Valid @RequestBody TextReplaceRequest request) {
         return ApiResponse.success(auditedOperations.replace(request), "Text replaced successfully");
+    }
+
+    @PostMapping("/html-entities")
+    @Operation(summary = "Encode or decode HTML entities",
+            description = "ENCODE escapes & first, then <, >, \" and ' to &amp; &lt; &gt; &quot; &#39;. "
+                    + "DECODE resolves those five named entities plus decimal (&#NN;) and hexadecimal (&#xHH;) "
+                    + "numeric references; unknown or malformed references are preserved verbatim. "
+                    + "The response echoes the action plus the result, whether it changed and the code-point length. "
+                    + "Every call is journalled as TEXT_HTML_ENTITIES and can be replayed.")
+    public ApiResponse<TextHtmlEntitiesResponse> htmlEntities(@Valid @RequestBody TextHtmlEntitiesRequest request) {
+        return ApiResponse.success(auditedOperations.htmlEntities(request), "HTML entities processed successfully");
     }
 
     @PostMapping("/stats")

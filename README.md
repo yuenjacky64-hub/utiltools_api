@@ -161,6 +161,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/text/transform` | Apply a deterministic case/format operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`) to a string |
 | `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
 | `POST` | `/api/v1/utils/text/replace` | Replace every (or, with `all=false`, the first) occurrence of a literal or regex `pattern`, reporting `replacements`, `changed` and code-point `length` |
+| `POST` | `/api/v1/utils/text/html-entities` | `ENCODE` a string for safe HTML embedding (`&`, `<`, `>`, `"`, `'`) or `DECODE` the five named entities plus decimal/hex numeric references, reporting `changed` and code-point `length` |
 | `POST` | `/api/v1/utils/jobs/hash` | Submit a bounded async batch-hash job; `202` with a job id, idempotent via `idempotencyKey` |
 | `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `CANCELLING` / `COMPLETED` / `FAILED` / `CANCELLED` |
 | `DELETE` | `/api/v1/utils/jobs/{jobId}` | Cancel a job: `QUEUED` → `CANCELLED` immediately, `RUNNING` → `CANCELLING` (`200`, idempotent, the worker stops at its next checkpoint); `409` `JOB_CANCELLATION_CONFLICT` for `COMPLETED`/`FAILED` |
@@ -1274,9 +1275,10 @@ populated only when a cached result is served).
 
 ## 🧾 Operation Journal & Replay Verification
 
-All sixteen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+All seventeen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
 `datetime/shift`, `crypto/hash`, `crypto/base64`, `crypto/url`, `crypto/uuid`, `json/format`, `json/validate`,
-`json/query`, `json/merge-patch`, `json/pointer`, `text/transform`, `text/stats`, `text/replace` — are recorded in a **bounded in-memory journal** so a failed
+`json/query`, `json/merge-patch`, `json/pointer`, `text/transform`, `text/stats`, `text/replace`,
+`text/html-entities` — are recorded in a **bounded in-memory journal** so a failed
 hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
 can be verified against the original outcome without ever mutating the original entry.
 `GET /api/v1/utils/datetime/timezones` is read-only catalogue metadata and is not journalled.
@@ -1667,15 +1669,79 @@ by every match. There is no regex
 timeout in this service, so keep untrusted patterns simple — the route sits behind the standard
 `/api/v1/utils/**` rate limit.
 
+#### HTML entities
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/text/html-entities \
+  -H 'Content-Type: application/json' \
+  -d '{"action": "ENCODE", "text": "Fish & chips <b>today</b>"}'
+```
+
+```json
+{
+  "success": true,
+  "message": "HTML entities processed successfully",
+  "data": {
+    "action": "ENCODE",
+    "result": "Fish &amp; chips &lt;b&gt;today&lt;/b&gt;",
+    "changed": true,
+    "length": 41
+  },
+  "timestamp": "2026-01-01T00:00:00Z",
+  "requestId": "3d9b7e10-4c2a-4f6b-8e51-9a0c1d2b3e44"
+}
+```
+
+| Field | Type | Required | Default | Meaning |
+| :--- | :--- | :--- | :--- | :--- |
+| `action` | string | yes | — | `ENCODE` or `DECODE`, matched **case-insensitively** (`encode` works); anything else is a validation error |
+| `text` | string | yes | — | Input text, non-blank; there is no request-size cap, only the 1000000-character bound on `result` (see **Errors and bounds**) |
+
+| Response field | Definition |
+| :--- | :--- |
+| `action` | the caller's `action` echoed back verbatim (`encode` stays `encode`, like `/transform`) |
+| `result` | the escaped (ENCODE) or unescaped (DECODE) text |
+| `changed` | `true` when `result` differs from the supplied `text` |
+| `length` | **Unicode code-point count of `result`** (an emoji counts once) |
+
+**ENCODE.** Exactly five characters are escaped, ampersand **first** so no double-encoding or
+re-escaping of earlier replacements can happen: `&` → `&amp;`, `<` → `&lt;`, `>` → `&gt;`, `"` → `&quot;`,
+`'` → `&#39;`. Apostrophes use the numeric form `&#39;` because `&apos;` is not defined in HTML 4. Text
+without any of the five characters is returned unchanged with `changed: false`. This is a **codec, not a
+sanitiser**: tags, attributes and scripts are escaped, never removed — render the result as HTML text, and
+sanitise elsewhere if you need a security boundary.
+
+**DECODE.** Resolves the five named entities (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#39;`), decimal numeric
+references (`&#NN;`, e.g. `&#65;` → `A`) and hexadecimal numeric references (`&#xHH;` / `&#XHH;`, e.g.
+`&#x41;` → `A`). A single decode pass runs left to right, so `&amp;lt;` becomes `&lt;` (not `<`). Everything
+else is preserved **verbatim**, character for character: unknown named entities (`&nbsp;`, `&copy;`),
+malformed references (`&`, `&#;`, `&#x;`, `&#99999999;`, a missing semicolon such as `&#65`), and references
+to code points that are not valid Unicode scalar values (`&#0;`, surrogate halves such as `&#xD800;`, values
+above `U+10FFFF`) — no error, no substitution, no data loss. Numeric bodies are length-capped, not
+normalised: decimal bodies carry at most 7 digits and hexadecimal bodies at most 6, so `&#00065;` → `A`
+and `&#x000041;` → `A` decode, while a longer body such as `&#00000065;` is preserved verbatim.
+**DECODE inverts escaping; it does not sanitise.** The output is plain text with references resolved and
+is *less* safe to render than its input — `&lt;script&gt;` becomes `<script>`. Never use `DECODE` to
+clean untrusted markup; sanitise with a dedicated HTML sanitiser and treat the result as untrusted.
+
+**Round-trip.** `DECODE(ENCODE(text))` reproduces `text` exactly for any text, because every character the
+encoder emits is one the decoder understands.
+
+**Errors and bounds.** Blank `text`, an absent `text`, or an `action` other than `ENCODE`/`DECODE` answers
+`400 VALIDATION_ERROR` (through `GlobalExceptionHandler`) and is not journalled. The output is bounded by the
+existing `MAX_RESULT_CHARS` (1000000 code points): a text whose encoding would exceed it answers
+`400 BAD_REQUEST` with `html-entity result exceeds 1000000 characters`, raised before the result is
+materialised beyond the bound.
+
 #### Journal & replay
 
-All three endpoints call `AuditedOperations`, so every call is recorded as `TEXT_TRANSFORM`,
-`TEXT_STATS` or `TEXT_REPLACE` in `GET /api/v1/utils/audit/entries`, with the request (redacted like every other
+All four endpoints call `AuditedOperations`, so every call is recorded as `TEXT_TRANSFORM`,
+`TEXT_STATS`, `TEXT_REPLACE` or `TEXT_HTML_ENTITIES` in `GET /api/v1/utils/audit/entries`, with the request (redacted like every other
 operation) and the response. A replace that compiles and reaches `TextService` but then fails — invalid regex,
 an out-of-range `$n` group reference, or the output bound — is recorded as `TEXT_REPLACE` with `state = FAILED`
 and `errorCode = BAD_REQUEST`. A *bean-validation* rejection (blank `text`/`pattern`, absent `replacement`,
 over-limit fields) is raised while Spring MVC resolves the `@Valid` argument, before the controller body runs, so
-— exactly like `/transform` and `/stats` — it answers `400 VALIDATION_ERROR` and is **not** journalled. All three
+— exactly like `/transform` and `/stats` — it answers `400 VALIDATION_ERROR` and is **not** journalled. All four
 are deterministic, so
 `POST /api/v1/utils/audit/entries/{id}/replay` re-runs the stored request and answers
 `replay.state = VERIFIED` with `detail = results match` without mutating the entry's original `state`, `result`

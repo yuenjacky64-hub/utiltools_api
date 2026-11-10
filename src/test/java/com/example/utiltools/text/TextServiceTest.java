@@ -1,5 +1,7 @@
 package com.example.utiltools.text;
 
+import com.example.utiltools.text.dto.TextHtmlEntitiesRequest;
+import com.example.utiltools.text.dto.TextHtmlEntitiesResponse;
 import com.example.utiltools.text.dto.TextReplaceRequest;
 import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
@@ -287,5 +289,101 @@ class TextServiceTest {
         assertThat(response.changed()).isTrue();
         assertThat(response.result()).startsWith("b".repeat(11) + "a");
         assertThat(response.length()).isEqualTo(100010);
+    }
+
+    @Test
+    @DisplayName("ENCODE escapes & first and then the remaining four HTML-significant characters")
+    void shouldEncodeHtmlEntitiesAmpersandFirst() {
+        assertThat(service.htmlEntities(new TextHtmlEntitiesRequest("ENCODE", "<a href=\"x\">Fish & chips 'n' more</a>")))
+                .isEqualTo(new TextHtmlEntitiesResponse("ENCODE",
+                        "&lt;a href=&quot;x&quot;&gt;Fish &amp; chips &#39;n&#39; more&lt;/a&gt;", true, 71));
+
+        assertThat(service.htmlEntities(new TextHtmlEntitiesRequest("ENCODE", "&amp;")))
+                .isEqualTo(new TextHtmlEntitiesResponse("ENCODE", "&amp;amp;", true, 9));
+
+        assertThat(service.htmlEntities(new TextHtmlEntitiesRequest("ENCODE", "plain text")))
+                .isEqualTo(new TextHtmlEntitiesResponse("ENCODE", "plain text", false, 10));
+    }
+
+    @Test
+    @DisplayName("DECODE resolves the five named entities plus decimal and hexadecimal numeric references")
+    void shouldDecodeNamedAndNumericReferences() {
+        assertThat(service.htmlEntities(new TextHtmlEntitiesRequest("DECODE",
+                "&amp; &lt; &gt; &quot; &#39;")))
+                .isEqualTo(new TextHtmlEntitiesResponse("DECODE", "& < > \" '", true, 9));
+
+        assertThat(service.htmlEntities(new TextHtmlEntitiesRequest("DECODE", "&#65;&#x42;&#X43;&#00071;")))
+                .isEqualTo(new TextHtmlEntitiesResponse("DECODE", "ABCG", true, 4));
+
+        assertThat(service.htmlEntities(new TextHtmlEntitiesRequest("DECODE", "&#x1F600;")))
+                .isEqualTo(new TextHtmlEntitiesResponse("DECODE", "\uD83D\uDE00", true, 1));
+
+        assertThat(service.htmlEntities(new TextHtmlEntitiesRequest("DECODE", "Caf&#233; &#x2014; ok")))
+                .isEqualTo(new TextHtmlEntitiesResponse("DECODE", "Café — ok", true, 9));
+    }
+
+    @Test
+    @DisplayName("DECODE preserves unknown and malformed references verbatim")
+    void shouldPreserveUnknownAndMalformedReferences() {
+        String text = "&nbsp; &AMP; &copy 5 & &#; &#x; &#0; &#xD800; &#9999999; &#xFFFFFF; bare & end";
+        assertThat(service.htmlEntities(new TextHtmlEntitiesRequest("DECODE", text)))
+                .isEqualTo(new TextHtmlEntitiesResponse("DECODE", text, false, text.length()));
+    }
+
+    @Test
+    @DisplayName("decode(encode(text)) round-trips without double-decoding")
+    void shouldRoundTripEncodeThenDecode() {
+        String text = "<script>alert(\"it's & <fine>\");</script> 100% ✓";
+        String encoded = service.htmlEntities(new TextHtmlEntitiesRequest("ENCODE", text)).result();
+
+        assertThat(encoded).doesNotContain("<", ">", "\"", "'").contains("&amp;");
+        assertThat(service.htmlEntities(new TextHtmlEntitiesRequest("DECODE", encoded)).result()).isEqualTo(text);
+    }
+
+    @Test
+    @DisplayName("the action is matched case-insensitively, echoed verbatim and rejects anything else")
+    void shouldMatchActionCaseInsensitivelyAndRejectUnknownActions() {
+        assertThat(service.htmlEntities(new TextHtmlEntitiesRequest(" encode ", "&")))
+                .isEqualTo(new TextHtmlEntitiesResponse(" encode ", "&amp;", true, 5));
+        assertThat(service.htmlEntities(new TextHtmlEntitiesRequest("decode", "&amp;")))
+                .isEqualTo(new TextHtmlEntitiesResponse("decode", "&", true, 1));
+
+        assertThatThrownBy(() -> service.htmlEntities(new TextHtmlEntitiesRequest("STRIP", "<b>")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Unsupported action: STRIP. Allowed values: ENCODE, DECODE");
+    }
+
+    @Test
+    @DisplayName("an html-entity result that would exceed the bound is rejected before it is built")
+    void shouldRejectOversizedHtmlEntityResult() {
+        assertThatThrownBy(() -> service.htmlEntities(
+                new TextHtmlEntitiesRequest("ENCODE", "&".repeat(210_000))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("html-entity result exceeds 1000000 characters");
+
+        assertThat(service.htmlEntities(new TextHtmlEntitiesRequest("ENCODE", "&".repeat(200_000))).length())
+                .isEqualTo(1_000_000);
+    }
+
+    @Test
+    @DisplayName("the html-entities request validates action and text like the other text DTOs")
+    void shouldValidateHtmlEntitiesRequest() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+
+            assertThat(validator.validate(new TextHtmlEntitiesRequest(" ", "abc")))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("action is required");
+
+            assertThat(validator.validate(new TextHtmlEntitiesRequest("SHRUG", "abc")))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("action must be either ENCODE or DECODE");
+
+            assertThat(validator.validate(new TextHtmlEntitiesRequest("encode", "   ")))
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly("text is required");
+
+            assertThat(validator.validate(new TextHtmlEntitiesRequest("Decode", "&amp;"))).isEmpty();
+        }
     }
 }
