@@ -59,6 +59,7 @@ public class CryptoService {
 
     private static final String UUID_VERSION_V4 = "V4";
     private static final String UUID_VERSION_V7 = "V7";
+    private static final String UUID_VERSION_V8 = "V8";
 
     private static final long SEQ_BITS = 16;
     private static final long SEQ_MASK = (1L << SEQ_BITS) - 1;
@@ -66,6 +67,8 @@ public class CryptoService {
     private static final long LOW_58_MASK = (1L << 58) - 1;
     private static final long UUID_V7_VERSION_BITS = 0x7000L;
     private static final long UUID_V7_VARIANT_BITS = 0x8000000000000000L;
+    private static final long UUID_V8_VERSION_BITS = 0x8000L;
+    private static final long UUID_V8_VARIANT_BITS = 0x8000000000000000L;
     private static final long NEVER_MINTED = -1L;
 
     private static final int JWT_MAX_TOKEN_LENGTH = 16384;
@@ -375,18 +378,45 @@ public class CryptoService {
             throw new IllegalArgumentException("UUID count must be between 1 and 100");
         }
         String resolvedVersion = version == null ? UUID_VERSION_V4 : version.trim().toUpperCase(Locale.ROOT);
-        if (!UUID_VERSION_V4.equals(resolvedVersion) && !UUID_VERSION_V7.equals(resolvedVersion)) {
-            throw new IllegalArgumentException("Invalid version: " + version + ". Expected V4 or V7.");
+        if (!UUID_VERSION_V4.equals(resolvedVersion)
+                && !UUID_VERSION_V7.equals(resolvedVersion)
+                && !UUID_VERSION_V8.equals(resolvedVersion)) {
+            throw new IllegalArgumentException("Invalid version: " + version + ". Expected V4, V7 or V8.");
         }
         List<String> result = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
-            UUID uuid = UUID_VERSION_V7.equals(resolvedVersion) ? generateUuidV7() : UUID.randomUUID();
+            UUID uuid = switch (resolvedVersion) {
+                case UUID_VERSION_V7 -> generateUuidV7();
+                case UUID_VERSION_V8 -> generateUuidV8();
+                default -> UUID.randomUUID();
+            };
             result.add(compact ? uuid.toString().replace("-", "") : uuid.toString());
         }
         return new UuidResponse(count, result, resolvedVersion);
     }
 
     public UUID generateUuidV7() {
+        long next = nextMonotonicState();
+        long sequenceMillis = next >>> SEQ_BITS;
+        long sequence = next & SEQ_MASK;
+
+        long mostSignificantBits = (sequenceMillis << 16)
+                | UUID_V7_VERSION_BITS
+                | ((sequence >>> 4) & 0x0FFFL);
+        long leastSignificantBits = UUID_V7_VARIANT_BITS
+                | ((sequence & 0x0FL) << 58)
+                | (ThreadLocalRandom.current().nextLong() & LOW_58_MASK);
+        return new UUID(mostSignificantBits, leastSignificantBits);
+    }
+
+    /**
+     * Mints the next state of the shared per-process monotonic {@link #counter}: the upper 48 bits
+     * hold the unix-millisecond timestamp (never moving backwards) and the low 16 bits hold a
+     * strictly ascending sequence that rolls over into the millisecond on saturation.
+     *
+     * @return the claimed {@code (millis << 16) | sequence} state
+     */
+    private long nextMonotonicState() {
         long millis = clock.millis() & MILLIS_MASK;
         long current;
         long next;
@@ -402,16 +432,35 @@ public class CryptoService {
                 next = (currentMillis + 1) << SEQ_BITS;
             }
         } while (!counter.compareAndSet(current, next));
+        return next;
+    }
 
-        long sequenceMillis = next >>> SEQ_BITS;
-        long sequence = next & SEQ_MASK;
+    /**
+     * Mints a time-ordered RFC 9562 UUIDv8 from the shared monotonic counter, so ids produced in the
+     * same millisecond stay strictly ascending and unique.
+     *
+     * @return the next UUIDv8
+     */
+    public UUID generateUuidV8() {
+        long next = nextMonotonicState();
+        return buildUuidV8(next >>> SEQ_BITS, next & SEQ_MASK);
+    }
 
-        long mostSignificantBits = (sequenceMillis << 16)
-                | UUID_V7_VERSION_BITS
-                | ((sequence >>> 4) & 0x0FFFL);
-        long leastSignificantBits = UUID_V7_VARIANT_BITS
-                | ((sequence & 0x0FL) << 58)
-                | (ThreadLocalRandom.current().nextLong() & LOW_58_MASK);
+    /**
+     * Builds a UUIDv8 for the current clock reading and the caller-supplied logical counter, whose
+     * low 16 bits become the last 16 bits of the id. Pure: it never reads or advances the shared
+     * monotonic counter.
+     *
+     * @param counter caller-supplied logical counter, used modulo {@code 65536}
+     * @return the UUIDv8 for {@code (now, counter)}
+     */
+    public UUID generateUuidV8(long counter) {
+        return buildUuidV8(clock.millis(), counter);
+    }
+
+    private static UUID buildUuidV8(long millis, long counter) {
+        long mostSignificantBits = ((millis & MILLIS_MASK) << 16) | UUID_V8_VERSION_BITS;
+        long leastSignificantBits = UUID_V8_VARIANT_BITS | (counter & SEQ_MASK);
         return new UUID(mostSignificantBits, leastSignificantBits);
     }
 

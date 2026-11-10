@@ -37,6 +37,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class CryptoServiceTest {
 
     private static final long FIXED_CLOCK_MILLIS = 0x017F22E279B0L;
+    private static final String UUID_V8_PATTERN =
+            "^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 
     private CryptoService cryptoService;
 
@@ -292,6 +294,147 @@ class CryptoServiceTest {
     }
 
     @Test
+    @DisplayName("Should generate UUIDv8 with the millisecond prefix, version nibble 8 and ascending counters")
+    void shouldGenerateUuidV8WithFixedClock() {
+        CryptoService fixedClockService = new CryptoService(
+                Clock.fixed(Instant.ofEpochMilli(FIXED_CLOCK_MILLIS), ZoneOffset.UTC));
+
+        UuidResponse response = fixedClockService.generateUuids(5, false, "V8");
+        List<String> uuids = response.uuids();
+        assertThat(response.version()).isEqualTo("V8");
+        assertThat(uuids).hasSize(5);
+
+        List<Long> counters = new ArrayList<>(uuids.size());
+        for (String uuid : uuids) {
+            assertThat(uuid).matches(UUID_V8_PATTERN);
+            assertThat(uuid).startsWith("017f22e2-79b0-");
+            assertThat(timestampMillis(uuid)).isEqualTo(FIXED_CLOCK_MILLIS);
+            assertThat(uuid.charAt(14)).isEqualTo('8');
+            assertThat(uuid.substring(15, 18)).isEqualTo("000");
+            assertThat(uuid.charAt(19)).isEqualTo('8');
+            long counter = counterLow16(uuid);
+            // The least significant 16 bits are the whole counter: the 48 bits before it stay zero.
+            assertThat(uuid.substring(24)).isEqualTo(String.format("%012x", counter));
+            counters.add(counter);
+        }
+        assertThat(counters).isSorted().doesNotHaveDuplicates();
+        assertThat(uuids).isSorted();
+    }
+
+    @Test
+    @DisplayName("Should keep 100 UUIDv8 ids from one frozen millisecond lexicographically sorted and unique")
+    void shouldSortUuidV8LexicographicallyWithinOneMillisecond() {
+        CryptoService fixedClockService = new CryptoService(
+                Clock.fixed(Instant.ofEpochMilli(FIXED_CLOCK_MILLIS), ZoneOffset.UTC));
+
+        List<String> uuids = fixedClockService.generateUuids(100, false, "V8").uuids();
+        assertThat(uuids).hasSize(100).doesNotHaveDuplicates().isSorted();
+        assertThat(uuids).allSatisfy(uuid -> {
+            assertThat(uuid).matches(UUID_V8_PATTERN);
+            assertThat(uuid.charAt(14)).isEqualTo('8');
+        });
+        List<Long> counters = uuids.stream().map(CryptoServiceTest::counterLow16).toList();
+        assertThat(counters).isSorted().doesNotHaveDuplicates();
+    }
+
+    @Test
+    @DisplayName("Should take the caller-supplied UUIDv8 counter modulo 65536 without touching the shared counter")
+    void shouldMaskUuidV8CounterModulo65536() {
+        CryptoService fixedClockService = new CryptoService(
+                Clock.fixed(Instant.ofEpochMilli(FIXED_CLOCK_MILLIS), ZoneOffset.UTC));
+
+        String masked = fixedClockService.generateUuidV8(0x1_0001L).toString();
+        String direct = fixedClockService.generateUuidV8(0x0001L).toString();
+        assertThat(masked).isEqualTo(direct);
+        assertThat(masked).matches(UUID_V8_PATTERN);
+        assertThat(counterLow16(masked)).isEqualTo(0x0001L);
+
+        String saturated = fixedClockService.generateUuidV8(-1L).toString();
+        assertThat(saturated).matches(UUID_V8_PATTERN).endsWith("ffff");
+        assertThat(counterLow16(saturated)).isEqualTo(0xFFFFL);
+
+        // The explicit-counter overload is pure: the batch mint still starts at sequence 0.
+        List<String> batch = fixedClockService.generateUuids(2, false, "V8").uuids();
+        assertThat(counterLow16(batch.getFirst())).isZero();
+        assertThat(counterLow16(batch.get(1))).isEqualTo(0x0001L);
+    }
+
+    @Test
+    @DisplayName("Should accept the V8 version case-insensitively and keep V4/V7 unchanged")
+    void shouldAcceptUuidV8VersionCaseInsensitively() {
+        for (String version : List.of("V8", "v8", " V8 ", "v8\t")) {
+            UuidResponse response = cryptoService.generateUuids(1, false, version);
+            assertThat(response.version()).isEqualTo("V8");
+            assertThat(response.uuids().getFirst()).matches(UUID_V8_PATTERN);
+        }
+        for (String version : List.of("V4", "v4", " V4")) {
+            assertThat(cryptoService.generateUuids(1, false, version).version()).isEqualTo("V4");
+        }
+        for (String version : List.of("V7", "v7", " V7 ")) {
+            assertThat(cryptoService.generateUuids(1, false, version).version()).isEqualTo("V7");
+        }
+
+        String compact = cryptoService.generateUuids(1, true, "v8").uuids().getFirst();
+        assertThat(compact).matches("^[0-9a-f]{32}$");
+        assertThat(compact.charAt(12)).isEqualTo('8');
+    }
+
+    @Test
+    @DisplayName("Should generate duplicate-free UUIDv8 values across threads without clock flake")
+    void shouldGenerateDuplicateFreeUuidV8UnderConcurrency() throws Exception {
+        CryptoService fixedClockService = new CryptoService(
+                Clock.fixed(Instant.ofEpochMilli(FIXED_CLOCK_MILLIS), ZoneOffset.UTC));
+
+        int threads = 8;
+        int mintsPerThread = 10000;
+        Set<String> collected = ConcurrentHashMap.newKeySet();
+        List<List<String>> perThread = new ArrayList<>(threads);
+        for (int i = 0; i < threads; i++) {
+            perThread.add(new ArrayList<>(mintsPerThread));
+        }
+
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threads);
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try {
+            for (int t = 0; t < threads; t++) {
+                List<String> sink = perThread.get(t);
+                pool.execute(() -> {
+                    try {
+                        start.await();
+                        for (int i = 0; i < mintsPerThread; i++) {
+                            String id = fixedClockService.generateUuidV8().toString();
+                            collected.add(id);
+                            sink.add(id);
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+            start.countDown();
+            assertThat(done.await(60, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertThat(collected).hasSize(threads * mintsPerThread);
+        for (List<String> list : perThread) {
+            assertThat(list).hasSize(mintsPerThread);
+            for (int i = 1; i < list.size(); i++) {
+                String previous = list.get(i - 1);
+                String current = list.get(i);
+                assertThat(current)
+                        .as("uuidv8 must stay strictly ascending for %s -> %s", previous, current)
+                        .isGreaterThan(previous);
+            }
+        }
+        assertThat(collected).allSatisfy(uuid -> assertThat(uuid).matches(UUID_V8_PATTERN));
+    }
+
+    @Test
     @DisplayName("Should parse the UUID version case-insensitively and reject unknown versions")
     void shouldParseUuidVersionCaseInsensitively() {
         for (String version : List.of("V7", "v7", " V7 ", "v7\t")) {
@@ -310,7 +453,7 @@ class CryptoServiceTest {
             assertThatThrownBy(() -> cryptoService.generateUuids(1, false, version))
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageContaining("Invalid version:")
-                    .hasMessageContaining("Expected V4 or V7.");
+                    .hasMessageContaining("Expected V4, V7 or V8.");
         }
     }
 
@@ -327,6 +470,10 @@ class CryptoServiceTest {
 
     private static long timestampMillis(String uuid) {
         return Long.parseLong(uuid.substring(0, 8) + uuid.substring(9, 13), 16);
+    }
+
+    private static long counterLow16(String uuid) {
+        return Long.parseLong(uuid.substring(32), 16);
     }
 
     private static long sequence(String uuid) {
