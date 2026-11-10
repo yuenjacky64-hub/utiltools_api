@@ -82,6 +82,37 @@ class AuditJournalServiceTest {
     }
 
     @Test
+    @DisplayName("PENDING -> FAILED stores a bounded result payload and withholds an oversize one")
+    void shouldStoreBoundedResultPayloadOnFail() {
+        AuditEntry entry = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-12345678");
+
+        AuditEntry failed = journal.fail(entry.id(), "BATCH_ITEM_HASH_FAILED",
+                Map.of("succeededItems", List.of(0, 2), "failedItems", List.of(1)));
+
+        assertThat(failed.state()).isEqualTo(JournalState.FAILED);
+        assertThat(failed.errorCode()).isEqualTo("BATCH_ITEM_HASH_FAILED");
+        assertThat(failed.completedAt()).isNotNull();
+        assertThat(failed.replayable()).isTrue();
+        assertThat(failed.result().path("succeededItems").toString()).isEqualTo("[0,2]");
+        assertThat(failed.result().path("failedItems").toString()).isEqualTo("[1]");
+
+        // An oversize payload is withheld - not truncated - exactly like an oversize success:
+        // the entry still closes as FAILED with its error code but the payload does not survive.
+        AuditJournalService bounded = new AuditJournalService(new ObjectMapper(), 3, 64, 300L);
+        AuditEntry boundedEntry = bounded.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-oversized3");
+        String huge = "x".repeat(4096);
+
+        AuditEntry boundedFailed = bounded.fail(boundedEntry.id(), "BATCH_ITEM_HASH_FAILED",
+                Map.of("failedItemErrors", List.of(Map.of("index", 0, "error", huge))));
+
+        assertThat(boundedFailed.state()).isEqualTo(JournalState.FAILED);
+        assertThat(boundedFailed.errorCode()).isEqualTo("BATCH_ITEM_HASH_FAILED");
+        assertThat(boundedFailed.replayable()).isFalse();
+        assertThat(boundedFailed.result().has("omitted")).isTrue();
+        assertThat(boundedFailed.result().toString()).doesNotContain(huge);
+    }
+
+    @Test
     @DisplayName("a late transition after a terminal state throws IllegalStateException")
     void lateSucceedThrows() {
         AuditEntry entry = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-12345678");

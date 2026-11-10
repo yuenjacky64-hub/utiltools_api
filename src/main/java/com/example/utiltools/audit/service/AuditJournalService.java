@@ -174,6 +174,28 @@ public class AuditJournalService {
     }
 
     /**
+     * PENDING -> FAILED, keeping the attempt's outcome payload when it fits
+     * {@code utiltools.audit.max-replay-bytes}, so a partially completed batch still replays which of
+     * its items succeeded and which failed. An oversize payload is withheld exactly as an oversize
+     * success payload is, and the entry is still closed as FAILED with the given error code. An entry
+     * closed this way is not replayable: a FAILED operation is never replayed.
+     */
+    public AuditEntry fail(String id, String errorCode, Object result) {
+        synchronized (lock) {
+            JournalRecord record = requirePending(id, JournalState.FAILED);
+            AuditEntry base = record.base;
+            JsonNode resultTree = objectMapper.valueToTree(result);
+            boolean oversizeResult = resultTree != null && serializedBytes(resultTree) > maxReplayBytes;
+            AuditEntry updated = new AuditEntry(base.id(), base.requestId(), base.operation(),
+                    JournalState.FAILED, base.createdAt(), Instant.now(clock), base.request(),
+                    oversizeResult ? withheldPayload() : resultTree, errorCode,
+                    base.replayable() && !oversizeResult, record.replay);
+            record.base = updated;
+            return updated;
+        }
+    }
+
+    /**
      * Records intent to reclaim a PENDING entry on the next {@link #reap()} pass. Changes no state
      * and writes no tombstone here.
      *

@@ -1954,7 +1954,9 @@ curl http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d47-5b2da1f0e8c
     "createdAt": "2026-10-31T19:12:04.418273Z",
     "startedAt": "2026-10-31T19:12:04.420118Z",
     "completedAt": "2026-10-31T19:12:04.421907Z",
-    "completedItems": 3
+    "completedItems": 3,
+    "succeededItems": [0, 1, 2],
+    "failedItems": []
   },
   "timestamp": "2026-10-31T19:12:05.012775Z"
 }
@@ -1968,17 +1970,30 @@ blocks later jobs.
 
 Every snapshot also carries the attempt bookkeeping: `attempt` (1-based, `1` for a first submission and
 incremented by each accepted retry), `maxAttempts` (the configured ceiling) and `attempts`, a bounded history
-where each entry is `{ "attempt", "status", "startedAt", "completedAt", "error", "resumedFrom" }`, with
-`resumedFrom` the 0-based input index the execution started at (`0` for a first attempt). The history holds at
-most one entry per attempt, so it can never exceed `maxAttempts`. All three fields are additive: existing fields
-keep their names and meaning.
+where each entry is `{ "attempt", "status", "startedAt", "completedAt", "error", "auditEntryId",
+"resumedFrom", "succeededItems", "failedItems" }`, with `resumedFrom` the 0-based input index the execution
+started at (`0` for a first attempt and for a retry that inherited no progress), `auditEntryId` the `BATCH_HASH`
+journal entry this attempt wrote (absent when the attempt never started or no journal is wired), and
+`succeededItems` / `failedItems` the ascending item indices **that attempt** hashed and that threw (empty lists
+when it has none, so both are present on a `RUNNING` row too). Note the scope distinction: an attempt row reports
+its own indices, while the job-level `succeededItems` / `failedItems` described below are job-wide and therefore
+also include the progress a resumed attempt inherited. The history holds at most one entry per attempt, so it can
+never exceed `maxAttempts`. All of these fields are additive: existing fields keep their names and meaning.
 
-Hashing is **checkpointed per item**. `completedItems` (additive, `0..itemCount`) reports how many leading items
-are durably hashed: it advances one item at a time as the worker commits each digest, so a `RUNNING` job shows
-real progress and a `FAILED` one shows how much survived. The prefix is private to the job — `results` stays
-absent until the job `COMPLETES`, and a `CANCELLING` or `CANCELLED` job reports `completedItems: 0` — so a poller can watch
-progress without ever seeing a partial digest. The checkpoint lives in memory with the rest of the job registry:
-eviction, expiry and restart discard it.
+Hashing is **checkpointed per item** and **isolated per item**: an item whose hash throws is recorded as failed
+and the worker carries on with the remaining items, so one bad item never aborts the whole batch. `completedItems`
+(additive, `0..itemCount`) reports **how many items are durably hashed** — it is the size of the per-item
+checkpoint (`checkpoint.size()`), not a contiguous leading prefix, so a partially failed batch can report `2`
+while an item at an index below that count failed. It advances one item at a time as the worker commits each
+digest, so a `RUNNING` job shows real progress and a `FAILED` one shows how much survived. `succeededItems` and
+`failedItems` (additive, ascending input indices, always present, empty when the set is empty) are the per-item
+projections: `succeededItems` lists every index whose digest is durably retained and `failedItems` every index
+whose hash threw — so a partially failed batch reads as "these indices hashed, those threw" instead of a
+whole-job failure. Both carry **indices only, never a digest or item content**. The checkpoint is private to the
+job — `results` stays absent until the job `COMPLETES`, and a `CANCELLING` or `CANCELLED` job withdrew its
+progress, so it reports `completedItems: 0` with both index lists empty — so a poller can watch progress without
+ever seeing a partial digest. The checkpoint lives in memory with the rest of the job registry: eviction, expiry
+and restart discard it.
 
 #### C. Cancel a job (200 OK, idempotent)
 
@@ -2016,6 +2031,9 @@ curl -i -X DELETE http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d4
     "idempotencyKey": "batch-2026-10-31-001",
     "status": "CANCELLED",
     "itemCount": 3,
+    "completedItems": 0,
+    "succeededItems": [],
+    "failedItems": [],
     "createdAt": "2026-10-31T19:12:04.418273Z",
     "completedAt": "2026-10-31T19:12:04.502114Z"
   },
@@ -2034,6 +2052,8 @@ curl -i -X DELETE http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d4
     "status": "CANCELLING",
     "itemCount": 3,
     "completedItems": 0,
+    "succeededItems": [],
+    "failedItems": [],
     "createdAt": "2026-10-31T19:12:04.418273Z",
     "startedAt": "2026-10-31T19:12:04.420118Z"
   },
@@ -2071,25 +2091,45 @@ curl -i -X POST http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d47-
     "maxAttempts": 3,
     "attempts": [
       { "attempt": 1, "status": "FAILED", "startedAt": "2026-10-31T19:12:04.420118Z",
-        "completedAt": "2026-10-31T19:12:04.421907Z", "error": "IllegalArgumentException: Unsupported hash algorithm: SHA-9",
-        "resumedFrom": 0 }
+        "completedAt": "2026-10-31T19:12:04.421907Z", "error": "BATCH_ITEM_HASH_FAILED",
+        "auditEntryId": "6d1c2a1e-7b52-4d3f-9a3c-4c1a2b7e5d90", "resumedFrom": 0,
+        "succeededItems": [0, 2], "failedItems": [1] }
     ],
     "createdAt": "2026-10-31T19:12:04.418273Z",
-    "completedItems": 0
+    "completedItems": 2,
+    "succeededItems": [0, 2],
+    "failedItems": [1]
   },
   "timestamp": "2026-10-31T19:12:09.004112Z"
 }
 ```
 
 `startedAt`, `completedAt`, `results` and `error` are cleared by the requeue, so the retried attempt's outcome is
-written fresh on the next poll. A retry does **not** rehash from item `0`: the durable prefix survives the
-`FAILED → QUEUED` transition, `completedItems` keeps reporting it (still without publishing `results`), and the
-retried attempt resumes at `completedItems`. For a batch of up to 1000 items that turns a late transient failure
-into a suffix-sized retry instead of a full re-run. Workers are fenced by generation: each execution captures the
+written fresh on the next poll. A retry does **not** rehash from item `0`: the checkpoint survives the
+`FAILED → QUEUED` transition, `completedItems`, `succeededItems` and `failedItems` keep reporting it (still
+without publishing `results`), and the retried attempt resumes at the first **unprocessed** index. That equals
+`completedItems` only when no item failed mid-batch: indices that already succeeded **and** indices already
+recorded as failed are both skipped, so the retried attempt hashes only what is still unprocessed — a failed index
+stays failed and is not retried by the same job, and a success is never rehashed. That applies to interruptions too:
+a `JOB_DEADLINE_EXCEEDED`, or a reaped `EXECUTION_LEASE_EXPIRED` that left the tail of the batch unvisited, retries
+only the unvisited suffix — for a batch of up to 1000 items that is a suffix-sized retry instead of a full re-run.
+This example has no such suffix: every index is already recorded (`2` succeeded, `1` failed), so its retried
+attempt has nothing left to hash and re-enters `FAILED` with `BATCH_ITEM_HASH_FAILED` on the next poll as `attempt` 2,
+without re-hashing `0`, `1` or `2`. Workers are fenced by generation: each execution captures the
 `attempt` it was admitted under and commits an item, or writes `RUNNING`, `COMPLETED` or `FAILED`, **only** if
 that generation is still current. A late worker from attempt 1 therefore cannot append to the checkpoint or
 overwrite the retried attempt's status, results or error — and the attempt history shows where each execution
 started via `resumedFrom`.
+
+A batch with mixed outcomes ends `FAILED` with `error: BATCH_ITEM_HASH_FAILED` once the worker has walked the
+whole batch: it fails only when at least one item threw **and** not every item ended up durably hashed, never
+because of an individual item on its own. `results` stays absent, the per-item causes (throwable type and message,
+bounded) ride the closing `BATCH_HASH` journal entry together with `checkpointItems`, `itemSuccesses` and
+`itemFailures`, and the snapshot's `succeededItems` / `failedItems` disclose **indices only** — never a digest or
+item content. A batch whose every item hashed `COMPLETES` normally, reporting `succeededItems: [0..itemCount-1]`
+and `failedItems: []`. Partial failure does not disturb the lease: the worker renews its execution lease before
+each item it hashes, so an intermittently failing batch keeps the lease alive across items, and a lease nobody
+renews still lapses into `EXECUTION_LEASE_EXPIRED` through the reaper exactly as before.
 
 A `RUNNING` worker may also **renew its execution lease** with
 `POST /api/v1/utils/jobs/{jobId}/heartbeat` (no request body). Each successful renewal sets
@@ -2131,8 +2171,9 @@ duplicate submission with the same key observes the `CANCELLED` snapshot until t
 | Retry rejected because the bounded queue is saturated | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Retry `POST …/retry` again once capacity frees: the previous `FAILED` snapshot and its `attempt` are restored, so nothing is consumed |
 | The client already holds `utiltools.jobs.max-active-jobs-per-client` non-terminal jobs | `429 TOO_MANY_REQUESTS` | `JOB_QUOTA_EXCEEDED` | Retry once one of your **own** jobs finishes — the quota is per client identity, so other callers are unaffected. `details.limit` is the ceiling and `details.activeJobs` is your current count. Nothing is registered on a rejected submission (no job row, no `idempotencyKey` mapping, no consumed slot), and a rejected `POST …/retry` restores the previous `FAILED` snapshot with its `attempt` unchanged. A resubmission that repeats the same `idempotencyKey` **and** payload is a duplicate, not a new job: it returns the existing snapshot instead of a quota error |
 | Same `idempotencyKey` reused with a different `algorithm`, `items` or `secretKey` | `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | The first job is untouched and keeps running; the conflicting submission is discarded before registration (no job, no execution, no key residue). Pick a new `idempotencyKey` for a genuinely new payload |
-| The job's total-life bound (`deadlineSeconds`, or the configured `utiltools.jobs.default-deadline-seconds`) is reached — in the queue or mid-execution | `202`, then `FAILED` on poll | — (`data.error` = `JOB_DEADLINE_EXCEEDED`) | The bound covers queue wait plus execution and fires even while the execution lease is live; it is distinct from `EXECUTION_LEASE_EXPIRED` (a stalled worker). `completedItems` reports the committed prefix and `results` stays `null` — no partial digest is published — so `POST …/retry` starts `attempt + 1` with a fresh deadline and resumes at that index |
-| Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit with a **new** `idempotencyKey` (or none). `POST …/retry` would re-run the same rejected algorithm and fail again; reusing the failed job's key replays its cached `FAILED` snapshot instead of re-executing |
+| The job's total-life bound (`deadlineSeconds`, or the configured `utiltools.jobs.default-deadline-seconds`) is reached — in the queue or mid-execution | `202`, then `FAILED` on poll | — (`data.error` = `JOB_DEADLINE_EXCEEDED`) | The bound covers queue wait plus execution and fires even while the execution lease is live; it is distinct from `EXECUTION_LEASE_EXPIRED` (a stalled worker). `completedItems`, `succeededItems` and `failedItems` report the retained progress and `results` stays `null` — no partial digest is published — so `POST …/retry` starts `attempt + 1` with a fresh deadline and resumes at the first unprocessed index |
+| One item's hash throws during execution (`REQ-01`) | `202`, then `FAILED` on poll | — (`data.error` = `BATCH_ITEM_HASH_FAILED`) | Don't resubmit: the batch is not aborted, the failing index is recorded `FAILED`, every remaining item is still hashed, and the job ends `FAILED` only when not every item is durably hashed. The per-item causes are journalled (content-free), `results` stays `null`, and `succeededItems` / `failedItems` expose indices only. `POST …/retry` resumes at the first unprocessed index, skipping both succeeded and failed indices |
+| Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error` = `BATCH_ITEM_HASH_FAILED`) | The rejection is per item like any other item-level failure: every index throws `Unsupported hash algorithm: …`, so `failedItems` is `0..itemCount-1`, `completedItems` stays `0`, `results` stays `null` and the job ends `FAILED`. Fix the algorithm and resubmit with a **new** `idempotencyKey` (or none) — `POST …/retry` re-runs the same rejected algorithm, and since every index is already recorded failed it has nothing left to hash and re-enters `FAILED` with this same code. Reusing the failed job's key replays its cached `FAILED` snapshot instead of re-executing |
 | Blank/empty `items` | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Send a non-empty list of non-blank strings (max 1000) |
 
 #### F. Batch job configuration
@@ -2292,8 +2333,13 @@ deterministic tie-breaker, so two jobs created in the same instant always keep t
       "attempt": 1,
       "maxAttempts": 3,
       "attempts": [
-        { "attempt": 1, "status": "RUNNING", "startedAt": "2026-11-07T13:41:02.113004Z" }
+        { "attempt": 1, "status": "RUNNING", "startedAt": "2026-11-07T13:41:02.113004Z",
+          "auditEntryId": "0b7f4c33-51a2-4e0a-9c18-2f7d6a3e91b4", "resumedFrom": 0,
+          "succeededItems": [0], "failedItems": [] }
       ],
+      "completedItems": 1,
+      "succeededItems": [0],
+      "failedItems": [],
       "createdAt": "2026-11-07T13:41:02.108621Z",
       "startedAt": "2026-11-07T13:41:02.113004Z",
       "executionLeaseExpiresAt": "2026-11-07T13:41:32.113004Z",
@@ -2311,8 +2357,13 @@ deterministic tie-breaker, so two jobs created in the same instant always keep t
       "maxAttempts": 3,
       "attempts": [
         { "attempt": 1, "status": "COMPLETED", "startedAt": "2026-11-07T13:40:58.004117Z",
-          "completedAt": "2026-11-07T13:40:58.006902Z" }
+          "completedAt": "2026-11-07T13:40:58.006902Z",
+          "auditEntryId": "8e2a6b15-3c47-4f90-b2d5-7a1e9c40f682", "resumedFrom": 0,
+          "succeededItems": [0], "failedItems": [] }
       ],
+      "completedItems": 1,
+      "succeededItems": [0],
+      "failedItems": [],
       "createdAt": "2026-11-07T13:40:58.001550Z",
       "startedAt": "2026-11-07T13:40:58.004117Z",
       "completedAt": "2026-11-07T13:40:58.006902Z"
@@ -2445,6 +2496,7 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | `409 CONFLICT` | `JOB_CANCELLATION_CONFLICT` | Cancellation attempted on a batch job that is `COMPLETED` or `FAILED` (a `QUEUED` or `RUNNING` job is cancelled: `CANCELLED` or `CANCELLING`) |
 | `429 TOO_MANY_REQUESTS` | `QUEUE_FULL` | Batch job queue is saturated; retry after capacity frees |
 | `429 TOO_MANY_REQUESTS` | `JOB_QUOTA_EXCEEDED` | Client holds `utiltools.jobs.max-active-jobs-per-client` non-terminal batch jobs; `details` carries `limit` and `activeJobs` |
+| `202`, then `FAILED` on poll (`data.error`) | `BATCH_ITEM_HASH_FAILED` | One or more items threw while hashing and not every item ended up durably hashed; the remaining items were still hashed, and `succeededItems` / `failedItems` carry the per-item outcome |
 | `429 TOO_MANY_REQUESTS` | `RATE_LIMITED` | Request budget for `/api/v1/utils/*` exhausted (see [Rate Limiting](#-rate-limiting)) |
 | `500 INTERNAL_SERVER_ERROR` | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception |
 
@@ -2516,7 +2568,7 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, empty-`operations` validation rejection, and the stale-fallback envelopes: an opt-in request served from the cache with `staleFallback`/`cachedAt`/`cacheAgeMillis` on an `OPEN` breaker, plus the unchanged `503` `CIRCUIT_OPEN` envelope for a miss, a different `jsonPath` and a non-opt-in caller.
 - **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`), sentence-case idempotence and `[.!?]`-run boundaries, diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points; plus replace coverage: `$n` group expansion, literal metacharacters, `all=false` first-match-only, case-insensitive matching, no-match results, invalid-regex rejection, code-point `length`, every request constraint bound, and the 1000000-character result bound.
 - **`TextControllerTest`**: Text endpoints MockMvc suite, including the snake-case and sentence-case transform envelopes, diacritic slugging, `400 BAD_REQUEST` for an unknown operation, `400 VALIDATION_ERROR` for blank text, and a `TEXT_TRANSFORM` entry listed by `/audit/entries` and replayed as `VERIFIED`; a replace envelope with `$n` groups, `400 BAD_REQUEST` for an invalid regex (journalled `TEXT_REPLACE`/`FAILED`), `400 VALIDATION_ERROR` for blank text, an absent `replacement` and an oversized `pattern`, and a `TEXT_REPLACE` entry listed by `/audit/entries` and replayed as `VERIFIED`.
-- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, key/payload fingerprint conflict detection (changed items, reordered items, changed algorithm or `secretKey`), 8-thread different-payload races, identical-key/identical-payload retries that mint no second execution, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff. Retry coverage: transient failure then a successful retry (`attempt` 2, attempt-1 `FAILED` entry retained), `RUNNING`/`COMPLETED`/`CANCELLED` conflicts that leave the snapshot unchanged, attempt exhaustion at `maxAttempts`, stale-worker fencing (a superseded generation writes nothing after a retry), and queue-rejection rollback that leaves the job `FAILED` with an unconsumed attempt while a later retry succeeds. Checkpoint coverage: a transient failure at a chosen item reports `completedItems` equal to the hashes that succeeded, leaves `results` absent and does not reach later items; the retry rehashes only the suffix (per-item invocation counts) and publishes the full batch in input order with `resumedFrom` on the second attempt; a stale worker from a reaped or superseded generation cannot advance or overwrite the checkpoint (replaying `executeAttempt` leaves the snapshot identical); a `429 QUEUE_FULL` retry restores the exact pre-retry `FAILED` snapshot including attempt, `completedItems` and the checkpoint; the journal descriptor and outcome carry `resumedFrom`/`completedItems` but never items or `secretKey`; and a cancelled job exposes no checkpoint results.
+- **`BatchHashJobServiceTest`**: Concurrent same-key deduplication, key/payload fingerprint conflict detection (changed items, reordered items, changed algorithm or `secretKey`), 8-thread different-payload races, identical-key/identical-payload retries that mint no second execution, queue-saturation rollback and retry, result ordering, worker-failure terminal state, eviction safety, queued cancellation (single transition, no hashing afterwards, idempotent repeat), `RUNNING`/terminal cancellation conflict, and `CANCELLED` eviction only after the retention cutoff. Retry coverage: transient failure then a successful retry (`attempt` 2, attempt-1 `FAILED` entry retained), `RUNNING`/`COMPLETED`/`CANCELLED` conflicts that leave the snapshot unchanged, attempt exhaustion at `maxAttempts`, stale-worker fencing (a superseded generation writes nothing after a retry), and queue-rejection rollback that leaves the job `FAILED` with an unconsumed attempt while a later retry succeeds. Checkpoint coverage: a transient failure at a chosen item reports `completedItems` equal to the hashes that succeeded and leaves `results` absent; the retry rehashes only the suffix (per-item invocation counts) and publishes the full batch in input order with `resumedFrom` on the second attempt; per-item isolation coverage: one item's hash throwing keeps the batch going (later items still hashed, `failedItems` on the snapshot and the attempt row, `itemFailures` in the attempt's `BATCH_HASH` entry), every item throwing still ends `FAILED` with `BATCH_ITEM_HASH_FAILED`, a retry hashes **only** the unprocessed indices while a resumed attempt reports job-wide outcomes including the inherited prefix, and lease renewal plus heartbeat stay live across item failures; a stale worker from a reaped or superseded generation cannot advance or overwrite the checkpoint (replaying `executeAttempt` leaves the snapshot identical); a `429 QUEUE_FULL` retry restores the exact pre-retry `FAILED` snapshot including attempt, `completedItems` and the checkpoint; the journal descriptor and outcome carry `resumedFrom`/`completedItems` but never items or `secretKey`; and a cancelled job exposes no checkpoint results.
   Heartbeat coverage: a `RUNNING` job with a live lease extends `executionLeaseExpiresAt` to `Instant.now(clock) + executionLeaseSeconds` and stamps `lastHeartbeatAt` with the same instant; an unknown `jobId` is `404 JOB_NOT_FOUND`, a `QUEUED`/`CANCELLING`/`COMPLETED`/`CANCELLED` job is `409 JOB_RETRY_CONFLICT`, and an already-expired lease is `400 BAD_REQUEST` without reviving it; a heartbeat from a superseded attempt generation writes neither the lease nor a journal row; the success writes exactly one `HEARTBEAT` row with the bounded detail `lease renewed via heartbeat`; and the entry's `status`, `results`, `error`, `completedAt`, `startedAt`, `checkpoint` and `attemptHistory` are byte-identical afterwards.
 - **`BatchJobControllerTest`**: Job endpoints MockMvc suite (202 submit/retry, 400, 404 `JOB_NOT_FOUND`, 409 `IDEMPOTENCY_CONFLICT`, 429 `QUEUE_FULL`, `DELETE` 200 `CANCELLED`, 404 `JOB_NOT_FOUND`, 409 `JOB_CANCELLATION_CONFLICT`, and `POST …/retry` 202 `QUEUED` vs 409 `JOB_RETRY_CONFLICT` with `jobId`/`status`/`attempt`/`maxAttempts` details, plus the additive `completedItems` on a `FAILED` snapshot beside every pre-existing field, and `POST …/heartbeat` returning the `200` success envelope with the renewed `executionLeaseExpiresAt`/`lastHeartbeatAt` beside `404 JOB_NOT_FOUND`, `409 JOB_RETRY_CONFLICT` and `400 BAD_REQUEST` error envelopes for each failure case).
 - **`GlobalExceptionHandlerTest`**: Centralized error mapping and constraint validation verification.

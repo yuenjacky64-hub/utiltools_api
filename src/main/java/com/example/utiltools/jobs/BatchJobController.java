@@ -87,14 +87,17 @@ public class BatchJobController {
                     + "starts attempt+1. A job submitted with deadlineSeconds (or bound by the configured "
                     + "server default) also reports the additive deadlineAt = createdAt + effective deadline; "
                     + "a job that passes it is moved to FAILED with error JOB_DEADLINE_EXCEEDED even while its "
-                    + "lease is live, completedItems reports the committed prefix and results stays null, and "
-                    + "the same retry starts attempt+1 with a fresh deadline and resumes at that prefix. A "
+                    + "lease is live, completedItems reports the durably hashed item count and results stays null, "
+                    + "and the same retry starts attempt+1 with a fresh deadline and resumes at the first "
+                    + "unprocessed index. A "
                     + "DELETE on a RUNNING job moves it to CANCELLING, which the worker "
                     + "honours at its next checkpoint (completedItems stays 0 and results stay null while the job "
                     + "is CANCELLING); a CANCELLING job whose lease lapses is reaped straight to CANCELLED. "
-                    + "Hashing is checkpointed per item: completedItems reports how many "
-                    + "leading items are durably hashed (0..itemCount), results stays null until the job is "
-                    + "COMPLETED, and a retry resumes at completedItems instead of rehashing the prefix")
+                    + "Hashing is checkpointed and isolated per item: completedItems reports how many "
+                    + "items are durably hashed (0..itemCount) - the checkpoint size, not a contiguous leading "
+                    + "prefix, because a per-item hash failure is recorded and the remaining items are still "
+                    + "hashed - results stays null until the job is COMPLETED, and a retry skips every index "
+                    + "already recorded as succeeded or failed instead of rehashing it")
     public ApiResponse<BatchHashJobResponse> status(@PathVariable String jobId) {
         return ApiResponse.success(jobService.getJob(jobId), "Job status retrieved");
     }
