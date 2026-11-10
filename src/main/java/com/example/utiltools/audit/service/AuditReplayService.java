@@ -11,8 +11,14 @@ import com.example.utiltools.common.AuditEntryNotFoundException;
 import com.example.utiltools.common.ReplayConflictException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
@@ -28,22 +34,81 @@ import java.util.Optional;
  * lock before the operation runs and the outcome is recorded owner-scoped afterwards, so two
  * concurrent replays of the same entry cannot both execute and a failed invocation still leaves a
  * {@code FAILED} trace.</p>
+ *
+ * <p>A replay that outlives {@code utiltools.audit.replay-lease-seconds} renews its own claim on
+ * the {@code utiltools.audit.replay-heartbeat-seconds} cadence while the operation runs, so a long
+ * replay still completes as {@code VERIFIED} / {@code MISMATCH} instead of losing its claim.</p>
  */
 @Service
 public class AuditReplayService {
+
+    private static final Logger log = LoggerFactory.getLogger(AuditReplayService.class);
 
     private static final int MAX_DETAIL_LENGTH = 200;
 
     private final AuditJournalService journal;
     private final AuditedOperations auditedOperations;
     private final ObjectMapper objectMapper;
+    private final long replayHeartbeatSeconds;
+    private final ReplayHeartbeatScheduler heartbeatScheduler;
 
+    @Autowired
+    public AuditReplayService(AuditJournalService journal,
+                              AuditedOperations auditedOperations,
+                              ObjectMapper objectMapper,
+                              @Value("${utiltools.audit.replay-heartbeat-seconds:#{null}}")
+                              Long replayHeartbeatSeconds) {
+        this(journal, auditedOperations, objectMapper, replayHeartbeatSeconds,
+                ReplayHeartbeatScheduler.daemonThreadPool());
+    }
+
+    /** Fixed 30s-lease seam used by tests: no heartbeat is scheduled. */
     public AuditReplayService(AuditJournalService journal,
                               AuditedOperations auditedOperations,
                               ObjectMapper objectMapper) {
+        this(journal, auditedOperations, objectMapper, null, ReplayHeartbeatScheduler.disabled());
+    }
+
+    /**
+     * Canonical constructor. {@code replayHeartbeatSeconds} defaults to half the claim lease (at
+     * least one second) and must be positive when configured; a non-positive value is a startup
+     * error because it would renew in a loop.
+     */
+    public AuditReplayService(AuditJournalService journal,
+                              AuditedOperations auditedOperations,
+                              ObjectMapper objectMapper,
+                              Long replayHeartbeatSeconds,
+                              ReplayHeartbeatScheduler heartbeatScheduler) {
         this.journal = journal;
         this.auditedOperations = auditedOperations;
         this.objectMapper = objectMapper;
+        this.replayHeartbeatSeconds = resolveHeartbeatSeconds(replayHeartbeatSeconds);
+        this.heartbeatScheduler = heartbeatScheduler == null
+                ? ReplayHeartbeatScheduler.disabled()
+                : heartbeatScheduler;
+    }
+
+    private long resolveHeartbeatSeconds(Long configured) {
+        if (configured == null) {
+            return Math.max(1L, journal.replayLeaseSeconds() / 2L);
+        }
+        if (configured < 1L) {
+            throw new IllegalArgumentException(
+                    "utiltools.audit.replay-heartbeat-seconds must be positive, was " + configured);
+        }
+        return configured;
+    }
+
+    /** Shuts the daemon heartbeat pool down with the context; a no-op for other schedulers. */
+    @PreDestroy
+    void shutdownHeartbeatScheduler() {
+        if (heartbeatScheduler instanceof AutoCloseable closeable) {
+            try {
+                closeable.close();
+            } catch (Exception e) {
+                log.debug("replay lease heartbeat scheduler did not close cleanly: {}", describe(e));
+            }
+        }
     }
 
     /**
@@ -137,12 +202,31 @@ public class AuditReplayService {
         }
 
         Object actual;
+        ReplayHeartbeatScheduler.Handle heartbeat = null;
         try {
+            try {
+                heartbeat = heartbeatScheduler.schedule(() -> renewLease(id, claim.ownerToken()),
+                        Duration.ofSeconds(replayHeartbeatSeconds));
+            } catch (RuntimeException e) {
+                // A heartbeat that cannot be scheduled must not replace the operation's outcome.
+                log.warn("replay lease heartbeat could not be scheduled for {}: {}", id,
+                        boundedDetail("replay lease heartbeat failed: " + describe(e)));
+            }
             actual = auditedOperations.replayInvoke(operation, original);
         } catch (RuntimeException e) {
             String detail = boundedDetail("replay failed: " + describe(e));
             journal.completeReplay(id, claim.ownerToken(), ReplayState.FAILED, detail);
             return new EntryAttempt(id, operation, ReplayState.FAILED, detail, null, null);
+        } finally {
+            // Renewal never runs after the operation, so completion always sees the final expiry.
+            if (heartbeat != null) {
+                try {
+                    heartbeat.cancel();
+                } catch (RuntimeException e) {
+                    log.warn("replay lease heartbeat could not be cancelled for {}: {}", id,
+                            boundedDetail("replay lease heartbeat cancel failed: " + describe(e)));
+                }
+            }
         }
 
         JsonNode expected = claimed.result();
@@ -156,6 +240,22 @@ public class AuditReplayService {
             return new EntryAttempt(id, operation, null, boundedDetail(lost.getMessage()), "CLAIM_LOST", lost);
         }
         return new EntryAttempt(id, operation, state, detail, null, null);
+    }
+
+    /**
+     * One heartbeat tick: renew the claim this attempt still owns. A refusal (claim completed, lost
+     * or expired) is not an error — the operation's own outcome decides the result — and any
+     * failure is bounded and logged rather than propagated into the replay.
+     */
+    private void renewLease(String id, String ownerToken) {
+        try {
+            if (journal.renewReplayLease(id, ownerToken).isEmpty()) {
+                log.debug("replay lease renewal refused for {}", id);
+            }
+        } catch (RuntimeException e) {
+            log.warn("replay lease renewal failed for {}: {}", id,
+                    boundedDetail("replay lease renewal failed: " + describe(e)));
+        }
     }
 
     /**
