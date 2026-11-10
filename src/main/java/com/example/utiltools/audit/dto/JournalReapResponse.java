@@ -10,7 +10,10 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  * the pass and is therefore the sum of the four per-reason counts:
  * {@code reaped == replayLeaseExpired + manuallyReaped + stalePending + oversizePayload}. A
  * {@code REPLAY_LEASE_EXPIRED} reap counts as reaped because it appends a tombstone, even though
- * the entry itself is left untouched.</p>
+ * the entry itself is left untouched. A {@code REPLAY_LEASE_QUARANTINED} reap is a replay-lease
+ * expiry outcome and is therefore also counted in {@code replayLeaseExpired}: the entry's claim
+ * has now expired {@code utiltools.audit.replay-lease-quarantine-threshold} times, so it is failed
+ * for good instead of rolled back again.</p>
  *
  * <p>{@code dryRun} marks a preview: the counts are those the equivalent applying pass would
  * report, and no entry, tombstone, replay claim or manual intent was changed. {@code entryId}

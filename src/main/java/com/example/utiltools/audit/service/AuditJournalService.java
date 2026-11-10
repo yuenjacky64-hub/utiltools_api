@@ -79,6 +79,8 @@ public class AuditJournalService {
     private final int maxReplayBytes;
     private final long stalePendingSeconds;
     private final long replayLeaseSeconds;
+    /** Rollbacks of one entry's replay claim allowed before the entry is quarantined; REQ-05. */
+    private final int replayLeaseQuarantineThreshold;
     private final Clock clock;
 
     private final Object lock = new Object();
@@ -96,13 +98,26 @@ public class AuditJournalService {
                                @Value("${utiltools.audit.max-replay-bytes:65536}") int maxReplayBytes,
                                @Value("${utiltools.audit.stale-pending-seconds:300}") long stalePendingSeconds,
                                @Value("${utiltools.audit.replay-lease-seconds:30}") long replayLeaseSeconds,
+                               @Value("${utiltools.audit.replay-lease-quarantine-threshold:3}")
+                               int replayLeaseQuarantineThreshold,
                                Clock clock) {
         this.objectMapper = objectMapper;
         this.maxEntries = Math.max(1, maxEntries);
         this.maxReplayBytes = Math.max(1, maxReplayBytes);
         this.stalePendingSeconds = Math.max(1L, stalePendingSeconds);
         this.replayLeaseSeconds = Math.max(1L, replayLeaseSeconds);
+        this.replayLeaseQuarantineThreshold = Math.max(1, replayLeaseQuarantineThreshold);
         this.clock = clock == null ? Clock.systemUTC() : clock;
+    }
+
+    /**
+     * Convenience constructor defaulting the replay-lease quarantine threshold to
+     * {@code utiltools.audit.replay-lease-quarantine-threshold}'s default of 3.
+     */
+    public AuditJournalService(ObjectMapper objectMapper, int maxEntries, int maxReplayBytes,
+                               long stalePendingSeconds, long replayLeaseSeconds, Clock clock) {
+        this(objectMapper, maxEntries, maxReplayBytes, stalePendingSeconds, replayLeaseSeconds, 3,
+                clock);
     }
 
     /** Defaults the replay lease to 30s and the clock to system UTC. */
@@ -348,7 +363,7 @@ public class AuditJournalService {
                 applyDecision(id, record, decision, reclaimQueue, now);
             }
             switch (decision.reason()) {
-                case REPLAY_LEASE_EXPIRED -> replayLeaseExpired++;
+                case REPLAY_LEASE_EXPIRED, REPLAY_LEASE_QUARANTINED -> replayLeaseExpired++;
                 case MANUALLY_REAPED -> manuallyReaped++;
                 case STALE_PENDING -> stalePending++;
                 case OVERSIZE_PAYLOAD -> oversizePayload++;
@@ -378,10 +393,21 @@ public class AuditJournalService {
         AuditEntry base = record.base;
         JournalState stateAtScan = base.state();
 
+        // REQ-06: a quarantined entry is terminal and permanently ineligible — the fall-through.
+        if (record.replayLeaseQuarantined) {
+            return null;
+        }
+
         ReplayRecord claim = record.replay;
         if (claim != null && claim.state() == ReplayState.IN_PROGRESS
                 && claim.leaseExpiresAt() != null
                 && !claim.leaseExpiresAt().isAfter(now)) {
+            // REQ-03: project the post-increment count without mutating (dryRun parity).
+            int projected = record.replayLeaseExhaustionCount + 1;
+            if (projected >= replayLeaseQuarantineThreshold) {
+                return new ReapDecision(ReapReason.REPLAY_LEASE_QUARANTINED, ReapAction.FAIL_ENTRY,
+                        ReapReason.REPLAY_LEASE_QUARANTINED.name(), quarantineDetail(projected));
+            }
             return new ReapDecision(ReapReason.REPLAY_LEASE_EXPIRED, ReapAction.ROLLBACK_CLAIM,
                     null, REPLAY_LEASE_EXPIRED_DETAIL);
         }
@@ -420,6 +446,7 @@ public class AuditJournalService {
                 ReplayRecord rolledBack = new ReplayRecord(ReplayState.FAILED, now,
                         boundedDetail(ReplayState.FAILED, REPLAY_LEASE_EXPIRED_DETAIL
                                 + " at " + (claim == null ? null : claim.leaseExpiresAt())), null);
+                record.replayLeaseExhaustionCount++;
                 record.replayOwnerToken = null;
                 record.replay = rolledBack;
                 record.base = withReplay(base, rolledBack);
@@ -427,6 +454,16 @@ public class AuditJournalService {
             case FAIL_ENTRY -> {
                 if (decision.reason() == ReapReason.MANUALLY_REAPED) {
                     record.manualReapRequested = false;
+                }
+                if (decision.reason() == ReapReason.REPLAY_LEASE_QUARANTINED) {
+                    // REQ-04: one final rollback of the lapsed claim, then the entry is failed
+                    // for good — the flag makes every later pass skip it.
+                    ReplayRecord quarantinedClaim = new ReplayRecord(ReplayState.FAILED, now,
+                            boundedDetail(ReplayState.FAILED, decision.detail()), null);
+                    record.replayLeaseExhaustionCount++;
+                    record.replayLeaseQuarantined = true;
+                    record.replayOwnerToken = null;
+                    record.replay = quarantinedClaim;
                 }
                 record.base = new AuditEntry(base.id(), base.requestId(), base.operation(),
                         JournalState.FAILED, base.createdAt(), now, base.request(), null,
@@ -727,6 +764,12 @@ public class AuditJournalService {
         return text.length() > MAX_DETAIL_LENGTH ? text.substring(0, MAX_DETAIL_LENGTH) : text;
     }
 
+    /** REQ-02: "replay lease expired N times; entry quarantined", clamped like every other detail. */
+    private static String quarantineDetail(int expirations) {
+        return boundedDetail(ReplayState.FAILED,
+                ReapReason.REPLAY_LEASE_QUARANTINED_DETAIL.formatted(expirations));
+    }
+
     private static AuditEntry withReplay(AuditEntry base, ReplayRecord replay) {
         return new AuditEntry(base.id(), base.requestId(), base.operation(), base.state(),
                 base.createdAt(), base.completedAt(), base.request(), base.result(),
@@ -792,6 +835,10 @@ public class AuditJournalService {
         private String replayOwnerToken;
         /** Set by {@link #requestManualReap(String)} and cleared by the pass that reclaims it. */
         private boolean manualReapRequested;
+        /** Rollbacks applied to this entry's replay claim; REQ-01, mutated under the journal lock. */
+        private int replayLeaseExhaustionCount;
+        /** Set once the entry is quarantined; REQ-06, makes the entry permanently ineligible. */
+        private boolean replayLeaseQuarantined;
 
         private JournalRecord(AuditEntry base, Object originalRequest, ReplayRecord replay,
                               boolean requestOversize) {
@@ -799,6 +846,8 @@ public class AuditJournalService {
             this.originalRequest = originalRequest;
             this.replay = replay;
             this.requestOversize = requestOversize;
+            this.replayLeaseExhaustionCount = 0;
+            this.replayLeaseQuarantined = false;
         }
     }
 }
