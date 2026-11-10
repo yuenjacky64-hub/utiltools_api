@@ -50,6 +50,11 @@ DEFAULT_MEMORY_MAX_LEARNINGS = 500
 # restores the historical one-at-a-time admission.
 DEFAULT_MAX_CONCURRENT_CYCLES = 2
 
+# Wall-clock budget for one OpenCode runner invocation (UTILTOOLS-90 REQ-01).
+# Ten minutes by default; ``validate()`` accepts the inclusive range
+# ``[60, 3600]`` seconds.
+DEFAULT_OPENCODE_TIMEOUT_SEC = 600
+
 DEFAULT_PRIMARY_CLI: str | None = None
 DEFAULT_PRIMARY_MODEL: str | None = None
 DEFAULT_SECONDARY_CLI: str | None = None
@@ -159,6 +164,7 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
             "fingerprint_quarantine_threshold",
             "max_fingerprint_buckets",
             "max_concurrent_cycles",
+            "opencode_timeout_sec",
         ):
             if isinstance(value, bool):
                 raise ValueError(f"{key} must be an integer")
@@ -251,6 +257,10 @@ class MaintainerConfig:
     stale_recovery_grace_sec: float = DEFAULT_STALE_RECOVERY_GRACE_SEC
     max_shutdown_wait_sec: float = DEFAULT_MAX_SHUTDOWN_WAIT_SEC
     max_concurrent_cycles: int = DEFAULT_MAX_CONCURRENT_CYCLES
+    # Deliberate exception to the ``__post_init__`` convention: this knob is
+    # ``validate()``-only so out-of-range values stay constructible and are
+    # reportable through ``validate()`` instead of raising at build time.
+    opencode_timeout_sec: int = DEFAULT_OPENCODE_TIMEOUT_SEC
 
     # Path knobs (see ``CONFIG_PATH_FIELDS``). Stored as trimmed ``str | None`` so
     # the single ``Path(...)``/``expanduser()`` conversion site lives in
@@ -375,6 +385,10 @@ class MaintainerConfig:
         * ``<field>: path is not absolute: <path>``
         * ``<field>: not a directory: <path>``
         * ``<field>: not accessible: <path>`` - ``os.R_OK | os.X_OK`` fails
+        * ``opencode_timeout_sec must be a positive integer`` / ``... must be
+          >= 60`` / ``... must be <= 3600`` - appended once, after the path
+          fields, when the knob is not a positive ``int`` or falls outside the
+          inclusive ``[60, 3600]`` second range (UTILTOOLS-90 REQ-01, REQ-02)
 
         Every filesystem or proxy call sits behind a guard, so the method is
         total: for any field content it returns a ``list[str]`` and never raises.
@@ -415,6 +429,19 @@ class MaintainerConfig:
                 usable = False
             if not usable:
                 issues.append(f"{name}: not accessible: {path}")
+        # REQ-01 / REQ-02: appended after the path loop so path-only results keep
+        # their exact ordering; at most one message is emitted.
+        opencode_timeout = self.opencode_timeout_sec
+        if (
+            isinstance(opencode_timeout, bool)
+            or not isinstance(opencode_timeout, int)
+            or opencode_timeout < 1
+        ):
+            issues.append("opencode_timeout_sec must be a positive integer")
+        elif opencode_timeout < 60:
+            issues.append("opencode_timeout_sec must be >= 60")
+        elif opencode_timeout > 3600:
+            issues.append("opencode_timeout_sec must be <= 3600")
         return issues
 
     @classmethod
