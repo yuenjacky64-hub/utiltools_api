@@ -11,6 +11,7 @@ import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
 import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
+import com.example.utiltools.datetime.dto.DateTimeWeekResponse;
 import com.example.utiltools.datetime.dto.TimeZoneInfo;
 import com.example.utiltools.datetime.dto.TimeZoneListResponse;
 import com.example.utiltools.datetime.service.DateTimeService;
@@ -737,5 +738,73 @@ class DateTimeServiceTest {
                 new DateTimeBusinessDaysRequest("2026-01-02T17:00:00Z", "UTC", 1, null, tooManyHolidays)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("holidays must contain at most 366 entries");
+    }
+
+    @Test
+    @DisplayName("Should resolve ISO week for the Monday that rolls over into the next week-year")
+    void shouldResolveIsoWeekForMondayWeekYearRollover() {
+        DateTimeWeekResponse response = dateTimeService.week("2024-12-30");
+
+        assertThat(response.date()).isEqualTo("2024-12-30");
+        assertThat(response.isoWeekYear()).isEqualTo(2025);
+        assertThat(response.isoWeek()).isEqualTo(1);
+        assertThat(response.dayOfWeek()).isEqualTo("MONDAY");
+        assertThat(response.dayOfYear()).isEqualTo(365);
+        assertThat(response.weekend()).isFalse();
+    }
+
+    @Test
+    @DisplayName("Should resolve week 53 of the previous week-year")
+    void shouldResolveWeek53OfPreviousWeekYear() {
+        DateTimeWeekResponse response = dateTimeService.week("2021-01-01");
+
+        assertThat(response.date()).isEqualTo("2021-01-01");
+        assertThat(response.isoWeekYear()).isEqualTo(2020);
+        assertThat(response.isoWeek()).isEqualTo(53);
+        assertThat(response.dayOfWeek()).isEqualTo("FRIDAY");
+    }
+
+    @Test
+    @DisplayName("Should resolve the weekend flag and day of year, Sunday included")
+    void shouldResolveWeekendAndDayOfYear() {
+        DateTimeWeekResponse saturday = dateTimeService.week("2026-11-14");
+
+        assertThat(saturday.isoWeekYear()).isEqualTo(2026);
+        assertThat(saturday.isoWeek()).isEqualTo(46);
+        assertThat(saturday.dayOfWeek()).isEqualTo("SATURDAY");
+        assertThat(saturday.dayOfYear()).isEqualTo(318);
+        assertThat(saturday.weekend()).isTrue();
+
+        DateTimeWeekResponse sunday = dateTimeService.week("2026-11-15");
+        assertThat(sunday.isoWeek()).isEqualTo(46);
+        assertThat(sunday.weekend()).isTrue();
+
+        DateTimeWeekResponse monday = dateTimeService.week("2026-11-16");
+        assertThat(monday.isoWeek()).isEqualTo(47);
+        assertThat(monday.weekend()).isFalse();
+
+        DateTimeWeekResponse padded = dateTimeService.week(" 2026-11-14 ");
+        assertThat(padded.date()).isEqualTo("2026-11-14");
+        assertThat(padded.dayOfWeek()).isEqualTo("SATURDAY");
+    }
+
+    @Test
+    @DisplayName("Should reject null, blank and malformed dates on week")
+    void shouldRejectNullBlankAndMalformedDatesOnWeek() {
+        assertThatThrownBy(() -> dateTimeService.week(null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("yyyy-MM-dd");
+
+        assertThatThrownBy(() -> dateTimeService.week("  "))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("yyyy-MM-dd");
+
+        assertThatThrownBy(() -> dateTimeService.week("2026-13-01"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("yyyy-MM-dd");
+
+        assertThatThrownBy(() -> dateTimeService.week("31/12/2024"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("yyyy-MM-dd");
     }
 }
