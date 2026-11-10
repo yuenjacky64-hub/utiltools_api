@@ -22,6 +22,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
@@ -33,6 +34,8 @@ import java.util.Locale;
 import java.util.PriorityQueue;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -137,6 +140,16 @@ public class BatchHashJobService {
     private static final long DEFAULT_EXECUTION_LEASE_SECONDS = 30;
     private static final long DEFAULT_EXECUTION_REAPER_INTERVAL_MS = 5000;
     private static final String BATCH_HASH_FAILED = "BATCH_HASH_FAILED";
+    /**
+     * Error recorded on a batch that hashed some items and failed others: the attempt is FAILED, no
+     * partial result list is published, and both per-item sets stay on the job so a retry resumes
+     * from the checkpoint instead of losing the items that did hash.
+     */
+    private static final String BATCH_ITEM_HASH_FAILED = "BATCH_ITEM_HASH_FAILED";
+    /** Bound on the journaled detail of one item failure, mirroring {@link #MAX_AUDIT_TEXT}. */
+    private static final int ITEM_ERROR_TEXT = 200;
+    /** Cap on the per-item error map a journaled outcome may carry (a partial report, not a dump). */
+    private static final int MAX_ITEM_ERROR_ENTRIES = 20;
     /** Bounded, payload-free detail of a heartbeat row; compile-time constant (27 chars, far under 200). */
     private static final String HEARTBEAT_DETAIL = "lease renewed via heartbeat";
     /** Result marker that distinguishes a lease-renewal row from an attempt row. */
@@ -1249,6 +1262,12 @@ public class BatchHashJobService {
             job.completedAt = Instant.now(clock);
             job.results = null; // explicit: nothing was hashed
             job.checkpoint.clear(); // a withdrawn job retains no partial digests
+            job.failedItems.clear(); // nor any per-item failure: a withdrawal takes the whole batch
+            job.itemErrors.clear();
+            // The per-attempt projections go with them, so a withdrawn job's history row reports no
+            // partial outcome either (the snapshot and the attempt rows must agree).
+            job.attemptSucceededItems.remove(job.attempt);
+            job.attemptFailedItems.remove(job.attempt);
             job.error = null;
             job.lastHeartbeatAt = null;
             job.executionLeaseExpiresAt = null;
@@ -1289,6 +1308,11 @@ public class BatchHashJobService {
         job.completedAt = Instant.now(clock);
         job.results = null; // explicit: a cancelled batch never publishes results
         job.checkpoint.clear(); // a cancelled job retains no partial digests
+        job.failedItems.clear(); // nor any per-item failure: a withdrawal takes the whole batch
+        job.itemErrors.clear();
+        // Dropped before recordAttempt below, so the CANCELLED row reports no partial outcome.
+        job.attemptSucceededItems.remove(generation);
+        job.attemptFailedItems.remove(generation);
         job.error = null;
         job.lastHeartbeatAt = null;
         job.executionLeaseExpiresAt = null;
@@ -1797,18 +1821,21 @@ public class BatchHashJobService {
             boolean running = job.status == JobStatus.RUNNING;
             // The checkpoint projection is derived, never stored: a second counter could drift across
             // the reap / retry / cancel edges.
-            int completedItems = switch (job.status) {
-                case COMPLETED -> job.items.size(); // the prefix was cleared when results were published
-                case CANCELLING, CANCELLED -> 0; // never expose a cancelled job's prefix
-                default -> job.checkpoint.size(); // QUEUED / RUNNING / FAILED
-            };
+            int completedItems = completedItems(job);
+            // Per-item projections, derived the same way (REQ-02). A cancelled job withdrew its
+            // progress, so it discloses neither set; a COMPLETED job's checkpoint was moved into
+            // results, so its successes are exactly 0..size-1. The helpers are shared with the journal
+            // payload, so the snapshot and its audit row are computed from one source.
+            List<Integer> succeeded = succeededItems(job);
+            List<Integer> failed = failedItems(job);
             return new BatchHashJobResponse(job.jobId, job.idempotencyKey, job.status, job.items.size(),
                     job.results, job.error, job.createdAt, job.startedAt, job.completedAt,
                     job.attempt, job.maxAttempts, List.copyOf(job.attemptHistory),
                     running ? job.executionLeaseExpiresAt : null,
                     running ? job.lastHeartbeatAt : null,
                     completedItems,
-                    job.deadlineAt); // projected for every status: null when the job has no bound
+                    job.deadlineAt, // projected for every status: null when the job has no bound
+                    succeeded, failed);
         }
     }
 
@@ -1844,9 +1871,10 @@ public class BatchHashJobService {
                     job.startedAt = now;
                     job.lastHeartbeatAt = now;
                     job.executionLeaseExpiresAt = now.plusSeconds(executionLeaseSeconds);
-                    // The attempt continues at the checkpoint's next index; recorded before the audit
-                    // descriptor is built so both attempt history and journal agree where it started.
-                    int resumedFrom = job.checkpoint.size();
+                    // The attempt continues at the first index neither hashed nor failed; recorded
+                    // before the audit descriptor is built so both attempt history and journal agree
+                    // where it started.
+                    int resumedFrom = nextUnprocessedIndex(job);
                     job.attemptResumedFrom.put(generation, resumedFrom);
                     // Admission is the moment the attempt "starts": install the submitter's
                     // correlation id on this (possibly reused) pool thread and open exactly one audit
@@ -1868,11 +1896,24 @@ public class BatchHashJobService {
             try {
                 int resumedFrom = job.attemptResumedFrom.getOrDefault(generation, 0);
                 for (int i = resumedFrom; i < job.items.size(); i++) {
+                    if (isProcessed(job, i)) {
+                        continue; // INV-PI-3: a succeeded or failed index is never hashed twice
+                    }
                     if (!renewLease(job, generation)) {
                         return; // fenced: the attempt was reaped, retried or cancelled while hashing
                     }
-                    HashResponse hashed = cryptoService.hash(
-                            new HashRequest(job.algorithm, job.items.get(i), job.secretKey));
+                    HashResponse hashed;
+                    try {
+                        hashed = cryptoService.hash(
+                                new HashRequest(job.algorithm, job.items.get(i), job.secretKey));
+                    } catch (RuntimeException itemFailure) {
+                        // INV-PI-1: one item's failure never aborts the batch. The index is recorded as
+                        // failed - keeping every item already hashed - and the loop carries on.
+                        if (!recordItemFailure(job, generation, i, itemFailure)) {
+                            return; // fenced, or cancelled by the writer above: stop hashing
+                        }
+                        continue;
+                    }
                     if (!commitCheckpoint(job, generation, i, hashed)) {
                         return; // fenced mid-hash: nothing is written, not even the item just hashed
                     }
@@ -1900,26 +1941,40 @@ public class BatchHashJobService {
                             // published for a job that ran out of time.
                             released = failDeadlineLocked(job, generation, now);
                         } else {
-                            if (job.checkpoint.size() != job.items.size()) {
-                                // Unreachable through input; surfaces as an ordinary FAILED job rather
-                                // than publishing a short result list.
-                                throw new IllegalStateException("checkpoint prefix does not cover the batch");
+                            if (isFullyHashed(job)) {
+                                job.results = List.copyOf(job.checkpoint.values()); // ascending = input order
+                                job.checkpoint.clear(); // results own the values; retained state stays bounded
+                                job.error = null;
+                                job.status = JobStatus.COMPLETED;
+                                job.completedAt = Instant.now(clock);
+                                job.lastHeartbeatAt = null;
+                                job.executionLeaseExpiresAt = null;
+                                recordAttempt(job, generation, JobStatus.COMPLETED, job.startedAt,
+                                        job.completedAt, null);
+                                // Same section that wrote the terminal status: the audit outcome can never
+                                // disagree with the snapshot, and a journal fault cannot change it.
+                                succeedQuietly(job, generation, "COMPLETED");
+                                // Claimed in the same section as the terminal write: the slot covering this
+                                // attempt is released exactly once, by the writer that terminated it.
+                                released = job.quotaReserved.compareAndSet(true, false);
+                            } else {
+                                // INV-PI-6: at least one item failed. results stay null (a partial list is
+                                // never published) and both per-item sets are retained, so the batch is
+                                // resumable rather than lost. The code is exactly BATCH_ITEM_HASH_FAILED
+                                // (never a code with an appended cause): clients switch on it, and the
+                                // per-item causes ride the journal payload instead.
+                                job.results = null;
+                                job.error = BATCH_ITEM_HASH_FAILED;
+                                job.status = JobStatus.FAILED;
+                                job.completedAt = Instant.now(clock);
+                                job.lastHeartbeatAt = null;
+                                job.executionLeaseExpiresAt = null;
+                                recordAttempt(job, generation, JobStatus.FAILED, job.startedAt,
+                                        job.completedAt, job.error);
+                                failQuietly(job, generation, job.error,
+                                        itemOutcomePayload(job, generation, "FAILED"));
+                                released = job.quotaReserved.compareAndSet(true, false);
                             }
-                            job.results = List.copyOf(job.checkpoint); // the full ordered prefix, input order
-                            job.checkpoint.clear(); // results own the values; retained state stays bounded
-                            job.error = null;
-                            job.status = JobStatus.COMPLETED;
-                            job.completedAt = Instant.now(clock);
-                            job.lastHeartbeatAt = null;
-                            job.executionLeaseExpiresAt = null;
-                            recordAttempt(job, generation, JobStatus.COMPLETED, job.startedAt,
-                                    job.completedAt, null);
-                            // Same section that wrote the terminal status: the audit outcome can never
-                            // disagree with the snapshot, and a journal fault cannot change it.
-                            succeedQuietly(job, generation, "COMPLETED");
-                            // Claimed in the same section as the terminal write: the slot covering this
-                            // attempt is released exactly once, by the writer that terminated it.
-                            released = job.quotaReserved.compareAndSet(true, false);
                         }
                     }
                 }
@@ -2015,8 +2070,9 @@ public class BatchHashJobService {
      * <p>The fence is deliberately re-checked <em>after</em> the hash: {@code CryptoService.hash}
      * can outlive the attempt (reaped, retried or superseded while the worker was inside it), and a
      * pre-hash-only fence would let a stale worker splice item {@code index} into a fresh
-     * generation's prefix. The {@code checkpoint.size() == index} guard additionally guarantees an
-     * attempt can only continue the prefix, never append out of order.</p>
+     * generation's checkpoint. The {@code containsKey / failedItems} guard additionally guarantees an
+     * index is recorded exactly once: the loop walks indices ascending, so success is never overwritten
+     * and a failed index is never converted into a success by a concurrent writer.</p>
      *
      * <p>A CANCELLING job is terminalized instead of appended to: the item just hashed is dropped with
      * the rest of the prefix, so a cancelled job never reports progress it did not publish
@@ -2035,10 +2091,11 @@ public class BatchHashJobService {
                 cancelPending = true; // terminalized below, outside this monitor section
             } else if (job.status != JobStatus.RUNNING) {
                 return false; // fenced, reaped or superseded
-            } else if (job.checkpoint.size() != index) {
-                return false; // drifted prefix: never append at the wrong index
+            } else if (job.checkpoint.containsKey(index) || job.failedItems.get(index)) {
+                return true; // already recorded (INV-PI-2): a success is never overwritten
             } else {
-                job.checkpoint.add(hashed);
+                job.checkpoint.put(index, hashed);
+                attemptSucceeded(job, generation).set(index);
                 return true;
             }
         }
@@ -2049,6 +2106,168 @@ public class BatchHashJobService {
     }
 
     /**
+     * Records one item-level hash failure and lets the batch carry on.
+     *
+     * <p>The fence mirrors {@link #commitCheckpoint}: the generation and status are re-checked after
+     * the throw, so a failure that surfaced after the attempt was reaped, retried or cancelled writes
+     * nothing. Only a still-RUNNING generation of this attempt records the index.</p>
+     *
+     * @return {@code true} when the failure was recorded and the loop may continue; {@code false} when
+     *         this generation no longer owns the job, or when the CANCELLING writer above terminalized
+     *         it and the worker must stop
+     */
+    private boolean recordItemFailure(MutableJob job, int generation, int index,
+            RuntimeException failure) {
+        boolean cancelPending = false;
+        synchronized (job) {
+            if (job.attempt != generation) {
+                return false; // fenced, cancelled, reaped or superseded
+            }
+            if (job.status == JobStatus.CANCELLING) {
+                cancelPending = true; // terminalized below, outside this monitor section
+            } else if (job.status != JobStatus.RUNNING) {
+                return false; // fenced, reaped or superseded
+            } else {
+                job.failedItems.set(index);
+                job.itemErrors.put(index, describeItemFailure(failure));
+                attemptFailed(job, generation).set(index);
+                log.debug("BATCH_HASH item {} of job {} attempt {} failed: {}", index, job.jobId,
+                        generation, failure.toString());
+                return true;
+            }
+        }
+        if (cancelPending) {
+            finalizeCancelled(job, generation);
+        }
+        return false;
+    }
+
+    /** Per-attempt succeeded index set of {@code generation}; created on first use. */
+    private static BitSet attemptSucceeded(MutableJob job, int generation) {
+        return job.attemptSucceededItems.computeIfAbsent(generation, key -> new BitSet());
+    }
+
+    /** Per-attempt failed index set of {@code generation}; created on first use. */
+    private static BitSet attemptFailed(MutableJob job, int generation) {
+        return job.attemptFailedItems.computeIfAbsent(generation, key -> new BitSet());
+    }
+
+    /** Ascending index list of a bit set: the compact, JSON-friendly projection of an index set. */
+    private static List<Integer> ascending(BitSet indexes) {
+        List<Integer> out = new ArrayList<>();
+        for (int i = indexes.nextSetBit(0); i >= 0; i = indexes.nextSetBit(i + 1)) {
+            out.add(i);
+        }
+        return out;
+    }
+
+    /**
+     * {@code [0, itemCount)}: the per-item success projection of a COMPLETED job, whose checkpoint
+     * has already been moved into {@code results}.
+     */
+    private static List<Integer> allIndexes(int itemCount) {
+        List<Integer> out = new ArrayList<>(itemCount);
+        for (int i = 0; i < itemCount; i++) {
+            out.add(i);
+        }
+        return out;
+    }
+
+    /** True when {@code index} is already recorded (hashed or failed) and must not be re-hashed. */
+    private static boolean isProcessed(MutableJob job, int index) {
+        synchronized (job) {
+            return job.checkpoint.containsKey(index) || job.failedItems.get(index);
+        }
+    }
+
+    /**
+     * The first index neither hashed nor failed: the checkpoint resume point of the next attempt.
+     * Every index below it is already recorded, so it is also the size of the durable prefix a retry
+     * keeps.
+     */
+    private static int nextUnprocessedIndex(MutableJob job) {
+        synchronized (job) {
+            int index = 0;
+            while (index < job.items.size()
+                    && (job.checkpoint.containsKey(index) || job.failedItems.get(index))) {
+                index++;
+            }
+            return index;
+        }
+    }
+
+    /** True when every item of the batch is hashed and none is recorded as failed. */
+    private static boolean isFullyHashed(MutableJob job) {
+        return job.failedItems.isEmpty() && job.checkpoint.size() == job.items.size();
+    }
+
+    /**
+     * Bounded, content-free description of an item-level hash failure: the throwable's simple name and
+     * message only, so neither the item text nor the secret key can reach a snapshot or the journal.
+     */
+    private static String describeItemFailure(Throwable failure) {
+        String message = failure.getMessage();
+        String text = failure.getClass().getSimpleName()
+                + (message == null || message.isBlank() ? "" : ": " + message);
+        return boundedAuditText(text, BATCH_ITEM_HASH_FAILED);
+    }
+
+    /**
+     * The job-wide success projection, shared by {@link #snapshot(MutableJob)} and the journal payload
+     * so the two can never disagree ({@code REQ-02}). A cancelled job withdrew its progress and a
+     * COMPLETED job's checkpoint was moved into {@code results}, so both are projected from status.
+     */
+    private static List<Integer> succeededItems(MutableJob job) {
+        return switch (job.status) {
+            case COMPLETED -> allIndexes(job.items.size());
+            case CANCELLING, CANCELLED -> List.of();
+            default -> List.copyOf(job.checkpoint.keySet()); // TreeMap key set is ascending
+        };
+    }
+
+    /** The job-wide failure projection, derived exactly like {@link #succeededItems(MutableJob)}. */
+    private static List<Integer> failedItems(MutableJob job) {
+        return switch (job.status) {
+            case COMPLETED, CANCELLING, CANCELLED -> List.of();
+            default -> ascending(job.failedItems);
+        };
+    }
+
+    /**
+     * The item-outcome payload of the attempt's closing journal entry ({@code REQ-03}, {@code DOD-06}):
+     * how many items the batch holds, how many are durably hashed ({@code checkpointItems}), which item
+     * indices succeeded ({@code itemSuccesses}), which failed ({@code itemFailures}) and the bounded
+     * cause of each failure ({@code itemFailureErrors}) - the plan's schema, verbatim.
+     *
+     * <p>Every projection is job-wide and identical to what {@link #snapshot(MutableJob)} publishes, so a
+     * resumed attempt's row also reports the prefix it inherited instead of only the indices it hashed
+     * itself. Indices only - no item text and no secret key - so the journal stays a bounded replay
+     * trail. {@code outcome}, {@code resultCount}, {@code resumedFrom} and {@code completedItems} are the
+     * keys the entry carried before item tracking existed and are kept for existing replay consumers.
+     */
+    private Map<String, Object> itemOutcomePayload(MutableJob job, int generation, String outcome) {
+        List<Map<String, Object>> failures = new ArrayList<>();
+        for (int i = job.failedItems.nextSetBit(0);
+                i >= 0 && failures.size() < MAX_ITEM_ERROR_ENTRIES;
+                i = job.failedItems.nextSetBit(i + 1)) {
+            failures.add(Map.of("index", i, "error",
+                    boundedAuditText(job.itemErrors.get(i), BATCH_ITEM_HASH_FAILED)));
+        }
+        int completedItems = completedItems(job);
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("outcome", outcome);
+        payload.put("resultCount", job.items.size());
+        payload.put("resumedFrom", job.attemptResumedFrom.getOrDefault(generation, 0));
+        payload.put("completedItems", completedItems);
+        // checkpointItems equals the durably hashed entry count (entries 0..size-1 on a finished batch).
+        payload.put("checkpointItems", completedItems);
+        payload.put("itemSuccesses", succeededItems(job));
+        payload.put("itemFailures", failedItems(job));
+        payload.put("itemFailureErrors", failures);
+        return payload;
+    }
+
+    /**
      * Upserts the single history entry for {@code attempt}: it first appears as RUNNING and is then
      * replaced in place by its terminal status, so the history stays bounded by {@code maxAttempts}
      * and no entry is ever duplicated.
@@ -2056,7 +2275,8 @@ public class BatchHashJobService {
     private void recordAttempt(MutableJob job, int attempt, JobStatus status, Instant startedAt,
             Instant completedAt, String error) {
         JobAttempt entry = new JobAttempt(attempt, status, startedAt, completedAt, error,
-                job.attemptAuditEntryIds.get(attempt), job.attemptResumedFrom.getOrDefault(attempt, 0));
+                job.attemptAuditEntryIds.get(attempt), job.attemptResumedFrom.getOrDefault(attempt, 0),
+                ascending(attemptSucceeded(job, attempt)), ascending(attemptFailed(job, attempt)));
         for (int i = 0; i < job.attemptHistory.size(); i++) {
             if (job.attemptHistory.get(i).attempt() == attempt) {
                 job.attemptHistory.set(i, entry);
@@ -2097,9 +2317,7 @@ public class BatchHashJobService {
             return;
         }
         try {
-            audit.succeed(entryId, Map.of("outcome", outcome, "resultCount", job.items.size(),
-                    "resumedFrom", job.attemptResumedFrom.getOrDefault(generation, 0),
-                    "completedItems", completedItems(job)));
+            audit.succeed(entryId, itemOutcomePayload(job, generation, outcome));
         } catch (RuntimeException e) {
             log.debug("BATCH_HASH audit succeed failed for job {} attempt {}: {}", job.jobId, generation,
                     e.toString());
@@ -2108,13 +2326,26 @@ public class BatchHashJobService {
 
     /** Closes the attempt's entry as FAILED with a bounded code; a missing entry is ignored. */
     private void failQuietly(MutableJob job, int generation, String error) {
+        failQuietly(job, generation, error, null);
+    }
+
+    /**
+     * Closes the attempt's entry as FAILED with a bounded code and, when {@code result} is non-null,
+     * the per-item outcome payload so the replay trail records which items were hashed before the
+     * batch failed ({@code REQ-03}).
+     */
+    private void failQuietly(MutableJob job, int generation, String error, Map<String, Object> result) {
         AuditJournalService audit = this.journal;
         String entryId = job.attemptAuditEntryIds.remove(generation);
         if (audit == null || entryId == null) {
             return;
         }
         try {
-            audit.fail(entryId, boundedAuditText(error, BATCH_HASH_FAILED));
+            if (result == null) {
+                audit.fail(entryId, boundedAuditText(error, BATCH_HASH_FAILED));
+            } else {
+                audit.fail(entryId, boundedAuditText(error, BATCH_HASH_FAILED), result);
+            }
         } catch (RuntimeException e) {
             log.debug("BATCH_HASH audit fail failed for job {} attempt {}: {}", job.jobId, generation,
                     e.toString());
@@ -2202,20 +2433,25 @@ public class BatchHashJobService {
         private final Instant completedAt;
         private final String error;
         private final List<HashResponse> results;
-        private final List<HashResponse> checkpoint;
+        private final SortedMap<Integer, HashResponse> checkpoint;
+        private final BitSet failedItems;
+        private final Map<Integer, String> itemErrors;
         private final Instant lastHeartbeatAt;
         private final Instant executionLeaseExpiresAt;
         private final Instant deadlineAt;
 
         private FailedState(int attempt, Instant startedAt, Instant completedAt, String error,
-                List<HashResponse> results, List<HashResponse> checkpoint, Instant lastHeartbeatAt,
-                Instant executionLeaseExpiresAt, Instant deadlineAt) {
+                List<HashResponse> results, SortedMap<Integer, HashResponse> checkpoint,
+                BitSet failedItems, Map<Integer, String> itemErrors,
+                Instant lastHeartbeatAt, Instant executionLeaseExpiresAt, Instant deadlineAt) {
             this.attempt = attempt;
             this.startedAt = startedAt;
             this.completedAt = completedAt;
             this.error = error;
             this.results = results;
             this.checkpoint = checkpoint;
+            this.failedItems = failedItems;
+            this.itemErrors = itemErrors;
             this.lastHeartbeatAt = lastHeartbeatAt;
             this.executionLeaseExpiresAt = executionLeaseExpiresAt;
             this.deadlineAt = deadlineAt;
@@ -2223,7 +2459,8 @@ public class BatchHashJobService {
 
         private static FailedState of(MutableJob job) {
             return new FailedState(job.attempt, job.startedAt, job.completedAt, job.error, job.results,
-                    List.copyOf(job.checkpoint), job.lastHeartbeatAt, job.executionLeaseExpiresAt,
+                    new TreeMap<>(job.checkpoint), (BitSet) job.failedItems.clone(),
+                    new HashMap<>(job.itemErrors), job.lastHeartbeatAt, job.executionLeaseExpiresAt,
                     job.deadlineAt);
         }
 
@@ -2235,7 +2472,11 @@ public class BatchHashJobService {
             job.error = error;
             job.results = results;
             job.checkpoint.clear();
-            job.checkpoint.addAll(checkpoint);
+            job.checkpoint.putAll(checkpoint);
+            job.failedItems.clear();
+            job.failedItems.or(failedItems);
+            job.itemErrors.clear();
+            job.itemErrors.putAll(itemErrors);
             job.lastHeartbeatAt = lastHeartbeatAt;
             job.executionLeaseExpiresAt = executionLeaseExpiresAt;
             job.deadlineAt = deadlineAt; // a refused requeue must not leave a future deadline behind
@@ -2333,8 +2574,23 @@ public class BatchHashJobService {
         private final Map<Integer, String> attemptRequestIds = new HashMap<>();
         /** Audit entry id of every attempt that actually started, keyed by attempt number. */
         private final Map<Integer, String> attemptAuditEntryIds = new HashMap<>();
-        /** Durable ordered prefix of this job: entries 0..size-1 are hashed and committed. */
-        private final List<HashResponse> checkpoint = new ArrayList<>();
+        /**
+         * Durable per-item checkpoint of this job: the item index is the key and the hashed response
+         * the value, so an ascending key walk is the input-order result list and the first absent
+         * index is the resume point.
+         */
+        private final TreeMap<Integer, HashResponse> checkpoint = new TreeMap<>();
+        /**
+         * Item indices this job has recorded as failed. They are never re-hashed ({@code INV-PI-3}),
+         * so a retry skips them exactly like the succeeded ones while the job keeps the evidence.
+         */
+        private final BitSet failedItems = new BitSet();
+        /** Bounded detail of the latest failure of each item index; never carries the item content. */
+        private final Map<Integer, String> itemErrors = new HashMap<>();
+        /** Item indices each admitted attempt hashed (per-attempt projection for its history row). */
+        private final Map<Integer, BitSet> attemptSucceededItems = new HashMap<>();
+        /** Item indices each admitted attempt failed (per-attempt projection for its history row). */
+        private final Map<Integer, BitSet> attemptFailedItems = new HashMap<>();
         /** Where each admitted attempt started, keyed by attempt number. */
         private final Map<Integer, Integer> attemptResumedFrom = new HashMap<>();
 
