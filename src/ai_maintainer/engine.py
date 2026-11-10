@@ -1568,11 +1568,19 @@ class MaintainerEngine:
         A cancel is attributed to ``cancel_requested`` and a stop to the reason
         the first publisher recorded, so a step never invents a reason
         (INV-COOP-1).
+
+        A stop published *without* an explicit reason keeps the neutral
+        default on :attr:`stop_reason` (UTILTOOLS-80 REQ-02: an ordinary cycle
+        must not read as interrupted), but a step body unwinding on it is
+        attributed ``stopped`` - the one token that classifies ``INTERRUPTED``
+        - instead of the neutral default (Review v4 NIT-04).
         """
 
         with self._lock:
             if self._cancel.is_set():
                 return self._cancel_reason or DEFAULT_CANCEL_REASON
+            if self._stop.is_set() and self._stop_reason == DEFAULT_STOP_REASON:
+                return STOP_REASON_STOPPED
             return self._stop_reason or DEFAULT_STOP_REASON
 
     def _wind_down_requested(self) -> bool:

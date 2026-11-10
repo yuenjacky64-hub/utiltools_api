@@ -20,6 +20,7 @@ import pytest
 
 from ai_maintainer.config import MaintainerConfig
 from ai_maintainer.engine import (
+    DEFAULT_STOP_REASON,
     FINALIZED_EVENT,
     FORCE_STOP_EVENT,
     MONITOR_STOPPED,
@@ -622,3 +623,31 @@ def test_cancel_signal_view_cannot_publish_a_stop(tmp_path: Path) -> None:
     assert view.wait(0) is True
     assert engine.check_cancel() is True
     assert engine.stop_reason == "operator"
+
+
+def test_check_cancel_reason_reports_stopped_for_anonymous_stop(tmp_path: Path) -> None:
+    """NIT-04 (review v4): an unattributed stop names the interrupt token.
+
+    ``stop_reason`` keeps the neutral default (UTILTOOLS-80 REQ-02: a normal
+    cycle stays ``SUCCESS``), but a step body that unwinds with
+    ``CooperativeCancel(check_cancel_reason())`` now carries ``stopped``, which
+    ``_outcome_for`` maps to ``INTERRUPTED`` without the caller having to pass
+    ``interrupted=True``.
+    """
+
+    engine, _sleeper = _frozen_engine(tmp_path)
+    assert engine.check_cancel_reason() == DEFAULT_STOP_REASON  # nothing pending
+
+    engine.request_stop()  # no explicit reason -> neutral default
+    assert engine.stop_reason == DEFAULT_STOP_REASON
+    assert MaintainerEngine._outcome_for(engine.stop_reason) == OUTCOME_SUCCESS
+    assert engine.check_cancel_reason() == STOP_REASON_STOPPED
+    assert (
+        MaintainerEngine._outcome_for(engine.check_cancel_reason())
+        == OUTCOME_INTERRUPTED
+    )
+
+    # An explicit reason is never rewritten by the fallback.
+    engine2, _sleeper2 = _frozen_engine(tmp_path / "explicit")
+    engine2.request_stop("operator")
+    assert engine2.check_cancel_reason() == "operator"
