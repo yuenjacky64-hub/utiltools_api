@@ -15,6 +15,7 @@ import com.example.utiltools.json.service.JsonService;
 import com.example.utiltools.text.service.TextService;
 import com.example.utiltools.resilience.ResilienceConfig;
 import com.example.utiltools.crypto.controller.CryptoController;
+import com.example.utiltools.crypto.dto.UuidResponse;
 import com.example.utiltools.crypto.service.CryptoService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -30,6 +31,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -50,11 +52,17 @@ class CryptoControllerTest {
     private static final String UUID_V7_PATTERN =
             "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 
+    private static final String UUID_V8_PATTERN =
+            "^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$";
+
     @Autowired
     private MockMvc mockMvc;
 
     @Autowired
     private AuditJournalService journal;
+
+    @Autowired
+    private AuditedOperations auditedOperations;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -149,6 +157,124 @@ class CryptoControllerTest {
         String uuid = objectMapper.readTree(body).path("data").path("uuids").get(0).asText();
         assertThat(uuid).matches("^[0-9a-f]{32}$");
         assertThat(uuid.charAt(12)).isEqualTo('7');
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/crypto/uuid?version=V8 - should return two ascending UUIDv8 values")
+    void shouldReturnUuidV8List() throws Exception {
+        String body = mockMvc.perform(get("/api/v1/utils/crypto/uuid")
+                        .param("version", "V8")
+                        .param("count", "2"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.version").value("V8"))
+                .andExpect(jsonPath("$.data.count").value(2))
+                .andExpect(jsonPath("$.data.uuids.length()").value(2))
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+
+        JsonNode uuids = objectMapper.readTree(body).path("data").path("uuids");
+        List<String> values = new ArrayList<>();
+        uuids.forEach(node -> values.add(node.asText()));
+
+        assertThat(values).hasSize(2).isSorted();
+        assertThat(values).allSatisfy(value -> {
+            assertThat(value).matches(UUID_V8_PATTERN);
+            assertThat(value.charAt(14)).isEqualTo('8');
+        });
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/crypto/uuid?version=v8&compact=true - should return compact UUIDv8 values")
+    void shouldReturnCompactUuidV8() throws Exception {
+        String body = mockMvc.perform(get("/api/v1/utils/crypto/uuid")
+                        .param("version", "v8")
+                        .param("compact", "true"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.version").value("V8"))
+                .andExpect(jsonPath("$.data.count").value(1))
+                .andExpect(jsonPath("$.data.uuids.length()").value(1))
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+
+        String uuid = objectMapper.readTree(body).path("data").path("uuids").get(0).asText();
+        assertThat(uuid).matches("^[0-9a-f]{32}$");
+        assertThat(uuid.charAt(12)).isEqualTo('8');
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/crypto/uuid?version=V8 - should reject invalid count and version with 400")
+    void shouldRejectInvalidUuidV8Inputs() throws Exception {
+        for (String count : List.of("0", "101")) {
+            mockMvc.perform(get("/api/v1/utils/crypto/uuid")
+                            .param("version", "V8")
+                            .param("count", count))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.success").value(false))
+                    .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                    .andExpect(jsonPath("$.message")
+                            .value("UUID count must be between 1 and 100"));
+        }
+
+        mockMvc.perform(get("/api/v1/utils/crypto/uuid")
+                        .param("version", "V8")
+                        .param("count", "abc"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false));
+
+        mockMvc.perform(get("/api/v1/utils/crypto/uuid")
+                        .param("version", "V9"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message")
+                        .value(org.hamcrest.Matchers.containsString("Invalid version:")));
+
+        List<AuditEntry> failed = journal.list(200, JournalState.FAILED).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_UUID)
+                .toList();
+        assertThat(failed).hasSizeGreaterThanOrEqualTo(3);
+        assertThat(failed).allSatisfy(entry -> assertThat(entry.errorCode()).isEqualTo("BAD_REQUEST"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/crypto/uuid?version=V8 - should journal and replay through CRYPTO_UUID")
+    void shouldJournalAndReplayUuidV8() throws Exception {
+        int before = (int) journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_UUID)
+                .count();
+
+        mockMvc.perform(get("/api/v1/utils/crypto/uuid")
+                        .param("version", "V8")
+                        .param("count", "2"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.version").value("V8"));
+
+        List<AuditEntry> entries = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_UUID)
+                .toList();
+        assertThat(entries).hasSize(before + 1);
+
+        AuditEntry entry = entries.get(0);
+        assertThat(entry.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entry.replayable()).isTrue();
+        assertThat(entry.request().path("version").asText()).isEqualTo("V8");
+        assertThat(entry.request().path("count").asInt()).isEqualTo(2);
+        assertThat(entry.request().path("compact").asBoolean()).isFalse();
+
+        assertThat(OperationType.CRYPTO_UUID.isDeterministic()).isFalse();
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> storedRequest = objectMapper.convertValue(entry.request(), Map.class);
+        UuidResponse replayed = (UuidResponse) auditedOperations.replayInvoke(
+                OperationType.CRYPTO_UUID, storedRequest);
+
+        assertThat(replayed.version()).isEqualTo("V8");
+        assertThat(replayed.count()).isEqualTo(2);
+        assertThat(replayed.uuids()).hasSize(2)
+                .allSatisfy(uuid -> assertThat(uuid).matches(UUID_V8_PATTERN));
     }
 
     @Test

@@ -44,7 +44,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | Tool | Base Path | Core Capabilities |
 | :--- | :--- | :--- |
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, current global time |
-| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 generation (`version=V4|V7`) |
+| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 / UUID v8 generation (`version=V4|V7|V8`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit, and NDJSON / JSON Lines conversion (array <-> line-delimited records) |
 | **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
 
@@ -617,10 +617,13 @@ curl -X POST http://localhost:8080/api/v1/utils/crypto/base64 \
 Query parameters:
 - `count` (optional, default `1`, max `100`)
 - `compact` (optional, default `false`; when `true`, removes hyphens into 32-hex chars)
-- `version` (optional, default `V4`; values `V4|V7`, case-insensitive). `V4` is random; `V7` is
+- `version` (optional, default `V4`; values `V4|V7|V8`, case-insensitive). `V4` is random; `V7` is
   time-ordered RFC 9562 UUIDv7 — 48-bit unix-millisecond prefix plus a per-process monotonic counter,
-  so ids sort lexicographically and stay unique under concurrent generation. Any other value returns
-  `400 BAD_REQUEST` with `Invalid version:`.
+  so ids sort lexicographically and stay unique under concurrent generation. `V8` is a time-ordered
+  RFC 9562 UUIDv8 with the same 48-bit unix-millisecond prefix and version nibble `8`, and the last 16
+  bits are the shared per-process monotonic counter — so V8 ids also sort lexicographically within the
+  same millisecond. V8 carries no entropy and must not be used as a secret or capability token. Any
+  other value returns `400 BAD_REQUEST` with `Invalid version:`.
 
 ```bash
 # random v4 (default), compact
@@ -628,6 +631,9 @@ curl "http://localhost:8080/api/v1/utils/crypto/uuid?count=2&compact=true"
 
 # time-ordered v7
 curl "http://localhost:8080/api/v1/utils/crypto/uuid?version=V7&count=2"
+
+# time-ordered v8
+curl "http://localhost:8080/api/v1/utils/crypto/uuid?version=V8&count=2"
 ```
 
 **Response (v4 default, `compact=true`):**
@@ -661,6 +667,26 @@ unix-millisecond timestamp, the 13th hex char is the version nibble `7`:
       "017f22e2-79b0-7c4b-8b2e-4d6f7a8b9c0d"
     ],
     "version": "V7"
+  },
+  "timestamp": "2026-10-30T16:50:38.954060989Z"
+}
+```
+
+**Response (`version=V8`):** values are ascending in string order, the 12 leading hex chars are the
+unix-millisecond timestamp, the 13th hex char is the version nibble `8` and the last 16 bits are the
+per-process monotonic counter:
+
+```json
+{
+  "success": true,
+  "message": "UUIDs generated successfully",
+  "data": {
+    "count": 2,
+    "uuids": [
+      "017f22e2-79b0-8000-8000-000000000001",
+      "017f22e2-79b0-8000-8000-000000000002"
+    ],
+    "version": "V8"
   },
   "timestamp": "2026-10-30T16:50:38.954060989Z"
 }
@@ -2484,8 +2510,8 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 
 - **`DateTimeServiceTest`**: Epoch parsing, timezone shifts, duration math, DST-aware shift arithmetic (month-end clamping, spring-forward, fall-back), boundary checks.
 - **`DateTimeControllerTest`**: Full HTTP endpoint testing with MockMvc, including shift validation and error envelopes.
-- **`CryptoServiceTest`**: Standard hashing vectors, HMAC calculations, Base64 encode/decode, URL percent-encoding across `COMPONENT`/`PATH`/`FORM` (round-trip, mode-specific `+`, malformed escape and undecodable UTF-8 rejection), UUID v4 generation, UUIDv7 fixed-clock vector, `version=V4|V7` parsing, clock-regression monotonicity, and an 8-thread x 10000 duplicate-free concurrency invariant.
-- **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `crypto/url` encode/decode, decode-only `crypto/jwt/decode` (`algorithm`, `payload`, `signatureBytes`, `verified=false`, no raw token or signature echoed), 400 `BAD_REQUEST` vs `VALIDATION_ERROR`, and `CRYPTO_URL` / `CRYPTO_JWT_DECODE` journal/replay (`VERIFIED`), including `version=V4|V7` selection, compact UUIDv7, and the 400 unified envelope for an unknown `version`.
+- **`CryptoServiceTest`**: Standard hashing vectors, HMAC calculations, Base64 encode/decode, URL percent-encoding across `COMPONENT`/`PATH`/`FORM` (round-trip, mode-specific `+`, malformed escape and undecodable UTF-8 rejection), UUID v4 generation, UUIDv7 fixed-clock vector, UUIDv8 fixed-clock vector and counter-modulo-65536 masking, `version=V4|V7|V8` parsing, clock-regression monotonicity, and an 8-thread x 10000 duplicate-free concurrency invariant.
+- **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `crypto/url` encode/decode, decode-only `crypto/jwt/decode` (`algorithm`, `payload`, `signatureBytes`, `verified=false`, no raw token or signature echoed), 400 `BAD_REQUEST` vs `VALIDATION_ERROR`, and `CRYPTO_URL` / `CRYPTO_JWT_DECODE` journal/replay (`VERIFIED`), including `version=V4|V7|V8` selection, compact UUIDv7 and UUIDv8, `CRYPTO_UUID` journal/replay for V8, and the 400 unified envelope for an unknown `version`.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries, six-op patch success, rollback to byte-identical original, missing paths, malformed pointers, `-` append, dry runs, input-not-mutated.
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, empty-`operations` validation rejection, and the stale-fallback envelopes: an opt-in request served from the cache with `staleFallback`/`cachedAt`/`cacheAgeMillis` on an `OPEN` breaker, plus the unchanged `503` `CIRCUIT_OPEN` envelope for a miss, a different `jsonPath` and a non-opt-in caller.
 - **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`), sentence-case idempotence and `[.!?]`-run boundaries, diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points; plus replace coverage: `$n` group expansion, literal metacharacters, `all=false` first-match-only, case-insensitive matching, no-match results, invalid-regex rejection, code-point `length`, every request constraint bound, and the 1000000-character result bound.
