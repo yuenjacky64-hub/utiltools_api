@@ -9,7 +9,9 @@ injected state root; the consistency validators it is written through stay in
 
 from __future__ import annotations
 
+from ai_maintainer.memory.locking import file_lock
 from ai_maintainer.memory.store import (
+    KNOWLEDGE_BASE_DOC_NAME,
     MEMORY_DOC_NAME,
     MEMORY_DOC_VERSION,
     MemoryStore,
@@ -17,8 +19,10 @@ from ai_maintainer.memory.store import (
 )
 
 __all__ = [
+    "KNOWLEDGE_BASE_DOC_NAME",
     "MEMORY_DOC_NAME",
     "MEMORY_DOC_VERSION",
     "MemoryStore",
     "atomic_write_text",
+    "file_lock",
 ]
