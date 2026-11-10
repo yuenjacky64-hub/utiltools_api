@@ -1649,8 +1649,11 @@ punctuation and whitespace are separators. With tokenizer output `w1..wn`:
 | `SLUG` | tokens lower-cased, NFD-normalised with combining marks stripped, emptied tokens dropped; joined with `-` | `hello-world` |
 | `SENTENCE_CASE` | first letter of each `[.!?]`-delimited sentence upper-cased, remaining letters lower-cased, all other characters copied through in place | `Hello world. Bye.` |
 
-`operation` is case-insensitive on input and echoed back upper-case. Unknown operations answer
-`400 BAD_REQUEST` and list the allowed values; blank `text` answers `400 VALIDATION_ERROR`.
+`operation` is case-insensitive on input and echoed back upper-case; surrounding whitespace is **not**
+tolerated. An unknown operation, a whitespace-padded operation and a blank `operation` all fail bean
+validation before the service is reached, answering HTTP `400` with error `VALIDATION_ERROR`, message
+`Validation failed` and the supported operation list in `details`; blank `text` likewise answers
+`400 VALIDATION_ERROR`.
 
 #### Transform
 
