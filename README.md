@@ -2091,13 +2091,14 @@ curl -i -X POST http://localhost:8080/api/v1/utils/jobs/3f6b0c2e-9a54-4f01-8d47-
     "maxAttempts": 3,
     "attempts": [
       { "attempt": 1, "status": "FAILED", "startedAt": "2026-10-31T19:12:04.420118Z",
-        "completedAt": "2026-10-31T19:12:04.421907Z", "error": "IllegalArgumentException: Unsupported hash algorithm: SHA-9",
-        "resumedFrom": 0, "succeededItems": [], "failedItems": [] }
+        "completedAt": "2026-10-31T19:12:04.421907Z", "error": "BATCH_ITEM_HASH_FAILED",
+        "auditEntryId": "6d1c2a1e-7b52-4d3f-9a3c-4c1a2b7e5d90", "resumedFrom": 0,
+        "succeededItems": [0, 2], "failedItems": [1] }
     ],
     "createdAt": "2026-10-31T19:12:04.418273Z",
-    "completedItems": 0,
-    "succeededItems": [],
-    "failedItems": []
+    "completedItems": 2,
+    "succeededItems": [0, 2],
+    "failedItems": [1]
   },
   "timestamp": "2026-10-31T19:12:09.004112Z"
 }
@@ -2109,8 +2110,12 @@ written fresh on the next poll. A retry does **not** rehash from item `0`: the c
 without publishing `results`), and the retried attempt resumes at the first **unprocessed** index. That equals
 `completedItems` only when no item failed mid-batch: indices that already succeeded **and** indices already
 recorded as failed are both skipped, so the retried attempt hashes only what is still unprocessed — a failed index
-stays failed and is not retried by the same job, and a success is never rehashed. For a batch of up to 1000 items
-that turns a late transient failure into a suffix-sized retry instead of a full re-run. Workers are fenced by generation: each execution captures the
+stays failed and is not retried by the same job, and a success is never rehashed. That applies to interruptions too:
+a `JOB_DEADLINE_EXCEEDED`, or a reaped `EXECUTION_LEASE_EXPIRED` that left the tail of the batch unvisited, retries
+only the unvisited suffix — for a batch of up to 1000 items that is a suffix-sized retry instead of a full re-run.
+This example has no such suffix: every index is already recorded (`2` succeeded, `1` failed), so its retried
+attempt has nothing left to hash and re-enters `FAILED` with `BATCH_ITEM_HASH_FAILED` on the next poll as `attempt` 2,
+without re-hashing `0`, `1` or `2`. Workers are fenced by generation: each execution captures the
 `attempt` it was admitted under and commits an item, or writes `RUNNING`, `COMPLETED` or `FAILED`, **only** if
 that generation is still current. A late worker from attempt 1 therefore cannot append to the checkpoint or
 overwrite the retried attempt's status, results or error — and the attempt history shows where each execution
@@ -2168,7 +2173,7 @@ duplicate submission with the same key observes the `CANCELLED` snapshot until t
 | Same `idempotencyKey` reused with a different `algorithm`, `items` or `secretKey` | `409 CONFLICT` | `IDEMPOTENCY_CONFLICT` | The first job is untouched and keeps running; the conflicting submission is discarded before registration (no job, no execution, no key residue). Pick a new `idempotencyKey` for a genuinely new payload |
 | The job's total-life bound (`deadlineSeconds`, or the configured `utiltools.jobs.default-deadline-seconds`) is reached — in the queue or mid-execution | `202`, then `FAILED` on poll | — (`data.error` = `JOB_DEADLINE_EXCEEDED`) | The bound covers queue wait plus execution and fires even while the execution lease is live; it is distinct from `EXECUTION_LEASE_EXPIRED` (a stalled worker). `completedItems`, `succeededItems` and `failedItems` report the retained progress and `results` stays `null` — no partial digest is published — so `POST …/retry` starts `attempt + 1` with a fresh deadline and resumes at the first unprocessed index |
 | One item's hash throws during execution (`REQ-01`) | `202`, then `FAILED` on poll | — (`data.error` = `BATCH_ITEM_HASH_FAILED`) | Don't resubmit: the batch is not aborted, the failing index is recorded `FAILED`, every remaining item is still hashed, and the job ends `FAILED` only when not every item is durably hashed. The per-item causes are journalled (content-free), `results` stays `null`, and `succeededItems` / `failedItems` expose indices only. `POST …/retry` resumes at the first unprocessed index, skipping both succeeded and failed indices |
-| Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error`) | Fix the algorithm and resubmit with a **new** `idempotencyKey` (or none). `POST …/retry` would re-run the same rejected algorithm and fail again; reusing the failed job's key replays its cached `FAILED` snapshot instead of re-executing |
+| Unsupported `algorithm` | `202`, then `FAILED` on poll | — (`data.error` = `BATCH_ITEM_HASH_FAILED`) | The rejection is per item like any other item-level failure: every index throws `Unsupported hash algorithm: …`, so `failedItems` is `0..itemCount-1`, `completedItems` stays `0`, `results` stays `null` and the job ends `FAILED`. Fix the algorithm and resubmit with a **new** `idempotencyKey` (or none) — `POST …/retry` re-runs the same rejected algorithm, and since every index is already recorded failed it has nothing left to hash and re-enters `FAILED` with this same code. Reusing the failed job's key replays its cached `FAILED` snapshot instead of re-executing |
 | Blank/empty `items` | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Send a non-empty list of non-blank strings (max 1000) |
 
 #### F. Batch job configuration
@@ -2329,7 +2334,8 @@ deterministic tie-breaker, so two jobs created in the same instant always keep t
       "maxAttempts": 3,
       "attempts": [
         { "attempt": 1, "status": "RUNNING", "startedAt": "2026-11-07T13:41:02.113004Z",
-          "resumedFrom": 0, "succeededItems": [0], "failedItems": [] }
+          "auditEntryId": "0b7f4c33-51a2-4e0a-9c18-2f7d6a3e91b4", "resumedFrom": 0,
+          "succeededItems": [0], "failedItems": [] }
       ],
       "completedItems": 1,
       "succeededItems": [0],
@@ -2351,7 +2357,8 @@ deterministic tie-breaker, so two jobs created in the same instant always keep t
       "maxAttempts": 3,
       "attempts": [
         { "attempt": 1, "status": "COMPLETED", "startedAt": "2026-11-07T13:40:58.004117Z",
-          "completedAt": "2026-11-07T13:40:58.006902Z", "resumedFrom": 0,
+          "completedAt": "2026-11-07T13:40:58.006902Z",
+          "auditEntryId": "8e2a6b15-3c47-4f90-b2d5-7a1e9c40f682", "resumedFrom": 0,
           "succeededItems": [0], "failedItems": [] }
       ],
       "completedItems": 1,
