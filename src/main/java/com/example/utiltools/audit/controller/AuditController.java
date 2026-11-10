@@ -2,6 +2,7 @@ package com.example.utiltools.audit.controller;
 
 import com.example.utiltools.audit.dto.JournalReapResponse;
 import com.example.utiltools.audit.dto.JournalVerifyResponse;
+import com.example.utiltools.audit.dto.QuarantineStatusResponse;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
 import com.example.utiltools.audit.model.ReapReason;
@@ -126,5 +127,18 @@ public class AuditController {
             @RequestParam(value = "limit", required = false, defaultValue = "50") int limit,
             @RequestParam(value = "reason", required = false) ReapReason reason) {
         return ApiResponse.success(journal.reapLog(limit, reason), "Reap tombstones retrieved successfully");
+    }
+
+    @GetMapping("/quarantine-status")
+    @Operation(summary = "Get replay-lease quarantine status",
+               description = """
+                       Returns the effective `utiltools.audit.replay-lease-quarantine-threshold` and two
+                       counters: how many bounded `REPLAY_LEASE_QUARANTINED` tombstones the journal has
+                       recorded, and how many times replay claim leases have expired across the journal's
+                       entries (the counter that drives quarantine). Read-only — no reap pass runs and no
+                       entry, replay claim or tombstone is created or changed. Counts only: no request,
+                       result, replay owner token or lease deadline is returned.""")
+    public ApiResponse<QuarantineStatusResponse> quarantineStatus() {
+        return ApiResponse.success(journal.quarantineStatus(), "Quarantine status retrieved successfully");
     }
 }

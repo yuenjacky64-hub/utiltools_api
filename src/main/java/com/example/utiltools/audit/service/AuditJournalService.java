@@ -1,6 +1,7 @@
 package com.example.utiltools.audit.service;
 
 import com.example.utiltools.audit.dto.JournalReapResponse;
+import com.example.utiltools.audit.dto.QuarantineStatusResponse;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
 import com.example.utiltools.audit.model.OperationType;
@@ -739,6 +740,46 @@ public class AuditJournalService {
     /** The claim lease window, so the replay service can derive its heartbeat cadence. */
     public long replayLeaseSeconds() {
         return replayLeaseSeconds;
+    }
+
+    /** Rollbacks of one entry's replay claim allowed before quarantine; exposed read-only. */
+    public int replayLeaseQuarantineThreshold() {
+        return replayLeaseQuarantineThreshold;
+    }
+
+    /**
+     * Read-only quarantine snapshot: the effective quarantine threshold, how many bounded
+     * {@code REPLAY_LEASE_QUARANTINED} tombstones the journal holds, and how many times replay claim
+     * leases have expired across the journal's entries.
+     *
+     * <p>Read-only (INV-QS-1): it never runs a reap pass and never calls {@code classify},
+     * {@code applyDecision}, {@code recordReap}, {@code enforceBound} or {@code claimReplay}, so
+     * polling it cannot roll back a claim, fail an entry or append a tombstone. One
+     * {@code synchronized (lock)} block (INV-QS-3) makes the three values one journal instant, and
+     * the work is {@code O(maxEntries)} field reads with no snapshot list allocation (INV-QS-6).</p>
+     *
+     * <p>Each counter has exactly one source (INV-QS-2): {@code totalExpirationCount} sums the
+     * per-entry {@code replayLeaseExhaustionCount} — the counter that drives quarantine, including
+     * entries already quarantined — and {@code quarantinedCount} counts tombstones carrying
+     * {@link ReapReason#REPLAY_LEASE_QUARANTINED}. Tombstone counts are never added to the
+     * expiration sum, because a {@code ROLLBACK_CLAIM} reap both increments the counter and appends
+     * a {@code REPLAY_LEASE_EXPIRED} tombstone.</p>
+     */
+    public QuarantineStatusResponse quarantineStatus() {
+        synchronized (lock) {
+            int expirations = 0;
+            for (JournalRecord record : entries.values()) {
+                expirations += record.replayLeaseExhaustionCount;
+            }
+            int quarantined = 0;
+            for (ReapRecord tombstone : reaped) {
+                if (tombstone.reason() == ReapReason.REPLAY_LEASE_QUARANTINED) {
+                    quarantined++;
+                }
+            }
+            return new QuarantineStatusResponse(replayLeaseQuarantineThreshold, quarantined,
+                    expirations);
+        }
     }
 
     /** Package-visible: only {@link AuditReplayService} may read the private original request. */
