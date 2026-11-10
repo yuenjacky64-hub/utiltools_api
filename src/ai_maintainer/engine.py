@@ -77,11 +77,14 @@ from ai_maintainer.tasks.curriculum import (
 
 __all__ = [
     "CancelReport",
+    "CooperativeCancel",
     "CycleResult",
     "DEFAULT_CYCLE_INTERVAL_SEC",
     "DEFAULT_CANCEL_REASON",
     "DEFAULT_LEASE_TTL_SEC",
     "DEFAULT_STOP_REASON",
+    "FINALIZED_EVENT",
+    "FORCE_STOP_EVENT",
     "FingerprintBucket",
     "FingerprintCircuitState",
     "LEASE_ACQUIRED",
@@ -103,10 +106,20 @@ __all__ = [
     "LeaseTimeoutError",
     "LeaseTransitionError",
     "MaintainerEngine",
+    "MONITOR_STOPPED",
+    "MONITOR_TERMINAL",
+    "MONITOR_TIMEOUT",
+    "OUTCOME_FAILED",
+    "OUTCOME_INTERRUPTED",
+    "OUTCOME_SUCCESS",
+    "OUTCOME_TIMEOUT",
     "ReapReport",
     "RUNTIME_HEARTBEAT_FILE",
     "RUNTIME_MARKER_TMP_SUFFIX",
     "RUNTIME_PID_FILE",
+    "STOP_REASON_FAILED",
+    "STOP_REASON_STOPPED",
+    "STOP_REASON_TIMEOUT",
     "error_fingerprint",
 ]
 
@@ -114,6 +127,25 @@ EVENT_LOG_MAXLEN = 100
 DEFAULT_CYCLE_INTERVAL_SEC = 1.0
 DEFAULT_STOP_REASON = "stop_requested"
 DEFAULT_CANCEL_REASON = "cancel_requested"
+
+# Cooperative stop (REQ-01 .. REQ-04): the monitor tokens, the stop-reason
+# vocabulary ``_outcome_for()`` classifies and the outcome tokens it may return.
+# One table, one total classifier - no call site invents its own mapping.
+MONITOR_TERMINAL = "terminal"
+MONITOR_STOPPED = "stopped"
+MONITOR_TIMEOUT = "timeout"
+STOP_REASON_STOPPED = "stopped"
+STOP_REASON_FAILED = "failed"
+STOP_REASON_TIMEOUT = "timeout"
+OUTCOME_SUCCESS = "SUCCESS"
+OUTCOME_INTERRUPTED = "INTERRUPTED"
+OUTCOME_FAILED = "FAILED"
+OUTCOME_TIMEOUT = "TIMEOUT"
+
+# Cooperative-cancel events (REQ-02). A non-cooperative task is coerced in
+# bookkeeping only; the marker token is ``MONITOR_STOPPED``.
+FORCE_STOP_EVENT = "TASK_FORCE_STOPPED"
+FINALIZED_EVENT = "TASK_FINALIZED"
 
 # Execution leases (REQ-01 .. REQ-05): one ``Lease`` per cycle execution, both
 # the audit vocabulary and the history bound live here so every call site
@@ -206,6 +238,27 @@ def _signal_stop_reason(signum: int) -> str:
         return f"SIGNAL_{signal.Signals(int(signum)).name}"
     except (ValueError, TypeError):  # pragma: no cover - defensive
         return f"SIGNAL_{int(signum)}"
+
+
+#: REQ-04 / DOD-11: the stop *family* that classifies as an interruption on the
+#: bare reason (no ``interrupted`` flag needed). ``stop_requested`` and
+#: ``cancel_requested`` are deliberately **absent**: ``_stop_reason`` is
+#: initialised to ``stop_requested``, so mapping them here would turn every
+#: ordinary cycle into an interruption and flip UTILTOOLS-80 REQ-02 ("a stop
+#: observed after a committed step stays SUCCESS"); only the caller's
+#: ``interrupted`` statement may relax that. Fixed vocabulary, lower-cased once
+#: so the classifier never echoes or normalises input into a new token
+#: (INV-COOP-7).
+STOP_REASON_INTERRUPTIONS = frozenset(
+    token.lower()
+    for token in (
+        STOP_REASON_STOPPED,
+        "stop",
+        "cancelled",
+        _signal_stop_reason(signal.SIGTERM),
+        _signal_stop_reason(signal.SIGINT),
+    )
+)
 
 
 def _atomic_marker_write(path: Path, text: str) -> None:
@@ -492,6 +545,59 @@ class LeaseTransitionError(LeaseError):
         self.lease_id = lease_id
         self.reason = reason
         super().__init__(f"lease {lease_id!r} transition refused: {reason}")
+
+
+class CooperativeCancel(RuntimeError):
+    """Raised by a cooperative step that saw the stop/cancel signal (REQ-02).
+
+    ``reason`` is the stop reason that was published when the step observed the
+    signal, so :meth:`MaintainerEngine._outcome_for` can classify the cycle as
+    ``INTERRUPTED`` with a single, attributable call. The exception is
+    deliberately *not* a ``LeaseError`` and carries no fingerprint: a
+    cooperative stop is never an error.
+    """
+
+    def __init__(self, reason: str = STOP_REASON_STOPPED) -> None:
+        self.reason = str(reason)
+        super().__init__(f"cooperative cancel: {self.reason}")
+
+
+class StopSignalView:
+    """Read-only view of the engine's stop flag (REQ-02, INV-COOP-1).
+
+    Handed to step bodies through :attr:`MaintainerEngine.cancel_signal`. It
+    exposes exactly the two non-mutating ``threading.Event`` operations a poller
+    needs - ``is_set()`` and ``wait()`` - so a step body may block on the
+    wind-down but **cannot** publish a stop of its own: there is no ``set()`` /
+    ``clear()`` here to call. Review v3 NIT-02: the mutability guard on the
+    shared stop state is now structural instead of prose, and
+    :meth:`MaintainerEngine.request_stop` / :meth:`_publish_signal_reason` /
+    :meth:`MaintainerEngine.cancel_task` /
+    :meth:`MaintainerEngine._force_mark_stopped` stay the only writers
+    (INV-COOP-1; Review v4 NIT-03: coercion publishes the ``stopped`` reason,
+    so it is a writer too).
+    """
+
+    __slots__ = ("_event",)
+
+    def __init__(self, event: threading.Event) -> None:
+        self._event = event
+
+    def is_set(self) -> bool:
+        """Has a stop or cancel been published?"""
+
+        return self._event.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Block until a stop/cancel is published, or ``timeout`` elapses."""
+
+        return self._event.wait(timeout)
+
+    def __bool__(self) -> bool:
+        return self._event.is_set()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return f"StopSignalView(set={self._event.is_set()!r})"
 
 
 class LeaseAuditReporter:
@@ -1273,8 +1379,10 @@ class MaintainerEngine:
                     steps=0,
                     admitted=False,
                     # UTILTOOLS-80 DOD-05: the stop was seen while queued, so
-                    # the cycle never reached its review phase.
-                    outcome="INTERRUPTED",
+                    # the cycle never reached its review phase. REQ-04: the
+                    # token still comes from the one classifier, never from a
+                    # literal at the call site.
+                    outcome=self._outcome_for(self.stop_reason, interrupted=True),
                 )
             snapshot = self._capture_snapshot(cycle=cycle, difficulty=difficulty)
             self._register_cycle(cycle, difficulty, snapshot)
@@ -1409,6 +1517,64 @@ class MaintainerEngine:
 
         return self._cancel.is_set()
 
+    @property
+    def cancel_signal(self) -> StopSignalView:
+        """Read-only handle on the cooperative stop signal (REQ-02).
+
+        The returned :class:`StopSignalView` wraps the engine's own wind-down
+        flag: ``wait()`` returns as soon as a stop *or* a cancel is published, so
+        a step body can block on it instead of polling, and ``is_set()`` is the
+        non-raising predicate :meth:`check_cancel` uses. Only
+        :meth:`request_stop`, :meth:`_publish_signal_reason`,
+        :meth:`cancel_task` and :meth:`_force_mark_stopped` own the stop state
+        (INV-COOP-1) - the view has no mutator, so a step cannot publish an
+        unattributed stop (Review v3 NIT-02; Review v4 NIT-03 added the
+        coercion writer to this enumeration).
+        """
+
+        return StopSignalView(self._stop)
+
+    def check_cancel(self) -> bool:
+        """Cooperative check for a step body (REQ-02): ``True`` = finalize now.
+
+        Reads the stop and cancel flags without taking ``_lock`` and never
+        raises, so a step can call it between sub-operations as often as it
+        likes (INV-COOP-3). ``False`` means "keep working"; it is a hint, not a
+        guarantee - the flags may turn true one instruction later.
+        """
+
+        try:
+            return self._wind_down_requested()
+        except BaseException:  # pragma: no cover - defensive, never raises
+            return False
+
+    def check_cancel_now(self) -> None:
+        """Raise :class:`CooperativeCancel` when a stop is pending (REQ-02).
+
+        The exception-shaped variant of :meth:`check_cancel` for steps that
+        would rather unwind with ``raise`` than with a return-value ladder. The
+        reason carried is the published stop reason, so the cycle body can
+        classify the result as ``INTERRUPTED`` with
+        :meth:`_outcome_for` (REQ-04) and never as ``FAILED``.
+        """
+
+        if not self.check_cancel():
+            return
+        raise CooperativeCancel(self.check_cancel_reason())
+
+    def check_cancel_reason(self) -> str:
+        """The reason a pending stop/cancel should be attributed to (REQ-02).
+
+        A cancel is attributed to ``cancel_requested`` and a stop to the reason
+        the first publisher recorded, so a step never invents a reason
+        (INV-COOP-1).
+        """
+
+        with self._lock:
+            if self._cancel.is_set():
+                return self._cancel_reason or DEFAULT_CANCEL_REASON
+            return self._stop_reason or DEFAULT_STOP_REASON
+
     def _wind_down_requested(self) -> bool:
         """Stop flag or cancel flag — the state behind :meth:`should_stop`.
 
@@ -1480,14 +1646,21 @@ class MaintainerEngine:
 
         # INV-CANCEL-1: the wait holds no engine lock (mirrors ``shutdown()``),
         # so the running cycle can still commit its step and reach its break.
-        deadline = started + timeout
-        timed_out = False
-        while not self._cycle_done.is_set():
-            remaining = deadline - self._clock()
-            if remaining <= 0.0:
-                timed_out = True
-                break
-            self._sleep(min(SHUTDOWN_POLL_INTERVAL_SEC, remaining))
+        #
+        # REQ-01: the wait is the shared ``_monitor_until_terminal`` loop, so
+        # this path can never drift from ``shutdown()``'s. ``honour_stop=False``
+        # keeps the documented contract above (return only once the in-flight
+        # cycle left ``run_cycle()``): a *stop* published meanwhile must not cut
+        # the cancel wait short.
+        status = self._monitor_until_terminal(
+            timeout_sec=timeout, honour_stop=False, coerce=False
+        )
+        # Review v3 SHOULD_FIX: every non-terminal exit of the shared loop is a
+        # timeout for *this* caller. The loop can also come back ``MONITOR_
+        # STOPPED`` (a coercion), and reporting ``timed_out=False`` while the
+        # cycle is still inside ``run_cycle()`` would contradict the documented
+        # "returns only after the in-flight cycle left ``run_cycle()``".
+        timed_out = status != MONITOR_TERMINAL
         waited_sec = max(0.0, self._clock() - started)
 
         with self._lock:
@@ -1643,16 +1816,20 @@ class MaintainerEngine:
             try:
                 self._publish_signal_reason()
                 self._log_stop_reason()
-                report = self.graceful_shutdown()
-                # INV-MARK-4 / DOD-03: the markers are published at entry, but
-                # ``shutdown()`` is idempotent and returns its cached report on
-                # a second ``run_forever()`` without re-running the marker
-                # cleanup. Clearing here (a no-op when ``shutdown()`` already
-                # did it) keeps the loop's exit free of stale
-                # ``maintainer.pid``/heartbeat files no matter how many times
-                # it is entered.
-                self._clear_runtime_markers()
-                return report
+                try:
+                    report = self.graceful_shutdown()
+                    return report
+                finally:
+                    # REQ-03 / INV-COOP-4: the teardown runs *after* the
+                    # heartbeat stamp and the memory ``_save()``, so an operator
+                    # reading the markers during the wind-down still sees the
+                    # ``STOPPED`` heartbeat. It lives in ``finally`` so a
+                    # raising ``graceful_shutdown()`` (or a second Ctrl-C during
+                    # the drain) cannot strand ``maintainer.pid`` /
+                    # ``maintainer.heartbeat``; a second call is safe because
+                    # ``shutdown()`` is memoized (INV-MARK-4) and
+                    # ``_clear_runtime_markers()`` unlinks only what exists.
+                    self._clear_runtime_markers()
             finally:
                 if previous:
                     _restore_stop_handlers(previous)
@@ -1743,17 +1920,217 @@ class MaintainerEngine:
         heartbeat, persists the memory document and unlinks the runtime markers,
         so letting an impatient second Ctrl-C unwind through here would leave
         the stale state REQ-03 forbids. The wait stays bounded by ``deadline``.
+
+        REQ-01: this is a thin wrapper over :meth:`_monitor_until_terminal`, so
+        the teardown and the operator-facing monitor can never disagree about
+        the poll interval, the ``KeyboardInterrupt`` tolerance or the bound.
+        ``honour_stop=False`` because the whole point of the drain is to wait
+        for an *already published* stop to reach its break point
+        (INV-COOP-2): returning early on the flag would defeat it.
         """
 
-        while not self._cycle_done.is_set():
+        timeout = max(0.0, deadline - self._clock())
+        status = self._monitor_until_terminal(timeout_sec=timeout, honour_stop=False)
+        return status == MONITOR_TIMEOUT
+
+    def _monitor_until_terminal(
+        self,
+        poll_interval_sec: float | None = None,
+        *,
+        timeout_sec: float | None = None,
+        honour_stop: bool = True,
+        coerce: bool = True,
+    ) -> str:
+        """Poll the in-flight cycle until it ends, times out, or a stop lands.
+
+        REQ-01: one monitoring helper for every wait loop in the engine, so a
+        stop is observed *within one poll interval* instead of at the end of a
+        full cycle. Returns one of :data:`MONITOR_TERMINAL`,
+        :data:`MONITOR_STOPPED` or :data:`MONITOR_TIMEOUT`.
+
+        ``poll_interval_sec`` defaults to :data:`SHUTDOWN_POLL_INTERVAL_SEC`
+        and is validated by :meth:`_interval`; ``timeout_sec`` defaults to
+        ``config.max_shutdown_wait_sec`` and is validated by
+        :meth:`_cancel_timeout`. ``honour_stop=False`` keeps waiting after a
+        stop was published - only :meth:`cancel_task` and the teardown drain
+        ask for that (INV-COOP-2).
+
+        ``coerce`` (default ``True``) allows the timeout path to force-mark the
+        *monitored* task as stopped when a stop is already published but the
+        cycle never left ``run_cycle()`` (REQ-02). :meth:`cancel_task` passes
+        ``coerce=False`` because ``self._monitored`` may then belong to a
+        *different* in-flight cycle than the task it cancelled - the cancelled
+        task is already parked ``CANCELLED`` by the caller, so there is nothing
+        here to coerce and no foreign task to touch (Review v3 SHOULD_FIX).
+
+        INV-COOP-3: no lock is held across the wait, so a cycle that is
+        mid-commit can still acquire ``_lock`` and finish. INV-COOP-5: a
+        ``KeyboardInterrupt`` raised by ``self._sleep`` is a repeated stop
+        request, not an abort, so the loop keeps polling.
+        """
+
+        interval = (
+            SHUTDOWN_POLL_INTERVAL_SEC
+            if poll_interval_sec is None
+            else self._interval(poll_interval_sec)
+        )
+        bound = self._cancel_timeout(timeout_sec)
+        started = self._clock()
+        deadline = started + bound
+        while True:
+            if self._cycle_done.is_set():
+                return MONITOR_TERMINAL
+            if honour_stop and self.should_stop():
+                return MONITOR_STOPPED
             remaining = deadline - self._clock()
             if remaining <= 0.0:
-                return True
+                # REQ-02 coercion: a task that ignored every ``check_cancel()``
+                # is force-marked in bookkeeping, and only that coercion turns
+                # the timeout into a ``stopped`` token - an honest timeout
+                # (nothing to coerce, or no stop pending) stays a timeout.
+                # ``_force_mark_stopped`` takes ``_lock`` itself, so the wait
+                # never nests it (INV-COOP-3).
+                if coerce and not honour_stop and self.should_stop():
+                    coerced = self._force_mark_stopped(
+                        self._monitored,
+                        max(0.0, self._clock() - started),
+                        bound,
+                    )
+                    if coerced:
+                        return MONITOR_STOPPED
+                return MONITOR_TIMEOUT
             try:
-                self._sleep(min(SHUTDOWN_POLL_INTERVAL_SEC, remaining))
+                self._sleep(min(interval, remaining))
             except KeyboardInterrupt:
                 continue
-        return False
+
+    @classmethod
+    def _outcome_for(cls, stop_reason: Any, *, interrupted: bool = False) -> str:
+        """Classify a finished cycle from its stop reason (REQ-04).
+
+        Total by construction (INV-COOP-6): ``None``, unknown and non-``str``
+        input all classify, and the result is always one of
+        :data:`OUTCOME_SUCCESS`, :data:`OUTCOME_INTERRUPTED`,
+        :data:`OUTCOME_FAILED` or :data:`OUTCOME_TIMEOUT`, so no call site
+        invents its own mapping.
+
+        DOD-11 (plan v1.3): the stop *family* in
+        :data:`STOP_REASON_INTERRUPTIONS` - ``stopped`` (the token
+        :meth:`_force_mark_stopped` publishes for a coerced task), ``stop``,
+        ``cancelled`` and the two ``SIGNAL_*`` reasons - classifies as
+        ``INTERRUPTED`` on the bare reason, because a task the operator
+        interrupted is *not* a failure. ``"failed"``/``"timeout"`` keep their
+        tokens so a genuine failure is never laundered as an interruption.
+        ``interrupted`` wins over every reason (UTILTOOLS-80 attribution).
+        ``stop_requested``/``cancel_requested`` stay ``SUCCESS`` for the reason
+        spelled out in :data:`STOP_REASON_INTERRUPTIONS`.
+
+        INV-COOP-7: the comparison is exact-match on the token vocabulary, so no
+        reason is echoed into a path or a log token it did not come from.
+        """
+
+        if interrupted:
+            return OUTCOME_INTERRUPTED
+        if not isinstance(stop_reason, str) or not stop_reason:
+            return OUTCOME_SUCCESS
+        # DOD-11: the stop family is an interruption on the bare reason. The
+        # comparison is case-insensitive so an operator-facing spelling
+        # (``STOPPED``) cannot smuggle itself past the interrupt rows.
+        # NIT-01 (Review v4): the fold *and* every comparison that consumes it
+        # sit inside one guard, so a hostile ``str`` subclass whose
+        # ``strip()``/``lower()`` yields something unhashable (the set
+        # membership below would raise ``TypeError``) still classifies instead
+        # of raising. Engine-reachable input is unaffected - every writer
+        # stores a plain ``str`` or ``None``.
+        try:
+            token = stop_reason.strip().lower()
+            if token in STOP_REASON_INTERRUPTIONS:
+                return OUTCOME_INTERRUPTED
+            if token == STOP_REASON_FAILED:
+                return OUTCOME_FAILED
+            if token == STOP_REASON_TIMEOUT:
+                return OUTCOME_TIMEOUT
+        except BaseException:  # pragma: no cover - hostile str subclass
+            return OUTCOME_SUCCESS
+        return OUTCOME_SUCCESS
+
+    def _force_mark_stopped(
+        self,
+        task: TaskSpec | None,
+        waited_sec: float,
+        timeout_sec: float | None = None,
+    ) -> bool:
+        """Force-mark a non-cooperative task as stopped (REQ-02 coercion).
+
+        Returns ``True`` when it coerced, ``False`` when there was nothing to
+        coerce (no task, or the task is already terminal) - the caller turns
+        that into the ``stopped`` token, so a drain with no monitored task still
+        reports an honest timeout.
+
+        "Force-marked" is bookkeeping only, never termination: the task is
+        parked in the existing terminal :attr:`TaskState.CANCELLED` (no new
+        ``TaskState`` member, INV-COOP-8) and exactly one
+        :data:`FORCE_STOP_EVENT` is appended with the wait that was spent on it.
+        A task that already ran its own ``check_cancel()`` path is terminal here
+        and is not re-marked, so the event is never duplicated.
+
+        MUST_FIX (Review v3): publishing the reason is part of coercion. The
+        stop reason becomes :data:`STOP_REASON_STOPPED` so the ``stopped`` row of
+        :meth:`_outcome_for` is reachable *from the engine* - the cycle that was
+        still inside ``run_cycle()`` when the window expired now classifies as
+        ``INTERRUPTED`` instead of inheriting the pre-coercion
+        ``stop_requested``/``SIGNAL_*`` reason and reporting ``SUCCESS``.
+        Attribution is not lost: ``STOP_REQUESTED``/``STOP_HONOURED`` recorded
+        the operator's reason before the drain started, and this event carries
+        the coercion's own facts.
+
+        ``timeout_sec`` is the bound that was *actually* applied (the drain
+        passes ``deadline - clock``), so the event reports the real window
+        instead of always echoing ``config.max_shutdown_wait_sec`` (NIT-01).
+
+        MUST_FIX (Review v7): coercion is *terminal*, so it also unbinds the
+        cycle slot that still points at the task. ``CANCELLED`` is a sink state
+        (``Implementation_Plan.md:101``, INV-COOP-8), but the in-flight step's
+        commit block used to guard on slot identity only - leaving the slot
+        bound let the uncooperative step return later and walk the coerced
+        record forward (``progress + 1``, then ``CANCELLED`` ->
+        ``COMPLETED`` plus a ``COMPLETED`` tally that clears the block streak).
+        Unbinding here makes the late commit observe a slot it no longer owns
+        and discard the step; the commit path carries its own terminal-state
+        guard as a second line of defence.
+        """
+
+        if task is None or task.state not in NON_TERMINAL:
+            return False
+        bound = (
+            float(self._config.max_shutdown_wait_sec)
+            if timeout_sec is None
+            else float(timeout_sec)
+        )
+        with self._lock:
+            task.state = TaskState.CANCELLED
+            task.pending_since = None
+            # MUST_FIX (Review v7): unbind every cycle slot still holding the
+            # coerced task, mirroring the ``cancel_task`` bookkeeping (REQ-05),
+            # so the in-flight step's commit is discarded instead of
+            # resurrecting the record to COMPLETED.
+            for slot, bound_task in list(self._monitored_by_cycle.items()):
+                if bound_task is task:
+                    self._monitored_by_cycle.pop(slot, None)
+            if self._carried_monitored is task:
+                self._carried_monitored = None
+            self._stop_reason = STOP_REASON_STOPPED
+            self._events.append(
+                {
+                    "event": FORCE_STOP_EVENT,
+                    "task": str(task.name),
+                    "cycle": int(self._cycles),
+                    "waited_sec": float(waited_sec),
+                    "timeout_sec": bound,
+                    "reason": self._stop_reason,
+                }
+            )
+        return True
 
     def _shielded(self, step: Callable[[], Any]) -> Any:
         """Run a teardown step that a repeated stop signal must not abort.
@@ -2093,8 +2470,14 @@ class MaintainerEngine:
                 break
             # Monitor step body runs outside the lock.
             error: BaseException | None = None
+            cooperative: CooperativeCancel | None = None
             try:
                 self._monitor_step(task)
+            except CooperativeCancel as exc:
+                # REQ-02 / REQ-04: a step that observed the signal and unwound
+                # on purpose is an *interruption*, never a failure - it must not
+                # reach the BLOCKED tally below or open a quarantine circuit.
+                cooperative = exc
             except Exception as exc:  # pragma: no cover - defensive path
                 error = exc
 
@@ -2103,6 +2486,34 @@ class MaintainerEngine:
                     # A concurrent cycle preempted or retired it: discard.
                     steps += 1
                     continue
+                if task.state is not TaskState.RUNNING:
+                    # MUST_FIX (Review v7): the record is already terminal, so
+                    # the step's result must not be committed at all. This is
+                    # the second line of defence behind the slot unbinding in
+                    # ``_force_mark_stopped``: a coerced (``TASK_FORCE_STOPPED``)
+                    # task stays in its sink state instead of being walked
+                    # forward to ``COMPLETED`` (and clearing its block streak)
+                    # by a step that returned after the cancel window expired.
+                    steps += 1
+                    continue
+                if cooperative is not None:
+                    # The step finalized its in-progress work and left of its
+                    # own accord: park the task in the existing terminal
+                    # CANCELLED state (INV-COOP-8) and record exactly one
+                    # FINALIZED_EVENT instead of a failure tally.
+                    task.state = TaskState.CANCELLED
+                    task.pending_since = None
+                    self._monitored_by_cycle.pop(cycle, None)
+                    self._events.append(
+                        {
+                            "event": FINALIZED_EVENT,
+                            "task": str(task.name),
+                            "cycle": int(cycle),
+                            "reason": cooperative.reason,
+                        }
+                    )
+                    interrupted = True
+                    break
                 if error is not None:
                     task.state = TaskState.FAILED
                     task.pending_since = None
@@ -2139,7 +2550,9 @@ class MaintainerEngine:
             steps=steps,
             admitted=True,
             memory_cycle=cycle if memory_installed else None,
-            outcome="INTERRUPTED" if interrupted else "SUCCESS",
+            # REQ-04: one total classifier decides the outcome token; the
+            # UTILTOOLS-80 ``interrupted`` short-circuit keeps precedence.
+            outcome=self._outcome_for(self.stop_reason, interrupted=interrupted),
             interrupted_by=(
                 ("STOP" if self._stop.is_set() else "CANCEL")
                 if interrupted
