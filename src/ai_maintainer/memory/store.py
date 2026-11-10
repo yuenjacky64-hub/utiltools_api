@@ -58,10 +58,14 @@ LOG = logging.getLogger(__name__)
 
 _COLLECTIONS = ("runs", "bug_fixes", "learnings")
 
+#: How many ``<name>.corrupt-<stamp>[-n]`` names a quarantine may try before it
+#: gives up and leaves the document in place (UTILTOOLS-82).
+_QUARANTINE_ATTEMPTS = 10
+
 #: Fields an import uses to recognise a record it has already seen. The first
 #: field of each tuple is the brief key of UTILTOOLS-79 REQ-04; the remaining
 #: ones are the validators' identity keys, which must also be unique or the
-#: next ``_read`` would blank the store.
+#: next ``_load`` would blank the store.
 _DEDUPE_FIELDS: dict[str, tuple[tuple[str, str], ...]] = {
     "runs": (("task_id", "text"), ("run_id", "text")),
     "bug_fixes": (("git_commit", "text"), ("fix_id", "text")),
@@ -105,6 +109,31 @@ def _corrupt_label(issues: Collection[str]) -> str:
     if first.startswith("MEMORY_CORRUPT"):
         return first
     return f"MEMORY_CORRUPT: {first}"
+
+
+def _structure_issues(document: Any) -> list[str]:
+    """One ``MEMORY_CORRUPT`` issue per collection key that is missing/not a list.
+
+    Only the envelope is inspected: a non-mapping root is left to
+    :func:`validate_memory_records`, and the values themselves are never
+    iterated, counted or coerced, so a huge or exotic payload cannot make the
+    predicate expensive or raise (UTILTOOLS-82 REQ-01/REQ-02/REQ-03).
+    """
+
+    if not isinstance(document, Mapping):
+        return []  # root shape stays with validate_memory_records
+    issues: list[str] = []
+    for name in _COLLECTIONS:
+        if name not in document:
+            issues.append(
+                f"MEMORY_CORRUPT: {MEMORY_DOC_NAME} is missing the '{name}' list"
+            )
+        elif not isinstance(document[name], list):
+            issues.append(
+                f"MEMORY_CORRUPT: {MEMORY_DOC_NAME} field '{name}' must be a list"
+                f" (got {type(document[name]).__name__})"
+            )
+    return issues
 
 
 def _finite_timestamp(value: Any) -> float | None:
@@ -390,10 +419,13 @@ class MemoryStore:
         self._clock = clock
         self._records: dict[str, list[Any]] = {name: [] for name in _COLLECTIONS}
         self._issues: list[str] = []
-        # ``False`` once ``_read`` met a corrupt document: the empty records are
+        # ``False`` once ``_load`` met a corrupt document: the empty records are
         # then a degraded view, not the truth, so exporting or importing over
         # them would destroy the bytes still on disk (UTILTOOLS-79).
         self._loaded_ok = True
+        # Where a structural failure moved the document, if it fired at all
+        # (UTILTOOLS-82); ``None`` until then and after a failed rename.
+        self._quarantined_path: Path | None = None
         # Leaf-most lock in the engine's order (gate -> engine ``_lock`` ->
         # this), taken by every read/write of the in-memory document so
         # overlapping cycles cannot interleave a record append with a restore
@@ -412,10 +444,10 @@ class MemoryStore:
         """
 
         store = cls(path, clock=clock)
-        store._read()
+        store._load()
         return store
 
-    def _read(self) -> None:
+    def _load(self) -> None:
         path = self._path
         try:
             info = os.lstat(path)
@@ -453,6 +485,12 @@ class MemoryStore:
                 f"({type(error).__name__})"
             ]
             return
+        structure = _structure_issues(document)
+        if structure:
+            self._loaded_ok = False
+            self._issues = structure
+            self._quarantine_corrupt_file()
+            return
         issues = validate_memory_records(document)
         if issues:
             self._loaded_ok = False
@@ -460,6 +498,81 @@ class MemoryStore:
             return
         for name in _COLLECTIONS:
             self._records[name] = list(document[name])
+
+    def _quarantine_corrupt_file(self) -> Path | None:
+        """Move a structurally corrupt document aside; ``None`` when it cannot.
+
+        The bytes are preserved under ``<name>.corrupt-<stamp>[-n]`` beside the
+        document so a later ``save()`` can start a fresh file without destroying
+        the evidence. Every failure - no file, a non-regular file, a read-only
+        directory - is logged or silently skipped instead of raised: the load
+        path must never fail because the quarantine could not be performed
+        (UTILTOOLS-82, INV-STR-1).
+        """
+
+        if self._quarantined_path is not None:
+            return self._quarantined_path
+        try:
+            info = os.lstat(self._path)
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            return None  # never rename a link, FIFO, directory or device
+        try:
+            stamp = str(int(self._clock()))
+        except (TypeError, ValueError, OverflowError):
+            stamp = "0"
+        parent = self._path.parent
+        name = self._path.name
+        candidates = [parent / f"{name}.corrupt-{stamp}"]
+        candidates += [
+            parent / f"{name}.corrupt-{stamp}-{index}"
+            for index in range(1, _QUARANTINE_ATTEMPTS + 1)
+        ]
+        for candidate in candidates:
+            try:
+                os.close(
+                    os.open(
+                        candidate,
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                        0o600,
+                    )
+                )
+            except FileExistsError:
+                continue
+            except OSError as error:
+                LOG.warning(
+                    "memory document quarantine unavailable: %s (%s)",
+                    candidate,
+                    type(error).__name__,
+                )
+                return None
+            try:
+                os.replace(self._path, candidate)
+            except OSError as error:
+                try:
+                    candidate.unlink()
+                except OSError:
+                    pass
+                LOG.warning(
+                    "memory document quarantine failed: %s -> %s (%s)",
+                    self._path,
+                    candidate,
+                    type(error).__name__,
+                )
+                return None
+            try:  # the rename carries the document's own mode; tighten it
+                os.chmod(candidate, 0o600)
+            except OSError:
+                pass
+            LOG.warning("memory document quarantined: %s -> %s", self._path, candidate)
+            self._quarantined_path = candidate
+            return candidate
+        LOG.warning(
+            "memory document quarantine skipped: no free name for %s",
+            self._path,
+        )
+        return None
 
     def records(self) -> dict[str, Any]:
         """Defensive copy of the document this store would write."""
@@ -477,6 +590,17 @@ class MemoryStore:
         """The issues found by the last :meth:`save` / :meth:`load`."""
 
         return list(self._issues)
+
+    def quarantined_path(self) -> str | None:
+        """Where a structural failure moved the document, ``None`` otherwise.
+
+        Read-only and lock-free: the value is set at most once, inside the
+        single-threaded :meth:`load` (UTILTOOLS-82).
+        """
+
+        if self._quarantined_path is None:
+            return None
+        return str(self._quarantined_path)
 
     def validate(
         self,
