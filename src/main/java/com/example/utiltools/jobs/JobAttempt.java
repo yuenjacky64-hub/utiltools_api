@@ -3,6 +3,7 @@ package com.example.utiltools.jobs;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 import java.time.Instant;
+import java.util.List;
 
 /**
  * One execution attempt of a batch hash job: the 1-based attempt number, the status that attempt
@@ -18,6 +19,12 @@ import java.time.Instant;
  * attempt hashed, i.e. the size of the durable prefix the job carried into the attempt. It is
  * {@code 0} for a first attempt and for a retry that had no committed progress, and non-zero for a
  * retry that resumed at a checkpoint. Being a primitive, it is always serialized.</p>
+ *
+ * <p>{@code succeededItems} and {@code failedItems} are the additive per-item projection of this
+ * attempt ({@code REQ-02}): ascending input indices, empty when the attempt has none, and bounded
+ * by the job's {@code itemCount}. A {@code RUNNING} row therefore reports the progress so far and a
+ * terminal row the attempt's frozen outcome, so a partially failed batch is readable as
+ * "these indices hashed, those threw" without failing the whole attempt as a unit.</p>
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record JobAttempt(
@@ -27,12 +34,20 @@ public record JobAttempt(
         Instant completedAt,
         String error,
         String auditEntryId,
-        int resumedFrom
+        int resumedFrom,
+        List<Integer> succeededItems,
+        List<Integer> failedItems
 ) {
+
+    /** Backward-compatible constructor for the 7-component checkpoint-resume shape. */
+    public JobAttempt(int attempt, JobStatus status, Instant startedAt, Instant completedAt, String error,
+            String auditEntryId, int resumedFrom) {
+        this(attempt, status, startedAt, completedAt, error, auditEntryId, resumedFrom, List.of(), List.of());
+    }
 
     /** Backward-compatible constructor for call sites that predate per-attempt journalling. */
     public JobAttempt(int attempt, JobStatus status, Instant startedAt, Instant completedAt, String error) {
-        this(attempt, status, startedAt, completedAt, error, null, 0);
+        this(attempt, status, startedAt, completedAt, error, null, 0, List.of(), List.of());
     }
 
     /**
@@ -41,6 +56,6 @@ public record JobAttempt(
      */
     public JobAttempt(int attempt, JobStatus status, Instant startedAt, Instant completedAt, String error,
             String auditEntryId) {
-        this(attempt, status, startedAt, completedAt, error, auditEntryId, 0);
+        this(attempt, status, startedAt, completedAt, error, auditEntryId, 0, List.of(), List.of());
     }
 }
