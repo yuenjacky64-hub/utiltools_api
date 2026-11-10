@@ -1821,23 +1821,13 @@ public class BatchHashJobService {
             boolean running = job.status == JobStatus.RUNNING;
             // The checkpoint projection is derived, never stored: a second counter could drift across
             // the reap / retry / cancel edges.
-            int completedItems = switch (job.status) {
-                case COMPLETED -> job.items.size(); // the prefix was cleared when results were published
-                case CANCELLING, CANCELLED -> 0; // never expose a cancelled job's prefix
-                default -> job.checkpoint.size(); // QUEUED / RUNNING / FAILED
-            };
+            int completedItems = completedItems(job);
             // Per-item projections, derived the same way (REQ-02). A cancelled job withdrew its
             // progress, so it discloses neither set; a COMPLETED job's checkpoint was moved into
-            // results, so its successes are exactly 0..size-1.
-            List<Integer> succeededItems = switch (job.status) {
-                case COMPLETED -> allIndexes(job.items.size());
-                case CANCELLING, CANCELLED -> List.of();
-                default -> List.copyOf(job.checkpoint.keySet()); // TreeMap key set is ascending
-            };
-            List<Integer> failedItems = switch (job.status) {
-                case COMPLETED, CANCELLING, CANCELLED -> List.of();
-                default -> ascending(job.failedItems);
-            };
+            // results, so its successes are exactly 0..size-1. The helpers are shared with the journal
+            // payload, so the snapshot and its audit row are computed from one source.
+            List<Integer> succeeded = succeededItems(job);
+            List<Integer> failed = failedItems(job);
             return new BatchHashJobResponse(job.jobId, job.idempotencyKey, job.status, job.items.size(),
                     job.results, job.error, job.createdAt, job.startedAt, job.completedAt,
                     job.attempt, job.maxAttempts, List.copyOf(job.attemptHistory),
@@ -1845,7 +1835,7 @@ public class BatchHashJobService {
                     running ? job.lastHeartbeatAt : null,
                     completedItems,
                     job.deadlineAt, // projected for every status: null when the job has no bound
-                    succeededItems, failedItems);
+                    succeeded, failed);
         }
     }
 
@@ -1970,12 +1960,11 @@ public class BatchHashJobService {
                             } else {
                                 // INV-PI-6: at least one item failed. results stay null (a partial list is
                                 // never published) and both per-item sets are retained, so the batch is
-                                // resumable rather than lost.
+                                // resumable rather than lost. The code is exactly BATCH_ITEM_HASH_FAILED
+                                // (never a code with an appended cause): clients switch on it, and the
+                                // per-item causes ride the journal payload instead.
                                 job.results = null;
-                                String detail = firstItemFailure(job);
-                                job.error = detail == null
-                                        ? BATCH_HASH_FAILED
-                                        : BATCH_ITEM_HASH_FAILED + ": " + detail;
+                                job.error = BATCH_ITEM_HASH_FAILED;
                                 job.status = JobStatus.FAILED;
                                 job.completedAt = Instant.now(clock);
                                 job.lastHeartbeatAt = null;
@@ -2224,18 +2213,37 @@ public class BatchHashJobService {
     }
 
     /**
-     * The detail of the lowest-index failed item, or null when nothing failed; it is what a partially
-     * hashed batch appends to its error code so the cause stays visible on the snapshot.
+     * The job-wide success projection, shared by {@link #snapshot(MutableJob)} and the journal payload
+     * so the two can never disagree ({@code REQ-02}). A cancelled job withdrew its progress and a
+     * COMPLETED job's checkpoint was moved into {@code results}, so both are projected from status.
      */
-    private static String firstItemFailure(MutableJob job) {
-        int first = job.failedItems.nextSetBit(0);
-        return first < 0 ? null : job.itemErrors.get(first);
+    private static List<Integer> succeededItems(MutableJob job) {
+        return switch (job.status) {
+            case COMPLETED -> allIndexes(job.items.size());
+            case CANCELLING, CANCELLED -> List.of();
+            default -> List.copyOf(job.checkpoint.keySet()); // TreeMap key set is ascending
+        };
+    }
+
+    /** The job-wide failure projection, derived exactly like {@link #succeededItems(MutableJob)}. */
+    private static List<Integer> failedItems(MutableJob job) {
+        return switch (job.status) {
+            case COMPLETED, CANCELLING, CANCELLED -> List.of();
+            default -> ascending(job.failedItems);
+        };
     }
 
     /**
-     * The per-attempt item-outcome payload of the attempt's closing journal entry ({@code REQ-03}):
-     * which indices this attempt hashed, which it failed and the bounded cause of each failure.
-     * Indices only - no item text and no secret key - so the journal stays a bounded replay trail.
+     * The item-outcome payload of the attempt's closing journal entry ({@code REQ-03}, {@code DOD-06}):
+     * how many items the batch holds, how many are durably hashed ({@code checkpointItems}), which item
+     * indices succeeded ({@code itemSuccesses}), which failed ({@code itemFailures}) and the bounded
+     * cause of each failure ({@code itemFailureErrors}) - the plan's schema, verbatim.
+     *
+     * <p>Every projection is job-wide and identical to what {@link #snapshot(MutableJob)} publishes, so a
+     * resumed attempt's row also reports the prefix it inherited instead of only the indices it hashed
+     * itself. Indices only - no item text and no secret key - so the journal stays a bounded replay
+     * trail. {@code outcome}, {@code resultCount}, {@code resumedFrom} and {@code completedItems} are the
+     * keys the entry carried before item tracking existed and are kept for existing replay consumers.
      */
     private Map<String, Object> itemOutcomePayload(MutableJob job, int generation, String outcome) {
         List<Map<String, Object>> failures = new ArrayList<>();
@@ -2245,14 +2253,17 @@ public class BatchHashJobService {
             failures.add(Map.of("index", i, "error",
                     boundedAuditText(job.itemErrors.get(i), BATCH_ITEM_HASH_FAILED)));
         }
+        int completedItems = completedItems(job);
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("outcome", outcome);
         payload.put("resultCount", job.items.size());
         payload.put("resumedFrom", job.attemptResumedFrom.getOrDefault(generation, 0));
-        payload.put("completedItems", completedItems(job));
-        payload.put("succeededItems", ascending(attemptSucceeded(job, generation)));
-        payload.put("failedItems", ascending(job.failedItems));
-        payload.put("failedItemErrors", failures);
+        payload.put("completedItems", completedItems);
+        // checkpointItems equals the durably hashed entry count (entries 0..size-1 on a finished batch).
+        payload.put("checkpointItems", completedItems);
+        payload.put("itemSuccesses", succeededItems(job));
+        payload.put("itemFailures", failedItems(job));
+        payload.put("itemFailureErrors", failures);
         return payload;
     }
 
