@@ -33,11 +33,13 @@ from ai_maintainer.engine import (
     RUNTIME_MARKER_TMP_SUFFIX,
     RUNTIME_PID_FILE,
     STOP_REASON_FAILED,
+    STOP_REASON_INTERRUPTIONS,
     STOP_REASON_STOPPED,
     STOP_REASON_TIMEOUT,
     CooperativeCancel,
     CycleResult,
     MaintainerEngine,
+    StopSignalView,
 )
 from ai_maintainer.tasks.curriculum import (
     Difficulty,
@@ -363,6 +365,18 @@ def test_uncooperative_task_force_marked_stopped(tmp_path: Path) -> None:
     assert len(coerced) == 1  # exactly once, never duplicated
     assert coerced[0]["task"] == "task-a"
     assert coerced[0]["waited_sec"] >= 0.15
+    # Review v3 MUST_FIX: coercion *publishes* the ``stopped`` token, so the
+    # classifier row is reachable from the engine and not only from a direct
+    # ``_outcome_for`` call. A cycle still inside ``run_cycle()`` now classifies
+    # INTERRUPTED instead of inheriting the pre-coercion ``stop_requested``.
+    assert coerced[0]["reason"] == STOP_REASON_STOPPED
+    assert engine.stop_reason == STOP_REASON_STOPPED
+    assert (
+        MaintainerEngine._outcome_for(engine.stop_reason) == OUTCOME_INTERRUPTED
+    )
+    # Review v3 NIT-01: the event reports the bound this caller actually
+    # supplied, not always ``config.max_shutdown_wait_sec``.
+    assert coerced[0]["timeout_sec"] == pytest.approx(0.15)
     seen = getattr(engine, "seen", None)
     assert seen is not None and seen.state is TaskState.CANCELLED
 
@@ -453,22 +467,27 @@ def test_sigterm_during_run_once_cleans_markers(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "reason",
-    ["stop_requested", "cancel_requested", "SIGNAL_SIGTERM", "SIGNAL_SIGINT"],
+    sorted(STOP_REASON_INTERRUPTIONS),
 )
 def test_outcome_for_maps_stop_reasons_to_interrupted(reason: str) -> None:
-    """DOD-11: the coercion token and every interruption map to INTERRUPTED.
+    """DOD-11: the whole stop family classifies as INTERRUPTED on the bare reason.
 
-    ``interrupted`` is the caller's "the stop ended the cycle before it could
-    commit" statement, so the stop-family reasons classify through it. A stop
-    seen *after* a committed step deliberately stays ``SUCCESS`` (UTILTOOLS-80
-    REQ-02), which is why the bare reason alone is not enough.
+    Plan §4.4 row 2: ``stopped`` (the coercion token), ``stop``, ``cancelled``
+    and the two ``SIGNAL_*`` reasons are interruptions *without* the caller's
+    ``interrupted`` flag, and the comparison is case-insensitive (INV-COOP-11).
+    ``stop_requested`` is initialised as the engine's default reason, so it must
+    stay ``SUCCESS`` on the bare reason - otherwise every ordinary cycle would
+    report ``INTERRUPTED`` (UTILTOOLS-80 REQ-02).
     """
 
-    assert MaintainerEngine._outcome_for(STOP_REASON_STOPPED) == OUTCOME_INTERRUPTED
+    assert reason in {"stopped", "stop", "cancelled", "signal_sigterm", "signal_sigint"}
+    assert MaintainerEngine._outcome_for(reason) == OUTCOME_INTERRUPTED
+    assert MaintainerEngine._outcome_for(reason.upper()) == OUTCOME_INTERRUPTED
     assert (
         MaintainerEngine._outcome_for(reason, interrupted=True) == OUTCOME_INTERRUPTED
     )
-    assert MaintainerEngine._outcome_for(reason) == OUTCOME_SUCCESS
+    assert MaintainerEngine._outcome_for("stop_requested") == OUTCOME_SUCCESS
+    assert MaintainerEngine._outcome_for("cancel_requested") == OUTCOME_SUCCESS
     # Total by construction: junk input classifies instead of raising.
     for junk in (None, "", 42, object(), [], {"reason": reason}):
         assert MaintainerEngine._outcome_for(junk) in {
@@ -491,3 +510,87 @@ def test_outcome_for_preserves_failed_and_timeout() -> None:
     assert MaintainerEngine._outcome_for(STOP_REASON_FAILED, interrupted=True) == (
         OUTCOME_INTERRUPTED
     )
+
+
+# ------------------- REQ-01 / review-v3 advisory rows: honest report + view
+
+
+def test_cancel_task_reports_timeout_while_cycle_still_running(
+    tmp_path: Path,
+) -> None:
+    """SHOULD_FIX (review v3): a bound that expires mid-``run_cycle()`` says so.
+
+    ``CancelReport`` documents "returns only after the in-flight cycle left
+    ``run_cycle()``", so a non-terminal exit of the shared monitor loop must
+    report ``timed_out=True`` - never ``cancelled=True, timed_out=False`` while
+    the cycle is still alive.
+    """
+
+    engine = _gated_engine(tmp_path)
+    assert isinstance(engine, MaintainerEngine)
+    thread, errors = _start_cycle(engine)
+    try:
+        assert engine.step_started.wait(5.0)
+        report = engine.cancel_task(0.2)
+        assert report.cancelled is True
+        assert report.timed_out is True
+        assert report.waited_sec >= 0.2
+        assert thread.is_alive()  # the cycle had not left run_cycle()
+        assert report.state == TaskState.CANCELLED.value
+        cancelled = _events(engine, "TASK_CANCELLED")
+        assert len(cancelled) == 1
+        assert cancelled[0]["timed_out"] is True
+    finally:
+        engine.release.set()
+        thread.join(10.0)
+    assert not errors
+    assert not thread.is_alive()
+
+
+def test_cancel_task_treats_coerced_monitor_exit_as_timeout(
+    tmp_path: Path,
+) -> None:
+    """SHOULD_FIX (review v3): the monitor's ``stopped`` exit is a timeout too.
+
+    The loop can also come back ``MONITOR_STOPPED`` (a coercion) while the cycle
+    is still inside ``run_cycle()``; mapping only ``MONITOR_TIMEOUT`` to
+    ``timed_out`` would hide that from the caller.
+    """
+
+    engine = _gated_engine(tmp_path)
+    thread, errors = _start_cycle(engine)
+    try:
+        assert engine.step_started.wait(5.0)
+        engine._monitor_until_terminal = lambda *a, **k: MONITOR_STOPPED  # type: ignore[method-assign]
+        report = engine.cancel_task(0.2)
+        assert report.cancelled is True
+        assert report.timed_out is True
+        assert thread.is_alive()
+    finally:
+        engine.release.set()
+        thread.join(10.0)
+    assert not errors
+
+
+def test_cancel_signal_view_cannot_publish_a_stop(tmp_path: Path) -> None:
+    """NIT-02 (review v3): INV-COOP-1 is structural, not prose.
+
+    ``cancel_signal`` hands out a read-only view: a step body can observe the
+    wind-down but has no ``set()``/``clear()`` to publish an unattributed stop.
+    """
+
+    engine, _sleeper = _frozen_engine(tmp_path)
+    view = engine.cancel_signal  # property: read-only handle
+    assert isinstance(view, StopSignalView)
+    assert not hasattr(view, "set")
+    assert not hasattr(view, "clear")
+    assert view.is_set() is False
+    assert bool(view) is False
+    assert view.wait(0) is False
+    assert repr(view) == "StopSignalView(set=False)"
+
+    engine.request_stop("operator")
+    assert view.is_set() is True
+    assert view.wait(0) is True
+    assert engine.check_cancel() is True
+    assert engine.stop_reason == "operator"
