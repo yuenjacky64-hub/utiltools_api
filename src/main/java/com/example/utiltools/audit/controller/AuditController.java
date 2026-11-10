@@ -101,7 +101,10 @@ public class AuditController {
                        once per pass and exactly one tombstone is appended per reaped entry. `dryRun=true`
                        uses the same eligibility classification but mutates nothing — no
                        PENDING-to-FAILED transition, no replay-claim rollback, no tombstone, no manual
-                       intent consumed and no eviction. `entryId` targets one PENDING entry: intent is
+                       intent consumed and no eviction. An entry whose replay claim lease expired
+                       utiltools.audit.replay-lease-quarantine-threshold times is failed for good with reason
+                       REPLAY_LEASE_QUARANTINED and skipped by every later pass; that tombstone is counted in
+                       `replayLeaseExpired`, so `reaped` stays the sum of the four counts. `entryId` targets one PENDING entry: intent is
                        recorded under the lock and consumed by this pass, an unknown id answers 404
                        NOT_FOUND and an already-terminal entry answers 409 REAP_CONFLICT without
                        mutating it, consuming intent or writing a tombstone. The endpoint appends no

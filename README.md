@@ -1513,6 +1513,7 @@ journal and only `leaseExpiresAt` (already part of the `replay` record) is retur
 | :------- | :------ | :------ |
 | `utiltools.audit.replay-lease-seconds` | `30` | Lifetime of a replay claim before it may be taken over or reaped |
 | `utiltools.audit.replay-heartbeat-seconds` | half of the lease (`15`) | Cadence at which a running replay's owner renews its claim; minimum `1`, must be positive |
+| `utiltools.audit.replay-lease-quarantine-threshold` | `3` | How many times one entry's replay claim may expire and be rolled back before the reaper fails the entry for good with `REPLAY_LEASE_QUARANTINED`; clamped to `>= 1` |
 
 **Failed replays are audited.** If `replayInvoke` throws (for example the stored payload is no
 longer accepted by the service), the replay is recorded as `FAILED` with a bounded
@@ -1620,8 +1621,8 @@ curl "http://localhost:8080/api/v1/utils/audit/reaps?limit=2&reason=STALE_PENDIN
 }
 ```
 
-`reason` accepts `REPLAY_LEASE_EXPIRED`, `MANUALLY_REAPED`, `STALE_PENDING` and `OVERSIZE_PAYLOAD`
-(omit for all); `limit` defaults to `50` and is clamped to `[1, max-entries]`. An unknown `reason`
+`reason` accepts `REPLAY_LEASE_EXPIRED`, `REPLAY_LEASE_QUARANTINED`, `MANUALLY_REAPED`,
+`STALE_PENDING` and `OVERSIZE_PAYLOAD` (omit for all); `limit` defaults to `50` and is clamped to `[1, max-entries]`. An unknown `reason`
 value or a non-numeric `limit` answers `400 BAD_REQUEST` in the standard envelope. The route never
 triggers a reap pass, never mutates an entry and never writes a journal record — polling it cannot
 reclaim anything, and the log is in-process, so it is empty again after a restart.

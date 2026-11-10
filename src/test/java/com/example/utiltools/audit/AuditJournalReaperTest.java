@@ -12,6 +12,7 @@ import com.example.utiltools.audit.service.ReplayClaim;
 import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.common.AuditEntryNotFoundException;
 import com.example.utiltools.common.ReapConflictException;
+import com.example.utiltools.common.ReplayConflictException;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -736,6 +737,85 @@ class AuditJournalReaperTest {
         Map<ReapReason, Long> tally = tallyByReason(journal.reapLog(MAX_ENTRIES));
         assertThat(tally).containsOnlyKeys(ReapReason.MANUALLY_REAPED);
         assertThat(tally.get(ReapReason.MANUALLY_REAPED)).isEqualTo((long) MAX_ENTRIES);
+    }
+
+    @Test
+    @DisplayName("an entry is quarantined after repeated replay-lease expirations and skipped after")
+    void quarantinesAfterRepeatedLeaseExpirations() {
+        AuditEntry succeeded = succeeded("req-00000001");
+
+        for (int pass = 1; pass <= 2; pass++) {
+            journal.claimReplay(succeeded.id());
+            clock.advanceSeconds(LEASE_SECONDS);
+
+            assertThat(journal.reap()).isEqualTo(1);
+
+            AuditEntry rolledBack = journal.find(succeeded.id()).orElseThrow();
+            assertThat(rolledBack.state()).isEqualTo(JournalState.SUCCEEDED);
+            assertThat(rolledBack.replay().state()).isEqualTo(ReplayState.FAILED);
+            assertThat(journal.reapLog(MAX_ENTRIES, ReapReason.REPLAY_LEASE_EXPIRED)).hasSize(pass);
+            assertThat(journal.reapLog(MAX_ENTRIES, ReapReason.REPLAY_LEASE_QUARANTINED)).isEmpty();
+        }
+
+        ReplayClaim thirdOwner = journal.claimReplay(succeeded.id());
+        clock.advanceSeconds(LEASE_SECONDS);
+
+        assertThat(journal.reap()).isEqualTo(1);
+
+        AuditEntry quarantined = journal.find(succeeded.id()).orElseThrow();
+        assertThat(quarantined.state()).isEqualTo(JournalState.FAILED);
+        assertThat(quarantined.errorCode()).isEqualTo(ReapReason.REPLAY_LEASE_QUARANTINED.name());
+        assertThat(quarantined.replay().state()).isEqualTo(ReplayState.FAILED);
+        assertThat(quarantined.replay().leaseExpiresAt()).isNull();
+
+        List<ReapRecord> quarantineTombstones =
+                journal.reapLog(MAX_ENTRIES, ReapReason.REPLAY_LEASE_QUARANTINED);
+        assertThat(quarantineTombstones).hasSize(1);
+        ReapRecord tombstone = quarantineTombstones.get(0);
+        assertThat(tombstone.status()).isEqualTo("REAPED");
+        assertThat(tombstone.entryId()).isEqualTo(succeeded.id());
+        assertThat(tombstone.operation()).isEqualTo(OperationType.CRYPTO_HASH);
+        assertThat(tombstone.detail()).isEqualTo("replay lease expired 3 times; entry quarantined");
+        assertThat(journal.reapLog(MAX_ENTRIES)).hasSize(3);
+
+        assertThat(journal.reap()).isZero();
+        assertThatCode(journal::reapJournal).doesNotThrowAnyException();
+        assertThat(journal.reap()).isZero();
+        assertThat(journal.reapLog(MAX_ENTRIES)).hasSize(3);
+
+        assertThat(journal.completeReplay(succeeded.id(), thirdOwner.ownerToken(),
+                ReplayState.VERIFIED, "late owner")).isFalse();
+        assertThatThrownBy(() -> journal.claimReplay(succeeded.id()))
+                .isInstanceOf(ReplayConflictException.class)
+                .hasMessageContaining("entry is FAILED");
+    }
+
+    @Test
+    @DisplayName("threshold 1 quarantines on the first expiry and a preview mutates nothing")
+    void quarantinesOnFirstExpiryWhenThresholdIsOneAndPreviewIsSideEffectFree() {
+        AuditJournalService strict = new AuditJournalService(new ObjectMapper(), MAX_ENTRIES,
+                MAX_REPLAY_BYTES, STALE_SECONDS, LEASE_SECONDS, 1, clock);
+        AuditEntry pending = strict.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000001");
+        AuditEntry succeeded = strict.succeed(pending.id(), hashResponse());
+        strict.claimReplay(succeeded.id());
+        clock.advanceSeconds(LEASE_SECONDS);
+
+        JournalReapResponse preview = strict.reapManually(null, true);
+        assertThat(preview.dryRun()).isTrue();
+        assertThat(preview.replayLeaseExpired()).isEqualTo(1);
+        assertThat(preview.reaped()).isEqualTo(1);
+        assertThat(strict.reapLog(MAX_ENTRIES)).isEmpty();
+        AuditEntry previewed = strict.find(succeeded.id()).orElseThrow();
+        assertThat(previewed.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(previewed.replay().state()).isEqualTo(ReplayState.IN_PROGRESS);
+
+        assertThat(strict.reap()).isEqualTo(1);
+
+        AuditEntry quarantined = strict.find(succeeded.id()).orElseThrow();
+        assertThat(quarantined.state()).isEqualTo(JournalState.FAILED);
+        assertThat(quarantined.errorCode()).isEqualTo(ReapReason.REPLAY_LEASE_QUARANTINED.name());
+        assertThat(strict.reapLog(MAX_ENTRIES, ReapReason.REPLAY_LEASE_QUARANTINED)).hasSize(1);
+        assertThat(strict.reap()).isZero();
     }
 
     private static Map<ReapReason, Long> tallyByReason(List<ReapRecord> tombstones) {
