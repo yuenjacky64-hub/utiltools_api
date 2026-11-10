@@ -483,6 +483,47 @@ def test_wait_loop_reaches_natural_break_point_within_timeout(
     assert record["timed_out"] is False
 
 
+def test_shutdown_delegates_to_monitor_until_terminal(tmp_path: Path) -> None:
+    """UTILTOOLS-89 REQ-01: one monitoring helper, reused by ``shutdown()``.
+
+    The wind-down wait must stay the single ``_monitor_until_terminal`` loop so a
+    stop observed there is never re-implemented (and never drifts) per caller.
+    """
+
+    clock = FrozenClock()
+    engine = _engine(
+        tmp_path,
+        [_spec("task-a")],
+        clock=clock,
+        sleeper=FakeSleeper(clock),
+        config=MaintainerConfig(max_shutdown_wait_sec=5.0),
+    )
+    engine._cycle_done.clear()
+
+    calls: list[tuple[float | None, float | None, bool]] = []
+    real = engine._monitor_until_terminal
+
+    def _spy(
+        poll_interval_sec: float | None = None,
+        *,
+        timeout_sec: float | None = None,
+        honour_stop: bool = True,
+    ) -> str:
+        calls.append((poll_interval_sec, timeout_sec, honour_stop))
+        return real(poll_interval_sec, timeout_sec=timeout_sec, honour_stop=honour_stop)
+
+    engine._monitor_until_terminal = _spy  # type: ignore[method-assign]
+
+    engine.shutdown()
+
+    assert len(calls) == 1
+    poll_interval_sec, timeout_sec, honour_stop = calls[0]
+    assert poll_interval_sec is None  # helper supplies SHUTDOWN_POLL_INTERVAL_SEC
+    assert timeout_sec == 5.0
+    # The drain waits for an *already published* stop: honour_stop=False.
+    assert honour_stop is False
+
+
 def test_wait_loop_times_out_at_max_shutdown_wait_sec(tmp_path: Path) -> None:
     """DOD-11: a break point that never arrives stops at the configured bound."""
 

@@ -64,7 +64,7 @@ maintainer_leases.log.tmp
 maintainer_heartbeat.json
 maintainer_heartbeat.json.tmp
 
-### Python bytecode / cache artifacts (never source) - UTILTOOLS-90 compliance gate fix ###
+### Python bytecode / interpreter cache (never source) - UTILTOOLS-89 compliance gate ###
 __pycache__/
 *.pyc
 *.pyo

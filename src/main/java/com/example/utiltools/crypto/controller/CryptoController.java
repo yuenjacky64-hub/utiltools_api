@@ -74,7 +74,7 @@ public class CryptoController {
     }
 
     @GetMapping("/uuid")
-    @Operation(summary = "Generate random UUIDs", description = "Generates single or batch UUIDs with optional compact 32-character format; version selects random UUIDv4 (default) or time-ordered RFC 9562 UUIDv7")
+    @Operation(summary = "Generate random UUIDs", description = "Generates single or batch UUIDs with optional compact 32-character format; version selects random UUIDv4 (default), time-ordered RFC 9562 UUIDv7, or time-ordered RFC 9562 UUIDv8 (48-bit unix-millisecond prefix plus a per-process monotonic counter)")
     public ApiResponse<UuidResponse> uuid(
             @RequestParam(value = "count", required = false, defaultValue = "1") int count,
             @RequestParam(value = "compact", required = false, defaultValue = "false") boolean compact,
