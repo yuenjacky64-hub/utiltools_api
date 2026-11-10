@@ -180,9 +180,12 @@ def _gated_engine(
     )
 
 
-def _start_cycle(engine: MaintainerEngine) -> tuple[threading.Thread, list[BaseException]]:
+def _start_cycle(
+    engine: MaintainerEngine,
+    results: "list[CycleResult] | None" = None,
+) -> tuple[threading.Thread, list[BaseException]]:
     errors: list[BaseException] = []
-    results: list[CycleResult] = []
+    results = [] if results is None else results
 
     def body() -> None:
         try:
@@ -350,9 +353,9 @@ def test_uncooperative_task_force_marked_stopped(tmp_path: Path) -> None:
     """DOD-07: a task that ignores the signal is coerced in bookkeeping only."""
 
     engine = _gated_engine(tmp_path)
-    thread, errors = _start_cycle(engine)
+    results: list[CycleResult] = []
+    thread, errors = _start_cycle(engine, results)
     assert engine.step_started.wait(10.0)
-
     engine.request_stop()
     started = time.monotonic()
     status = engine._monitor_until_terminal(0.02, timeout_sec=0.15, honour_stop=False)
@@ -383,6 +386,18 @@ def test_uncooperative_task_force_marked_stopped(tmp_path: Path) -> None:
     engine.release.set()
     thread.join(10.0)
     assert errors == []
+    # SHOULD_FIX (review v7): the coercion must survive the in-flight step's
+    # return. Before the fix the step's commit walked the record out of
+    # ``CANCELLED`` (PROGRESS -> RUNNING, then COMPLETED), so asserting only
+    # *before* the gate opened hid the resurrection completely.
+    assert seen.state is TaskState.CANCELLED
+    assert seen.progress == 1  # the discarded commit never advanced it
+    assert seen.pending_since is None
+    assert _events(engine, "COMPLETED") == []
+    assert _events(engine, "PROGRESS") == []
+    assert _events(engine, FORCE_STOP_EVENT) == coerced  # still exactly one
+    assert len(results) == 1
+    assert results[0].outcome == OUTCOME_INTERRUPTED
 
 
 # ------------------------------- REQ-03 / DOD-08 .. DOD-10: cleanup guarantees

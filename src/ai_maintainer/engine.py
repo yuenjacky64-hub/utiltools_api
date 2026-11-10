@@ -2087,6 +2087,17 @@ class MaintainerEngine:
         ``timeout_sec`` is the bound that was *actually* applied (the drain
         passes ``deadline - clock``), so the event reports the real window
         instead of always echoing ``config.max_shutdown_wait_sec`` (NIT-01).
+
+        MUST_FIX (Review v7): coercion is *terminal*, so it also unbinds the
+        cycle slot that still points at the task. ``CANCELLED`` is a sink state
+        (``Implementation_Plan.md:101``, INV-COOP-8), but the in-flight step's
+        commit block used to guard on slot identity only - leaving the slot
+        bound let the uncooperative step return later and walk the coerced
+        record forward (``progress + 1``, then ``CANCELLED`` ->
+        ``COMPLETED`` plus a ``COMPLETED`` tally that clears the block streak).
+        Unbinding here makes the late commit observe a slot it no longer owns
+        and discard the step; the commit path carries its own terminal-state
+        guard as a second line of defence.
         """
 
         if task is None or task.state not in NON_TERMINAL:
@@ -2099,6 +2110,15 @@ class MaintainerEngine:
         with self._lock:
             task.state = TaskState.CANCELLED
             task.pending_since = None
+            # MUST_FIX (Review v7): unbind every cycle slot still holding the
+            # coerced task, mirroring the ``cancel_task`` bookkeeping (REQ-05),
+            # so the in-flight step's commit is discarded instead of
+            # resurrecting the record to COMPLETED.
+            for slot, bound_task in list(self._monitored_by_cycle.items()):
+                if bound_task is task:
+                    self._monitored_by_cycle.pop(slot, None)
+            if self._carried_monitored is task:
+                self._carried_monitored = None
             self._stop_reason = STOP_REASON_STOPPED
             self._events.append(
                 {
@@ -2464,6 +2484,16 @@ class MaintainerEngine:
             with self._lock:
                 if self._monitored_by_cycle.get(cycle) is not task:
                     # A concurrent cycle preempted or retired it: discard.
+                    steps += 1
+                    continue
+                if task.state is not TaskState.RUNNING:
+                    # MUST_FIX (Review v7): the record is already terminal, so
+                    # the step's result must not be committed at all. This is
+                    # the second line of defence behind the slot unbinding in
+                    # ``_force_mark_stopped``: a coerced (``TASK_FORCE_STOPPED``)
+                    # task stays in its sink state instead of being walked
+                    # forward to ``COMPLETED`` (and clearing its block streak)
+                    # by a step that returned after the cancel window expired.
                     steps += 1
                     continue
                 if cooperative is not None:
