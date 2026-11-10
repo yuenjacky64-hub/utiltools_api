@@ -512,6 +512,34 @@ def test_outcome_for_preserves_failed_and_timeout() -> None:
     )
 
 
+def test_outcome_for_survives_hostile_str_subclass() -> None:
+    """DOD-22 / NIT-01 (review v4): totality covers a booby-trapped ``str``.
+
+    INV-COOP-11 as narrowed: the fold *and* the comparisons that consume it are
+    inside one guard, so a ``str`` subclass whose ``strip()``/``lower()``
+    returns an unhashable classifies instead of raising ``TypeError`` from the
+    ``STOP_REASON_INTERRUPTIONS`` membership test.
+    """
+
+    class _UnhashableFold(str):
+        def strip(self) -> Any:
+            return ["stopped"]
+
+        def lower(self) -> Any:
+            return {"stopped"}
+
+    for hostile in (_UnhashableFold("stopped"), _UnhashableFold("timeout")):
+        assert MaintainerEngine._outcome_for(hostile) == OUTCOME_SUCCESS
+        # ``interrupted`` still short-circuits ahead of the hostile fold.
+        assert (
+            MaintainerEngine._outcome_for(hostile, interrupted=True)
+            == OUTCOME_INTERRUPTED
+        )
+    # Engine-reachable spellings keep their tokens (no behaviour drift).
+    assert MaintainerEngine._outcome_for("  STOPPED  ") == OUTCOME_INTERRUPTED
+    assert MaintainerEngine._outcome_for("Timeout") == OUTCOME_TIMEOUT
+
+
 # ------------------- REQ-01 / review-v3 advisory rows: honest report + view
 
 

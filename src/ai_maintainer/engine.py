@@ -572,7 +572,10 @@ class StopSignalView:
     ``clear()`` here to call. Review v3 NIT-02: the mutability guard on the
     shared stop state is now structural instead of prose, and
     :meth:`MaintainerEngine.request_stop` / :meth:`_publish_signal_reason` /
-    :meth:`cancel_task` stay the only writers.
+    :meth:`MaintainerEngine.cancel_task` /
+    :meth:`MaintainerEngine._force_mark_stopped` stay the only writers
+    (INV-COOP-1; Review v4 NIT-03: coercion publishes the ``stopped`` reason,
+    so it is a writer too).
     """
 
     __slots__ = ("_event",)
@@ -1522,10 +1525,11 @@ class MaintainerEngine:
         flag: ``wait()`` returns as soon as a stop *or* a cancel is published, so
         a step body can block on it instead of polling, and ``is_set()`` is the
         non-raising predicate :meth:`check_cancel` uses. Only
-        :meth:`request_stop`, :meth:`_publish_signal_reason` and
-        :meth:`cancel_task` own the stop state (INV-COOP-1) - the view has no
-        mutator, so a step cannot publish an unattributed stop (Review v3
-        NIT-02).
+        :meth:`request_stop`, :meth:`_publish_signal_reason`,
+        :meth:`cancel_task` and :meth:`_force_mark_stopped` own the stop state
+        (INV-COOP-1) - the view has no mutator, so a step cannot publish an
+        unattributed stop (Review v3 NIT-02; Review v4 NIT-03 added the
+        coercion writer to this enumeration).
         """
 
         return StopSignalView(self._stop)
@@ -2032,16 +2036,22 @@ class MaintainerEngine:
         # DOD-11: the stop family is an interruption on the bare reason. The
         # comparison is case-insensitive so an operator-facing spelling
         # (``STOPPED``) cannot smuggle itself past the interrupt rows.
+        # NIT-01 (Review v4): the fold *and* every comparison that consumes it
+        # sit inside one guard, so a hostile ``str`` subclass whose
+        # ``strip()``/``lower()`` yields something unhashable (the set
+        # membership below would raise ``TypeError``) still classifies instead
+        # of raising. Engine-reachable input is unaffected - every writer
+        # stores a plain ``str`` or ``None``.
         try:
             token = stop_reason.strip().lower()
+            if token in STOP_REASON_INTERRUPTIONS:
+                return OUTCOME_INTERRUPTED
+            if token == STOP_REASON_FAILED:
+                return OUTCOME_FAILED
+            if token == STOP_REASON_TIMEOUT:
+                return OUTCOME_TIMEOUT
         except BaseException:  # pragma: no cover - hostile str subclass
             return OUTCOME_SUCCESS
-        if token in STOP_REASON_INTERRUPTIONS:
-            return OUTCOME_INTERRUPTED
-        if token == STOP_REASON_FAILED:
-            return OUTCOME_FAILED
-        if token == STOP_REASON_TIMEOUT:
-            return OUTCOME_TIMEOUT
         return OUTCOME_SUCCESS
 
     def _force_mark_stopped(
