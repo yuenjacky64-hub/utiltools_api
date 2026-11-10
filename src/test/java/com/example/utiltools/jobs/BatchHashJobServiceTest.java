@@ -2509,7 +2509,12 @@ class BatchHashJobServiceTest {
             }
         }
 
-        /** The next {@code times} hashes of {@code item} throw a transient failure. */
+        /**
+         * The next {@code times} hashes of {@code item} abort the whole attempt with a transient
+         * {@link WholeAttemptFault}: an item-level {@link RuntimeException} would instead be recorded
+         * as that item's own failure and never retried (REQ-04), which is not what the retry-lane
+         * fixture below models.
+         */
         void failOnce(String item, int times) {
             remainingFailures.put(item, new AtomicInteger(times));
         }
@@ -2521,7 +2526,7 @@ class BatchHashJobServiceTest {
             entryOrder.add(content);
             AtomicInteger remaining = remainingFailures.get(content);
             if (remaining != null && remaining.getAndUpdate(n -> n > 0 ? n - 1 : 0) > 0) {
-                throw new IllegalStateException("transient hashing failure for " + content);
+                throw new WholeAttemptFault("transient hashing failure for " + content);
             }
             Gate gate = gates.get(content);
             if (gate != null) {
@@ -2640,6 +2645,26 @@ class BatchHashJobServiceTest {
         }
     }
 
+    /**
+     * The whole-attempt fault the retry and checkpoint fixtures inject. A {@link RuntimeException} a
+     * single item's hash raises is now that item's own outcome - recorded, isolated and deliberately
+     * never retried (REQ-01, REQ-04) - so the long-standing fixtures that model an attempt which
+     * *aborts mid-batch* (retry bookkeeping, attempt fencing, eviction races, queue-full rollback and
+     * the fenced-checkpoint resume) inject this unchecked {@link Error} instead. It reaches the
+     * worker's outer {@code catch (Throwable)} fence, which still fails the whole attempt and leaves
+     * every remaining item unprocessed: exactly the pre-existing state those tests assert on.
+     */
+    private static final class WholeAttemptFault extends Error {
+
+        private WholeAttemptFault(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * Stub whose designated item fails the whole attempt (see {@link WholeAttemptFault}) a bounded
+     * number of times, optionally blocking on latches so the attempt can be held mid-hash.
+     */
     private static final class RetryCryptoService extends CryptoService {
 
         private final Map<String, AtomicInteger> remainingFailures = new ConcurrentHashMap<>();
@@ -2661,7 +2686,7 @@ class BatchHashJobServiceTest {
         public HashResponse hash(HashRequest request) {
             AtomicInteger remaining = remainingFailures.get(request.content());
             if (remaining != null && remaining.getAndUpdate(n -> n > 0 ? n - 1 : 0) > 0) {
-                throw new IllegalStateException("transient hashing failure for " + request.content());
+                throw new WholeAttemptFault("transient hashing failure for " + request.content());
             }
             if (blockItem != null && blockItem.equals(request.content())) {
                 if (enteredHash != null) {
@@ -3092,7 +3117,8 @@ class BatchHashJobServiceTest {
                     before.status(), before.itemCount(), before.results(), before.error(),
                     before.createdAt(), before.startedAt(), before.completedAt(), before.attempt(),
                     before.maxAttempts(), before.attempts(), after.executionLeaseExpiresAt(),
-                    after.lastHeartbeatAt(), before.completedItems()));
+                    after.lastHeartbeatAt(), before.completedItems(), before.deadlineAt(),
+                    before.succeededItems(), before.failedItems()));
         } finally {
             crypto.unblock("c");
         }
@@ -3481,6 +3507,317 @@ class BatchHashJobServiceTest {
                 .isEqualTo(JournalState.PENDING); // fail() threw, so the entry stays open
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Per-item failure isolation (REQ-01..REQ-05)
+    // ---------------------------------------------------------------------------------------------
+
+    /** A three-item batch whose middle item is the one the fault stub fails. */
+    private static final List<String> PARTIAL_ITEMS = List.of("alpha", "bravo", "charlie");
+
+    /**
+     * DOD-01 / DOD-02 / REQ-01: one item's hash exception neither aborts the batch nor loses the items
+     * already hashed - every remaining item is still hashed, the batch terminalizes FAILED with
+     * {@code BATCH_ITEM_HASH_FAILED}, publishes no results and keeps the two successes in its prefix.
+     */
+    @Test
+    @DisplayName("per-item failure - one item's hash exception does not abort the batch")
+    void shouldContinueBatchWhenOneItemHashThrows() {
+        ItemFaultCryptoService crypto = new ItemFaultCryptoService(Set.of("bravo"), Set.of());
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
+
+        BatchHashJobResponse failed = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", PARTIAL_ITEMS, null, null)).jobId(),
+                JobStatus.FAILED);
+
+        // The loop carried on past the throw: the item after the failing one was hashed too.
+        assertThat(crypto.count("alpha")).isEqualTo(1);
+        assertThat(crypto.count("bravo")).isEqualTo(1);
+        assertThat(crypto.count("charlie")).isEqualTo(1);
+        assertThat(failed.results()).isNull();
+        assertThat(failed.error()).startsWith("BATCH_ITEM_HASH_FAILED");
+        assertThat(failed.error()).doesNotContain("bravo"); // the item text stays out of the snapshot
+        assertThat(failed.completedItems()).isEqualTo(2);
+        assertThat(failed.succeededItems()).containsExactly(0, 2);
+        assertThat(failed.failedItems()).containsExactly(1);
+    }
+
+    /**
+     * DOD-02 / REQ-01: a batch in which every item's hash throws still terminalizes as a per-item
+     * failure - FAILED with {@code BATCH_ITEM_HASH_FAILED}, no results published and nothing to keep
+     * - while each item is still attempted exactly once.
+     */
+    @Test
+    @DisplayName("per-item failure - a batch whose items all throw fails with BATCH_ITEM_HASH_FAILED")
+    void shouldFailJobWithPerItemErrorWhenEveryItemHashThrows() {
+        ItemFaultCryptoService crypto = new ItemFaultCryptoService(Set.of("alpha", "bravo", "charlie"), Set.of());
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
+
+        BatchHashJobResponse failed = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", PARTIAL_ITEMS, null, null)).jobId(),
+                JobStatus.FAILED);
+
+        // No success to lose: every item was attempted once and recorded as failed.
+        assertThat(crypto.count("alpha")).isEqualTo(1);
+        assertThat(crypto.count("bravo")).isEqualTo(1);
+        assertThat(crypto.count("charlie")).isEqualTo(1);
+        assertThat(failed.results()).isNull();
+        assertThat(failed.error()).startsWith("BATCH_ITEM_HASH_FAILED");
+        assertThat(failed.completedItems()).isZero();
+        assertThat(failed.succeededItems()).isEmpty();
+        assertThat(failed.failedItems()).containsExactly(0, 1, 2);
+    }
+
+    /**
+     * DOD-03 / REQ-02: the per-item tracking is observable on both surfaces - ascending
+     * {@code succeededItems}/{@code failedItems} on the snapshot and the matching index lists on the
+     * attempt-history row of the failing attempt.
+     */
+    @Test
+    @DisplayName("per-item failure - the attempt row carries the same index lists as the snapshot")
+    void shouldExposePerItemTrackingOnSnapshotAndAttemptRow() {
+        service = new BatchHashJobService(new ItemFaultCryptoService(Set.of("bravo"), Set.of()), 1, 10, 300, 3);
+
+        BatchHashJobResponse failed = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", PARTIAL_ITEMS, null, null)).jobId(),
+                JobStatus.FAILED);
+
+        assertThat(failed.attempts()).hasSize(1);
+        JobAttempt row = failed.attempts().get(0);
+        assertThat(row.attempt()).isEqualTo(1);
+        assertThat(row.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(row.error()).isEqualTo(failed.error());
+        assertThat(row.succeededItems()).isEqualTo(failed.succeededItems());
+        assertThat(row.failedItems()).isEqualTo(failed.failedItems());
+        assertThat(row.resumedFrom()).isZero();
+        // A terminal batch keeps the per-item projections of the attempt that produced them.
+        assertThat(failed.attempt()).isEqualTo(1);
+        assertThat(failed.completedItems()).isEqualTo(2);
+    }
+
+    /**
+     * DOD-06 / REQ-03: the attempt's closing journal entry replays the partial outcome - per-item
+     * index lists plus the resume point - and discloses neither the item pre-image nor the secret.
+     */
+    @Test
+    @DisplayName("per-item failure - the attempt journal entry records per-item outcomes")
+    void shouldRecordPerItemOutcomesInAttemptJournalEntry() {
+        AuditJournalService journal = newJournal();
+        service = new BatchHashJobService(new ItemFaultCryptoService(Set.of("bravo"), Set.of()), 1, 10, 300, 3,
+                LEASE_SECONDS, 5000, 1, new MutableJobClock(LEASE_START), journal);
+
+        BatchHashJobResponse failed = awaitStatus(service.submit(
+                new BatchHashRequest("SHA-256", PARTIAL_ITEMS, "s3cret", null)).jobId(), JobStatus.FAILED);
+
+        List<AuditEntry> entries = batchHashEntries(journal, failed.jobId());
+        assertThat(entries).hasSize(1);
+        AuditEntry entry = entries.get(0);
+        assertThat(entry.state()).isEqualTo(JournalState.FAILED);
+        assertThat(entry.errorCode()).isEqualTo(failed.error());
+        assertThat(entry.result().path("outcome").asText()).isEqualTo("FAILED");
+        assertThat(entry.result().path("resultCount").asInt()).isEqualTo(PARTIAL_ITEMS.size());
+        assertThat(entry.result().path("completedItems").asInt()).isEqualTo(2);
+        assertThat(entry.result().path("resumedFrom").asInt()).isZero();
+        assertThat(entry.result().path("succeededItems").toString()).isEqualTo("[0,2]");
+        assertThat(entry.result().path("failedItems").toString()).isEqualTo("[1]");
+        assertThat(entry.result().path("failedItemErrors").get(0).path("index").asInt()).isEqualTo(1);
+        // Bounded, content-free detail: no item text and no secret key anywhere in the payload.
+        assertThat(entry.result().toString()).doesNotContain("bravo").doesNotContain("s3cret");
+    }
+
+    /**
+     * DOD-05 / REQ-04: a retry of a batch whose every index is already recorded is refused with the
+     * existing 409 shape - nothing is re-hashed and the FAILED snapshot stays byte-identical.
+     */
+    @Test
+    @DisplayName("retry - a batch whose every index is already recorded is refused without hashing")
+    void shouldTerminalizeRetryWithoutHashingWhenNothingRemains() {
+        ItemFaultCryptoService crypto = new ItemFaultCryptoService(Set.of("bravo"), Set.of());
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3);
+
+        BatchHashJobResponse failed = awaitStatus(
+                service.submit(new BatchHashRequest("SHA-256", PARTIAL_ITEMS, null, null)).jobId(),
+                JobStatus.FAILED);
+
+        assertThat(service.retry(failed.jobId()).status()).isEqualTo(JobStatus.QUEUED);
+
+        // Every index was hashed or failed, so the requeued attempt hashes nothing and goes straight
+        // to FAILED: zero new hash calls, and the retained per-item state is unchanged.
+        BatchHashJobResponse terminal = awaitStatus(failed.jobId(), JobStatus.FAILED);
+        assertThat(terminal.attempt()).isEqualTo(2);
+        assertThat(crypto.count("alpha")).isEqualTo(1);
+        assertThat(crypto.count("bravo")).isEqualTo(1);
+        assertThat(crypto.count("charlie")).isEqualTo(1);
+        assertThat(terminal.succeededItems()).containsExactly(0, 2);
+        assertThat(terminal.failedItems()).containsExactly(1);
+        assertThat(terminal.results()).isNull();
+        assertThat(terminal.attempts()).hasSize(2);
+    }
+
+    /**
+     * DOD-04 / REQ-04: a retry resumes at the first unprocessed index - the item hashed before the
+     * stalled worker was reaped is never hashed twice, and only the remaining ones are hashed.
+     */
+    @Test
+    @DisplayName("retry - resume starts at the first unprocessed index and never re-hashes a processed item")
+    void shouldResumeOnlyUnprocessedItemsOnRetry() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        ItemFaultCryptoService crypto = new ItemFaultCryptoService(Set.of("faulty"), Set.of("stall"));
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("alpha", "stall", "tail"), null, null));
+        assertThat(crypto.awaitEntered("stall")).isTrue();
+
+        // The worker stalls inside item 1 with item 0 already committed; the reaper fails the attempt.
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        BatchHashJobResponse reaped = service.getJob(accepted.jobId());
+        assertThat(reaped.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(reaped.completedItems()).isEqualTo(1);
+        assertThat(reaped.succeededItems()).containsExactly(0);
+        assertThat(reaped.failedItems()).isEmpty();
+
+        crypto.unblock("stall");
+        assertThat(service.retry(accepted.jobId()).attempt()).isEqualTo(2);
+        BatchHashJobResponse resumed = awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+
+        assertThat(resumed.results()).hasSize(3);
+        assertThat(resumed.attempts()).hasSize(2);
+        assertThat(resumed.attempts().get(1).resumedFrom()).isEqualTo(1);
+        assertThat(crypto.count("alpha")).isEqualTo(1); // the committed prefix was not re-hashed
+        assertThat(crypto.count("stall")).isEqualTo(2); // once before the reap, once on the resume
+        assertThat(crypto.count("tail")).isEqualTo(1);
+    }
+
+    /**
+     * DOD-08 / REQ-05: the lease and heartbeat keep working across item failures - the lease expires
+     * afresh for every remaining item hash, a heartbeat still extends a job that already has a failed
+     * item, and an expired lease is still reaped to FAILED with {@code EXECUTION_LEASE_EXPIRED}.
+     */
+    @Test
+    @DisplayName("per-item failure - the lease is renewed per item and the reaper still fails a lapsed lease")
+    void shouldRenewLeaseAndHeartbeatAcrossItemFailures() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        ItemFaultCryptoService crypto = new ItemFaultCryptoService(Set.of("faulty"), Set.of("stall"));
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        // Item 0 fails, item 1 stalls: the batch survives the failure with the lease still live.
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("faulty", "stall", "tail"), null, null));
+        assertThat(crypto.awaitEntered("stall")).isTrue();
+        BatchHashJobResponse running = service.getJob(accepted.jobId());
+        assertThat(running.status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(running.failedItems()).containsExactly(0);
+        assertThat(running.executionLeaseExpiresAt()).isEqualTo(clock.instant().plusSeconds(LEASE_SECONDS));
+
+        // A heartbeat after the item failure still extends the running attempt.
+        clock.advanceSeconds(LEASE_SECONDS - 1);
+        BatchHashJobResponse renewed = service.heartbeat(accepted.jobId());
+        assertThat(renewed.lastHeartbeatAt()).isEqualTo(clock.instant());
+        assertThat(renewed.executionLeaseExpiresAt()).isEqualTo(clock.instant().plusSeconds(LEASE_SECONDS));
+        assertThat(renewed.failedItems()).containsExactly(0);
+
+        // Let the lease lapse: the reaper still moves the job to FAILED with the unchanged error code.
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        BatchHashJobResponse reaped = service.getJob(accepted.jobId());
+        assertThat(reaped.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(reaped.error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        assertThat(reaped.results()).isNull();
+        assertThat(crypto.count("tail")).isZero();
+    }
+
+    /**
+     * DOD-09 / REQ-02: a cancellation withdraws the whole batch, so the CANCELLED snapshot reports
+     * empty per-item lists and discloses no partial outcome.
+     */
+    @Test
+    @DisplayName("cancel - a job with per-item outcomes reports empty index lists once cancelled")
+    void shouldDiscardPerItemOutcomesOnCancel() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        ItemFaultCryptoService crypto = new ItemFaultCryptoService(Set.of("faulty"), Set.of("stall"));
+        service = new BatchHashJobService(crypto, 1, 10, 300, 3, LEASE_SECONDS, 5000, clock);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("faulty", "stall", "tail"), null, null));
+        assertThat(crypto.awaitEntered("stall")).isTrue();
+        assertThat(service.getJob(accepted.jobId()).failedItems()).containsExactly(0);
+
+        BatchHashJobResponse cancelling = service.cancel(accepted.jobId());
+        assertThat(cancelling.failedItems()).isEmpty();
+        assertThat(cancelling.succeededItems()).isEmpty();
+
+        crypto.unblock("stall");
+        BatchHashJobResponse cancelled = awaitStatus(accepted.jobId(), JobStatus.CANCELLED);
+        assertThat(cancelled.results()).isNull();
+        assertThat(cancelled.succeededItems()).isEmpty();
+        assertThat(cancelled.failedItems()).isEmpty();
+        assertThat(cancelled.completedItems()).isZero();
+        assertThat(cancelled.attempts()).hasSize(1);
+        assertThat(cancelled.attempts().get(0).succeededItems()).isEmpty();
+        assertThat(cancelled.attempts().get(0).failedItems()).isEmpty();
+    }
+
+    /**
+     * Hashing stub for the per-item failure tests: counts invocations per item, throws a content-free
+     * {@link IllegalStateException} for every item of {@code failingItems} and blocks the worker on a
+     * latch for every item of {@code gatedItems} until {@link #unblock(String)} releases it. Every
+     * other item delegates to real hashing, so digests stay comparable with {@link CryptoService}.
+     */
+    private static final class ItemFaultCryptoService extends CryptoService {
+
+        private final Map<String, AtomicInteger> invocations = new ConcurrentHashMap<>();
+        private final Map<String, Gate> gates = new ConcurrentHashMap<>();
+        private final Set<String> failingItems;
+
+        private ItemFaultCryptoService(Set<String> failingItems, Set<String> gatedItems) {
+            this.failingItems = Set.copyOf(failingItems);
+            for (String item : gatedItems) {
+                gates.put(item, new Gate());
+            }
+        }
+
+        private boolean awaitEntered(String item) throws InterruptedException {
+            Gate gate = gates.get(item);
+            return gate != null && gate.entered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+
+        private void unblock(String item) {
+            Gate gate = gates.get(item);
+            if (gate != null) {
+                gate.released.countDown();
+            }
+        }
+
+        private int count(String item) {
+            AtomicInteger counter = invocations.get(item);
+            return counter == null ? 0 : counter.get();
+        }
+
+        @Override
+        public HashResponse hash(HashRequest request) {
+            invocations.computeIfAbsent(request.content(), key -> new AtomicInteger()).incrementAndGet();
+            if (failingItems.contains(request.content())) {
+                throw new IllegalStateException("synthetic hash fault");
+            }
+            Gate gate = gates.get(request.content());
+            if (gate != null) {
+                gate.entered.countDown();
+                try {
+                    gate.released.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return super.hash(request);
+        }
+
+        private static final class Gate {
+            private final CountDownLatch entered = new CountDownLatch(1);
+            private final CountDownLatch released = new CountDownLatch(1);
+        }
+    }
+
     private static AuditJournalService newJournal() {
         return new AuditJournalService(new ObjectMapper(), 200, 65536, 300L);
     }
@@ -3788,7 +4125,7 @@ class BatchHashJobServiceTest {
             invocations.computeIfAbsent(request.content(), key -> new AtomicInteger()).incrementAndGet();
             AtomicInteger remaining = remainingFailures.get(request.content());
             if (remaining != null && remaining.getAndUpdate(n -> n > 0 ? n - 1 : 0) > 0) {
-                throw new IllegalStateException("transient hashing failure for " + request.content());
+                throw new WholeAttemptFault("transient hashing failure for " + request.content());
             }
             if (gateItem != null && gateItem.equals(request.content())) {
                 gateEntered.countDown();
@@ -3863,6 +4200,11 @@ class BatchHashJobServiceTest {
 
         @Override
         public AuditEntry fail(String id, String errorCode) {
+            throw new IllegalStateException("journal fail unavailable");
+        }
+
+        @Override
+        public AuditEntry fail(String id, String errorCode, Object result) {
             throw new IllegalStateException("journal fail unavailable");
         }
     }

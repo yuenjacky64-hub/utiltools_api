@@ -39,6 +39,14 @@ import java.util.List;
  * whose bound passes is FAILED with error {@code JOB_DEADLINE_EXCEEDED} and keeps its checkpoint
  * prefix. Being nullable it is simply absent from the JSON when no bound applies, and the previous
  * 15-, 14- and 12-component constructor shapes still compile and report null.</p>
+ *
+ * <p>{@code succeededItems} and {@code failedItems} are the additive per-item projections
+ * ({@code REQ-02}): ascending input indices, {@code succeededItems} being every index whose digest
+ * is durably retained and {@code failedItems} every index whose hash threw and is recorded as
+ * failed. Both are always non-null lists, so they are serialised on every status; a
+ * {@code CANCELLED} job withdrew its progress and therefore reports both empty, and a
+ * {@code COMPLETED} job reports every index as succeeded with nothing failed. Indices only — never
+ * a digest of an uncommitted item — so a partially hashed batch discloses no results.</p>
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record BatchHashJobResponse(
@@ -57,8 +65,24 @@ public record BatchHashJobResponse(
         Instant executionLeaseExpiresAt,
         Instant lastHeartbeatAt,
         int completedItems,
-        Instant deadlineAt
+        Instant deadlineAt,
+        List<Integer> succeededItems,
+        List<Integer> failedItems
 ) {
+
+    /**
+     * Backward-compatible constructor for callers compiled against the 16-component deadline shape:
+     * such a caller cannot express per-item outcomes, so both index lists are empty.
+     */
+    public BatchHashJobResponse(String jobId, String idempotencyKey, JobStatus status, int itemCount,
+            List<HashResponse> results, String error, Instant createdAt, Instant startedAt,
+            Instant completedAt, int attempt, int maxAttempts, List<JobAttempt> attempts,
+            Instant executionLeaseExpiresAt, Instant lastHeartbeatAt, int completedItems,
+            Instant deadlineAt) {
+        this(jobId, idempotencyKey, status, itemCount, results, error, createdAt, startedAt, completedAt,
+                attempt, maxAttempts, attempts, executionLeaseExpiresAt, lastHeartbeatAt, completedItems,
+                deadlineAt, List.of(), List.of());
+    }
 
     /**
      * Backward-compatible constructor for callers compiled against the 15-component checkpoint
