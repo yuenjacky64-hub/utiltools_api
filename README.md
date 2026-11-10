@@ -1404,6 +1404,32 @@ in flight:
 the in-flight record untouched. The claim lease is `utiltools.audit.replay-lease-seconds` (default
 `30`).
 
+**The live owner renews its own lease.** A replay that runs longer than the lease is not abandoned:
+while `replayInvoke` executes, the owning replay renews its claim every
+`utiltools.audit.replay-heartbeat-seconds` (default half of `replay-lease-seconds`, minimum `1`,
+validated positive at startup). Renewal is **owner-fenced** — it runs under the same journal lock as
+every other transition and only extends `leaseExpiresAt` when the entry still exists, its replay is
+`IN_PROGRESS`, the presented owner token is the one currently issued for that claim, and the lease
+has not already lapsed. A stale token, missing entry, terminal replay or expired claim is refused
+with no mutation at all, so a forgotten or superseded owner can never buy itself more time. The
+schedule is cancelled in a `finally` block as soon as the operation finishes, so nothing is renewed
+after completion; a renewal that fails is logged and never replaces the operation's own outcome.
+
+Consequences: `completeReplay` accepts the latest renewed expiry, so a long replay finishes
+`VERIFIED`/`MISMATCH` instead of failing with `409 REPLAY_CONFLICT`; the reaper's
+`REPLAY_LEASE_EXPIRED` rollback reads the same renewed `leaseExpiresAt`, so a renewed claim never
+produces a `REAPED` tombstone; and a renewal racing a reap resolves under the journal lock, so
+exactly one of *renewed claim* or *reaped claim* wins. Renewal stops being possible the moment the
+operation ends — a claim left `IN_PROGRESS` after that is still rolled back to `FAILED` exactly once
+with reason `REPLAY_LEASE_EXPIRED`. Renewal exposes nothing new: owner tokens remain private to the
+journal and only `leaseExpiresAt` (already part of the `replay` record) is returned by `list`,
+`find` and `replay`.
+
+| Property | Default | Meaning |
+| :------- | :------ | :------ |
+| `utiltools.audit.replay-lease-seconds` | `30` | Lifetime of a replay claim before it may be taken over or reaped |
+| `utiltools.audit.replay-heartbeat-seconds` | half of the lease (`15`) | Cadence at which a running replay's owner renews its claim; minimum `1`, must be positive |
+
 **Failed replays are audited.** If `replayInvoke` throws (for example the stored payload is no
 longer accepted by the service), the replay is recorded as `FAILED` with a bounded
 `detail` before the claim is released, then `409 REPLAY_CONFLICT` is returned. The entry's
