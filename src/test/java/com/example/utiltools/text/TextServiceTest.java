@@ -107,7 +107,8 @@ class TextServiceTest {
             Set<ConstraintViolation<TextTransformRequest>> operationViolations =
                     validator.validate(new TextTransformRequest("Hello", " "));
             assertThat(operationViolations).extracting(ConstraintViolation::getMessage)
-                    .containsExactly("operation is required");
+                    .containsExactlyInAnyOrder("operation is required",
+                            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE");
 
             Set<ConstraintViolation<TextStatsRequest>> statsViolations =
                     validator.validate(new TextStatsRequest(""));
