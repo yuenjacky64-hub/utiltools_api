@@ -77,6 +77,12 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
     }
 
+    @ExceptionHandler(ReapConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleReapConflictException(ReapConflictException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "REAP_CONFLICT", null);
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
+    }
+
     @ExceptionHandler(JobQueueFullException.class)
     public ResponseEntity<ApiResponse<Void>> handleJobQueueFull(JobQueueFullException ex) {
         ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "QUEUE_FULL", null);

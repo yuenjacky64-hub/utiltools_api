@@ -1,5 +1,6 @@
 package com.example.utiltools.audit.service;
 
+import com.example.utiltools.audit.dto.JournalReapResponse;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
 import com.example.utiltools.audit.model.OperationType;
@@ -8,6 +9,8 @@ import com.example.utiltools.audit.model.ReapRecord;
 import com.example.utiltools.audit.model.ReplayRecord;
 import com.example.utiltools.audit.model.ReplayState;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.example.utiltools.common.AuditEntryNotFoundException;
+import com.example.utiltools.common.ReapConflictException;
 import com.example.utiltools.common.ReplayConflictException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -235,70 +238,189 @@ public class AuditJournalService {
      * @return the number of reaped entries/tombstones produced by this pass
      */
     public int reap() {
-        Instant now = Instant.now(clock);
-        Instant staleCutoff = now.minusSeconds(stalePendingSeconds);
-        int reapedCount = 0;
         synchronized (lock) {
-            List<Map.Entry<String, JournalRecord>> snapshot = new ArrayList<>(entries.entrySet());
-            List<String> reclaimed = new ArrayList<>();
-            for (Map.Entry<String, JournalRecord> candidate : snapshot) {
-                String id = candidate.getKey();
-                JournalRecord record = candidate.getValue();
-                AuditEntry base = record.base;
-                JournalState stateAtScan = base.state();
+            return runPassLocked(false, null, Instant.now(clock)).reaped();
+        }
+    }
 
-                ReplayRecord claim = record.replay;
-                if (claim != null && claim.state() == ReplayState.IN_PROGRESS
-                        && claim.leaseExpiresAt() != null
-                        && !claim.leaseExpiresAt().isAfter(now)) {
-                    ReplayRecord rolledBack = new ReplayRecord(ReplayState.FAILED, now,
-                            boundedDetail(ReplayState.FAILED, REPLAY_LEASE_EXPIRED_DETAIL
-                                    + " at " + claim.leaseExpiresAt()), null);
-                    record.replayOwnerToken = null;
-                    record.replay = rolledBack;
-                    record.base = withReplay(base, rolledBack);
-                    recordReap(id, base.operation(), ReapReason.REPLAY_LEASE_EXPIRED,
-                            REPLAY_LEASE_EXPIRED_DETAIL, now);
-                    reapedCount++;
-                    continue;
+    /**
+     * One operator-triggered, bounded and synchronous pass over the journal: the manual sibling of
+     * the scheduled {@link #reapJournal()} pass.
+     *
+     * <p>Both passes execute the same classification and the same mutations, under the same journal
+     * lock, so a manual pass can never interleave with a scheduled pass, can never reap an entry
+     * twice and can never append a second {@link ReapRecord} for one entry. The only difference is
+     * {@code dryRun}: a preview classifies and counts exactly like an applying pass but touches
+     * nothing — no {@code PENDING -> FAILED} transition, no replay-claim rollback, no tombstone, no
+     * manual-intent consumption and no eviction.</p>
+     *
+     * <p>{@code entryId}, when non-blank, targets one entry. Under the lock the entry must exist
+     * ({@link AuditEntryNotFoundException} otherwise, answered as 404) and must still be
+     * {@code PENDING} ({@link ReapConflictException} otherwise, answered as 409
+     * {@code REAP_CONFLICT}); the conflict path mutates nothing and leaves any stored intent for a
+     * different entry untouched. Intent for the target is recorded through
+     * {@link #requestManualReap(String)} and consumed by the pass it triggers, so a
+     * {@code PENDING} target is always reported once as {@code MANUALLY_REAPED} — in preview and in
+     * apply alike. The pass itself still sweeps the whole journal, so a targeted call also reports
+     * any other entry that became eligible. An entry that reached a terminal state between two
+     * passes is never rewritten: it is simply not classified as {@code PENDING} any more.</p>
+     *
+     * <p>The returned DTO carries counts only. A pass invoked here never appends an audit journal
+     * entry (no recursive journalling) and every reclaim still goes through the
+     * {@code utiltools.audit.max-entries} clamp.</p>
+     *
+     * @param entryId blank/null for a full pass, otherwise the id of one {@code PENDING} entry
+     * @param dryRun  true to preview the pass without mutating anything
+     * @return the per-reason counts produced (or, for a preview, that would be produced) by the pass
+     */
+    public JournalReapResponse reapManually(String entryId, boolean dryRun) {
+        String target = (entryId == null || entryId.isBlank()) ? null : entryId;
+        Instant now = Instant.now(clock);
+        synchronized (lock) {
+            if (target != null) {
+                JournalRecord record = entries.get(target);
+                if (record == null) {
+                    throw new AuditEntryNotFoundException(target);
                 }
-
-                if (stateAtScan == JournalState.PENDING && record.manualReapRequested) {
-                    record.manualReapRequested = false;
-                    record.base = new AuditEntry(base.id(), base.requestId(), base.operation(),
-                            JournalState.FAILED, base.createdAt(), now, base.request(), null,
-                            MANUALLY_REAPED, base.replayable(), record.replay);
-                    recordReap(id, base.operation(), ReapReason.MANUALLY_REAPED,
-                            MANUALLY_REAPED_DETAIL, now);
-                    reapedCount++;
-                    continue;
+                if (record.base.state() != JournalState.PENDING) {
+                    throw new ReapConflictException(target, "state is " + record.base.state());
                 }
-
-                if (stateAtScan == JournalState.PENDING && base.createdAt() != null
-                        && base.createdAt().isBefore(staleCutoff)) {
-                    record.base = new AuditEntry(base.id(), base.requestId(), base.operation(),
-                            JournalState.FAILED, base.createdAt(), now, base.request(), null,
-                            STALE_PENDING_REAPED, base.replayable(), record.replay);
-                    recordReap(id, base.operation(), ReapReason.STALE_PENDING,
-                            STALE_PENDING_DETAIL, now);
-                    reapedCount++;
-                    continue;
-                }
-
-                if (stateAtScan != JournalState.PENDING && record.requestOversize) {
-                    reclaimed.add(id);
-                    recordReap(id, base.operation(), ReapReason.OVERSIZE_PAYLOAD,
-                            OVERSIZE_PAYLOAD_DETAIL, now);
-                    reapedCount++;
+                if (!dryRun) {
+                    record.manualReapRequested = true;
                 }
             }
-            for (String id : reclaimed) {
+            return runPassLocked(dryRun, target, now);
+        }
+    }
+
+    /**
+     * Shared body of the manual and scheduled passes. The caller must hold {@link #lock} and must
+     * have resolved {@code manualTargetId} already (validated, intent recorded).
+     *
+     * <p>The classification snapshot is taken up front, so each entry is decided at most once per
+     * pass with fixed precedence — expired replay claim, manual intent, stale PENDING, oversize
+     * request — and carries at most one reason. A pass therefore never both rolls back and fails
+     * one entry, and never double-tombstones it.</p>
+     */
+    private JournalReapResponse runPassLocked(boolean dryRun, String manualTargetId, Instant now) {
+        Instant staleCutoff = now.minusSeconds(stalePendingSeconds);
+        List<Map.Entry<String, JournalRecord>> snapshot = new ArrayList<>(entries.entrySet());
+        List<String> reclaimQueue = new ArrayList<>();
+        int replayLeaseExpired = 0;
+        int manuallyReaped = 0;
+        int stalePending = 0;
+        int oversizePayload = 0;
+        int reapedCount = 0;
+        for (Map.Entry<String, JournalRecord> candidate : snapshot) {
+            String id = candidate.getKey();
+            JournalRecord record = candidate.getValue();
+            // A preview of a targeted pass simulates the intent the applying pass would record,
+            // without touching the flag: the same classification, no mutation.
+            boolean manualIntent = record.manualReapRequested
+                    || (dryRun && id.equals(manualTargetId));
+            ReapDecision decision = classify(record, now, staleCutoff, manualIntent);
+            if (decision == null) {
+                continue;
+            }
+            if (!dryRun) {
+                applyDecision(id, record, decision, reclaimQueue, now);
+            }
+            switch (decision.reason()) {
+                case REPLAY_LEASE_EXPIRED -> replayLeaseExpired++;
+                case MANUALLY_REAPED -> manuallyReaped++;
+                case STALE_PENDING -> stalePending++;
+                case OVERSIZE_PAYLOAD -> oversizePayload++;
+                default -> throw new IllegalStateException(
+                        "Unclassified reap reason: " + decision.reason());
+            }
+            reapedCount++;
+        }
+        if (!dryRun) {
+            for (String id : reclaimQueue) {
                 entries.remove(id);
             }
             enforceBound();
         }
-        return reapedCount;
+        return new JournalReapResponse(dryRun, snapshot.size(), reapedCount, replayLeaseExpired,
+                manuallyReaped, stalePending, oversizePayload, manualTargetId);
     }
+
+    /**
+     * Pure eligibility classification: reads the record, never writes it (a preview runs exactly
+     * this code, so classification must be free of side effects). Returns null when the entry is
+     * not eligible in this pass. {@code manualIntent} is the stored flag plus, for a targeted
+     * preview, the intent that the applying pass would have recorded.
+     */
+    private ReapDecision classify(JournalRecord record, Instant now, Instant staleCutoff,
+                                  boolean manualIntent) {
+        AuditEntry base = record.base;
+        JournalState stateAtScan = base.state();
+
+        ReplayRecord claim = record.replay;
+        if (claim != null && claim.state() == ReplayState.IN_PROGRESS
+                && claim.leaseExpiresAt() != null
+                && !claim.leaseExpiresAt().isAfter(now)) {
+            return new ReapDecision(ReapReason.REPLAY_LEASE_EXPIRED, ReapAction.ROLLBACK_CLAIM,
+                    null, REPLAY_LEASE_EXPIRED_DETAIL);
+        }
+
+        if (stateAtScan == JournalState.PENDING && manualIntent) {
+            return new ReapDecision(ReapReason.MANUALLY_REAPED, ReapAction.FAIL_ENTRY,
+                    MANUALLY_REAPED, MANUALLY_REAPED_DETAIL);
+        }
+
+        if (stateAtScan == JournalState.PENDING && base.createdAt() != null
+                && base.createdAt().isBefore(staleCutoff)) {
+            return new ReapDecision(ReapReason.STALE_PENDING, ReapAction.FAIL_ENTRY,
+                    STALE_PENDING_REAPED, STALE_PENDING_DETAIL);
+        }
+
+        if (stateAtScan != JournalState.PENDING && record.requestOversize) {
+            return new ReapDecision(ReapReason.OVERSIZE_PAYLOAD, ReapAction.RECLAIM_ENTRY,
+                    null, OVERSIZE_PAYLOAD_DETAIL);
+        }
+
+        return null;
+    }
+
+    /**
+     * Applies one {@link ReapDecision} to the live record and appends its single tombstone. Assumes
+     * the lock is held and that {@code decision} came from {@link #classify} for the same record in
+     * the same pass. Reclaims are queued and removed by the caller so the entry map is never
+     * structurally modified while iterating over the snapshot.
+     */
+    private void applyDecision(String id, JournalRecord record, ReapDecision decision,
+                               List<String> reclaimQueue, Instant now) {
+        AuditEntry base = record.base;
+        switch (decision.action()) {
+            case ROLLBACK_CLAIM -> {
+                ReplayRecord claim = record.replay;
+                ReplayRecord rolledBack = new ReplayRecord(ReplayState.FAILED, now,
+                        boundedDetail(ReplayState.FAILED, REPLAY_LEASE_EXPIRED_DETAIL
+                                + " at " + (claim == null ? null : claim.leaseExpiresAt())), null);
+                record.replayOwnerToken = null;
+                record.replay = rolledBack;
+                record.base = withReplay(base, rolledBack);
+            }
+            case FAIL_ENTRY -> {
+                if (decision.reason() == ReapReason.MANUALLY_REAPED) {
+                    record.manualReapRequested = false;
+                }
+                record.base = new AuditEntry(base.id(), base.requestId(), base.operation(),
+                        JournalState.FAILED, base.createdAt(), now, base.request(), null,
+                        decision.errorCode(), base.replayable(), record.replay);
+            }
+            case RECLAIM_ENTRY -> reclaimQueue.add(id);
+            default -> throw new IllegalStateException("Unclassified reap action: " + decision.action());
+        }
+        recordReap(id, base.operation(), decision.reason(), decision.detail(), now);
+    }
+
+    /** What to do to the entry behind one eligible reap reason. */
+    private enum ReapAction { ROLLBACK_CLAIM, FAIL_ENTRY, RECLAIM_ENTRY }
+
+    /** One classified eligibility decision: the reason, the action it implies and its tombstone text. */
+    private record ReapDecision(ReapReason reason, ReapAction action, String errorCode, String detail) {}
 
     /**
      * Newest-first snapshot of reaped-entry tombstones, clamped to {@code [1, maxEntries]} and,

@@ -6,9 +6,12 @@ import com.example.utiltools.audit.model.OperationType;
 import com.example.utiltools.audit.model.ReapReason;
 import com.example.utiltools.audit.model.ReapRecord;
 import com.example.utiltools.audit.model.ReplayState;
+import com.example.utiltools.audit.dto.JournalReapResponse;
 import com.example.utiltools.audit.service.AuditJournalService;
 import com.example.utiltools.audit.service.ReplayClaim;
 import com.example.utiltools.crypto.dto.HashRequest;
+import com.example.utiltools.common.AuditEntryNotFoundException;
+import com.example.utiltools.common.ReapConflictException;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -21,9 +24,16 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Contracts of the background journal reaper: one scheduled pass that rolls back expired replay
@@ -478,5 +488,261 @@ class AuditJournalReaperTest {
         }
         assertThat(mixed.reap()).isZero();
         assertThat(mixed.reapLog(10)).isEqualTo(before);
+    }
+
+    // ---- UTILTOOLS-84: operator-triggered manual reap pass ----
+
+    @Test
+    @DisplayName("a dry-run pass reports the counts of the applying pass and leaves the journal identical")
+    void dryRunCountsMatchApplyCounts() {
+        AuditJournalService mixed = new AuditJournalService(new ObjectMapper(), 10, 200,
+                STALE_SECONDS, LEASE_SECONDS, clock);
+
+        AuditEntry claimed = mixed.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000001");
+        mixed.succeed(claimed.id(), hashResponse());
+        assertThat(mixed.claimReplay(claimed.id())).isNotNull();
+
+        AuditEntry manual = mixed.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000002");
+        assertThat(mixed.requestManualReap(manual.id())).isTrue();
+
+        AuditEntry orphan = mixed.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000003");
+
+        AuditEntry oversize = mixed.begin(OperationType.CRYPTO_HASH,
+                Map.of("input", "x".repeat(400)), "req-00000004");
+        assertThat(oversize.replayable()).isFalse();
+        mixed.succeed(oversize.id(), hashResponse());
+
+        clock.advanceSeconds(STALE_SECONDS + 1);
+
+        List<AuditEntry> before = mixed.list(10, null);
+        assertThat(before).hasSize(4);
+
+        JournalReapResponse preview = mixed.reapManually(null, true);
+        assertThat(preview.dryRun()).isTrue();
+        assertThat(preview.entryId()).isNull();
+        assertThat(preview.scanned()).isEqualTo(4);
+        assertThat(preview.reaped()).isEqualTo(4);
+        assertThat(preview.replayLeaseExpired()).isEqualTo(1);
+        assertThat(preview.manuallyReaped()).isEqualTo(1);
+        assertThat(preview.stalePending()).isEqualTo(1);
+        assertThat(preview.oversizePayload()).isEqualTo(1);
+        assertThat(preview.reaped()).isEqualTo(preview.replayLeaseExpired()
+                + preview.manuallyReaped() + preview.stalePending() + preview.oversizePayload());
+
+        assertThat(mixed.reapLog(10)).isEmpty();
+        assertThat(mixed.list(10, null)).isEqualTo(before);
+        assertThat(mixed.find(claimed.id()).orElseThrow().replay().state())
+                .isEqualTo(ReplayState.IN_PROGRESS);
+        assertThat(mixed.find(manual.id())).contains(manual);
+        assertThat(mixed.find(orphan.id())).contains(orphan);
+        assertThat(mixed.size()).isEqualTo(4);
+
+        JournalReapResponse applied = mixed.reapManually(null, false);
+        assertThat(applied.dryRun()).isFalse();
+        assertThat(applied.scanned()).isEqualTo(preview.scanned());
+        assertThat(applied.reaped()).isEqualTo(preview.reaped());
+        assertThat(applied.replayLeaseExpired()).isEqualTo(preview.replayLeaseExpired());
+        assertThat(applied.manuallyReaped()).isEqualTo(preview.manuallyReaped());
+        assertThat(applied.stalePending()).isEqualTo(preview.stalePending());
+        assertThat(applied.oversizePayload()).isEqualTo(preview.oversizePayload());
+
+        assertThat(mixed.reapLog(10)).hasSize(4);
+        assertThat(mixed.find(manual.id()).orElseThrow().state()).isEqualTo(JournalState.FAILED);
+        assertThat(mixed.find(manual.id()).orElseThrow().errorCode()).isEqualTo("MANUALLY_REAPED");
+        assertThat(mixed.find(orphan.id()).orElseThrow().state()).isEqualTo(JournalState.FAILED);
+        assertThat(mixed.find(orphan.id()).orElseThrow().errorCode())
+                .isEqualTo("STALE_PENDING_REAPED");
+        AuditEntry claimedAfter = mixed.find(claimed.id()).orElseThrow();
+        assertThat(claimedAfter.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(claimedAfter.replay().state()).isEqualTo(ReplayState.FAILED);
+        assertThat(mixed.find(oversize.id())).isEmpty();
+    }
+
+    @Test
+    @DisplayName("a repeated manual apply pass reports zero reaps and appends no second tombstone")
+    void repeatedApplyPassReportsZero() {
+        AuditEntry orphan = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000001");
+        AuditEntry claimed = succeeded("req-00000002");
+        assertThat(journal.claimReplay(claimed.id())).isNotNull();
+        clock.advanceSeconds(STALE_SECONDS + 1);
+
+        JournalReapResponse first = journal.reapManually(null, false);
+        assertThat(first.reaped()).isEqualTo(2);
+        assertThat(first.stalePending()).isEqualTo(1);
+        assertThat(first.replayLeaseExpired()).isEqualTo(1);
+        assertThat(journal.reapLog(10)).hasSize(2);
+
+        JournalReapResponse second = journal.reapManually(null, false);
+        assertThat(second.reaped()).isZero();
+        assertThat(second.replayLeaseExpired()).isZero();
+        assertThat(second.manuallyReaped()).isZero();
+        assertThat(second.stalePending()).isZero();
+        assertThat(second.oversizePayload()).isZero();
+        assertThat(second.scanned()).isEqualTo(2);
+
+        assertThat(journal.reapLog(10)).hasSize(2);
+        assertThat(journal.size()).isEqualTo(2);
+        assertThat(journal.find(orphan.id()).orElseThrow().errorCode())
+                .isEqualTo("STALE_PENDING_REAPED");
+        assertThat(journal.find(claimed.id()).orElseThrow().state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(orphan.state()).isEqualTo(JournalState.PENDING);
+    }
+
+    @Test
+    @DisplayName("a targeted dry-run preview touches no entry, no tombstone and no manual intent")
+    void dryRunMutatesNothing() {
+        AuditEntry pending = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-00000001");
+
+        JournalReapResponse preview = journal.reapManually(pending.id(), true);
+        assertThat(preview.dryRun()).isTrue();
+        assertThat(preview.entryId()).isEqualTo(pending.id());
+        assertThat(preview.scanned()).isEqualTo(1);
+        assertThat(preview.reaped()).isEqualTo(1);
+        assertThat(preview.manuallyReaped()).isEqualTo(1);
+        assertThat(journal.find(pending.id())).contains(pending);
+        assertThat(journal.reapLog(10)).isEmpty();
+        assertThat(journal.size()).isEqualTo(1);
+
+        // the preview consumed no intent, so repeating it still reports one reap
+        assertThat(journal.reapManually(pending.id(), true).manuallyReaped()).isEqualTo(1);
+        assertThat(journal.find(pending.id())).contains(pending);
+
+        JournalReapResponse applied = journal.reapManually(pending.id(), false);
+        assertThat(applied.manuallyReaped()).isEqualTo(1);
+        assertThat(applied.reaped()).isEqualTo(1);
+        assertThat(journal.find(pending.id()).orElseThrow().state()).isEqualTo(JournalState.FAILED);
+        assertThat(journal.find(pending.id()).orElseThrow().errorCode()).isEqualTo("MANUALLY_REAPED");
+        assertThat(journal.reapLog(10)).hasSize(1);
+
+        assertThatThrownBy(() -> journal.reapManually(pending.id(), false))
+                .isInstanceOf(ReapConflictException.class);
+        assertThat(journal.reapLog(10)).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("a targeted manual pass answers NOT_FOUND for an unknown id and REAP_CONFLICT for a terminal id")
+    void targetedManualPassRejectsUnknownAndTerminalEntries() {
+        assertThatThrownBy(() -> journal.reapManually("missing-id", false))
+                .isInstanceOf(AuditEntryNotFoundException.class);
+        assertThat(journal.size()).isZero();
+        assertThat(journal.reapLog(10)).isEmpty();
+
+        AuditEntry succeeded = succeeded("req-00000001");
+        assertThatThrownBy(() -> journal.reapManually(succeeded.id(), false))
+                .isInstanceOf(ReapConflictException.class)
+                .hasMessageContaining("SUCCEEDED");
+        assertThatThrownBy(() -> journal.reapManually(succeeded.id(), true))
+                .isInstanceOf(ReapConflictException.class);
+        assertThat(journal.find(succeeded.id())).contains(succeeded);
+        assertThat(journal.reapLog(10)).isEmpty();
+
+        // the conflict consumed no intent, so an untargeted pass still reports zero
+        JournalReapResponse pass = journal.reapManually(null, false);
+        assertThat(pass.reaped()).isZero();
+        assertThat(pass.scanned()).isEqualTo(1);
+        assertThat(journal.reapLog(10)).isEmpty();
+        assertThat(journal.find(succeeded.id())).contains(succeeded);
+
+        JournalReapResponse blankTarget = journal.reapManually("   ", true);
+        assertThat(blankTarget.entryId()).isNull();
+        assertThat(blankTarget.dryRun()).isTrue();
+        assertThat(blankTarget.reaped()).isZero();
+    }
+
+    @Test
+    @DisplayName("concurrent manual and scheduled passes tombstone each eligible entry exactly once")
+    void concurrentManualAndScheduledPassesTombstoneExactlyOnce() throws Exception {
+        int entryCount = 64;
+        AuditJournalService wide = new AuditJournalService(new ObjectMapper(), 100, MAX_REPLAY_BYTES,
+                STALE_SECONDS, LEASE_SECONDS, clock);
+        List<String> ids = new ArrayList<>();
+        for (int i = 0; i < entryCount; i++) {
+            AuditEntry pending = wide.begin(OperationType.CRYPTO_HASH, hashRequest(),
+                    String.format("req-%08d", i));
+            assertThat(wide.requestManualReap(pending.id())).isTrue();
+            ids.add(pending.id());
+        }
+
+        int threads = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch gate = new CountDownLatch(1);
+        CountDownLatch finished = new CountDownLatch(threads);
+        AtomicInteger manualReaped = new AtomicInteger();
+        List<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            boolean scheduledPath = i % 2 == 0;
+            futures.add(pool.submit(() -> {
+                try {
+                    gate.await();
+                    if (scheduledPath) {
+                        wide.reapJournal();
+                    } else {
+                        manualReaped.addAndGet(wide.reapManually(null, false).reaped());
+                    }
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    finished.countDown();
+                }
+            }));
+        }
+        gate.countDown();
+        assertThat(finished.await(30, TimeUnit.SECONDS)).isTrue();
+        pool.close();
+        for (Future<?> future : futures) {
+            future.get();
+        }
+
+        assertThat(manualReaped.get()).isLessThanOrEqualTo(entryCount);
+
+        List<ReapRecord> tombstones = wide.reapLog(100);
+        assertThat(tombstones).hasSize(entryCount);
+        assertThat(tombstones).extracting(ReapRecord::entryId).doesNotHaveDuplicates();
+        assertThat(tombstones).extracting(ReapRecord::entryId)
+                .containsExactlyInAnyOrderElementsOf(ids);
+        assertThat(tombstones).allSatisfy(tombstone ->
+                assertThat(tombstone.reason()).isEqualTo(ReapReason.MANUALLY_REAPED));
+        for (String id : ids) {
+            AuditEntry entry = wide.find(id).orElseThrow();
+            assertThat(entry.state()).isEqualTo(JournalState.FAILED);
+            assertThat(entry.errorCode()).isEqualTo("MANUALLY_REAPED");
+        }
+        assertThat(wide.reapManually(null, false).reaped()).isZero();
+        assertThat(wide.reapLog(100)).hasSize(entryCount);
+    }
+
+    @Test
+    @DisplayName("repeated manual passes keep size() within utiltools.audit.max-entries and match the tombstone reasons")
+    void sizeStaysWithinBoundAfterRepeatedManualPasses() {
+        for (int i = 0; i < 12; i++) {
+            AuditEntry pending = journal.begin(OperationType.CRYPTO_HASH, hashRequest(),
+                    String.format("req-%08d", i));
+            assertThat(journal.requestManualReap(pending.id())).isTrue();
+        }
+        assertThat(journal.size()).isEqualTo(MAX_ENTRIES);
+
+        int cumulative = 0;
+        for (int pass = 0; pass < 5; pass++) {
+            JournalReapResponse result = journal.reapManually(null, false);
+            assertThat(journal.size()).isLessThanOrEqualTo(MAX_ENTRIES);
+            assertThat(result.scanned()).isLessThanOrEqualTo(MAX_ENTRIES);
+            assertThat(result.manuallyReaped()).isEqualTo(result.reaped());
+            cumulative += result.reaped();
+            assertThat(cumulative).isEqualTo(tallyByReason(journal.reapLog(MAX_ENTRIES))
+                    .getOrDefault(ReapReason.MANUALLY_REAPED, 0L).intValue());
+        }
+
+        assertThat(cumulative).isEqualTo(MAX_ENTRIES);
+        Map<ReapReason, Long> tally = tallyByReason(journal.reapLog(MAX_ENTRIES));
+        assertThat(tally).containsOnlyKeys(ReapReason.MANUALLY_REAPED);
+        assertThat(tally.get(ReapReason.MANUALLY_REAPED)).isEqualTo((long) MAX_ENTRIES);
+    }
+
+    private static Map<ReapReason, Long> tallyByReason(List<ReapRecord> tombstones) {
+        Map<ReapReason, Long> tally = new java.util.EnumMap<>(ReapReason.class);
+        for (ReapRecord tombstone : tombstones) {
+            tally.merge(tombstone.reason(), 1L, Long::sum);
+        }
+        return tally;
     }
 }
