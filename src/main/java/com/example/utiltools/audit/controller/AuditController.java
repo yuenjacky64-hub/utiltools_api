@@ -1,5 +1,6 @@
 package com.example.utiltools.audit.controller;
 
+import com.example.utiltools.audit.dto.JournalReapResponse;
 import com.example.utiltools.audit.dto.JournalVerifyResponse;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
@@ -24,7 +25,9 @@ import java.util.List;
 @RequestMapping("/api/v1/utils/audit")
 @Tag(name = "Audit Journal", description = "Bounded in-memory operation journal with request correlation and single-winner replay verification: "
         + "a replay claims the entry (IN_PROGRESS), records VERIFIED, MISMATCH or FAILED, and answers "
-        + "409 REPLAY_CONFLICT while another claim is live or when the caller's lease expired")
+        + "409 REPLAY_CONFLICT while another claim is live or when the caller's lease expired. "
+        + "POST /reaps runs one bounded manual reap pass (with dry-run preview and single-entry manual "
+        + "reclaim) under the same lock as the scheduled reaper")
 public class AuditController {
 
     private final AuditJournalService journal;
@@ -76,6 +79,29 @@ public class AuditController {
     public ApiResponse<JournalVerifyResponse> verify(
             @RequestParam(value = "limit", required = false, defaultValue = "20") int limit) {
         return ApiResponse.success(replayService.verify(limit), "Journal verification sweep completed");
+    }
+
+    @PostMapping("/reaps")
+    @Operation(summary = "Run a journal reap pass",
+               description = """
+                       Runs exactly one bounded, synchronous reaper pass and answers its counts
+                       (`scanned`, `reaped` and one count per reason: `replayLeaseExpired`,
+                       `manuallyReaped`, `stalePending`, `oversizePayload`), so an operator can preview
+                       or force the sweep the scheduled reaper runs. Shares the journal lock with the
+                       scheduled pass: the two are serialized, each eligible entry is reaped at most
+                       once per pass and exactly one tombstone is appended per reaped entry. `dryRun=true`
+                       uses the same eligibility classification but mutates nothing — no
+                       PENDING-to-FAILED transition, no replay-claim rollback, no tombstone, no manual
+                       intent consumed and no eviction. `entryId` targets one PENDING entry: intent is
+                       recorded under the lock and consumed by this pass, an unknown id answers 404
+                       NOT_FOUND and an already-terminal entry answers 409 REAP_CONFLICT without
+                       mutating it, consuming intent or writing a tombstone. The endpoint appends no
+                       audit journal entry (no recursive journalling) and no request, result, owner
+                       token or lease deadline is returned.""")
+    public ApiResponse<JournalReapResponse> reap(
+            @RequestParam(value = "dryRun", required = false, defaultValue = "false") boolean dryRun,
+            @RequestParam(value = "entryId", required = false) String entryId) {
+        return ApiResponse.success(journal.reapManually(entryId, dryRun), "Manual reap pass completed");
     }
 
     @GetMapping("/reaps")

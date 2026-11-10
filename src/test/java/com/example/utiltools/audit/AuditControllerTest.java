@@ -32,7 +32,6 @@ import org.springframework.test.web.servlet.MvcResult;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
@@ -493,6 +492,204 @@ class AuditControllerTest {
                     .andExpect(jsonPath("$.success").value(true))
                     .andExpect(jsonPath("$.data").isArray());
         }
+    }
+
+    // ---- UTILTOOLS-84: POST /api/v1/utils/audit/reaps ----
+
+    @Test
+    @DisplayName("POST /api/v1/utils/audit/reaps - dryRun defaults to false and answers per-reason counts")
+    void manualReapEndpointReturnsReasonCounts() throws Exception {
+        AuditEntry pending = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "audit-reap0001");
+        assertThat(journal.requestManualReap(pending.id())).isTrue();
+
+        MvcResult result = mockMvc.perform(post("/api/v1/utils/audit/reaps")
+                        .header("X-Request-Id", "audit-reap0002"))
+                .andExpect(status().isOk())
+                .andExpect(header().string("X-Request-Id", "audit-reap0002"))
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.requestId").value("audit-reap0002"))
+                .andExpect(jsonPath("$.data.dryRun").value(false))
+                .andExpect(jsonPath("$.data.entryId").doesNotExist())
+                .andExpect(jsonPath("$.data.scanned").isNumber())
+                .andExpect(jsonPath("$.data.reaped").isNumber())
+                .andExpect(jsonPath("$.data.replayLeaseExpired").isNumber())
+                .andExpect(jsonPath("$.data.manuallyReaped").isNumber())
+                .andExpect(jsonPath("$.data.stalePending").isNumber())
+                .andExpect(jsonPath("$.data.oversizePayload").isNumber())
+                .andReturn();
+
+        Map<String, Object> data = com.jayway.jsonpath.JsonPath.read(
+                result.getResponse().getContentAsString(), "$.data");
+        int reaped = ((Number) data.get("reaped")).intValue();
+        int perReason = ((Number) data.get("replayLeaseExpired")).intValue()
+                + ((Number) data.get("manuallyReaped")).intValue()
+                + ((Number) data.get("stalePending")).intValue()
+                + ((Number) data.get("oversizePayload")).intValue();
+        assertThat(reaped).isEqualTo(perReason);
+        assertThat(reaped).isGreaterThanOrEqualTo(1);
+        assertThat(((Number) data.get("manuallyReaped")).intValue()).isGreaterThanOrEqualTo(1);
+
+        AuditEntry reapedEntry = journal.find(pending.id()).orElseThrow();
+        assertThat(reapedEntry.state()).isEqualTo(JournalState.FAILED);
+        assertThat(reapedEntry.errorCode()).isEqualTo("MANUALLY_REAPED");
+        assertThat(result.getResponse().getContentAsString()).doesNotContain("super-secret-key");
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/audit/reaps?dryRun=true - leaves entry state and GET /reaps tombstones unchanged")
+    void dryRunLeavesEntryAndTombstonesUnchanged() throws Exception {
+        AuditEntry pending = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "audit-reap0010");
+        assertThat(journal.requestManualReap(pending.id())).isTrue();
+
+        List<Map<String, Object>> tombstonesBefore = reapTombstones();
+
+        mockMvc.perform(post("/api/v1/utils/audit/reaps")
+                        .param("dryRun", "true").param("entryId", pending.id()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.dryRun").value(true))
+                .andExpect(jsonPath("$.data.entryId").value(pending.id()))
+                .andExpect(jsonPath("$.data.scanned").isNumber())
+                .andExpect(jsonPath("$.data.reaped").value(1))
+                .andExpect(jsonPath("$.data.manuallyReaped").value(1));
+
+        assertThat(journal.find(pending.id())).contains(pending);
+        assertThat(reapTombstones()).isEqualTo(tombstonesBefore);
+
+        mockMvc.perform(post("/api/v1/utils/audit/reaps").param("entryId", pending.id()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.dryRun").value(false))
+                .andExpect(jsonPath("$.data.manuallyReaped").value(1));
+        assertThat(journal.find(pending.id()).orElseThrow().state()).isEqualTo(JournalState.FAILED);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/audit/reaps?entryId=unknown - returns 404 NOT_FOUND")
+    void unknownEntryIdAnswers404() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/audit/reaps").param("entryId", "no-such-entry")
+                        .header("X-Request-Id", "audit-reap0020"))
+                .andExpect(status().isNotFound())
+                .andExpect(header().string("X-Request-Id", "audit-reap0020"))
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("NOT_FOUND"))
+                .andExpect(jsonPath("$.requestId").value("audit-reap0020"));
+
+        assertThat(journal.reapLog(200)).noneMatch(record -> "no-such-entry".equals(record.entryId()));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/audit/reaps?entryId=terminal - returns 409 REAP_CONFLICT and mutates nothing")
+    void terminalEntryIdAnswers409ReapConflict() throws Exception {
+        AuditEntry succeeded = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "audit-reap0030");
+        journal.succeed(succeeded.id(), new HashResponse("SHA-256", "abc", false));
+        AuditEntry before = journal.find(succeeded.id()).orElseThrow();
+
+        List<Map<String, Object>> tombstonesBefore = reapTombstones();
+
+        mockMvc.perform(post("/api/v1/utils/audit/reaps").param("entryId", succeeded.id())
+                        .header("X-Request-Id", "audit-reap0032"))
+                .andExpect(status().isConflict())
+                .andExpect(header().string("X-Request-Id", "audit-reap0032"))
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("REAP_CONFLICT"))
+                .andExpect(jsonPath("$.requestId").value("audit-reap0032"));
+
+        assertThat(journal.find(succeeded.id())).contains(before);
+        assertThat(reapTombstones()).isEqualTo(tombstonesBefore);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/audit/reaps?entryId=pending - one FAILED entry with exactly one tombstone")
+    void manualReapEndpointReclaimsTargetedPendingEntry() throws Exception {
+        AuditEntry pending = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "audit-reap0040");
+
+        MvcResult result = mockMvc.perform(post("/api/v1/utils/audit/reaps")
+                        .param("entryId", pending.id()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.dryRun").value(false))
+                .andExpect(jsonPath("$.data.entryId").value(pending.id()))
+                .andExpect(jsonPath("$.data.manuallyReaped").value(1))
+                .andExpect(jsonPath("$.data.reaped").value(1))
+                .andReturn();
+        assertThat(result.getResponse().getContentAsString()).doesNotContain("super-secret-key");
+
+        AuditEntry reaped = journal.find(pending.id()).orElseThrow();
+        assertThat(reaped.state()).isEqualTo(JournalState.FAILED);
+        assertThat(reaped.errorCode()).isEqualTo("MANUALLY_REAPED");
+        assertThat(reaped.result()).isNull();
+
+        MvcResult tombstones = mockMvc.perform(get("/api/v1/utils/audit/reaps")
+                        .param("reason", "MANUALLY_REAPED").param("limit", "200"))
+                .andExpect(status().isOk())
+                .andReturn();
+        List<Map<String, Object>> rows = com.jayway.jsonpath.JsonPath.read(
+                tombstones.getResponse().getContentAsString(), "$.data");
+        assertThat(rows.stream().filter(row -> pending.id().equals(row.get("entryId")))).hasSize(1);
+        assertThat(rows).allSatisfy(row ->
+                assertThat(row.get("reason")).isEqualTo("MANUALLY_REAPED"));
+        assertThat(tombstones.getResponse().getContentAsString())
+                .doesNotContain("ownerToken").doesNotContain("leaseExpiresAt");
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/audit/reaps - appends no journal entry and leaks no stored payload")
+    void reapEndpointAppendsNoJournalEntryAndLeaksNothing() throws Exception {
+        AuditEntry pending = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "audit-reap0060");
+        assertThat(journal.requestManualReap(pending.id())).isTrue();
+        List<AuditEntry> before = journal.list(200, null);
+
+        MvcResult result = mockMvc.perform(post("/api/v1/utils/audit/reaps"))
+                .andExpect(status().isOk())
+                .andReturn();
+        String body = result.getResponse().getContentAsString();
+
+        // no recursive journalling: the pass adds no entry of its own and never grows the journal
+        assertThat(journal.list(200, null)).hasSizeLessThanOrEqualTo(before.size());
+        assertThat(journal.size()).isLessThanOrEqualTo(before.size());
+        assertThat(body).doesNotContain("super-secret-key")
+                .doesNotContain("abc123")
+                .doesNotContain("ownerToken")
+                .doesNotContain("leaseExpiresAt");
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/audit/reaps - pass counts match the tombstones exposed by GET /reaps")
+    void manualPassCountsMatchTombstoneLog() throws Exception {
+        AuditEntry pending = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "audit-reap0050");
+        assertThat(journal.requestManualReap(pending.id())).isTrue();
+
+        MvcResult pass = mockMvc.perform(post("/api/v1/utils/audit/reaps"))
+                .andExpect(status().isOk())
+                .andReturn();
+        Map<String, Object> data = com.jayway.jsonpath.JsonPath.read(
+                pass.getResponse().getContentAsString(), "$.data");
+        int reaped = ((Number) data.get("reaped")).intValue();
+        assertThat(reaped).isGreaterThanOrEqualTo(1);
+        assertThat(((Number) data.get("manuallyReaped")).intValue()).isGreaterThanOrEqualTo(1);
+        assertThat(((Number) data.get("scanned")).intValue())
+                .isGreaterThanOrEqualTo(Math.max(journal.size(), 1));
+        assertThat(journal.size()).isLessThanOrEqualTo(journal.maxEntries());
+
+        MvcResult tombstones = mockMvc.perform(get("/api/v1/utils/audit/reaps")
+                        .param("limit", "200"))
+                .andExpect(status().isOk())
+                .andReturn();
+        List<Map<String, Object>> rows = com.jayway.jsonpath.JsonPath.read(
+                tombstones.getResponse().getContentAsString(), "$.data");
+        assertThat(rows).hasSize(journal.reapLog(200).size());
+        assertThat(rows).anySatisfy(row -> {
+            assertThat(row.get("entryId")).isEqualTo(pending.id());
+            assertThat(row.get("reason")).isEqualTo("MANUALLY_REAPED");
+            assertThat(row.get("status")).isEqualTo("REAPED");
+        });
+    }
+
+    /** Tombstones as exposed by GET /api/v1/utils/audit/reaps (data only, no envelope timestamps). */
+    private List<Map<String, Object>> reapTombstones() throws Exception {
+        MvcResult result = mockMvc.perform(get("/api/v1/utils/audit/reaps").param("limit", "200"))
+                .andExpect(status().isOk())
+                .andReturn();
+        return com.jayway.jsonpath.JsonPath.read(
+                result.getResponse().getContentAsString(), "$.data");
     }
 
     private static HashRequest hashRequest() {
