@@ -386,9 +386,11 @@ public class CryptoService {
         List<String> result = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
             UUID uuid = switch (resolvedVersion) {
+                case UUID_VERSION_V4 -> UUID.randomUUID();
                 case UUID_VERSION_V7 -> generateUuidV7();
                 case UUID_VERSION_V8 -> generateUuidV8();
-                default -> UUID.randomUUID();
+                default -> throw new IllegalArgumentException(
+                        "Invalid version: " + version + ". Expected V4, V7 or V8.");
             };
             result.add(compact ? uuid.toString().replace("-", "") : uuid.toString());
         }

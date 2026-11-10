@@ -38,7 +38,7 @@ class CryptoServiceTest {
 
     private static final long FIXED_CLOCK_MILLIS = 0x017F22E279B0L;
     private static final String UUID_V8_PATTERN =
-            "^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
+            "^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$";
 
     private CryptoService cryptoService;
 
