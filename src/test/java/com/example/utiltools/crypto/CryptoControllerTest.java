@@ -27,8 +27,11 @@ import org.springframework.http.MediaType;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -536,5 +539,144 @@ class CryptoControllerTest {
 
         JsonNode replayed = objectMapper.readTree(replayBody).path("data");
         assertThat(replayed.path("result").path("result").asText()).isEqualTo("MZXW6YTBOI======");
+    }
+    // --- POST /api/v1/utils/crypto/jwt/decode -------------------------------------------------
+
+    private static final String JWT_KNOWN_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+            + ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"
+            + ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+    private static final String JWT_KNOWN_SIGNATURE = "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/jwt/decode - should decode the HS256 example as unverified claims")
+    void shouldDecodeHs256Example() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/jwt/decode")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + JWT_KNOWN_TOKEN + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.algorithm").value("HS256"))
+                .andExpect(jsonPath("$.data.type").value("JWT"))
+                .andExpect(jsonPath("$.data.header.alg").value("HS256"))
+                .andExpect(jsonPath("$.data.header.typ").value("JWT"))
+                .andExpect(jsonPath("$.data.payload.sub").value("1234567890"))
+                .andExpect(jsonPath("$.data.payload.name").value("John Doe"))
+                .andExpect(jsonPath("$.data.payload.iat").value(1516239022))
+                .andExpect(jsonPath("$.data.signaturePresent").value(true))
+                .andExpect(jsonPath("$.data.signatureBytes").value(32))
+                .andExpect(jsonPath("$.data.verified").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/jwt/decode - should answer BAD_REQUEST for malformed and VALIDATION_ERROR for blank tokens")
+    void shouldRejectMalformedAndBlankTokens() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/jwt/decode")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"only-two.segments\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/jwt/decode")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"   \"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/jwt/decode")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/jwt/decode - should journal a replayable CRYPTO_JWT_DECODE entry")
+    void shouldJournalJwtDecodeOperation() throws Exception {
+        Set<String> before = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_JWT_DECODE)
+                .map(AuditEntry::id)
+                .collect(Collectors.toSet());
+
+        mockMvc.perform(post("/api/v1/utils/crypto/jwt/decode")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + JWT_KNOWN_TOKEN + "\"}"))
+                .andExpect(status().isOk());
+
+        List<AuditEntry> entries = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_JWT_DECODE)
+                .filter(e -> !before.contains(e.id()))
+                .toList();
+        assertThat(entries).hasSize(1);
+        AuditEntry entry = entries.get(0);
+        assertThat(entry.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entry.replayable()).isTrue();
+        assertThat(entry.result().path("algorithm").asText()).isEqualTo("HS256");
+        assertThat(entry.result().path("payload").path("sub").asText()).isEqualTo("1234567890");
+        assertThat(entry.result().path("verified").asBoolean()).isFalse();
+
+        String listing = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+        assertThat(listing).contains("CRYPTO_JWT_DECODE");
+
+        String replayBody = mockMvc.perform(post("/api/v1/utils/audit/entries/" + entry.id() + "/replay"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value(ReplayState.VERIFIED.name()))
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+
+        JsonNode replayed = objectMapper.readTree(replayBody).path("data");
+        assertThat(replayed.path("replay").path("state").asText()).isEqualTo(ReplayState.VERIFIED.name());
+        assertThat(replayed.path("result").path("algorithm").asText()).isEqualTo("HS256");
+        assertThat(replayed.path("result").path("payload").path("sub").asText()).isEqualTo("1234567890");
+        assertThat(replayed.path("result").path("verified").asBoolean()).isFalse();
+        assertThat(Instant.parse(replayed.path("completedAt").asText())).isEqualTo(entry.completedAt());
+
+        List<AuditEntry> after = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_JWT_DECODE)
+                .toList();
+        assertThat(after).hasSize(before.size() + 1);
+        assertThat(after).extracting(AuditEntry::id).contains(entry.id());
+        AuditEntry stored = after.get(0);
+        assertThat(stored.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(stored.result()).isEqualTo(entry.result());
+        assertThat(stored.completedAt()).isEqualTo(entry.completedAt());
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/jwt/decode - should never echo the raw token or signature value")
+    void shouldNeverEchoTokenOrSignature() throws Exception {
+        String successBody = mockMvc.perform(post("/api/v1/utils/crypto/jwt/decode")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + JWT_KNOWN_TOKEN + "\"}"))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+        assertThat(successBody).doesNotContain(JWT_KNOWN_TOKEN);
+        assertThat(successBody).doesNotContain(JWT_KNOWN_SIGNATURE);
+
+        String malformedBody = mockMvc.perform(post("/api/v1/utils/crypto/jwt/decode")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"abc.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c\"}"))
+                .andExpect(status().isBadRequest())
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+        assertThat(malformedBody).doesNotContain(JWT_KNOWN_SIGNATURE);
+
+        String listing = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+        assertThat(listing).contains("\"token\":\"***\"");
+        assertThat(listing).doesNotContain(JWT_KNOWN_TOKEN);
+        assertThat(listing).doesNotContain(JWT_KNOWN_SIGNATURE);
     }
 }

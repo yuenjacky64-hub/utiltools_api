@@ -13,6 +13,7 @@ public enum OperationType {
     CRYPTO_BASE64(true),
     CRYPTO_BASE32(true),
     CRYPTO_URL(true),
+    CRYPTO_JWT_DECODE(true),
     CRYPTO_UUID(false),
     JSON_FORMAT(true),
     JSON_VALIDATE(true),

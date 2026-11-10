@@ -44,7 +44,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | Tool | Base Path | Core Capabilities |
 | :--- | :--- | :--- |
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, current global time |
-| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), UUID v4 batch generation and time-ordered RFC 9562 UUID v7 generation (`version=V4|V7`) |
+| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 generation (`version=V4|V7`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit, and NDJSON / JSON Lines conversion (array <-> line-delimited records) |
 | **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
 
@@ -147,6 +147,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-256, SHA-512, MD5) or HMAC |
 | `POST` | `/api/v1/utils/crypto/base64` | Encode or decode standard / URL-safe Base64 strings |
 | `POST` | `/api/v1/utils/crypto/url` | Percent-encode or decode a URL component, path segment list or form value (`COMPONENT`, `PATH`, `FORM`) |
+| `POST` | `/api/v1/utils/crypto/jwt/decode` | Decode a compact JWT into `algorithm`, `type`, `header` and `payload` without verifying the signature (`verified` is always `false`) |
 | `GET` | `/api/v1/utils/crypto/uuid` | Generate random UUID v4 list (standard or compact 32-hex) |
 | `POST` | `/api/v1/utils/json/format` | Pretty-print or minify JSON strings |
 | `POST` | `/api/v1/utils/json/validate` | Check JSON syntax validity and report exact syntax error line/col |
@@ -732,6 +733,63 @@ request, the entry is replayable: `POST /api/v1/utils/audit/entries/{id}/replay`
 answers `replay.state = VERIFIED` without rewriting the entry's original `state`, `result` or `completedAt`, and
 without appending a second journal entry.
 
+#### F. JWT Decode (decode-only)
+`POST /api/v1/utils/crypto/jwt/decode` turns a compact JWS/JWT into its header and claims, so you can inspect
+a token while debugging without pulling a JWT library into the client. It is **decode-only**: the signature is
+never verified, no key is ever supplied, and `verified` is always `false`. Never use the decoded claims for an
+authorization decision without verifying the signature elsewhere.
+
+| Field | Required | Constraints |
+| :--- | :--- | :--- |
+| `token` | yes | non-blank compact token of at most 16384 characters |
+
+Strictness — anything else is HTTP `400` with error `BAD_REQUEST`:
+
+| Rule | Rejected example |
+| :--- | :--- |
+| exactly three dot-separated segments | `header.payload` or `header.payload.signature.extra` |
+| non-empty header and payload segments | `.payload.signature` |
+| unpadded base64url in every segment (`-`/`_` alphabet, no `=` padding, no `+` or `/`) | `eyJhbGciOiJIUzI1NiJ9=` |
+| strict UTF-8 decoding of the header and payload bytes | byte sequence `C3 28` |
+| header and payload parse as JSON **objects**, with no trailing content | `[1,2]` or `"text"` |
+| `header.alg` present and a non-blank string; `header.typ` a string when present | `{"typ":"JWT"}` or `{"alg":256}` |
+
+An empty third segment (`header.payload.`) is legal and reports `signaturePresent: false` with
+`signatureBytes: 0` — that is the `alg: none` shape, not an error.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/crypto/jwt/decode \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "JWT decoded successfully (signature not verified)",
+  "data": {
+    "algorithm": "HS256",
+    "type": "JWT",
+    "header": { "alg": "HS256", "typ": "JWT" },
+    "payload": { "sub": "1234567890", "name": "John Doe", "iat": 1516239022 },
+    "signaturePresent": true,
+    "signatureBytes": 32,
+    "verified": false
+  },
+  "timestamp": "2026-10-30T16:50:38.954060989Z"
+}
+```
+
+`header` and `payload` are returned as raw JSON trees, so claims keep their JSON types (`iat` stays a number).
+The response never echoes the raw token or the raw signature segment, and the journal redacts `token` as `"***"`.
+
+**Journal & replay:** each call is recorded as a `CRYPTO_JWT_DECODE` entry that moves `PENDING` →
+`SUCCEEDED`/`FAILED`; the entry is replayable and `POST /api/v1/utils/audit/entries/{id}/replay` re-runs the
+decode and answers `replay.state = VERIFIED` without appending a second journal entry.
+
 ---
 
 ### 3. JSON & Data Processor Utility
@@ -1275,10 +1333,10 @@ populated only when a cached result is served).
 
 ## 🧾 Operation Journal & Replay Verification
 
-All seventeen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
-`datetime/shift`, `crypto/hash`, `crypto/base64`, `crypto/url`, `crypto/uuid`, `json/format`, `json/validate`,
-`json/query`, `json/merge-patch`, `json/pointer`, `text/transform`, `text/stats`, `text/replace`,
-`text/html-entities` — are recorded in a **bounded in-memory journal** so a failed
+All eighteen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+`datetime/shift`, `crypto/hash`, `crypto/base64`, `crypto/url`, `crypto/jwt/decode`, `crypto/uuid`,
+`json/format`, `json/validate`, `json/query`, `json/merge-patch`, `json/pointer`, `text/transform`,
+`text/stats`, `text/replace`, `text/html-entities` — are recorded in a **bounded in-memory journal** so a failed
 hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
 can be verified against the original outcome without ever mutating the original entry.
 `GET /api/v1/utils/datetime/timezones` is read-only catalogue metadata and is not journalled.
@@ -2351,7 +2409,7 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | HTTP Status | Error Code | Trigger Condition |
 | :--- | :--- | :--- |
 | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Missing required fields (`@NotBlank`, `@NotNull`, etc.) |
-| `400 BAD_REQUEST` | `BAD_REQUEST` | Invalid timezone ID, unsupported hash algorithm, corrupt Base64, malformed or non-UTF-8 percent escape on `crypto/url` |
+| `400 BAD_REQUEST` | `BAD_REQUEST` | Invalid timezone ID, unsupported hash algorithm, corrupt Base64, malformed or non-UTF-8 percent escape on `crypto/url`, malformed compact JWT (segment count, base64url, UTF-8, JSON shape, `alg`/`typ`) on `crypto/jwt/decode` |
 | `400 BAD_REQUEST` | `BAD_REQUEST` | Malformed HTTP request body |
 | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Unknown or evicted batch job id |
 | `404 NOT_FOUND` | `NOT_FOUND` | Unknown audit journal entry id |
@@ -2427,7 +2485,7 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 - **`DateTimeServiceTest`**: Epoch parsing, timezone shifts, duration math, DST-aware shift arithmetic (month-end clamping, spring-forward, fall-back), boundary checks.
 - **`DateTimeControllerTest`**: Full HTTP endpoint testing with MockMvc, including shift validation and error envelopes.
 - **`CryptoServiceTest`**: Standard hashing vectors, HMAC calculations, Base64 encode/decode, URL percent-encoding across `COMPONENT`/`PATH`/`FORM` (round-trip, mode-specific `+`, malformed escape and undecodable UTF-8 rejection), UUID v4 generation, UUIDv7 fixed-clock vector, `version=V4|V7` parsing, clock-regression monotonicity, and an 8-thread x 10000 duplicate-free concurrency invariant.
-- **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `crypto/url` encode/decode, 400 `BAD_REQUEST` vs `VALIDATION_ERROR`, and `CRYPTO_URL` journal/replay (`VERIFIED`), including `version=V4|V7` selection, compact UUIDv7, and the 400 unified envelope for an unknown `version`.
+- **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `crypto/url` encode/decode, decode-only `crypto/jwt/decode` (`algorithm`, `payload`, `signatureBytes`, `verified=false`, no raw token or signature echoed), 400 `BAD_REQUEST` vs `VALIDATION_ERROR`, and `CRYPTO_URL` / `CRYPTO_JWT_DECODE` journal/replay (`VERIFIED`), including `version=V4|V7` selection, compact UUIDv7, and the 400 unified envelope for an unknown `version`.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries, six-op patch success, rollback to byte-identical original, missing paths, malformed pointers, `-` append, dry runs, input-not-mutated.
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, empty-`operations` validation rejection, and the stale-fallback envelopes: an opt-in request served from the cache with `staleFallback`/`cachedAt`/`cacheAgeMillis` on an `OPEN` breaker, plus the unchanged `503` `CIRCUIT_OPEN` envelope for a miss, a different `jsonPath` and a non-opt-in caller.
 - **`TextServiceTest`**: Every operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`), sentence-case idempotence and `[.!?]`-run boundaries, diacritic slugging over NFD, emoji/surrogate-pair and multiline statistics, blank-text constraint violations, unknown-operation rejection, and `changed`/`length` measured in code points; plus replace coverage: `$n` group expansion, literal metacharacters, `all=false` first-match-only, case-insensitive matching, no-match results, invalid-regex rejection, code-point `length`, every request constraint bound, and the 1000000-character result bound.
