@@ -118,7 +118,7 @@ class TextServiceTest {
     }
 
     @Test
-    @DisplayName("an unknown operation fails with BAD_REQUEST and echoes only the operation value")
+    @DisplayName("an unknown operation still fails at the service layer and echoes only the operation value")
     void shouldRejectUnknownOperation() {
         assertThatThrownBy(() -> service.transform(new TextTransformRequest("secret body", "shout")))
                 .isInstanceOf(IllegalArgumentException.class)
