@@ -23,22 +23,33 @@ import java.util.List;
  * constructor keeps callers compiled against the pre-lease shape working, with both lease fields
  * null.</p>
  *
- * <p>{@code completedItems} is the additive checkpoint projection: it reports how many leading
- * items of the batch are durably hashed and retained by the job's private checkpoint prefix. It is
- * {@code 0} before anything was committed (including on a {@code QUEUED} job and on a
- * {@code CANCELLED} job, which discards its prefix), the committed prefix size while the job is
- * {@code RUNNING} or {@code FAILED}, and {@code itemCount} once the job is {@code COMPLETED} and
- * has published {@code results}. {@code results} stays null until completion, so a partial prefix
- * is never disclosed as results. Being a primitive, it is serialized on every status; every
- * pre-existing component keeps its name and meaning, and both earlier constructor shapes are
- * retained.</p>
+ * <p>{@code completedItems} is the additive checkpoint projection: it reports how many items of the
+ * batch are durably hashed and retained — the size of the job's private checkpoint
+ * ({@code checkpoint.size()}), <em>not</em> a contiguous leading prefix, so a partially failed batch
+ * can report {@code 2} while an item at a lower index threw. It is {@code 0} before anything was
+ * committed (including on a {@code QUEUED} job and on a {@code CANCELLED} job, which discards its
+ * checkpoint), the durably hashed item count while the job is {@code RUNNING} or {@code FAILED}, and
+ * {@code itemCount} once the job is {@code COMPLETED} and has published {@code results}.
+ * {@code results} stays null until completion, so a partially hashed batch is never disclosed as
+ * results; {@code succeededItems} and {@code failedItems} below say which indices those are. Being a
+ * primitive, it is serialized on every status; every pre-existing component keeps its name and
+ * meaning, and both earlier constructor shapes are retained.</p>
  *
  * <p>{@code deadlineAt} is the additive total-life bound: {@code createdAt + deadlineSeconds} when
  * the job carries a bound, and null when no bound applies (the default). It is projected for every
  * status, so a client can see the bound on a QUEUED, RUNNING, FAILED and COMPLETED job alike; a job
- * whose bound passes is FAILED with error {@code JOB_DEADLINE_EXCEEDED} and keeps its checkpoint
- * prefix. Being nullable it is simply absent from the JSON when no bound applies, and the previous
+ * whose bound passes is FAILED with error {@code JOB_DEADLINE_EXCEEDED} and keeps its checkpoint and
+ * per-item indices, so a retry resumes at the first unprocessed index. Being nullable it is simply
+ * absent from the JSON when no bound applies, and the previous
  * 15-, 14- and 12-component constructor shapes still compile and report null.</p>
+ *
+ * <p>{@code succeededItems} and {@code failedItems} are the additive per-item projections
+ * ({@code REQ-02}): ascending input indices, {@code succeededItems} being every index whose digest
+ * is durably retained and {@code failedItems} every index whose hash threw and is recorded as
+ * failed. Both are always non-null lists, so they are serialised on every status; a
+ * {@code CANCELLED} job withdrew its progress and therefore reports both empty, and a
+ * {@code COMPLETED} job reports every index as succeeded with nothing failed. Indices only — never
+ * a digest of an uncommitted item — so a partially hashed batch discloses no results.</p>
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record BatchHashJobResponse(
@@ -57,8 +68,24 @@ public record BatchHashJobResponse(
         Instant executionLeaseExpiresAt,
         Instant lastHeartbeatAt,
         int completedItems,
-        Instant deadlineAt
+        Instant deadlineAt,
+        List<Integer> succeededItems,
+        List<Integer> failedItems
 ) {
+
+    /**
+     * Backward-compatible constructor for callers compiled against the 16-component deadline shape:
+     * such a caller cannot express per-item outcomes, so both index lists are empty.
+     */
+    public BatchHashJobResponse(String jobId, String idempotencyKey, JobStatus status, int itemCount,
+            List<HashResponse> results, String error, Instant createdAt, Instant startedAt,
+            Instant completedAt, int attempt, int maxAttempts, List<JobAttempt> attempts,
+            Instant executionLeaseExpiresAt, Instant lastHeartbeatAt, int completedItems,
+            Instant deadlineAt) {
+        this(jobId, idempotencyKey, status, itemCount, results, error, createdAt, startedAt, completedAt,
+                attempt, maxAttempts, attempts, executionLeaseExpiresAt, lastHeartbeatAt, completedItems,
+                deadlineAt, List.of(), List.of());
+    }
 
     /**
      * Backward-compatible constructor for callers compiled against the 15-component checkpoint
