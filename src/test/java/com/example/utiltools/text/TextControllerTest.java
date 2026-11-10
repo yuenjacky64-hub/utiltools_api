@@ -43,6 +43,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @TestPropertySource(properties = {"utiltools.audit.max-entries=200", "utiltools.audit.max-replay-bytes=65536"})
 class TextControllerTest {
 
+    private static final String SUPPORTED_OPERATIONS_MESSAGE =
+            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE";
+
     @Autowired
     private MockMvc mockMvc;
 
@@ -104,10 +107,9 @@ class TextControllerTest {
                         .content(unknown))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
-                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
-                .andExpect(jsonPath("$.message").value(containsString("Unsupported operation 'shout'")))
-                .andExpect(jsonPath("$.message").value(containsString(
-                        "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE")));
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.message").value("Validation failed"))
+                .andExpect(jsonPath("$.details", hasItem(SUPPORTED_OPERATIONS_MESSAGE)));
     }
 
     @Test
@@ -118,7 +120,7 @@ class TextControllerTest {
                         .content("""
                                 {
                                     "text": "the API is FAST. try it.",
-                                    "operation": " sentence_case "
+                                    "operation": "sentence_case"
                                 }
                                 """))
                 .andExpect(status().isOk())
@@ -126,6 +128,62 @@ class TextControllerTest {
                 .andExpect(jsonPath("$.data.result").value("The api is fast. Try it."))
                 .andExpect(jsonPath("$.data.changed").value(true))
                 .andExpect(jsonPath("$.data.length").value(24));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/transform - an unsupported operation is rejected by bean validation")
+    void shouldRejectUnsupportedOperationWith400ValidationError() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/transform")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                    "text": "Hello, World!",
+                                    "operation": "FOO"
+                                }
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.message").value("Validation failed"))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem(SUPPORTED_OPERATIONS_MESSAGE)))
+                .andExpect(jsonPath("$.details.length()").value(1))
+                .andExpect(jsonPath("$.details[0]").value(SUPPORTED_OPERATIONS_MESSAGE));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/transform - every supported operation is accepted")
+    void shouldAcceptEverySupportedOperation() throws Exception {
+        String[] operations = {"UPPER", "LOWER", "TITLE", "CAMEL", "SNAKE", "KEBAB", "SLUG", "SENTENCE_CASE"};
+
+        for (String operation : operations) {
+            mockMvc.perform(post("/api/v1/utils/text/transform")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("""
+                                    {
+                                        "text": "Hello, World!",
+                                        "operation": "%s"
+                                    }
+                                    """.formatted(operation)))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.success").value(true))
+                    .andExpect(jsonPath("$.data.operation").value(operation))
+                    .andExpect(jsonPath("$.data.result").isNotEmpty());
+        }
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/transform - a whitespace-padded operation is rejected by bean validation")
+    void shouldRejectPaddedOperation() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/transform")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "hi", "operation": " sentence_case "}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.message").value("Validation failed"))
+                .andExpect(jsonPath("$.details", hasItem(SUPPORTED_OPERATIONS_MESSAGE)));
     }
 
     @Test

@@ -107,7 +107,8 @@ class TextServiceTest {
             Set<ConstraintViolation<TextTransformRequest>> operationViolations =
                     validator.validate(new TextTransformRequest("Hello", " "));
             assertThat(operationViolations).extracting(ConstraintViolation::getMessage)
-                    .containsExactly("operation is required");
+                    .containsExactlyInAnyOrder("operation is required",
+                            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE");
 
             Set<ConstraintViolation<TextStatsRequest>> statsViolations =
                     validator.validate(new TextStatsRequest(""));
@@ -117,7 +118,7 @@ class TextServiceTest {
     }
 
     @Test
-    @DisplayName("an unknown operation fails with BAD_REQUEST and echoes only the operation value")
+    @DisplayName("an unknown operation still fails at the service layer and echoes only the operation value")
     void shouldRejectUnknownOperation() {
         assertThatThrownBy(() -> service.transform(new TextTransformRequest("secret body", "shout")))
                 .isInstanceOf(IllegalArgumentException.class)
