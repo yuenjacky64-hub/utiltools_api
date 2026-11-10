@@ -13,6 +13,7 @@ import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
 import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
+import com.example.utiltools.datetime.dto.DateTimeWeekResponse;
 import com.example.utiltools.datetime.dto.TimeZoneListResponse;
 import com.example.utiltools.datetime.service.DateTimeService;
 import io.swagger.v3.oas.annotations.Operation;
@@ -96,5 +97,16 @@ public class DateTimeController {
             @RequestParam(value = "limit", required = false, defaultValue = "50") int limit) {
         TimeZoneListResponse result = dateTimeService.listTimeZones(prefix, limit);
         return ApiResponse.success(result, "Timezones retrieved successfully");
+    }
+
+    @GetMapping("/week")
+    @Operation(summary = "Resolve the ISO-8601 week-year and week of a calendar date",
+            description = "Computes WeekFields.ISO week-based year, week of week-based year, day of week, "
+                    + "day of year and weekend flag for a yyyy-MM-dd date, including week-year rollover "
+                    + "(2024-12-30 is 2025-W01). Read-only: not journalled.")
+    public ApiResponse<DateTimeWeekResponse> week(
+            @RequestParam(value = "date", required = false) String date) {
+        DateTimeWeekResponse result = dateTimeService.week(date);
+        return ApiResponse.success(result, "ISO week retrieved successfully");
     }
 }
