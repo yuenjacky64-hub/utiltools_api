@@ -243,3 +243,81 @@ def test_stale_knobs_default_and_validate(tmp_path: Path) -> None:
             maintainer_root=tmp_path,
             env={"MAINTAINER_STALE_TIMEOUT_SEC": "five minutes"},
         )
+
+
+# --- UTILTOOLS-90: opencode_timeout_sec ------------------------------------
+
+
+def _valid_path_kwargs(root: Path) -> dict[str, str]:
+    """Create the configured path fields under ``root`` so ``validate()`` has no path issues."""
+
+    created: dict[str, str] = {}
+    for name in config_module.CONFIG_PATH_FIELDS:
+        path = root / name
+        path.mkdir(parents=True, exist_ok=True)
+        created[name] = str(path)
+    return created
+
+
+def test_opencode_timeout_default_is_600() -> None:
+    """DOD-05 / REQ-01: the dataclass field still defaults to 600 seconds."""
+
+    assert config_module.DEFAULT_OPENCODE_TIMEOUT_SEC == 600
+    config = MaintainerConfig()
+    assert config.opencode_timeout_sec == 600
+    assert isinstance(config.opencode_timeout_sec, int)
+
+
+def test_validate_flags_nonpositive_opencode_timeout(tmp_path: Path) -> None:
+    """DOD-01 / REQ-01: ``0`` and negatives are reported, not raised."""
+
+    kwargs = _valid_path_kwargs(tmp_path)
+    for value in (0, -5):
+        issues = MaintainerConfig(**kwargs, opencode_timeout_sec=value).validate()
+        assert issues == ["opencode_timeout_sec must be a positive integer"]
+
+    # ``bool`` is an ``int`` subclass, so it must be rejected explicitly.
+    issues = MaintainerConfig(**kwargs, opencode_timeout_sec=True).validate()
+    assert issues == ["opencode_timeout_sec must be a positive integer"]
+
+
+def test_validate_flags_out_of_range_opencode_timeout(tmp_path: Path) -> None:
+    """DOD-02 / REQ-02: ``59`` and ``3601`` each produce one message."""
+
+    kwargs = _valid_path_kwargs(tmp_path)
+    assert MaintainerConfig(**kwargs, opencode_timeout_sec=59).validate() == [
+        "opencode_timeout_sec must be >= 60"
+    ]
+    assert MaintainerConfig(**kwargs, opencode_timeout_sec=3601).validate() == [
+        "opencode_timeout_sec must be <= 3600"
+    ]
+
+
+def test_validate_accepts_default_opencode_timeout(tmp_path: Path) -> None:
+    """DOD-03 / REQ-01: the shipped default emits no message."""
+
+    config = MaintainerConfig(**_valid_path_kwargs(tmp_path))
+    assert config.opencode_timeout_sec == 600
+    assert config.validate() == []
+
+
+def test_validate_accepts_valid_opencode_timeouts(
+    tmp_path: Path, empty_must_config: None
+) -> None:
+    """DOD-04 / DOD-07 / REQ-02: in-range values pass; the env layer yields an int."""
+
+    kwargs = _valid_path_kwargs(tmp_path)
+    for value in (60, 120, 300, 3600):
+        assert MaintainerConfig(**kwargs, opencode_timeout_sec=value).validate() == []
+
+    loaded = MaintainerConfig.load(
+        maintainer_root=tmp_path, env={"MAINTAINER_OPENCODE_TIMEOUT_SEC": "120"}
+    )
+    assert loaded.opencode_timeout_sec == 120
+    assert isinstance(loaded.opencode_timeout_sec, int)
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        MaintainerConfig.load(
+            maintainer_root=tmp_path,
+            env={"MAINTAINER_OPENCODE_TIMEOUT_SEC": "ten minutes"},
+        )
