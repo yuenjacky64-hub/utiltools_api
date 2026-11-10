@@ -305,4 +305,99 @@ class TextControllerTest {
         assertThat(after.completedAt()).isEqualTo(completedAt);
         assertThat(after.result()).isEqualTo(before.result());
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/html-entities - encodes with ampersand first and returns the envelope")
+    void shouldEncodeHtmlEntities() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/html-entities")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "text": "<b>Fish & chips</b>"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("HTML entities processed successfully"))
+                .andExpect(jsonPath("$.data.action").value("ENCODE"))
+                .andExpect(jsonPath("$.data.result").value("&lt;b&gt;Fish &amp; chips&lt;/b&gt;"))
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.length").value(35));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/html-entities - decodes named and numeric references case-insensitively")
+    void shouldDecodeHtmlEntities() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/html-entities")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "decode", "text": "&lt;p&gt; &amp; &#39;q&#39; &#x41;"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.action").value("decode"))
+                .andExpect(jsonPath("$.data.result").value("<p> & 'q' A"))
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.length").value(11));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/html-entities - blank text and an invalid action return 400 VALIDATION_ERROR")
+    void shouldRejectInvalidHtmlEntitiesRequest() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/html-entities")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "text": "   "}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("text is required")));
+
+        mockMvc.perform(post("/api/v1/utils/text/html-entities")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "SHRUG", "text": "abc"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("action must be either ENCODE or DECODE")));
+    }
+
+    @Test
+    @DisplayName("an html-entities call is journalled as TEXT_HTML_ENTITIES and replays as VERIFIED without a new entry")
+    void shouldJournalAndReplayTextHtmlEntities() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/html-entities")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "text": "Fish & <chips>"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.result").value("Fish &amp; &lt;chips&gt;"));
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_HTML_ENTITIES"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.result").value("Fish &amp; &lt;chips&gt;"))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        AuditEntry before = journal.find(id).orElseThrow();
+        Instant completedAt = before.completedAt();
+        int entriesBefore = journal.size();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("TEXT_HTML_ENTITIES"))
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.result.result").value("Fish &amp; &lt;chips&gt;"))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"));
+
+        AuditEntry after = journal.find(id).orElseThrow();
+        assertThat(after.operation()).isEqualTo(OperationType.TEXT_HTML_ENTITIES);
+        assertThat(after.completedAt()).isEqualTo(completedAt);
+        assertThat(after.result()).isEqualTo(before.result());
+        assertThat(journal.size()).isEqualTo(entriesBefore);
+    }
 }

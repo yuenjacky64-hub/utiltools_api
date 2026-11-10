@@ -53,6 +53,8 @@ import com.example.utiltools.json.dto.JsonToNdjsonResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.text.dto.TextHtmlEntitiesRequest;
+import com.example.utiltools.text.dto.TextHtmlEntitiesResponse;
 import com.example.utiltools.text.dto.TextReplaceRequest;
 import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
@@ -223,6 +225,10 @@ public class AuditedOperations {
         return record(OperationType.TEXT_REPLACE, request, () -> textService.replace(request));
     }
 
+    public TextHtmlEntitiesResponse htmlEntities(TextHtmlEntitiesRequest request) {
+        return record(OperationType.TEXT_HTML_ENTITIES, request, () -> textService.htmlEntities(request));
+    }
+
     /**
      * Re-runs a stored operation without journalling; the single entry point used by replay.
      */
@@ -258,6 +264,7 @@ public class AuditedOperations {
             case TEXT_TRANSFORM -> textService.transform((TextTransformRequest) request);
             case TEXT_STATS -> textService.stats((TextStatsRequest) request);
             case TEXT_REPLACE -> textService.replace((TextReplaceRequest) request);
+            case TEXT_HTML_ENTITIES -> textService.htmlEntities((TextHtmlEntitiesRequest) request);
             // Asynchronous batch hashing is audit-only: a BATCH_HASH entry can never be replayed,
             // because there is no servlet-bound payload to re-run and the operation is
             // non-deterministic. Defence in depth: claimReplay refuses the same entries.

@@ -2,6 +2,8 @@ package com.example.utiltools.text.service;
 
 import com.example.utiltools.text.dto.TextReplaceRequest;
 import com.example.utiltools.text.dto.TextReplaceResponse;
+import com.example.utiltools.text.dto.TextHtmlEntitiesRequest;
+import com.example.utiltools.text.dto.TextHtmlEntitiesResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
@@ -32,6 +34,15 @@ public class TextService {
     private static final Pattern SENTENCE_SEPARATORS = Pattern.compile("[.!?]+");
 
     private static final int MAX_RESULT_CHARS = 1_000_000;
+
+    private static final String ALLOWED_ACTIONS = "ENCODE, DECODE";
+
+    private static final String ENCODE = "ENCODE";
+
+    private static final String DECODE = "DECODE";
+
+    /** Longest character reference body accepted by {@link #decodeReference(String, int)}: {@code #9999999}. */
+    private static final int MAX_REFERENCE_BODY = 8;
 
     private static final String UPPER = "UPPER";
     private static final String LOWER = "LOWER";
@@ -188,6 +199,146 @@ public class TextService {
         return new IllegalArgumentException("Invalid replacement '" + request.replacement()
                 + "' for pattern '" + request.pattern() + "': " + cause.getMessage());
     }
+
+    /**
+     * Encodes or decodes HTML character references in a single left-to-right pass.
+     *
+     * <p>{@code ENCODE} escapes {@code &} first and then {@code <}, {@code >}, {@code "} and
+     * {@code '} to {@code &amp;}, {@code &lt;}, {@code &gt;}, {@code &quot;} and {@code &#39;}.
+     * {@code DECODE} resolves those five named entities plus decimal ({@code &#NN;}) and
+     * hexadecimal ({@code &#xHH;}) numeric references; every other reference is preserved
+     * verbatim, so decoding is total over its input. Produced text is never re-scanned, so
+     * {@code &amp;lt;} decodes to the literal {@code &lt;}. The result is bounded by
+     * {@link #MAX_RESULT_CHARS} and the bound is enforced before each append.</p>
+     */
+    public TextHtmlEntitiesResponse htmlEntities(TextHtmlEntitiesRequest request) {
+        String text = request.text();
+        String action = request.action().trim().toUpperCase(Locale.ROOT);
+        String result = switch (action) {
+            case ENCODE -> encodeHtmlEntities(text);
+            case DECODE -> decodeHtmlEntities(text);
+            default -> throw new IllegalArgumentException("Unsupported action: " + request.action()
+                    + ". Allowed values: " + ALLOWED_ACTIONS);
+        };
+        return new TextHtmlEntitiesResponse(request.action(), result, !result.equals(text),
+                result.codePointCount(0, result.length()));
+    }
+
+    /** One left-to-right pass; {@code &} is escaped first and produced text is never re-scanned. */
+    private static String encodeHtmlEntities(String text) {
+        StringBuilder builder = new StringBuilder(Math.min(MAX_RESULT_CHARS, text.length() + 16));
+        for (int index = 0; index < text.length(); index++) {
+            char current = text.charAt(index);
+            String escape = switch (current) {
+                case '&' -> "&amp;";
+                case '<' -> "&lt;";
+                case '>' -> "&gt;";
+                case '"' -> "&quot;";
+                case '\'' -> "&#39;";
+                default -> null;
+            };
+            if (escape == null) {
+                appendWithinBound(builder, current);
+            } else {
+                appendWithinBound(builder, escape);
+            }
+        }
+        return builder.toString();
+    }
+
+    /** One left-to-right pass; unknown or malformed references are copied through verbatim. */
+    private static String decodeHtmlEntities(String text) {
+        StringBuilder builder = new StringBuilder(Math.min(MAX_RESULT_CHARS, text.length() + 16));
+        int index = 0;
+        while (index < text.length()) {
+            if (text.charAt(index) != '&') {
+                appendWithinBound(builder, text.charAt(index));
+                index++;
+                continue;
+            }
+            DecodedReference decoded = decodeReference(text, index);
+            if (decoded == null) {
+                appendWithinBound(builder, '&');
+                index++;
+            } else {
+                appendWithinBound(builder, decoded.value());
+                index = decoded.next();
+            }
+        }
+        return builder.toString();
+    }
+
+    /**
+     * Matches one character reference starting at {@code start} (which must hold {@code '&'}).
+     * Returns {@code null} — meaning "copy the {@code &} verbatim and continue" — for an unknown
+     * name, a missing {@code ;}, an invalid or out-of-range numeric value and every other
+     * malformed reference, so decoding never throws on content.
+     */
+    private static DecodedReference decodeReference(String text, int start) {
+        int limit = Math.min(text.length(), start + 2 + MAX_REFERENCE_BODY);
+        int cursor = start + 1;
+        while (cursor < limit && text.charAt(cursor) != ';') {
+            char current = text.charAt(cursor);
+            boolean digit = current >= '0' && current <= '9';
+            boolean letter = (current >= 'a' && current <= 'z') || (current >= 'A' && current <= 'Z');
+            boolean marker = current == '#' || (cursor == start + 2 && text.charAt(start + 1) == '#'
+                    && (current == 'x' || current == 'X'));
+            if (!digit && !letter && !marker) {
+                return null;
+            }
+            cursor++;
+        }
+        if (cursor >= text.length() || text.charAt(cursor) != ';') {
+            return null;
+        }
+        String body = text.substring(start + 1, cursor);
+        String decoded = switch (body) {
+            case "amp" -> "&";
+            case "lt" -> "<";
+            case "gt" -> ">";
+            case "quot" -> "\"";
+            default -> body.startsWith("#") ? decodeNumericReference(body) : null;
+        };
+        return decoded == null ? null : new DecodedReference(decoded, cursor + 1);
+    }
+
+    /** Decodes {@code #NN} / {@code #xHH} bodies, rejecting zero, surrogates and out-of-range values. */
+    private static String decodeNumericReference(String body) {
+        boolean hex = body.length() > 2 && (body.charAt(1) == 'x' || body.charAt(1) == 'X');
+        String digits = body.substring(hex ? 2 : 1);
+        if (digits.isEmpty() || digits.length() > (hex ? 6 : 7)) {
+            return null;
+        }
+        int value;
+        try {
+            value = Integer.parseInt(digits, hex ? 16 : 10);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        if (value <= 0 || value > Character.MAX_CODE_POINT
+                || (value >= Character.MIN_SURROGATE && value <= Character.MAX_SURROGATE)) {
+            return null;
+        }
+        return new String(Character.toChars(value));
+    }
+
+    /** Enforces {@link #MAX_RESULT_CHARS} before the append, so an oversized result is never built. */
+    private static void appendWithinBound(StringBuilder builder, String chunk) {
+        if ((long) builder.length() + chunk.length() > MAX_RESULT_CHARS) {
+            throw new IllegalArgumentException("html-entity result exceeds " + MAX_RESULT_CHARS + " characters");
+        }
+        builder.append(chunk);
+    }
+
+    private static void appendWithinBound(StringBuilder builder, char character) {
+        if (builder.length() + 1 > MAX_RESULT_CHARS) {
+            throw new IllegalArgumentException("html-entity result exceeds " + MAX_RESULT_CHARS + " characters");
+        }
+        builder.append(character);
+    }
+
+    /** One matched character reference: the decoded text plus the index just past its {@code ';'}. */
+    private record DecodedReference(String value, int next) {}
 
     public TextStatsResponse stats(TextStatsRequest request) {
         String text = request.text();
