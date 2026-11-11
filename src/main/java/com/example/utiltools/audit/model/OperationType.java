@@ -36,7 +36,11 @@ public enum OperationType {
     TEXT_STATS(true),
     TEXT_REPLACE(true),
     TEXT_HTML_ENTITIES(true),
-    BATCH_HASH(false);
+    BATCH_HASH(false),
+    // A contact submission's dispatch attempt is non-deterministic end to end: delivery has a
+    // wall-clock lease, a retry budget, and an out-of-scope dispatcher seam, so the entry never
+    // replays as if it were a live evaluation (like BATCH_HASH and DATETIME_CURRENT).
+    CONTACT_SUBMIT(false);
 
     private final boolean deterministic;
 
