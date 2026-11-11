@@ -1224,4 +1224,79 @@ class DateTimeControllerTest {
         assertThat(after.completedAt()).isEqualTo(completedAt);
         assertThat(after.result()).isEqualTo(journalEntry.result());
     }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/datetime/week-date - resolves an ISO week to a calendar date without journaling")
+    void shouldResolveIsoWeekDate() throws Exception {
+        int before = auditJournal.size();
+
+        mockMvc.perform(get("/api/v1/utils/datetime/week-date")
+                        .param("year", "2025")
+                        .param("week", "1")
+                        .param("day", "MONDAY"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.date").value("2024-12-30"))
+                .andExpect(jsonPath("$.data.isoWeekYear").value(2025))
+                .andExpect(jsonPath("$.data.isoWeek").value(1))
+                .andExpect(jsonPath("$.data.dayOfWeek").value("MONDAY"))
+                .andExpect(jsonPath("$.data.weekend").value(false));
+
+        mockMvc.perform(get("/api/v1/utils/datetime/week-date")
+                        .param("year", "2020")
+                        .param("week", "53")
+                        .param("day", "THURSDAY"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.date").value("2020-12-31"))
+                .andExpect(jsonPath("$.data.isoWeek").value(53));
+
+        // Case-insensitive day name; omitted day defaults to MONDAY.
+        mockMvc.perform(get("/api/v1/utils/datetime/week-date")
+                        .param("year", "2025")
+                        .param("week", "1")
+                        .param("day", "friday"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.date").value("2025-01-03"))
+                .andExpect(jsonPath("$.data.dayOfWeek").value("FRIDAY"));
+
+        mockMvc.perform(get("/api/v1/utils/datetime/week-date")
+                        .param("year", "2025")
+                        .param("week", "1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.date").value("2024-12-30"))
+                .andExpect(jsonPath("$.data.dayOfWeek").value("MONDAY"));
+
+        // Read-only route: the journal is untouched by successful or rejected calls alike.
+        assertThat(auditJournal.size()).isEqualTo(before);
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/datetime/week-date - rejects invalid year/week/day with 400 without journaling")
+    void shouldRejectInvalidWeekDate() throws Exception {
+        int before = auditJournal.size();
+
+        mockMvc.perform(get("/api/v1/utils/datetime/week-date")
+                        .param("year", "2021")
+                        .param("week", "53"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(
+                        org.hamcrest.Matchers.containsString("does not exist in week-year 2021")));
+
+        mockMvc.perform(get("/api/v1/utils/datetime/week-date")
+                        .param("year", "2025")
+                        .param("week", "0"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+
+        mockMvc.perform(get("/api/v1/utils/datetime/week-date")
+                        .param("year", "2025")
+                        .param("week", "1")
+                        .param("day", "FRIDAYDAY"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+
+        assertThat(auditJournal.size()).isEqualTo(before);
+    }
 }
