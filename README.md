@@ -145,6 +145,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/datetime/range` | Enumerate a bounded, ordered list of `yyyy-MM-dd` dates between two dates with a `DAYS`/`WEEKS`/`MONTHS`/`YEARS` unit, positive `step` (1–1000) and inclusive/exclusive end (max 1000 points) |
 | `GET` | `/api/v1/utils/datetime/current` | Fetch current time in UTC and target timezone |
 | `GET` | `/api/v1/utils/datetime/timezones` | List IANA timezones with current UTC offsets, optionally filtered by `prefix` |
+| `GET` | `/api/v1/utils/datetime/week-date` | Resolve an ISO week (`year`, `week`, optional `day` = MONDAY..SUNDAY case-insensitive or 1..7, default MONDAY) back to its calendar date via `WeekFields.ISO`; rejects weeks that do not exist in that ISO week-year (e.g. 2021-W53). Read-only: not journalled |
 | `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-256, SHA-512, MD5) or HMAC |
 | `POST` | `/api/v1/utils/crypto/base64` | Encode or decode standard / URL-safe Base64 strings |
 | `POST` | `/api/v1/utils/crypto/url` | Percent-encode or decode a URL component, path segment list or form value (`COMPONENT`, `PATH`, `FORM`) |
@@ -1428,7 +1429,8 @@ All thirty journalled utility operations — `datetime/convert`, `datetime/diff`
 in-memory journal** so a failed
 hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
 can be verified against the original outcome without ever mutating the original entry.
-`GET /api/v1/utils/datetime/timezones` is read-only catalogue metadata and is not journalled.
+`GET /api/v1/utils/datetime/timezones` and `GET /api/v1/utils/datetime/week-date` are read-only
+catalogue/calendar metadata and are not journalled.
 An opt-in JSON query (`allowStaleFallback: true`) is journalled as `JSON_QUERY_FALLBACK` rather than
 `JSON_QUERY`: that type is non-deterministic, because the stored answer may be a cached last-known-good
 result, so it is rejected for replay with `NON_DETERMINISTIC`.

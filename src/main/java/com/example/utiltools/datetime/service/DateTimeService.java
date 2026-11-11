@@ -29,6 +29,7 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoUnit;
+import java.time.temporal.TemporalAdjusters;
 import java.time.temporal.WeekFields;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -350,6 +351,66 @@ public class DateTimeService {
      * {@code step} outside 1..1000, an unsupported unit, calendar overflow and a 1001st in-range point -
      * so a bad request surfaces as a 400 and never as a 500.</p>
      */
+    /**
+     * Resolves an ISO week (week-year, week, day) to its calendar date.
+     *
+     * <p>Inverse of {@link #week(String)}: pure function anchored on January 4 via
+     * {@link WeekFields#ISO}; it reads no clock, default timezone or locale. The day may be a
+     * {@code MONDAY..SUNDAY} name (case-insensitive) or a number {@code 1..7}
+     * (MONDAY=1 ... SUNDAY=7); a null or blank day defaults to {@code MONDAY}. Throws
+     * {@link IllegalArgumentException} for a year outside 1..9999, a week outside 1..53, an unknown
+     * day token, or an ISO week that does not exist in that week-year (e.g. 2021-W53).</p>
+     */
+    public DateTimeWeekResponse weekDate(int year, int week, String day) {
+        if (year < 1 || year > 9999) {
+            throw new IllegalArgumentException("year must be between 1 and 9999");
+        }
+        if (week < 1 || week > 53) {
+            throw new IllegalArgumentException("week must be between 1 and 53");
+        }
+        int dayNumber = parseDay(day);
+        WeekFields fields = WeekFields.ISO;
+        LocalDate week1Monday = LocalDate.of(year, 1, 4).with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY));
+        LocalDate date = week1Monday.plusWeeks(week - 1).plusDays(dayNumber - 1);
+        if (date.get(fields.weekBasedYear()) != year || date.get(fields.weekOfWeekBasedYear()) != week) {
+            throw new IllegalArgumentException("ISO week " + week + " does not exist in week-year " + year);
+        }
+        DayOfWeek dayOfWeek = date.getDayOfWeek();
+        return new DateTimeWeekResponse(
+                date.toString(),
+                date.get(fields.weekBasedYear()),
+                date.get(fields.weekOfWeekBasedYear()),
+                dayOfWeek.name(),
+                date.getDayOfYear(),
+                dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY);
+    }
+
+    /**
+     * Parses an optional ISO day-of-week token: a {@code MONDAY..SUNDAY} name (case-insensitive) or
+     * a number {@code 1..7} (MONDAY=1 ... SUNDAY=7). A null or blank value is the documented
+     * default {@code MONDAY} (1), returned before any name/number parsing. An unknown token or
+     * out-of-range number throws {@link IllegalArgumentException} with a stable 400 message.
+     */
+    private int parseDay(String day) {
+        if (day == null || day.isBlank()) {
+            return DayOfWeek.MONDAY.getValue();
+        }
+        String token = day.trim().toUpperCase(Locale.ROOT);
+        try {
+            int number = Integer.parseInt(token);
+            if (number >= 1 && number <= 7) {
+                return number;
+            }
+        } catch (NumberFormatException ignored) {
+            // fall through to day-name parsing
+        }
+        try {
+            return DayOfWeek.valueOf(token).getValue();
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("day must be MONDAY..SUNDAY (case-insensitive) or 1..7");
+        }
+    }
+
     public DateTimeRangeResponse range(DateTimeRangeRequest request) {
         if (request == null) {
             throw new IllegalArgumentException("request body is required");
