@@ -985,4 +985,243 @@ class DateTimeControllerTest {
 
         assertThat(auditJournal.size()).isEqualTo(before);
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/range - should generate an ordered range and echo the resolved request")
+    void shouldReturnDateRange() throws Exception {
+        String body = """
+                {
+                    "startDate": "2026-01-31",
+                    "endDate": "2026-04-30",
+                    "unit": "months"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Date range generated successfully"))
+                .andExpect(jsonPath("$.data.startDate").value("2026-01-31"))
+                .andExpect(jsonPath("$.data.endDate").value("2026-04-30"))
+                .andExpect(jsonPath("$.data.unit").value("MONTHS"))
+                .andExpect(jsonPath("$.data.step").value(1))
+                .andExpect(jsonPath("$.data.inclusive").value(true))
+                .andExpect(jsonPath("$.data.count").value(4))
+                .andExpect(jsonPath("$.data.dates.length()").value(4))
+                .andExpect(jsonPath("$.data.dates[0]").value("2026-01-31"))
+                .andExpect(jsonPath("$.data.dates[1]").value("2026-02-28"))
+                .andExpect(jsonPath("$.data.dates[2]").value("2026-03-31"))
+                .andExpect(jsonPath("$.data.dates[3]").value("2026-04-30"));
+
+        String steppedBody = """
+                {
+                    "startDate": "2026-01-01",
+                    "endDate": "2026-01-05",
+                    "step": 2,
+                    "inclusive": false
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(steppedBody))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.unit").value("DAYS"))
+                .andExpect(jsonPath("$.data.step").value(2))
+                .andExpect(jsonPath("$.data.inclusive").value(false))
+                .andExpect(jsonPath("$.data.count").value(2))
+                .andExpect(jsonPath("$.data.dates[0]").value("2026-01-01"))
+                .andExpect(jsonPath("$.data.dates[1]").value("2026-01-03"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/range - should reject a reversed range and an out-of-bounds step")
+    void shouldReturnBadRequestForReversedRangeAndStepOutOfBounds() throws Exception {
+        String reversed = """
+                {
+                    "startDate": "2026-01-05",
+                    "endDate": "2026-01-01"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(reversed))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers
+                        .containsString("startDate must not be after endDate")));
+
+        String zeroStep = """
+                {
+                    "startDate": "2026-01-01",
+                    "endDate": "2026-01-05",
+                    "step": 0
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(zeroStep))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers
+                        .containsString("step must be between 1 and 1000")));
+
+        String hugeStep = """
+                {
+                    "startDate": "2026-01-01",
+                    "endDate": "2026-01-05",
+                    "step": 1001
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(hugeStep))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers
+                        .containsString("step must be between 1 and 1000")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/range - should return BAD_REQUEST for an unsupported unit")
+    void shouldReturnBadRequestForUnsupportedRangeUnit() throws Exception {
+        String unknownUnit = """
+                {
+                    "startDate": "2026-01-01",
+                    "endDate": "2026-01-05",
+                    "unit": "HOURS"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(unknownUnit))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers
+                        .containsString("unit must be one of DAYS, WEEKS, MONTHS, YEARS")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/range - should return VALIDATION_ERROR for blank or malformed dates")
+    void shouldRejectBlankAndMalformedRangeDates() throws Exception {
+        String blankStart = """
+                {
+                    "startDate": "",
+                    "endDate": "2026-01-05"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(blankStart))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", org.hamcrest.Matchers.hasItem("startDate is required")));
+
+        String malformedStart = """
+                {
+                    "startDate": "31/12/2026",
+                    "endDate": "2026-01-05"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(malformedStart))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", org.hamcrest.Matchers.hasItem("startDate must be yyyy-MM-dd")));
+
+        String blankEnd = """
+                {
+                    "startDate": "2026-01-01",
+                    "endDate": "   "
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(blankEnd))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", org.hamcrest.Matchers.hasItem("endDate is required")));
+
+        String malformedEnd = """
+                {
+                    "startDate": "2026-01-01",
+                    "endDate": "2026-1-5"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(malformedEnd))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", org.hamcrest.Matchers.hasItem("endDate must be yyyy-MM-dd")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/range - is journalled as DATETIME_RANGE and replays identically")
+    void shouldJournalAndReplayDateTimeRange() throws Exception {
+        String body = """
+                {
+                    "startDate": "2026-01-31",
+                    "endDate": "2026-04-30",
+                    "unit": "MONTHS",
+                    "step": 1
+                }
+                """;
+
+        int before = auditJournal.size();
+
+        mockMvc.perform(post("/api/v1/utils/datetime/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.count").value(4));
+
+        assertThat(auditJournal.size()).isEqualTo(before + 1);
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("DATETIME_RANGE"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.count").value(4))
+                .andExpect(jsonPath("$.data[0].result.dates[1]").value("2026-02-28"))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        JsonNode storedResult = entry.get("result");
+        AuditEntry journalEntry = auditJournal.find(id).orElseThrow();
+        Instant completedAt = journalEntry.completedAt();
+        assertThat(OperationType.DATETIME_RANGE.isDeterministic()).isTrue();
+        assertThat(journalEntry.replayable()).isTrue();
+        assertThat(journalEntry.state()).isEqualTo(JournalState.SUCCEEDED);
+
+        MvcResult replay = mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("DATETIME_RANGE"))
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"))
+                .andReturn();
+
+        JsonNode replayedResult = objectMapper.readTree(replay.getResponse().getContentAsString())
+                .get("data").get("result");
+        assertThat(replayedResult).isEqualTo(storedResult);
+
+        assertThat(auditJournal.size()).isEqualTo(before + 1);
+        AuditEntry after = auditJournal.find(id).orElseThrow();
+        assertThat(after.operation()).isEqualTo(OperationType.DATETIME_RANGE);
+        assertThat(after.completedAt()).isEqualTo(completedAt);
+        assertThat(after.result()).isEqualTo(journalEntry.result());
+    }
 }

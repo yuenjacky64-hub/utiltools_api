@@ -8,6 +8,7 @@ public enum OperationType {
     DATETIME_SHIFT(true),
     DATETIME_DURATION(true),
     DATETIME_BUSINESS_DAYS(true),
+    DATETIME_RANGE(true),
     DATETIME_CURRENT(false),
     CRYPTO_HASH(true),
     CRYPTO_BASE64(true),
