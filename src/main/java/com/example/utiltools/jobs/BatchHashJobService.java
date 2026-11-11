@@ -139,6 +139,16 @@ public class BatchHashJobService {
 
     private static final long DEFAULT_EXECUTION_LEASE_SECONDS = 30;
     private static final long DEFAULT_EXECUTION_REAPER_INTERVAL_MS = 5000;
+    /**
+     * Opt-in automatic lease-expiry failover budget (REQ-01): {@code 0} disables the behaviour, so the
+     * reaper keeps terminalizing a lapsed attempt exactly as before.
+     */
+    private static final int DEFAULT_MAX_AUTO_FAILOVERS = 0;
+    /**
+     * Correlation id installed on the redriven attempt's admission: a fixed constant, so no caller
+     * text reaches the journal descriptor of an attempt nobody submitted.
+     */
+    private static final String AUTO_FAILOVER_REQUEST_ID = "auto-failover";
     private static final String BATCH_HASH_FAILED = "BATCH_HASH_FAILED";
     /**
      * Error recorded on a batch that hashed some items and failed others: the attempt is FAILED, no
@@ -189,6 +199,8 @@ public class BatchHashJobService {
     private final int queueCapacity;
     private final long retentionSeconds;
     private final int maxAttempts;
+    /** Auto-failover budget per job; {@code 0} disables automatic lease-expiry redrive (REQ-01). */
+    private final int maxAutoFailovers;
     private final long executionLeaseSeconds;
     private final long executionReaperIntervalMs;
     private final long shutdownGraceSeconds;
@@ -318,6 +330,7 @@ public class BatchHashJobService {
             @Value("${utiltools.jobs.max-active-jobs-per-client:20}") int maxActiveJobsPerClient,
             @Value("${utiltools.jobs.default-deadline-seconds:0}") long defaultDeadlineSeconds,
             @Value("${utiltools.jobs.max-retained-jobs:1000}") int maxRetainedJobs,
+            @Value("${utiltools.jobs.max-auto-failovers:0}") int maxAutoFailovers,
             Clock clock) {
         this.cryptoService = cryptoService;
         this.workerCount = workerCount;
@@ -353,6 +366,11 @@ public class BatchHashJobService {
                     "utiltools.jobs.default-deadline-seconds must be between 0 and 3600, was "
                             + defaultDeadlineSeconds);
         }
+        // 0 is legal and disables the feature; a negative budget would silently invert the bound.
+        if (maxAutoFailovers < 0) {
+            throw new IllegalArgumentException(
+                    "utiltools.jobs.max-auto-failovers must not be negative, was " + maxAutoFailovers);
+        }
         // A non-positive cap would either evict every terminal row or disable retention entirely.
         if (maxRetainedJobs <= 0) {
             throw new IllegalArgumentException(
@@ -364,6 +382,7 @@ public class BatchHashJobService {
         this.shutdownGraceSeconds = shutdownGraceSeconds;
         this.maxActiveJobsPerClient = maxActiveJobsPerClient;
         this.maxRetainedJobs = maxRetainedJobs;
+        this.maxAutoFailovers = maxAutoFailovers;
         this.clock = clock == null ? Clock.systemUTC() : clock;
         this.executor = new ThreadPoolExecutor(workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(queueCapacity), new ThreadPoolExecutor.AbortPolicy());
@@ -387,7 +406,8 @@ public class BatchHashJobService {
             Clock clock) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
-                maxActiveJobsPerClient, 0L, DEFAULT_MAX_RETAINED_JOBS, clock);
+                maxActiveJobsPerClient, 0L, DEFAULT_MAX_RETAINED_JOBS, DEFAULT_MAX_AUTO_FAILOVERS,
+                clock);
     }
 
     /**
@@ -450,7 +470,8 @@ public class BatchHashJobService {
             Clock clock, AuditJournalService journal) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
-                maxActiveJobsPerClient, 0L, DEFAULT_MAX_RETAINED_JOBS, clock);
+                maxActiveJobsPerClient, 0L, DEFAULT_MAX_RETAINED_JOBS, DEFAULT_MAX_AUTO_FAILOVERS,
+                clock);
         this.journal = journal;
     }
 
@@ -464,7 +485,7 @@ public class BatchHashJobService {
             int maxRetainedJobs, Clock clock, AuditJournalService journal) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
-                maxActiveJobsPerClient, 0L, maxRetainedJobs, clock);
+                maxActiveJobsPerClient, 0L, maxRetainedJobs, DEFAULT_MAX_AUTO_FAILOVERS, clock);
         this.journal = journal;
     }
 
@@ -479,8 +500,24 @@ public class BatchHashJobService {
             long defaultDeadlineSeconds, Clock clock, AuditJournalService journal) {
         this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
-                maxActiveJobsPerClient, defaultDeadlineSeconds, DEFAULT_MAX_RETAINED_JOBS, clock);
+                maxActiveJobsPerClient, defaultDeadlineSeconds, DEFAULT_MAX_RETAINED_JOBS,
+                DEFAULT_MAX_AUTO_FAILOVERS, clock);
         this.journal = journal;
+    }
+
+    /**
+     * Test convenience: an explicit auto-failover budget so a test can enable the automatic redrive
+     * without a Spring context. Unannotated on purpose - Spring must keep selecting the
+     * {@code @Autowired} constructor above.
+     */
+    public BatchHashJobService(CryptoService cryptoService, int workerCount, int queueCapacity,
+            long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
+            long executionReaperIntervalMs, long shutdownGraceSeconds, int maxActiveJobsPerClient,
+            long defaultDeadlineSeconds, int maxAutoFailovers, Clock clock) {
+        this(cryptoService, workerCount, queueCapacity, retentionSeconds, maxAttempts,
+                executionLeaseSeconds, executionReaperIntervalMs, shutdownGraceSeconds,
+                maxActiveJobsPerClient, defaultDeadlineSeconds, DEFAULT_MAX_RETAINED_JOBS,
+                maxAutoFailovers, clock);
     }
 
     /**
@@ -787,6 +824,16 @@ public class BatchHashJobService {
     private void forgetLaneLocked(String clientKey) {
         lanes.remove(clientKey);
         laneOrder.remove(clientKey);
+    }
+
+    /**
+     * Test seam (DOD-03): emulates the drain's lane closure - the exact refusal condition
+     * {@link #enqueue} reports for a {@code shutdownRequested} service - without stopping the
+     * executor, so the reaper can be observed rolling an automatic failover back on a still
+     * non-terminal job. No production caller; no behaviour beyond {@link #clearLanes()}.
+     */
+    void closeLanesForTest() {
+        clearLanes();
     }
 
     /** Drops every pending entry; used by the drain, whose sweep then settles the affected rows. */
@@ -1615,6 +1662,9 @@ public class BatchHashJobService {
         int reaped = 0;
         for (MutableJob job : jobs.values()) {
             boolean released = false;
+            // REQ-04: a successful auto-failover leaves a non-terminal row behind, so the retained-row
+            // cap pass below is skipped for that iteration only.
+            boolean terminalRowPublished = true;
             synchronized (job) {
                 if (job.status == JobStatus.CANCELLING) {
                     if (!deadlinePassed(job, now) && !leaseLapsed(job, now)) {
@@ -1631,21 +1681,62 @@ public class BatchHashJobService {
                         released = failDeadlineLocked(job, job.attempt, now);
                         reaped++;
                     } else if (leaseLapsed(job, now)) {
+                        // REQ-02: the predicate is evaluated before a single field is written, so it
+                        // still observes RUNNING, the live attempt number and the live deadline.
+                        boolean failover = autoFailoverEligible(job, now);
+                        int lapsedAttempt = job.attempt;
+                        // The lapsed attempt is settled exactly as before whether or not it is redriven:
+                        // FAILED / EXECUTION_LEASE_EXPIRED, one attempt row, its journal entry closed
+                        // once, and the status+attempt fence that keeps the stalled worker from writing
+                        // its own (late) outcome.
                         job.status = JobStatus.FAILED;
                         job.error = EXECUTION_LEASE_EXPIRED;
                         job.completedAt = now;
                         job.results = null;
                         job.executionLeaseExpiresAt = null;
                         job.lastHeartbeatAt = null;
-                        recordAttempt(job, job.attempt, JobStatus.FAILED, job.startedAt, now,
+                        recordAttempt(job, lapsedAttempt, JobStatus.FAILED, job.startedAt, now,
                                 EXECUTION_LEASE_EXPIRED);
                         // Close the audit entry the stalled worker opened: the fence keeps that worker
                         // from writing its own (late) outcome, so this is the only terminal write for
-                        // the attempt.
-                        failQuietly(job, job.attempt, EXECUTION_LEASE_EXPIRED);
-                        // Claimed in the same section as the terminal write; a late worker fenced by
-                        // this reap never reaches its own claim, so the slot is released exactly once.
-                        released = job.quotaReserved.compareAndSet(true, false);
+                        // the attempt (REQ-06).
+                        failQuietly(job, lapsedAttempt, EXECUTION_LEASE_EXPIRED);
+                        // Snapshot of the template FAILED row (REQ-04): a refused lane hand-off restores
+                        // exactly this, so the rollback keeps the error and the attempt number the
+                        // non-failover path would have published.
+                        FailedState before = failover ? FailedState.of(job) : null;
+                        if (failover) {
+                            // REQ-03: redrive in place under the same monitor, so no other writer can
+                            // observe a half-migrated job. checkpoint, failedItems, itemErrors and
+                            // deadlineAt are deliberately untouched: attempt+1 resumes at the first
+                            // unprocessed index inside the original total-life bound.
+                            job.attempt = lapsedAttempt + 1;
+                            job.status = JobStatus.QUEUED;
+                            job.startedAt = null;
+                            job.completedAt = null;
+                            job.error = null;
+                            job.results = null;
+                            job.lastHeartbeatAt = null;
+                            job.executionLeaseExpiresAt = null;
+                            job.attemptRequestIds.put(job.attempt, AUTO_FAILOVER_REQUEST_ID);
+                            // REQ-04: the reservation this job already holds is carried over - no
+                            // second quota claim and no release - so the client's active-job count and
+                            // the global capacity unit are unchanged by a successful failover.
+                            if (enqueue(job, job.attempt)) {
+                                job.autoFailovers++; // the only increment site (REQ-02)
+                                terminalRowPublished = false;
+                            } else {
+                                // Drain/refused hand-off: put the template FAILED row back, drop the
+                                // synthetic correlation id and leave the budget unconsumed.
+                                job.attemptRequestIds.remove(job.attempt);
+                                before.restore(job);
+                                released = job.quotaReserved.compareAndSet(true, false);
+                            }
+                        } else {
+                            // Claimed in the same section as the terminal write; a late worker fenced by
+                            // this reap never reaches its own claim, so the slot is released exactly once.
+                            released = job.quotaReserved.compareAndSet(true, false);
+                        }
                         reaped++;
                     }
                 } else if (job.status == JobStatus.QUEUED) {
@@ -1665,13 +1756,34 @@ public class BatchHashJobService {
                 releaseQuota(job.clientKey); // after the monitor block (REQ-08)
             }
             // REQ-02, enforcement site #4 (Plan §4.3): this pass just published a terminal row (reaped
-            // FAILED, or a finalised CANCELLED) — the two `continue` branches above are the only way
-            // to skip this line. It runs after the monitor block, so the order stays
+            // FAILED, or a finalised CANCELLED) — the two `continue` branches above and an admitted
+            // auto-failover (row is QUEUED again) are the only ways to skip this line. It runs after
+            // the monitor block, so the order stays
             // registryLock -> job monitor, and it is not gated on `released`: a quota claim already
             // spent by another writer must not leave the terminal row in place until the next pass.
-            enforceRetainedJobCap();
+            if (terminalRowPublished) {
+                enforceRetainedJobCap();
+            }
         }
         return reaped;
+    }
+
+    /**
+     * Whether the lapsed {@code RUNNING} attempt reaped at {@code now} may be redriven automatically
+     * (REQ-02). A pure predicate: it writes nothing, and it is called only from inside the reaper's job
+     * monitor, after the {@code CANCELLING} and deadline arms have had their chance, so outcome
+     * precedence (REQ-05) is decided by branch order rather than by this method.
+     *
+     * <p>Bounded twice - by the per-job failover budget and by the ordinary attempt budget - and it
+     * never extends {@code deadlineAt}, so a permanently broken job cannot loop.</p>
+     */
+    private boolean autoFailoverEligible(MutableJob job, Instant now) {
+        return maxAutoFailovers > 0
+                && job.autoFailovers < maxAutoFailovers
+                && job.attempt < job.maxAttempts
+                && job.status == JobStatus.RUNNING
+                && leaseLapsed(job, now)
+                && !deadlinePassed(job, now);
     }
 
     /**
@@ -1835,7 +1947,8 @@ public class BatchHashJobService {
                     running ? job.lastHeartbeatAt : null,
                     completedItems,
                     job.deadlineAt, // projected for every status: null when the job has no bound
-                    succeeded, failed);
+                    succeeded, failed,
+                    job.autoFailovers); // additive (REQ-07): 0 until an automatic redrive succeeded
         }
     }
 
@@ -2439,11 +2552,13 @@ public class BatchHashJobService {
         private final Instant lastHeartbeatAt;
         private final Instant executionLeaseExpiresAt;
         private final Instant deadlineAt;
+        private final int autoFailovers;
 
         private FailedState(int attempt, Instant startedAt, Instant completedAt, String error,
                 List<HashResponse> results, SortedMap<Integer, HashResponse> checkpoint,
                 BitSet failedItems, Map<Integer, String> itemErrors,
-                Instant lastHeartbeatAt, Instant executionLeaseExpiresAt, Instant deadlineAt) {
+                Instant lastHeartbeatAt, Instant executionLeaseExpiresAt, Instant deadlineAt,
+                int autoFailovers) {
             this.attempt = attempt;
             this.startedAt = startedAt;
             this.completedAt = completedAt;
@@ -2455,13 +2570,14 @@ public class BatchHashJobService {
             this.lastHeartbeatAt = lastHeartbeatAt;
             this.executionLeaseExpiresAt = executionLeaseExpiresAt;
             this.deadlineAt = deadlineAt;
+            this.autoFailovers = autoFailovers;
         }
 
         private static FailedState of(MutableJob job) {
             return new FailedState(job.attempt, job.startedAt, job.completedAt, job.error, job.results,
                     new TreeMap<>(job.checkpoint), (BitSet) job.failedItems.clone(),
                     new HashMap<>(job.itemErrors), job.lastHeartbeatAt, job.executionLeaseExpiresAt,
-                    job.deadlineAt);
+                    job.deadlineAt, job.autoFailovers);
         }
 
         private void restore(MutableJob job) {
@@ -2480,6 +2596,7 @@ public class BatchHashJobService {
             job.lastHeartbeatAt = lastHeartbeatAt;
             job.executionLeaseExpiresAt = executionLeaseExpiresAt;
             job.deadlineAt = deadlineAt; // a refused requeue must not leave a future deadline behind
+            job.autoFailovers = autoFailovers; // a rolled-back failover never consumes the budget
         }
     }
 
@@ -2595,6 +2712,8 @@ public class BatchHashJobService {
         private final Map<Integer, Integer> attemptResumedFrom = new HashMap<>();
 
         private int attempt = 1;
+        /** Successful automatic lease-expiry failovers of this job; incremented under the monitor. */
+        private int autoFailovers;
         private JobStatus status = JobStatus.QUEUED;
         private Instant startedAt;
         private Instant completedAt;

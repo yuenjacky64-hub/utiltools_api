@@ -1,6 +1,7 @@
 package com.example.utiltools.jobs;
 
 import com.example.utiltools.common.GlobalExceptionHandler;
+import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.service.CryptoService;
 import com.example.utiltools.ratelimit.ClientKeyResolver;
@@ -22,14 +23,20 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.Clock;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Delayed;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -861,4 +868,208 @@ class BatchJobControllerTest {
                 .andExpect(jsonPath("$.data[0].jobId").value(jobId))
                 .andExpect(jsonPath("$.data[0].deadlineAt").isNotEmpty());
     }
+    // ---------------------------------------------------------------------------------------------
+    // Auto-failover budget on the polling payload (REQ-07, DOD-06)
+    // ---------------------------------------------------------------------------------------------
+
+    private static final long AUTO_FAILOVER_LEASE_SECONDS = 30L;
+    private static final long AUTO_FAILOVER_AWAIT_SECONDS = 10L;
+    private static final String REDRIVEN_JOB_ID = "job-redriven-1";
+    private static final String PRE_FEATURE_JOB_ID = "job-pre-feature-1";
+
+    /**
+     * DOD-06 / REQ-07: {@code autoFailovers} is additive on the polling payload - the redriven job
+     * reports it next to the unchanged projections (checkpoint, deadline, results, attempts), a
+     * response built through the pre-feature 18-component constructor still reports {@code 0}, and
+     * {@link BatchHashJobService#retry(String)} neither increments nor resets the counter that a
+     * lease-expiry failover consumed.
+     *
+     * <p>The snapshots come from a real service instance (a one-worker service blocked inside the gate
+     * of {@link GatedCryptoService}) that the spy bean delegates to, so the JSON asserted below is the
+     * production projection of a genuinely redriven job rather than a hand-built response.</p>
+     */
+    @Test
+    @DisplayName("GET /api/v1/utils/jobs/{jobId} - should expose autoFailovers additively without changing retry semantics")
+    void shouldExposeAutoFailoversAdditivelyOnJobResponse() throws Exception {
+        GatedCryptoService crypto = new GatedCryptoService("stalled", "resumed");
+        TestClock clock = new TestClock(Instant.parse("2026-11-11T03:00:00Z"));
+        BatchHashJobService local = new BatchHashJobService(crypto, 1, 4, 300, 3,
+                AUTO_FAILOVER_LEASE_SECONDS, 5000L, 0L,
+                BatchHashJobService.DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT, 0L, 1, clock);
+        try {
+            // A response built the pre-feature way: no autoFailovers component reachable, so the
+            // additive field must serialise as 0 without disturbing any existing projection.
+            BatchHashJobResponse preFeature = new BatchHashJobResponse(PRE_FEATURE_JOB_ID, null,
+                    JobStatus.QUEUED, 2, null, null, Instant.parse("2026-11-11T03:00:00Z"), null, null,
+                    2, 3, List.of(), null, null, 0, Instant.parse("2026-11-11T03:30:00Z"),
+                    List.of(), List.of());
+            doAnswer(invocation -> {
+                String jobId = invocation.getArgument(0);
+                return PRE_FEATURE_JOB_ID.equals(jobId) ? preFeature : local.getJob(jobId);
+            }).when(jobService).getJob(anyString());
+            doAnswer(invocation -> local.retry(invocation.getArgument(0)))
+                    .when(jobService).retry(anyString());
+
+            String jobId = local
+                    .submit(new BatchHashRequest("SHA-256", List.of("stalled", "resumed"), null, null),
+                            "198.51.100.42")
+                    .jobId();
+            assertThat(crypto.awaitEntered("stalled"))
+                    .as("attempt 1 must block inside the service gate")
+                    .isTrue();
+            awaitStatus(local, jobId, JobStatus.RUNNING);
+
+            // 1) Lease expiry with the failover budget available: the job is redriven to QUEUED/attempt 2
+            // and the only worker is still stuck in attempt 1, so the row stays observable as QUEUED.
+            clock.advanceSeconds(AUTO_FAILOVER_LEASE_SECONDS);
+            assertThat(local.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+            BatchHashJobResponse redriven = local.getJob(jobId);
+            assertThat(redriven.status()).isEqualTo(JobStatus.QUEUED);
+            assertThat(redriven.attempt()).isEqualTo(2);
+            assertThat(redriven.autoFailovers()).isEqualTo(1);
+
+            mockMvc.perform(get("/api/v1/utils/jobs/" + jobId))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.data.jobId").value(jobId))
+                    .andExpect(jsonPath("$.data.status").value("QUEUED"))
+                    .andExpect(jsonPath("$.data.attempt").value(2))
+                    .andExpect(jsonPath("$.data.autoFailovers").value(1))
+                    .andExpect(jsonPath("$.data.completedItems").value(0))
+                    .andExpect(jsonPath("$.data.itemCount").value(2))
+                    .andExpect(jsonPath("$.data.maxAttempts").value(3))
+                    .andExpect(jsonPath("$.data.results").doesNotExist())
+                    .andExpect(jsonPath("$.data.deadlineAt").doesNotExist())
+                    .andExpect(jsonPath("$.data.executionLeaseExpiresAt").doesNotExist())
+                    .andExpect(jsonPath("$.data.lastHeartbeatAt").doesNotExist())
+                    .andExpect(jsonPath("$.data.error").doesNotExist())
+                    .andExpect(jsonPath("$.data.attempts[0].status").value("FAILED"))
+                    .andExpect(jsonPath("$.data.attempts[0].error").value(BatchHashJobService.EXECUTION_LEASE_EXPIRED));
+
+            // Additive, not a re-typed payload: the pre-feature constructor shape reports 0.
+            mockMvc.perform(get("/api/v1/utils/jobs/" + PRE_FEATURE_JOB_ID))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.data.autoFailovers").value(0))
+                    .andExpect(jsonPath("$.data.status").value("QUEUED"))
+                    .andExpect(jsonPath("$.data.attempt").value(2))
+                    .andExpect(jsonPath("$.data.maxAttempts").value(3))
+                    .andExpect(jsonPath("$.data.completedItems").value(0))
+                    .andExpect(jsonPath("$.data.deadlineAt").isNotEmpty())
+                    .andExpect(jsonPath("$.data.results").doesNotExist());
+
+            // 2) Budget spent (maxAutoFailovers = 1): the next lapsed lease is terminal again.
+            crypto.release("stalled");
+            assertThat(crypto.awaitEntered("resumed"))
+                    .as("attempt 2 must resume from the checkpoint and block on the next item")
+                    .isTrue();
+            awaitStatus(local, jobId, JobStatus.RUNNING);
+            clock.advanceSeconds(AUTO_FAILOVER_LEASE_SECONDS);
+            assertThat(local.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+            BatchHashJobResponse exhausted = local.getJob(jobId);
+            assertThat(exhausted.status()).isEqualTo(JobStatus.FAILED);
+            assertThat(exhausted.error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+            assertThat(exhausted.attempt()).isEqualTo(2);
+            assertThat(exhausted.autoFailovers()).isEqualTo(1);
+
+            // 3) Manual retry must neither increment nor reset the consumed failover budget.
+            mockMvc.perform(post("/api/v1/utils/jobs/" + jobId + "/retry"))
+                    .andExpect(status().isAccepted())
+                    .andExpect(jsonPath("$.data.status").value("QUEUED"))
+                    .andExpect(jsonPath("$.data.attempt").value(3))
+                    .andExpect(jsonPath("$.data.autoFailovers").value(1));
+            mockMvc.perform(get("/api/v1/utils/jobs/" + jobId))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.data.attempt").value(3))
+                    .andExpect(jsonPath("$.data.autoFailovers").value(1));
+        } finally {
+            crypto.release("resumed");
+            local.shutdown();
+        }
+    }
+
+    private static void awaitStatus(BatchHashJobService service, String jobId, JobStatus expected)
+            throws InterruptedException {
+        Instant deadline = Instant.now().plusSeconds(AUTO_FAILOVER_AWAIT_SECONDS);
+        JobStatus seen = null;
+        while (Instant.now().isBefore(deadline)) {
+            seen = service.getJob(jobId).status();
+            if (seen == expected) {
+                return;
+            }
+            Thread.sleep(5L);
+        }
+        assertThat(seen).as("job %s never reached %s", jobId, expected).isEqualTo(expected);
+    }
+
+    /** Test clock the service derives its lease, heartbeat and reap instants from. */
+    private static final class TestClock extends Clock {
+
+        private final AtomicReference<Instant> now;
+
+        private TestClock(Instant start) {
+            this.now = new AtomicReference<>(start);
+        }
+
+        private void advanceSeconds(long seconds) {
+            now.updateAndGet(current -> current.plusSeconds(seconds));
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return now.get();
+        }
+    }
+
+    /** {@link CryptoService} whose listed items block inside {@code hash} until released. */
+    private static final class GatedCryptoService extends CryptoService {
+
+        private final Map<String, Gate> gates = new ConcurrentHashMap<>();
+
+        private GatedCryptoService(String... gatedItems) {
+            for (String item : gatedItems) {
+                gates.put(item, new Gate());
+            }
+        }
+
+        private boolean awaitEntered(String item) throws InterruptedException {
+            Gate gate = gates.get(item);
+            return gate != null && gate.entered.await(AUTO_FAILOVER_AWAIT_SECONDS, TimeUnit.SECONDS);
+        }
+
+        private void release(String item) {
+            Gate gate = gates.get(item);
+            if (gate != null) {
+                gate.released.countDown();
+            }
+        }
+
+        @Override
+        public HashResponse hash(HashRequest request) {
+            Gate gate = gates.get(request.content());
+            if (gate != null) {
+                gate.entered.countDown();
+                try {
+                    gate.released.await(AUTO_FAILOVER_AWAIT_SECONDS, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return super.hash(request);
+        }
+
+        private static final class Gate {
+            private final CountDownLatch entered = new CountDownLatch(1);
+            private final CountDownLatch released = new CountDownLatch(1);
+        }
+    }
+
 }

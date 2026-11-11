@@ -5211,6 +5211,288 @@ class BatchHashJobServiceTest {
                 BatchHashJobService.DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT, 0L, clock, journal);
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Bounded automatic lease-expiry failover (Plan F3, REQ-01..REQ-07, DOD-01..DOD-06)
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Reaper-side fixture: one worker parked inside {@link LeaseCryptoService}, the requested
+     * auto-failover budget, no deadline, and room for the retained rows to stay irrelevant.
+     */
+    private BatchHashJobService failoverTest(int maxAutoFailovers, int maxAttempts,
+            LeaseCryptoService crypto, MutableJobClock clock, AuditJournalService journal) {
+        BatchHashJobService service = new BatchHashJobService(crypto, 1, 4, 300, maxAttempts,
+                LEASE_SECONDS, 5000, 0L, BatchHashJobService.DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT,
+                0L, maxAutoFailovers, clock);
+        if (journal != null) {
+            service.setAuditJournal(journal);
+        }
+        return service;
+    }
+
+    @Test
+    @DisplayName("auto-failover - a negative budget is rejected at startup; zero stays disabled")
+    void shouldRejectNegativeAutoFailoverBudgetAtStartup() {
+        assertThatThrownBy(() -> new BatchHashJobService(new CryptoService(), 1, 4, 300, 5,
+                LEASE_SECONDS, 5000, 0L, BatchHashJobService.DEFAULT_MAX_ACTIVE_JOBS_PER_CLIENT,
+                0L, -1, new MutableJobClock(LEASE_START)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("utiltools.jobs.max-auto-failovers");
+    }
+
+    @Test
+    @DisplayName("auto-failover - a stalled RUNNING job is reaped once into QUEUED attempt 2 and "
+            + "completes from its checkpoint")
+    void shouldAutoFailoverLapsedLeaseToQueuedAttemptTwo() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        String client = "198.51.100.99";
+        service = failoverTest(1, 5, crypto, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stalled", "done"), null, null), client);
+        assertThat(crypto.awaitEntered("stalled")).isTrue();
+        assertThat(awaitRunningAttempt(accepted.jobId(), 1).status()).isEqualTo(JobStatus.RUNNING);
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+
+        // At the inclusive lease boundary the reaper redrives instead of terminalising (REQ-03).
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+
+        BatchHashJobResponse redriven = service.getJob(accepted.jobId());
+        assertThat(redriven.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(redriven.attempt()).isEqualTo(2);
+        assertThat(redriven.autoFailovers()).isEqualTo(1);
+        assertThat(redriven.completedItems()).isZero(); // the lapsed attempt hashed nothing
+        assertThat(redriven.results()).isNull();
+        assertThat(redriven.startedAt()).isNull();
+        assertThat(redriven.error()).isNull();
+        assertThat(redriven.deadlineAt()).isNull(); // no bound configured: unchanged
+        // The reservation is carried over, not re-claimed (REQ-04): still exactly one active job.
+        assertThat(service.activeJobsForClient(client)).isEqualTo(1);
+        // A second pass over the same instant redrives nothing: only a non-terminal QUEUED row.
+        assertThat(service.reapExpiredExecutions(clock.instant())).isZero();
+
+        // Unblocking the stale worker fences it out; attempt 2 runs and completes from index 0.
+        crypto.unblock("stalled");
+        BatchHashJobResponse completed = awaitStatus(accepted.jobId(), JobStatus.COMPLETED);
+        assertThat(completed.attempt()).isEqualTo(2);
+        assertThat(completed.completedItems()).isEqualTo(2);
+        assertThat(completed.results()).extracting("digest").containsExactly(
+                "7b600e7fa8a5d86c7879c6764b9254397ca177a839ed068a5f2fe65d89983eea",
+                "a4c3ed04a95a3da14a9d235c83d868bed7c0f45cf7f3faa751ee8f50598d2211");
+        assertThat(completed.autoFailovers()).isEqualTo(1); // the count survives to the terminal row
+
+        // Journal exactly-once (REQ-06): the lapsed attempt closed FAILED once and was never
+        // reopened; attempt 2 opened its own single entry - admitted under the synthetic
+        // correlation id - and closed it with its own terminal outcome. No row resurrected by the
+        // stale worker, so the journal is still exactly two rows after the fence.
+        List<AuditEntry> rows = batchHashEntries(journal, accepted.jobId());
+        assertThat(rows).hasSize(2);
+        // The list order is not load-bearing, so match by state: exactly one FAILED close (the
+        // lapsed attempt) and one SUCCEEDED close (the redriven attempt), the latter only under
+        // the auto-failover correlation id.
+        assertThat(rows).filteredOn(e -> e.state() == JournalState.FAILED).hasSize(1);
+        assertThat(rows).filteredOn(e -> e.state() == JournalState.SUCCEEDED).hasSize(1)
+                .allSatisfy(e -> assertThat(e.requestId()).isEqualTo("auto-failover"));
+        assertThat(rows.get(1).completedAt()).isNotNull();
+        assertThat(crypto.count("stalled")).isEqualTo(2); // attempt 1 once, rehashed by attempt 2
+        awaitActiveJobs(client, 0);
+    }
+
+    @Test
+    @DisplayName("auto-failover - an exhausted failover budget terminalises the next lapsed attempt")
+    void shouldTerminaliseLapsedAttemptWhenFailoverBudgetExhausted() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("a", "b");
+        String client = "198.51.100.97";
+        service = failoverTest(1, 5, crypto, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("a", "b", "c"), null, null), client);
+        assertThat(crypto.awaitEntered("a")).isTrue();
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        BatchHashJobResponse redriven = service.getJob(accepted.jobId());
+        assertThat(redriven.status()).isEqualTo(JobStatus.QUEUED);
+        assertThat(redriven.autoFailovers()).isEqualTo(1); // budget spent on this redrive
+
+        // Attempt 2 resumes at index 0 (the lapsed attempt hashed nothing), stalls on "b" and lets
+        // its own lease lapse with the budget already spent.
+        crypto.unblock("a");
+        assertThat(crypto.awaitEntered("b")).isTrue();
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+
+        BatchHashJobResponse failed = service.getJob(accepted.jobId());
+        assertThat(failed.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(failed.error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        assertThat(failed.autoFailovers()).isEqualTo(1); // a refused budget never increments
+        assertThat(failed.attempts()).hasSize(2);
+        assertThat(failed.attempts().get(1).status()).isEqualTo(JobStatus.FAILED);
+        assertThat(failed.attempts().get(1).error())
+                .isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        // No lane entry was created: the terminal row waits for no worker.
+        assertThat(service.queuedJobsForClient(client)).isZero();
+        // The slot is freed exactly once: back to the pre-reap baseline and zero after the terminal.
+        awaitActiveJobs(client, 0);
+        // One FAILED close per lapsed attempt: the redriven attempt closed by its own reaper pass.
+        List<AuditEntry> rows = batchHashEntries(journal, accepted.jobId());
+        assertThat(rows).hasSize(2);
+        assertThat(rows.get(0).state()).isEqualTo(JournalState.FAILED);
+        assertThat(rows.get(1).state()).isEqualTo(JournalState.FAILED);
+        // The fenced attempt-2 worker must not resurrect the terminal row.
+        crypto.unblock("b");
+        awaitStatus(accepted.jobId(), JobStatus.FAILED);
+    }
+
+    @Test
+    @DisplayName("auto-failover - an attempt already at the attempt budget terminalises without failover")
+    void shouldNotFailoverWhenAttemptBudgetExhausted() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("a", "b");
+        String client = "198.51.100.96";
+        // Budget 3 is never the binding bound: the ordinary attempt budget (2) is.
+        service = failoverTest(3, 2, crypto, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("a", "b", "c"), null, null), client);
+        assertThat(crypto.awaitEntered("a")).isTrue();
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+        BatchHashJobResponse redriven = service.getJob(accepted.jobId());
+        assertThat(redriven.status()).isEqualTo(JobStatus.QUEUED); // the one permitted redrive
+        assertThat(redriven.attempt()).isEqualTo(2);
+
+        crypto.unblock("a");
+        assertThat(crypto.awaitEntered("b")).isTrue();
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+
+        BatchHashJobResponse failed = service.getJob(accepted.jobId());
+        assertThat(failed.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(failed.error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        assertThat(failed.attempt()).isEqualTo(2);
+        assertThat(failed.autoFailovers()).isEqualTo(1); // only the first redrive was spent
+        assertThat(failed.attempts()).hasSize(2);
+        awaitActiveJobs(client, 0);
+        crypto.unblock("b");
+        awaitStatus(accepted.jobId(), JobStatus.FAILED);
+    }
+
+    @Test
+    @DisplayName("auto-failover - a refused lane hand-off rolls the row back to the pre-reap "
+            + "FAILED snapshot without consuming the failover")
+    void shouldRollBackFailedSnapshotWhenLaneAdmissionRefused() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        String client = "198.51.100.95";
+        service = failoverTest(1, 5, crypto, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stalled", "done"), null, null), client);
+        assertThat(crypto.awaitEntered("stalled")).isTrue();
+        assertThat(awaitRunningAttempt(accepted.jobId(), 1).status()).isEqualTo(JobStatus.RUNNING);
+        List<AuditEntry> opened = batchHashEntries(journal, accepted.jobId());
+        assertThat(opened).hasSize(1);
+        assertThat(opened.get(0).state()).isEqualTo(JournalState.PENDING);
+
+        // The lease lapses, then the drain closes the lanes before the reap evaluates: the
+        // hand-off is refused and the whole redrive must be undone.
+        clock.advanceSeconds(LEASE_SECONDS);
+        service.closeLanesForTest();
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+
+        BatchHashJobResponse rolledBack = service.getJob(accepted.jobId());
+        assertThat(rolledBack.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(rolledBack.error()).isEqualTo(BatchHashJobService.EXECUTION_LEASE_EXPIRED);
+        assertThat(rolledBack.attempt()).isEqualTo(1); // the original attempt number
+        assertThat(rolledBack.completedAt()).isEqualTo(clock.instant());
+        assertThat(rolledBack.completedItems()).isZero();
+        assertThat(rolledBack.results()).isNull();
+        assertThat(rolledBack.autoFailovers()).isZero(); // the failover was not consumed
+        assertThat(rolledBack.attempts()).hasSize(1);
+        // No lane entry, and the reservation is released exactly once on the rollback.
+        assertThat(service.queuedJobsForClient(client)).isZero();
+        awaitActiveJobs(client, 0);
+        // The lapsed attempt's single row closed FAILED once; attempt 2 never reached a worker, so
+        // it opened no row of its own.
+        List<AuditEntry> rows = batchHashEntries(journal, accepted.jobId());
+        assertThat(rows).hasSize(1);
+        assertThat(rows.get(0).state()).isEqualTo(JournalState.FAILED);
+        assertThat(rows.get(0).completedAt()).isNotNull();
+        crypto.unblock("stalled"); // the fenced worker writes nothing
+    }
+
+    @Test
+    @DisplayName("auto-failover - an expired deadline still fails JOB_DEADLINE_EXCEEDED without failover")
+    void shouldNotFailoverALapsedJobPastItsDeadline() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        String client = "198.51.100.94";
+        service = failoverTest(1, 5, crypto, clock, journal);
+
+        // The deadline (5s) beats the lease (30s), so the total-life bound is the outcome even
+        // though a failover budget is available.
+        BatchHashJobResponse accepted = service.submit(new BatchHashRequest("SHA-256",
+                List.of("stalled", "done"), null, null, 5), client);
+        assertThat(crypto.awaitEntered("stalled")).isTrue();
+        assertThat(awaitRunningAttempt(accepted.jobId(), 1).status()).isEqualTo(JobStatus.RUNNING);
+        clock.advanceSeconds(5);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+
+        BatchHashJobResponse failed = service.getJob(accepted.jobId());
+        assertThat(failed.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(failed.error()).isEqualTo(BatchHashJobService.JOB_DEADLINE_EXCEEDED);
+        assertThat(failed.attempt()).isEqualTo(1);
+        assertThat(failed.autoFailovers()).isZero();
+        assertThat(failed.attempts()).hasSize(1);
+        List<AuditEntry> rows = batchHashEntries(journal, accepted.jobId());
+        assertThat(rows).hasSize(1);
+        assertThat(rows.get(0).state()).isEqualTo(JournalState.FAILED);
+        assertThat(rows.get(0).requestId()).isNotEqualTo("auto-failover");
+        awaitActiveJobs(client, 0);
+        crypto.unblock("stalled"); // the fenced worker writes nothing
+    }
+
+    @Test
+    @DisplayName("auto-failover - a CANCELLING job whose lease lapses still ends CANCELLED")
+    void shouldNotFailoverACancellingJob() throws Exception {
+        AuditJournalService journal = newJournal();
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        LeaseCryptoService crypto = new LeaseCryptoService("stalled");
+        String client = "198.51.100.93";
+        service = failoverTest(1, 5, crypto, clock, journal);
+
+        BatchHashJobResponse accepted = service.submit(
+                new BatchHashRequest("SHA-256", List.of("stalled", "done"), null, null), client);
+        assertThat(crypto.awaitEntered("stalled")).isTrue();
+        assertThat(awaitRunningAttempt(accepted.jobId(), 1).status()).isEqualTo(JobStatus.RUNNING);
+
+        // A pending withdrawal beats a lapsed lease even with failover budget available.
+        BatchHashJobResponse cancelling = service.cancel(accepted.jobId());
+        assertThat(cancelling.status()).isEqualTo(JobStatus.CANCELLING);
+        clock.advanceSeconds(LEASE_SECONDS);
+        assertThat(service.reapExpiredExecutions(clock.instant())).isEqualTo(1);
+
+        BatchHashJobResponse cancelled = service.getJob(accepted.jobId());
+        assertThat(cancelled.status()).isEqualTo(JobStatus.CANCELLED);
+        assertThat(cancelled.attempt()).isEqualTo(1);
+        assertThat(cancelled.autoFailovers()).isZero();
+        assertThat(service.queuedJobsForClient(client)).isZero();
+        // The withdrawal's single journal row closed once; no auto-failover row was ever opened.
+        List<AuditEntry> rows = batchHashEntries(journal, accepted.jobId());
+        assertThat(rows).hasSize(1);
+        assertThat(rows.get(0).requestId()).isNotEqualTo("auto-failover");
+        awaitActiveJobs(client, 0);
+        crypto.unblock("stalled"); // the fenced worker writes nothing
+    }
+
     /**
      * DOD-01 / REQ-01, REQ-04: a job that waits out its bound fails without hashing anything -
      * {@code FAILED} + {@code JOB_DEADLINE_EXCEEDED}, a non-null {@code completedAt}, no item hashed,
