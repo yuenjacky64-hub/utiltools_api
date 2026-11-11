@@ -25,6 +25,8 @@ import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
 import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
 import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
+import com.example.utiltools.datetime.dto.DateTimeRangeRequest;
+import com.example.utiltools.datetime.dto.DateTimeRangeResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.service.DateTimeService;
@@ -117,6 +119,10 @@ public class AuditedOperations {
     public DateTimeBusinessDaysResponse businessDays(DateTimeBusinessDaysRequest request) {
         return record(OperationType.DATETIME_BUSINESS_DAYS, request,
                 () -> dateTimeService.businessDays(request));
+    }
+
+    public DateTimeRangeResponse range(DateTimeRangeRequest request) {
+        return record(OperationType.DATETIME_RANGE, request, () -> dateTimeService.range(request));
     }
 
     public DateTimeDurationResponse duration(DateTimeDurationRequest request) {
@@ -245,6 +251,7 @@ public class AuditedOperations {
             case DATETIME_SHIFT -> dateTimeService.shift((DateTimeShiftRequest) request);
             case DATETIME_DURATION -> dateTimeService.duration((DateTimeDurationRequest) request);
             case DATETIME_BUSINESS_DAYS -> dateTimeService.businessDays((DateTimeBusinessDaysRequest) request);
+            case DATETIME_RANGE -> dateTimeService.range((DateTimeRangeRequest) request);
             case DATETIME_CURRENT -> dateTimeService.getCurrentTime(timeZoneOf(request));
             case CRYPTO_HASH -> cryptoService.hash((HashRequest) request);
             case CRYPTO_BASE64 -> cryptoService.base64((Base64Request) request);

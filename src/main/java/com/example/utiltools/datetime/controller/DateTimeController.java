@@ -11,6 +11,8 @@ import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
 import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
 import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
+import com.example.utiltools.datetime.dto.DateTimeRangeRequest;
+import com.example.utiltools.datetime.dto.DateTimeRangeResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.dto.DateTimeWeekResponse;
@@ -80,6 +82,16 @@ public class DateTimeController {
             @Valid @RequestBody DateTimeBusinessDaysRequest request) {
         return ResponseEntity.ok(ApiResponse.success(
                 auditedOperations.businessDays(request), "Business days calculated successfully"));
+    }
+
+    @PostMapping("/range")
+    @Operation(summary = "Generate a bounded calendar date range",
+            description = "Returns an ordered list of yyyy-MM-dd dates from startDate towards endDate in "
+                    + "DAYS/WEEKS/MONTHS/YEARS steps, anchored to startDate (month-end and leap-day clamped), "
+                    + "with an optional inclusive end and a hard bound of 1000 dates")
+    public ApiResponse<DateTimeRangeResponse> range(@Valid @RequestBody DateTimeRangeRequest request) {
+        DateTimeRangeResponse result = auditedOperations.range(request);
+        return ApiResponse.success(result, "Date range generated successfully");
     }
 
     @GetMapping("/current")

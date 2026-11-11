@@ -9,6 +9,8 @@ import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
 import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
 import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
+import com.example.utiltools.datetime.dto.DateTimeRangeRequest;
+import com.example.utiltools.datetime.dto.DateTimeRangeResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.dto.DateTimeWeekResponse;
@@ -26,6 +28,7 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
 import java.time.temporal.WeekFields;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -71,6 +74,9 @@ public class DateTimeService {
 
     /** Expected input form named in every {@code week} validation message. */
     private static final String EXPECTED_WEEK_DATE = "ISO-8601 local date (yyyy-MM-dd)";
+
+    /** Hard bound on generated dates: the 1001st in-range point is a 400. */
+    public static final int MAX_RANGE_POINTS = 1000;
 
     /** Calendar-dependent year/month components in the date part (the {@code M} of {@code PT1M} is minutes). */
     private static final Pattern CALENDAR_UNIT = Pattern.compile("^P[^T]*\\d+(?:\\.\\d+)?[YM]");
@@ -326,6 +332,105 @@ public class DateTimeService {
                 dayOfWeek.name(),
                 parsed.getDayOfYear(),
                 dayOfWeek == DayOfWeek.SATURDAY || dayOfWeek == DayOfWeek.SUNDAY);
+    }
+
+    /**
+     * Enumerates the calendar dates between two ISO dates as an ordered, bounded list.
+     *
+     * <p>Point {@code i} is always {@code startDate.plus((long) i * step, unit)}, never the previous point
+     * plus one step, so month-end and leap-day clamping stay anchored to {@code startDate}:
+     * {@code 2026-01-31} with {@code MONTHS} yields {@code 2026-02-28} then {@code 2026-03-31}, and
+     * {@code 2024-02-29} with {@code YEARS} yields {@code 2025-02-28}.
+     * With {@code inclusive = true} the last emitted point may equal {@code endDate} (so
+     * {@code startDate == endDate} yields a single date); with {@code inclusive = false} the end date is
+     * omitted (so {@code startDate == endDate} yields an empty list).</p>
+     *
+     * <p>Pure function: no clock, no locale-sensitive formatting, no mutable state. Every rejection is an
+     * {@link IllegalArgumentException} - an unparseable date, {@code startDate} after {@code endDate}, a
+     * {@code step} outside 1..1000, an unsupported unit, calendar overflow and a 1001st in-range point -
+     * so a bad request surfaces as a 400 and never as a 500.</p>
+     */
+    public DateTimeRangeResponse range(DateTimeRangeRequest request) {
+        if (request == null) {
+            throw new IllegalArgumentException("request body is required");
+        }
+        LocalDate start = parseRangeDate("startDate", request.startDate());
+        LocalDate end = parseRangeDate("endDate", request.endDate());
+        if (start.isAfter(end)) {
+            throw new IllegalArgumentException("startDate must not be after endDate: " + start + " > " + end);
+        }
+        ChronoUnit unit = resolveRangeUnit(request.unit());
+        int step = resolveRangeStep(request.step());
+        boolean inclusive = request.inclusive() == null || request.inclusive();
+
+        List<String> dates = new ArrayList<>();
+        for (int index = 0; ; index++) {
+            LocalDate point;
+            try {
+                point = start.plus((long) index * step, unit);
+            } catch (DateTimeException | ArithmeticException e) {
+                throw new IllegalArgumentException("Date range is outside the supported calendar range", e);
+            }
+            if (inclusive ? point.isAfter(end) : !point.isBefore(end)) {
+                break;
+            }
+            if (dates.size() == MAX_RANGE_POINTS) {
+                throw new IllegalArgumentException("Date range must produce at most " + MAX_RANGE_POINTS
+                        + " dates: narrow the range or increase step");
+            }
+            dates.add(point.toString());
+        }
+        return new DateTimeRangeResponse(start.toString(), end.toString(), unit.name(), step, inclusive,
+                dates.size(), List.copyOf(dates));
+    }
+
+    /**
+     * Parses an untrusted range boundary as an ISO local date, mapping every rejection - including
+     * {@code null}, blank and {@link java.time.DateTimeException} - to {@link IllegalArgumentException}.
+     */
+    private LocalDate parseRangeDate(String field, String value) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(field + " must be a valid yyyy-MM-dd date: " + value);
+        }
+        String trimmed = value.trim();
+        try {
+            return LocalDate.parse(trimmed, DateTimeFormatter.ISO_LOCAL_DATE);
+        } catch (DateTimeException e) {
+            throw new IllegalArgumentException(
+                    field + " must be a valid yyyy-MM-dd date: " + abbreviate(trimmed), e);
+        }
+    }
+
+    /**
+     * Resolves the optional unit name: blank means {@link ChronoUnit#DAYS}, matching is case-insensitive and
+     * only date-based units are accepted.
+     */
+    private ChronoUnit resolveRangeUnit(String unit) {
+        String raw = unit == null ? "" : unit.trim();
+        if (raw.isEmpty()) {
+            return ChronoUnit.DAYS;
+        }
+        try {
+            ChronoUnit resolved = ChronoUnit.valueOf(raw.toUpperCase(Locale.ROOT));
+            if (resolved == ChronoUnit.DAYS || resolved == ChronoUnit.WEEKS
+                    || resolved == ChronoUnit.MONTHS || resolved == ChronoUnit.YEARS) {
+                return resolved;
+            }
+        } catch (IllegalArgumentException e) {
+            // Fall through to the single rejection below so every bad unit reads the same.
+        }
+        throw new IllegalArgumentException("unit must be one of DAYS, WEEKS, MONTHS, YEARS: " + raw);
+    }
+
+    /** Resolves the optional stride: {@code null} means 1, otherwise 1..1000. */
+    private int resolveRangeStep(Integer step) {
+        if (step == null) {
+            return 1;
+        }
+        if (step < 1 || step > MAX_RANGE_POINTS) {
+            throw new IllegalArgumentException("step must be between 1 and 1000: " + step);
+        }
+        return step;
     }
 
     private DateTimeDurationResponse parseDuration(String input) {
