@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ai_maintainer.util.fs import (  # noqa: E402
     LOCK_PROBE_FREE,
     LOCK_PROBE_HELD,
+    LOCK_PROBE_UNAVAILABLE,
     MaintainerAlreadyRunning,
     InstanceLock,
     probe_lock,
@@ -55,6 +56,23 @@ class _FrozenClock:
     def advance(self, seconds: float) -> float:
         self.now += seconds
         return self.now
+
+
+def _long_sec(default: float) -> float:
+    """F-03: CI-tunable upper bound for the acceptance tests' wait timeouts.
+
+    ``UTILTOOLS_LOCK_TEST_LONG_SEC`` overrides the generous default so the
+    suite can run fast in CI; an unset or invalid value keeps the default,
+    so production behaviour is untouched (this is a test seam only).
+    """
+
+    raw = os.environ.get("UTILTOOLS_LOCK_TEST_LONG_SEC")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+    return default
 
 
 def _fresh_engine(label: str, state_root: Path) -> tuple[MaintainerEngine, list[float]]:
@@ -241,7 +259,10 @@ def test_concurrent_start_lets_exactly_one_daemon_own_the_lock(tmp_path: Path) -
         owner_pid = None
         while time.monotonic() < deadline:
             probe = probe_lock(lock_file)
-            if probe.state == LOCK_PROBE_HELD:
+            # Wait for a held lock *with* a recorded owner pid: ``acquire``
+            # records the pid just after ``flock``, so a HELD probe in that
+            # window reports no owner yet.
+            if probe.state == LOCK_PROBE_HELD and probe.owner_pid is not None:
                 owner_pid = probe.owner_pid
                 break
             time.sleep(0.05)
@@ -255,10 +276,11 @@ def test_concurrent_start_lets_exactly_one_daemon_own_the_lock(tmp_path: Path) -
             stderr=subprocess.PIPE,
             text=True,
         )
-        loser_proc.wait(timeout=30)
+        loser_proc.wait(timeout=_long_sec(30))
         # Loser exits non-zero and names the live owner (REQ-03).
+        loser_stderr = loser_proc.stderr.read() if loser_proc.stderr else ""
         assert loser_proc.returncode != 0
-        assert str(owner_pid) in (loser_proc.stderr or "")
+        assert str(owner_pid) in loser_stderr
         # Exactly one loop is live: the winner still runs and owns the lock.
         assert winner_proc.poll() is None
         assert probe_lock(lock_file).owner_pid == owner_pid
@@ -267,14 +289,19 @@ def test_concurrent_start_lets_exactly_one_daemon_own_the_lock(tmp_path: Path) -
         assert pid_file.read_text() == f"{owner_pid}\n"
         assert json.loads(heartbeat_file.read_text())["pid"] == owner_pid
     finally:
+        # Cleanup only: no assertions in ``finally`` (NIT), so a failure in
+        # the main body is not masked by teardown noise. A graceful stop
+        # releases the lock and clears the winner's markers.
         if winner_proc.poll() is None:
-            # Graceful stop releases the lock and clears the winner's markers.
             winner_proc.send_signal(signal.SIGTERM)
-            assert winner_proc.wait(timeout=30) == 0
-        assert probe_lock(lock_file).state == LOCK_PROBE_FREE
+        winner_proc.wait(timeout=_long_sec(30))
         if loser_proc is not None and loser_proc.poll() is None:
             loser_proc.send_signal(signal.SIGKILL)
-            loser_proc.wait(timeout=30)
+            loser_proc.wait(timeout=_long_sec(30))
+    # Success-path invariants (moved out of ``finally``; only reached when
+    # the body above completed, with the winner stopped gracefully).
+    assert winner_proc.returncode == 0
+    assert probe_lock(lock_file).state == LOCK_PROBE_FREE
 
 
 def test_sigkilled_owner_is_replaced_without_manual_cleanup(tmp_path: Path) -> None:
@@ -463,8 +490,8 @@ def test_race_window_without_pid_file_is_closed(tmp_path: Path) -> None:
     thread_b = threading.Thread(target=_runner, args=("b", engine_b))
     thread_a.start()
     thread_b.start()
-    thread_a.join(timeout=30)
-    thread_b.join(timeout=30)
+    thread_a.join(timeout=_long_sec(30))
+    thread_b.join(timeout=_long_sec(30))
 
     outcome_a, outcome_b = results.get("a"), results.get("b")
     assert isinstance(outcome_a, MaintainerAlreadyRunning) or isinstance(
@@ -535,6 +562,22 @@ def test_probe_is_total_over_garbage_payloads(tmp_path: Path) -> None:
         assert read_owner_pid(lock_file) is None
     lock_file.write_text(str(2**63 + 1), encoding="utf-8")
     assert read_owner_pid(lock_file) == 2**63 + 1
+    # A 26-digit value (far past any pid_t range) must round-trip verbatim
+    # through ``read_owner_pid``: it validates shape/type, not pid space.
+    lock_file.write_text("1" * 26, encoding="utf-8")
+    assert read_owner_pid(lock_file) == int("1" * 26)
+
+    # A mode-000 lock file is unreadable: the owner-pid read degrades to
+    # None and the probe degrades to UNAVAILABLE (both stay total). Under
+    # root, file modes are bypassed, so the check only bites when the suite
+    # runs unprivileged.
+    if os.geteuid() != 0:
+        lock_file.chmod(0o000)
+        try:
+            assert read_owner_pid(lock_file) is None
+            assert probe_lock(lock_file).state == LOCK_PROBE_UNAVAILABLE
+        finally:
+            lock_file.chmod(0o644)
 
     # A recycled, live but unrelated pid is not the maintainer (REQ-04).
     unrelated = subprocess.Popen(

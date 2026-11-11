@@ -61,7 +61,7 @@ from ai_maintainer.engine import (  # noqa: E402  (import after sys.path bootstr
     RUNTIME_PID_FILE,
 )
 from ai_maintainer.shutdown import SHUTDOWN_POLL_INTERVAL_SEC  # noqa: E402
-from ai_maintainer.config import MaintainerConfig  # noqa: E402
+from ai_maintainer.config import MAINTAINER_ROOT_ENV, MaintainerConfig  # noqa: E402
 from ai_maintainer.memory import MEMORY_DOC_NAME, MemoryStore  # noqa: E402
 from ai_maintainer.tasks.curriculum import TaskCurriculum  # noqa: E402
 from ai_maintainer.util.fs import (  # noqa: E402
@@ -123,6 +123,31 @@ def _finite_timeout(raw: str) -> float:
     return value
 
 
+def _markers_root(
+    root: Path,
+    maintainer_root: str | None,
+    state_root: str | None,
+) -> Path:
+    """The marker dir (pid / heartbeat / lock) for this invocation.
+
+    Precedence: ``--state-root`` (used verbatim), then
+    ``--maintainer-root``/data (the flag names the maintainer root whose
+    ``data/`` directory holds the markers), then the ``MAINTAINER_ROOT``
+    environment variable (the scratch data dir, used verbatim - the knob
+    the DOD concurrency tests pin so subprocess runs never touch the
+    repo's own ``data/``), then ``<root>/data``.
+    """
+
+    if state_root:
+        return Path(state_root)
+    if maintainer_root:
+        return Path(maintainer_root) / "data"
+    env_root = os.environ.get(MAINTAINER_ROOT_ENV, "").strip()
+    if env_root:
+        return Path(env_root)
+    return root / "data"
+
+
 def _lock_path(
     *,
     maintainer_root: str | None,
@@ -139,7 +164,7 @@ def _lock_path(
     """
 
     root = Path(maintainer_root) if maintainer_root else _repo_root()
-    markers_root = Path(state_root) if state_root else root / "data"
+    markers_root = _markers_root(root, maintainer_root, state_root)
     try:
         config = MaintainerConfig.load(config_path=config_path, maintainer_root=str(root))
     except (OSError, ValueError):
@@ -159,7 +184,7 @@ def _build_engine(
     """
 
     root = Path(maintainer_root) if maintainer_root else _repo_root()
-    markers_root = Path(state_root) if state_root else root / "data"
+    markers_root = _markers_root(root, maintainer_root, state_root)
     try:
         config = MaintainerConfig.load(config_path=config_path, maintainer_root=str(root))
     except (OSError, ValueError) as error:
@@ -227,7 +252,17 @@ def _run_start(
         command.extend(["--state-root", state_root])
     if config_path:
         command.extend(["--config", config_path])
-    child = subprocess.Popen(command, start_new_session=True)
+    # The detached daemon must not inherit the caller's stdio pipes: while
+    # the CLI parent exits promptly, a pipe-holding child would keep them
+    # open and block any output-capturing caller (subprocess.run with
+    # capture_output) in communicate() past --timeout (QA F-01).
+    child = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         probe = probe_lock(lock_path)
@@ -460,7 +495,7 @@ def _run_stop(
         return 1
 
     root = Path(maintainer_root) if maintainer_root else _repo_root()
-    markers_root = Path(state_root) if state_root else root / "data"
+    markers_root = _markers_root(root, maintainer_root, state_root)
     pid_path = markers_root / RUNTIME_PID_FILE
     lock_path = _lock_path(
         maintainer_root=maintainer_root, state_root=state_root, config_path=None
