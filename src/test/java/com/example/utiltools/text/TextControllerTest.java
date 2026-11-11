@@ -593,4 +593,101 @@ class TextControllerTest {
         assertThat(after.result()).isEqualTo(before.result());
         assertThat(journal.size()).isEqualTo(entriesBefore);
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/word-frequency - returns deterministic top words with ignored words excluded")
+    void shouldReturnWordFrequencyWithIgnoreWordsAndLimit() throws Exception {
+        String body = """
+                {
+                    "text": "the cat and the dog and the cat",
+                    "limit": 2,
+                    "ignoreWords": ["the"]
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/text/word-frequency")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.totalWords").value(5))
+                .andExpect(jsonPath("$.data.distinctWords").value(3))
+                .andExpect(jsonPath("$.data.topWords.length()").value(2))
+                .andExpect(jsonPath("$.data.topWords[0].word").value("and"))
+                .andExpect(jsonPath("$.data.topWords[0].count").value(2))
+                .andExpect(jsonPath("$.data.topWords[1].word").value("cat"))
+                .andExpect(jsonPath("$.data.topWords[1].count").value(2));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/word-frequency - blank text, oversized limit and bad ignoreWords return 400 VALIDATION_ERROR")
+    void shouldRejectInvalidWordFrequencyRequestWith400() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/word-frequency")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "   "}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("text is required")));
+
+        mockMvc.perform(post("/api/v1/utils/text/word-frequency")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "abc", "limit": 101}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("limit must be at most 100")));
+
+        mockMvc.perform(post("/api/v1/utils/text/word-frequency")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "abc", "ignoreWords": ["   "]}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("ignoreWords entries must not be blank")));
+    }
+
+    @Test
+    @DisplayName("a word-frequency call is journalled as TEXT_WORD_FREQUENCY and replays as VERIFIED without a new entry")
+    void shouldJournalAndReplayTextWordFrequency() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/word-frequency")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "the cat and the dog", "limit": 3}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.totalWords").value(5))
+                .andExpect(jsonPath("$.data.distinctWords").value(4))
+                .andExpect(jsonPath("$.data.topWords[0].word").value("the"));
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_WORD_FREQUENCY"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.totalWords").value(5))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        AuditEntry before = journal.find(id).orElseThrow();
+        int entriesBefore = journal.size();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("TEXT_WORD_FREQUENCY"))
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.result.totalWords").value(5))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"));
+
+        AuditEntry after = journal.find(id).orElseThrow();
+        assertThat(after.operation()).isEqualTo(OperationType.TEXT_WORD_FREQUENCY);
+        assertThat(after.completedAt()).isEqualTo(before.completedAt());
+        assertThat(after.result()).isEqualTo(before.result());
+        assertThat(journal.size()).isEqualTo(entriesBefore);
+    }
 }
