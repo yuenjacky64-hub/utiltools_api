@@ -44,8 +44,10 @@ from ai_maintainer.concurrency import (
 from ai_maintainer.config import MaintainerConfig
 from ai_maintainer.memory.store import atomic_write_text
 from ai_maintainer.util.fs import (
+    LOCK_PROBE_HELD,
     InstanceLock,
     MaintainerAlreadyRunning,
+    probe_lock,
     resolve_lock_path,
 )
 from ai_maintainer.shutdown import (
@@ -3149,16 +3151,33 @@ class MaintainerEngine:
         ``maintainer.pid`` and ``maintainer.heartbeat`` are only removed when
         this process still holds the instance lock *and* the pid file still
         identifies this process. A successor daemon that started inside the
-        previous owner's shutdown window therefore keeps its files. With the
-        lock disabled (INV-LOCK-3) the pre-change behaviour is preserved.
+        previous owner's shutdown window therefore keeps its files. The
+        "lock object is ``None``" state is not conflated: it means either the
+        lock was never enabled in this engine instance (INV-LOCK-3, legacy
+        unconditional clear) or it was released - in the released case the
+        lock file still exists on disk and a probe settles who owns it.
         """
 
         lock = self._instance_lock
-        if lock is None:
+        if lock is not None:
+            # Active: clear only while we still hold the lock and the pid
+            # marker still names this process.
+            return lock.owns() and self._pid_marker_is_ours()
+        lock_file = self.lock_file
+        if lock_file is None or not lock_file.is_file():
+            # INV-LOCK-3: the lock was disabled (or never created) in this
+            # engine's lifetime - the pre-change unconditional clear applies.
             return True
-        if not lock.owns():
-            return False
-        return self._pid_marker_is_ours()
+        probe = probe_lock(lock_file)
+        if probe.state == LOCK_PROBE_HELD:
+            # The lock was re-acquired after this engine released it: our own
+            # markers may be cleared, a foreign owner's may not.
+            return probe.owner_pid == os.getpid() and self._pid_marker_is_ours()
+        # The lock file exists but is free (or unreadable): this process has
+        # already released the lock and no longer owns the data directory - a
+        # successor may have started in the meantime, so its markers survive
+        # (REQ-05 / DOD-03). LOCK_PROBE_UNAVAILABLE fails closed too.
+        return False
 
     def _pid_marker_is_ours(self) -> bool:
         """``True`` when ``maintainer.pid`` still names this process (REQ-05)."""

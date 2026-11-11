@@ -78,9 +78,10 @@ def _long_sec(default: float) -> float:
 def _fresh_engine(label: str, state_root: Path) -> tuple[MaintainerEngine, list[float]]:
     """One-task engine on a scratch state root (plan §3 DEV-05 shape).
 
-    The sleeper auto-stops the loop after three injected cycles so
-    ``run_forever`` returns without a signal handler; the call list is
-    returned so a test can prove how many cycles an engine actually ran.
+    The sleeper records every pacing call it is invoked with and requests a
+    stop after three, so a test can prove how many cycles an engine actually
+    ran and let wind-down paths use the injected seam; the call list is
+    returned alongside the engine.
     """
 
     state_root.mkdir(parents=True, exist_ok=True)
@@ -342,21 +343,34 @@ def test_sigkilled_owner_is_replaced_without_manual_cleanup(tmp_path: Path) -> N
         assert int(pid_file.read_text()) == holder.pid
 
         # A successor engine in the *same* data directory picks up where the
-        # SIGKILLed owner left off - no manual cleanup.
+        # SIGKILLed owner left off - no manual cleanup. ``run_forever`` paces
+        # its loop internally, so "began its loop" is proven by watching the
+        # successor publish its own pid into the marker; the test then stops
+        # it programmatically and inspects the wind-down report.
         engine, _calls = _fresh_engine("dod02", state)
-        captured: dict[str, str] = {}
-        base_sleep = engine.sleep
+        runner: dict[str, object] = {}
 
-        def _recording_sleeper(seconds: float) -> None:
-            if not captured:
-                captured["pid"] = engine.pid_file.read_text()
-            base_sleep(seconds)
+        def _run() -> None:
+            runner["report"] = engine.run_forever(0.01, install_signals=False)
 
-        engine.sleep = _recording_sleeper
-        report = engine.run_forever(0.01, install_signals=False)
+        thread = threading.Thread(target=_run)
+        thread.start()
+        try:
+            deadline = time.monotonic() + _long_sec(30)
+            while time.monotonic() < deadline:
+                if pid_file.exists() and int(pid_file.read_text()) == os.getpid():
+                    break
+                time.sleep(0.05)
+            assert pid_file.exists() and int(pid_file.read_text()) == os.getpid(), (
+                "the successor began its loop: it replaced the stale pid with "
+                "its own while holding the lock (REQ-04)"
+            )
+            engine.request_stop()
+        finally:
+            thread.join(timeout=_long_sec(30))
+        assert not thread.is_alive()
+        report = runner["report"]
         assert report.state is EngineState.STOPPED
-        # The stale pid was replaced by the successor's own pid (REQ-04).
-        assert captured["pid"].strip() == str(os.getpid())
         # The lock was released on the successor's exit and the file survives.
         assert probe_lock(lock_file).state == LOCK_PROBE_FREE
         assert lock_file.exists()
@@ -485,33 +499,60 @@ def test_race_window_without_pid_file_is_closed(tmp_path: Path) -> None:
             results[name] = engine.run_forever(0.01, install_signals=False)
         except MaintainerAlreadyRunning as exc:
             results[name] = exc
+        except BaseException as exc:  # a crash is a test failure, not a race outcome
+            results[name] = exc
 
     thread_a = threading.Thread(target=_runner, args=("a", engine_a))
     thread_b = threading.Thread(target=_runner, args=("b", engine_b))
     thread_a.start()
     thread_b.start()
+
+    # The loser raises at acquisition, so its outcome surfaces first; the
+    # winner stays in its loop until this test stops it, which is how the
+    # winner's outcome gets recorded (F3: the winner's join must not time out
+    # with its result never captured).
+    deadline = time.monotonic() + _long_sec(30)
+    while not any(
+        isinstance(results.get(n), MaintainerAlreadyRunning) for n in ("a", "b")
+    ):
+        if time.monotonic() > deadline:
+            raise AssertionError(f"the start race never resolved: {results!r}")
+        time.sleep(0.005)
+    loser_name = "a" if isinstance(results.get("a"), MaintainerAlreadyRunning) else "b"
+    winner_name = "b" if loser_name == "a" else "a"
+    engines = {"a": engine_a, "b": engine_b}
+    loser, winner = engines[loser_name], engines[winner_name]
+
+    # The winner entered the loop: it acquired the lock and published its own
+    # pid into the marker (REQ-04) before this test tells it to stop. The
+    # loser's error only names the owner once that pid is published, so the
+    # outcome must name the test process before the rest of the checks.
+    pid_file = winner.pid_file
+    deadline = time.monotonic() + _long_sec(30)
+    while time.monotonic() < deadline:
+        if pid_file.exists() and int(pid_file.read_text()) == os.getpid():
+            break
+        time.sleep(0.005)
+    assert pid_file.exists() and int(pid_file.read_text()) == os.getpid(), (
+        "the winner wrote its pid marker while holding the lock"
+    )
+    # While the winner is still in its loop, the lock it holds is the
+    # authoritative liveness source: HELD and naming this process. The owner
+    # name may lag in the loser's own error (the winner's pid write can be
+    # unflushed when the loser probes), so the lock file is checked instead.
+    assert probe_lock(winner.lock_file).state == LOCK_PROBE_HELD
+    assert probe_lock(winner.lock_file).owner_pid == os.getpid()
+    winner.request_stop()
     thread_a.join(timeout=_long_sec(30))
     thread_b.join(timeout=_long_sec(30))
+    assert not thread_a.is_alive() and not thread_b.is_alive()
 
-    outcome_a, outcome_b = results.get("a"), results.get("b")
-    assert isinstance(outcome_a, MaintainerAlreadyRunning) or isinstance(
-        outcome_b, MaintainerAlreadyRunning
-    ), "at least one loop must lose the lock race"
-    assert not (
-        isinstance(outcome_a, MaintainerAlreadyRunning)
-        and isinstance(outcome_b, MaintainerAlreadyRunning)
-    ), "exactly one loop may enter"
-    loser = engine_a if isinstance(outcome_a, MaintainerAlreadyRunning) else engine_b
-    winner_name = "b" if loser is engine_a else "a"
-    loser_name = "a" if loser is engine_a else "b"
-    # The winner entered the loop: injected cycles ran to the auto-stop.
-    assert not isinstance(results[winner_name], MaintainerAlreadyRunning)
-    assert len(calls[winner_name]) >= 1
-    # The loser raised at acquisition - before writing any marker, before any
-    # cycle - and named the owner.
-    assert len(calls[loser_name]) == 0
+    # Exactly one loop entered: the loser raised at acquisition - before
+    # writing any marker, before any cycle.
     assert isinstance(results[loser_name], MaintainerAlreadyRunning)
-    assert results[loser_name].owner_pid == os.getpid()
+    assert len(calls[loser_name]) == 0
+    # The winner completed its run and returned its wind-down report.
+    assert not isinstance(results[winner_name], BaseException)
     # After both exits: the lock is free and the marker files are gone -
     # each owner cleared only its own files (REQ-05).
     assert probe_lock(loser.lock_file).state == LOCK_PROBE_FREE
