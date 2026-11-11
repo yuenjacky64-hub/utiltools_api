@@ -8,6 +8,8 @@ import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
 import com.example.utiltools.text.dto.TextTransformResponse;
+import com.example.utiltools.text.dto.TextTruncateRequest;
+import com.example.utiltools.text.dto.TextTruncateResponse;
 import org.springframework.stereotype.Service;
 
 import java.text.Normalizer;
@@ -355,6 +357,55 @@ public class TextService {
         int lines = text.replace("\r\n", "\n").replace('\r', '\n').split("\n", -1).length;
         int sentences = countSentences(text);
         return new TextStatsResponse(characters, charactersNoWhitespace, words, lines, sentences);
+    }
+
+    public TextTruncateResponse truncate(TextTruncateRequest request) {
+        String text = request.text();
+        int total = text.codePointCount(0, text.length());
+        int maxLength = request.maxLength();
+        if (total <= maxLength) {
+            return new TextTruncateResponse(text, false, total, total);
+        }
+        // A null ellipsis defaults to the single code point "…"; an empty one means no marker.
+        String marker = request.ellipsis() == null ? "…" : request.ellipsis();
+        int markerLength = marker.codePointCount(0, marker.length());
+        if (maxLength <= markerLength) {
+            // Content would remain after step 2, so the result could not hold any content: it would
+            // exceed maxLength or consist of nothing but the marker.
+            throw new IllegalArgumentException(
+                    "maxLength must exceed the ellipsis length so the truncated result can contain content");
+        }
+        int available = maxLength - markerLength;
+        // Whole-code-point slicing by construction: a code-point array slice can never split a
+        // surrogate pair, and cut + markerLength <= maxLength keeps the result within the bound.
+        int[] codePoints = text.codePoints().toArray();
+        int cut = wordBoundaryCut(codePoints, available, Boolean.TRUE.equals(request.wordBoundary()));
+        String result = new String(codePoints, 0, cut) + marker;
+        return new TextTruncateResponse(result, true, total, result.codePointCount(0, result.length()));
+    }
+
+    /**
+     * Index just past the prefix to keep. A hard cut at {@code available} unless word-boundary
+     * mode finds the last whitespace code point at or before the limit; the trailing whitespace of
+     * that cut is trimmed, and when no whitespace fits or the boundary cut would be empty the hard
+     * cut is used instead.
+     */
+    private static int wordBoundaryCut(int[] codePoints, int available, boolean wordBoundary) {
+        if (!wordBoundary) {
+            return available;
+        }
+        int boundary = -1;
+        for (int index = available - 1; index >= 0; index--) {
+            if (Character.isWhitespace(codePoints[index])) {
+                boundary = index;
+                break;
+            }
+        }
+        int cut = boundary + 1;
+        while (cut > 0 && Character.isWhitespace(codePoints[cut - 1])) {
+            cut--;
+        }
+        return cut > 0 ? cut : available;
     }
 
     /** Maximal runs of {@link Character#isLetterOrDigit(int)} code points. */

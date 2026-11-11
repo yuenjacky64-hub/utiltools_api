@@ -8,6 +8,8 @@ import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
 import com.example.utiltools.text.dto.TextTransformResponse;
+import com.example.utiltools.text.dto.TextTruncateRequest;
+import com.example.utiltools.text.dto.TextTruncateResponse;
 import com.example.utiltools.text.service.TextService;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validation;
@@ -386,5 +388,117 @@ class TextServiceTest {
 
             assertThat(validator.validate(new TextHtmlEntitiesRequest("Decode", "&amp;"))).isEmpty();
         }
+    }
+
+    @Test
+    @DisplayName("truncate - text within maxLength is returned unchanged with truncated=false")
+    void shouldReturnUnchangedWhenInputFits() {
+        TextTruncateResponse response = service.truncate(new TextTruncateRequest("Hello", 10, null, null));
+
+        assertThat(response.result()).isEqualTo("Hello");
+        assertThat(response.truncated()).isFalse();
+        assertThat(response.originalLength()).isEqualTo(5);
+        assertThat(response.length()).isEqualTo(5);
+    }
+
+    @Test
+    @DisplayName("truncate - a fitting input is not rejected even when the ellipsis is longer than maxLength")
+    void shouldNotValidateEllipsisWhenInputFits() {
+        TextTruncateResponse response = service.truncate(new TextTruncateRequest("a", 1, "12345", null));
+
+        assertThat(response.result()).isEqualTo("a");
+        assertThat(response.truncated()).isFalse();
+    }
+
+    @Test
+    @DisplayName("truncate - a hard cut with a null ellipsis defaults to '…'")
+    void shouldHardCutWithDefaultEllipsis() {
+        TextTruncateResponse response =
+                service.truncate(new TextTruncateRequest("abcdefghij", 5, null, Boolean.FALSE));
+
+        assertThat(response.result()).isEqualTo("abcd…");
+        assertThat(response.truncated()).isTrue();
+        assertThat(response.originalLength()).isEqualTo(10);
+        assertThat(response.length()).isEqualTo(5);
+    }
+
+    @Test
+    @DisplayName("truncate - a hard cut with a custom ellipsis")
+    void shouldHardCutWithCustomEllipsis() {
+        TextTruncateResponse response =
+                service.truncate(new TextTruncateRequest("abcdefghij", 5, "...", Boolean.FALSE));
+
+        assertThat(response.result()).isEqualTo("ab...");
+        assertThat(response.length()).isEqualTo(5);
+    }
+
+    @Test
+    @DisplayName("truncate - a word-boundary cut trims the trailing whitespace of the cut")
+    void shouldCutAtWordBoundaryAndTrimTrailingWhitespace() {
+        // "Hello  World" is 12 code points; available = 9 - 3 = 6, so the boundary at the
+        // double space is kept and both spaces are trimmed from the cut.
+        TextTruncateResponse response =
+                service.truncate(new TextTruncateRequest("Hello  World", 9, "...", Boolean.TRUE));
+
+        assertThat(response.result()).isEqualTo("Hello...");
+        assertThat(response.length()).isEqualTo(8);
+    }
+
+    @Test
+    @DisplayName("truncate - a word-boundary cut picks the last whitespace at or before the limit")
+    void shouldPickLastWhitespaceAtOrBeforeLimit() {
+        // "aa bb cc dd" is 11 code points; the null ellipsis is '…' (1), so available = 8 - 1 = 7
+        // and the last whitespace at or before index 7 sits at index 5.
+        TextTruncateResponse response =
+                service.truncate(new TextTruncateRequest("aa bb cc dd", 8, null, Boolean.TRUE));
+
+        assertThat(response.result()).isEqualTo("aa bb…");
+        assertThat(response.originalLength()).isEqualTo(11);
+        assertThat(response.length()).isEqualTo(6);
+    }
+
+    @Test
+    @DisplayName("truncate - a word-boundary cut falls back to a hard cut when no whitespace fits")
+    void shouldFallBackToHardCutWhenNoWhitespaceFits() {
+        TextTruncateResponse response =
+                service.truncate(new TextTruncateRequest("abcdefghij", 5, "...", Boolean.TRUE));
+
+        assertThat(response.result()).isEqualTo("ab...");
+        assertThat(response.length()).isEqualTo(5);
+    }
+
+    @Test
+    @DisplayName("truncate - an empty ellipsis truncates without a marker")
+    void shouldUseNoMarkerForEmptyEllipsis() {
+        TextTruncateResponse response =
+                service.truncate(new TextTruncateRequest("abcdefghij", 5, "", Boolean.FALSE));
+
+        assertThat(response.result()).isEqualTo("abcde");
+        assertThat(response.truncated()).isTrue();
+        assertThat(response.length()).isEqualTo(5);
+    }
+
+    @Test
+    @DisplayName("truncate - a cut never splits a surrogate pair")
+    void shouldKeepSurrogatePairsIntact() {
+        // "ab😀cd😀ef" is 8 code points; maxLength 4 with the default ellipsis leaves 3 for content.
+        TextTruncateResponse response =
+                service.truncate(new TextTruncateRequest("ab😀cd😀ef", 4, null, null));
+
+        assertThat(response.result()).isEqualTo("ab😀…");
+        assertThat(response.originalLength()).isEqualTo(8);
+        assertThat(response.length()).isEqualTo(4);
+    }
+
+    @Test
+    @DisplayName("truncate - a maxLength that cannot hold content next to the ellipsis is rejected")
+    void shouldRejectMaxLengthNotExceedingEllipsis() {
+        assertThatThrownBy(() -> service.truncate(new TextTruncateRequest("abcdef", 1, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("maxLength must exceed the ellipsis length");
+
+        assertThatThrownBy(() -> service.truncate(new TextTruncateRequest("abcdef", 5, "12345678", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("maxLength must exceed the ellipsis length");
     }
 }

@@ -36,6 +36,7 @@ public enum OperationType {
     TEXT_STATS(true),
     TEXT_REPLACE(true),
     TEXT_HTML_ENTITIES(true),
+    TEXT_TRUNCATE(true),
     BATCH_HASH(false),
     // A contact submission's dispatch attempt is non-deterministic end to end: delivery has a
     // wall-clock lease, a retry budget, and an out-of-scope dispatcher seam, so the entry never
