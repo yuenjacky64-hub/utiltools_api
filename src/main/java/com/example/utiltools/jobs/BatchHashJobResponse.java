@@ -50,6 +50,13 @@ import java.util.List;
  * {@code CANCELLED} job withdrew its progress and therefore reports both empty, and a
  * {@code COMPLETED} job reports every index as succeeded with nothing failed. Indices only — never
  * a digest of an uncommitted item — so a partially hashed batch discloses no results.</p>
+ *
+ * <p>{@code autoFailovers} is the additive automatic-redrive projection ({@code REQ-07}): how many
+ * times a lapsed {@code RUNNING} execution lease was automatically redriven as {@code attempt + 1}
+ * while {@code utiltools.jobs.max-auto-failovers > 0}. It is {@code 0} while the feature is disabled
+ * and is never changed by a manual {@code POST /api/v1/utils/jobs/{jobId}/retry}. Being a primitive
+ * it is serialised on every status, and the 18-component constructor of the previous shape still
+ * compiles and reports {@code 0}.</p>
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record BatchHashJobResponse(
@@ -70,8 +77,23 @@ public record BatchHashJobResponse(
         int completedItems,
         Instant deadlineAt,
         List<Integer> succeededItems,
-        List<Integer> failedItems
+        List<Integer> failedItems,
+        int autoFailovers
 ) {
+
+    /**
+     * Backward-compatible constructor for callers compiled against the 18-component per-item shape:
+     * such a caller cannot express an automatic redrive count, so {@code autoFailovers} is {@code 0}.
+     */
+    public BatchHashJobResponse(String jobId, String idempotencyKey, JobStatus status, int itemCount,
+            List<HashResponse> results, String error, Instant createdAt, Instant startedAt,
+            Instant completedAt, int attempt, int maxAttempts, List<JobAttempt> attempts,
+            Instant executionLeaseExpiresAt, Instant lastHeartbeatAt, int completedItems,
+            Instant deadlineAt, List<Integer> succeededItems, List<Integer> failedItems) {
+        this(jobId, idempotencyKey, status, itemCount, results, error, createdAt, startedAt, completedAt,
+                attempt, maxAttempts, attempts, executionLeaseExpiresAt, lastHeartbeatAt, completedItems,
+                deadlineAt, succeededItems, failedItems, 0);
+    }
 
     /**
      * Backward-compatible constructor for callers compiled against the 16-component deadline shape:
@@ -84,7 +106,7 @@ public record BatchHashJobResponse(
             Instant deadlineAt) {
         this(jobId, idempotencyKey, status, itemCount, results, error, createdAt, startedAt, completedAt,
                 attempt, maxAttempts, attempts, executionLeaseExpiresAt, lastHeartbeatAt, completedItems,
-                deadlineAt, List.of(), List.of());
+                deadlineAt, List.of(), List.of(), 0);
     }
 
     /**
@@ -97,7 +119,7 @@ public record BatchHashJobResponse(
             Instant executionLeaseExpiresAt, Instant lastHeartbeatAt, int completedItems) {
         this(jobId, idempotencyKey, status, itemCount, results, error, createdAt, startedAt, completedAt,
                 attempt, maxAttempts, attempts, executionLeaseExpiresAt, lastHeartbeatAt, completedItems,
-                null);
+                null, List.of(), List.of(), 0);
     }
 
     /**
@@ -108,7 +130,7 @@ public record BatchHashJobResponse(
             List<HashResponse> results, String error, Instant createdAt, Instant startedAt,
             Instant completedAt, int attempt, int maxAttempts, List<JobAttempt> attempts) {
         this(jobId, idempotencyKey, status, itemCount, results, error, createdAt, startedAt, completedAt,
-                attempt, maxAttempts, attempts, null, null);
+                attempt, maxAttempts, attempts, null, null, 0, null, List.of(), List.of(), 0);
     }
 
     /**
@@ -122,6 +144,6 @@ public record BatchHashJobResponse(
             Instant executionLeaseExpiresAt, Instant lastHeartbeatAt) {
         this(jobId, idempotencyKey, status, itemCount, results, error, createdAt, startedAt, completedAt,
                 attempt, maxAttempts, attempts, executionLeaseExpiresAt, lastHeartbeatAt,
-                results == null ? 0 : results.size(), null);
+                results == null ? 0 : results.size(), null, List.of(), List.of(), 0);
     }
 }

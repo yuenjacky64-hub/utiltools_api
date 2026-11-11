@@ -84,7 +84,10 @@ public class BatchJobController {
                     + "A RUNNING job carries an executionLeaseExpiresAt/lastHeartbeatAt lease that its "
                     + "worker renews before hashing each item; a job whose lease lapses is moved to FAILED "
                     + "with error EXECUTION_LEASE_EXPIRED, after which POST /api/v1/utils/jobs/{jobId}/retry "
-                    + "starts attempt+1. A job submitted with deadlineSeconds (or bound by the configured "
+                    + "starts attempt+1. When utiltools.jobs.max-auto-failovers > 0 the reaper instead redrives "
+                    + "such a job automatically as attempt+1 (keeping its checkpoint and deadlineAt) until that "
+                    + "budget is spent, and the snapshot's additive autoFailovers reports how many redrives "
+                    + "happened. A job submitted with deadlineSeconds (or bound by the configured "
                     + "server default) also reports the additive deadlineAt = createdAt + effective deadline; "
                     + "a job that passes it is moved to FAILED with error JOB_DEADLINE_EXCEEDED even while its "
                     + "lease is live, completedItems reports the durably hashed item count and results stays null, "
@@ -110,7 +113,8 @@ public class BatchJobController {
                     + "it if the worker never returns). A repeated DELETE on a CANCELLING or CANCELLED job is "
                     + "idempotent and returns the current snapshot, a CANCELLING job that also passes its "
                     + "deadline still ends CANCELLED (a withdrawal beats a deadline), a COMPLETED/FAILED job returns "
-                    + "409 JOB_CANCELLATION_CONFLICT, and an unknown or evicted id returns 404 JOB_NOT_FOUND")
+                    + "409 JOB_CANCELLATION_CONFLICT, and an unknown or evicted id returns 404 JOB_NOT_FOUND. A "
+                    + "CANCELLING job never auto-failovers even when utiltools.jobs.max-auto-failovers > 0")
     public ApiResponse<BatchHashJobResponse> cancel(@PathVariable String jobId) {
         return ApiResponse.success(jobService.cancel(jobId), "Job cancelled");
     }
@@ -120,7 +124,9 @@ public class BatchJobController {
             description = "Only FAILED -> QUEUED is allowed; returns 202 with the requeued snapshot, "
                     + "409 JOB_RETRY_CONFLICT for a QUEUED/RUNNING/COMPLETED/CANCELLED job or an exhausted "
                     + "attempt budget, 404 JOB_NOT_FOUND for an unknown or evicted id, and 429 QUEUE_FULL "
-                    + "when the retry is rejected by a saturated queue")
+                    + "when the retry is rejected by a saturated queue. Manual retry stays the recovery path for "
+                    + "any FAILED job and is never needed for an attempt that was redriven automatically by "
+                    + "utiltools.jobs.max-auto-failovers (it neither increments nor resets autoFailovers)")
     public ResponseEntity<ApiResponse<BatchHashJobResponse>> retry(@PathVariable String jobId) {
         return ResponseEntity.status(HttpStatus.ACCEPTED)
                 .body(ApiResponse.success(jobService.retry(jobId), "Job retried"));
