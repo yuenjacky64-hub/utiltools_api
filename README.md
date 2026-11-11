@@ -165,6 +165,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
 | `POST` | `/api/v1/utils/text/replace` | Replace every (or, with `all=false`, the first) occurrence of a literal or regex `pattern`, reporting `replacements`, `changed` and code-point `length` |
 | `POST` | `/api/v1/utils/text/html-entities` | `ENCODE` a string for safe HTML embedding (`&`, `<`, `>`, `"`, `'`) or `DECODE` the five named entities plus decimal/hex numeric references, reporting `changed` and code-point `length` |
+| `POST` | `/api/v1/utils/text/word-frequency` | Count `totalWords`, `distinctWords` and a bounded `topWords` list (`limit` defaults to `10`, `caseSensitive` defaults to `false`, optional `ignoreWords`) in deterministic count-desc/word-asc order, journalled as `TEXT_WORD_FREQUENCY` |
 | `POST` | `/api/v1/utils/jobs/hash` | Submit a bounded async batch-hash job; `202` with a job id, idempotent via `idempotencyKey` |
 | `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `CANCELLING` / `COMPLETED` / `FAILED` / `CANCELLED` |
 | `DELETE` | `/api/v1/utils/jobs/{jobId}` | Cancel a job: `QUEUED` → `CANCELLED` immediately, `RUNNING` → `CANCELLING` (`200`, idempotent, the worker stops at its next checkpoint); `409` `JOB_CANCELLATION_CONFLICT` for `COMPLETED`/`FAILED` |
@@ -1420,12 +1421,12 @@ populated only when a cached result is served).
 
 ## 🧾 Operation Journal & Replay Verification
 
-All thirty journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+All thirty-one journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
 `datetime/shift`, `datetime/duration`, `datetime/business-days`, `datetime/range`, `crypto/hash`,
 `crypto/base64`, `crypto/base32`, `crypto/url`, `crypto/jwt/decode`, `crypto/uuid`, `json/format`,
 `json/validate`, `json/query`, `json/flatten`, `json/unflatten`, `json/merge-patch`, `json/pointer`,
 `json/to-csv`, `json/from-csv`, `json/csv-to-json`, `json/to-ndjson`, `json/from-ndjson`, `json/diff`,
-`text/transform`, `text/stats`, `text/replace`, `text/html-entities` — are recorded in a **bounded
+`text/transform`, `text/stats`, `text/replace`, `text/html-entities`, `text/word-frequency` — are recorded in a **bounded
 in-memory journal** so a failed
 hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
 can be verified against the original outcome without ever mutating the original entry.
@@ -1911,6 +1912,54 @@ encoder emits is one the decoder understands.
 existing `MAX_RESULT_CHARS` (1000000 code points): a text whose encoding would exceed it answers
 `400 BAD_REQUEST` with `html-entity result exceeds 1000000 characters`, raised before the result is
 materialised beyond the bound.
+
+#### Word frequency
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/text/word-frequency \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "the cat and the dog and the cat and the tree",
+    "limit": 3,
+    "ignoreWords": ["the"]
+  }'
+```
+
+```json
+{
+  "success": true,
+  "message": "Word frequency calculated successfully",
+  "data": {
+    "totalWords": 7,
+    "distinctWords": 4,
+    "topWords": [
+      { "word": "and", "count": 3 },
+      { "word": "cat", "count": 2 },
+      { "word": "dog", "count": 1 }
+    ]
+  },
+  "timestamp": "2026-01-01T00:00:00Z",
+  "requestId": "9f2c4d60-5e1b-4a83-9c77-1a2b3c4d5e6f"
+}
+```
+
+| Field | Type | Required | Default | Meaning |
+| :--- | :--- | :--- | :--- | :--- |
+| `text` | string | yes | — | Input text, non-blank, at most 1000000 characters |
+| `limit` | integer | no | `10` | Max number of `topWords` entries, `1..100` |
+| `caseSensitive` | boolean | no | `false` | `false` folds tokens and `ignoreWords` to lower case (Locale.ROOT) before matching; `true` keeps each spelling distinct |
+| `ignoreWords` | string array | no | — | Up to 1000 non-blank entries of at most 100 characters; matching tokens are excluded from the totals and `topWords` |
+
+| Response field | Definition |
+| :--- | :--- |
+| `totalWords` | number of analysed (non-ignored) tokens |
+| `distinctWords` | number of distinct analysed (non-ignored) tokens |
+| `topWords` | at most `limit` `{word, count}` entries, ordered by count descending, then word ascending — deterministic, so replays match exactly |
+
+Words are tokenised with the same rules as `/stats` (whitespace-split, code-point aware). A token that
+appears in `ignoreWords` (after the same case folding) is dropped before counting, so `totalWords` and
+`distinctWords` count analysed tokens only. No clock or random source is read, so every journalled
+`TEXT_WORD_FREQUENCY` entry replays to the identical data and answers `replay.state = VERIFIED`.
 
 #### Journal & replay
 

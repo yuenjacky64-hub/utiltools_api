@@ -67,6 +67,8 @@ import com.example.utiltools.text.dto.TextTransformRequest;
 import com.example.utiltools.text.dto.TextTransformResponse;
 import com.example.utiltools.text.dto.TextTruncateRequest;
 import com.example.utiltools.text.dto.TextTruncateResponse;
+import com.example.utiltools.text.dto.TextWordFrequencyRequest;
+import com.example.utiltools.text.dto.TextWordFrequencyResponse;
 import com.example.utiltools.text.service.TextService;
 import org.springframework.stereotype.Service;
 
@@ -243,6 +245,10 @@ public class AuditedOperations {
         return record(OperationType.TEXT_HTML_ENTITIES, request, () -> textService.htmlEntities(request));
     }
 
+    public TextWordFrequencyResponse wordFrequency(TextWordFrequencyRequest request) {
+        return record(OperationType.TEXT_WORD_FREQUENCY, request, () -> textService.wordFrequency(request));
+    }
+
     public TextTruncateResponse truncate(TextTruncateRequest request) {
         return record(OperationType.TEXT_TRUNCATE, request, () -> textService.truncate(request));
     }
@@ -286,6 +292,7 @@ public class AuditedOperations {
             case TEXT_REPLACE -> textService.replace((TextReplaceRequest) request);
             case TEXT_HTML_ENTITIES -> textService.htmlEntities((TextHtmlEntitiesRequest) request);
             case TEXT_TRUNCATE -> textService.truncate((TextTruncateRequest) request);
+            case TEXT_WORD_FREQUENCY -> textService.wordFrequency((TextWordFrequencyRequest) request);
             // Asynchronous batch hashing is audit-only: a BATCH_HASH entry can never be replayed,
             // because there is no servlet-bound payload to re-run and the operation is
             // non-deterministic. Defence in depth: claimReplay refuses the same entries.

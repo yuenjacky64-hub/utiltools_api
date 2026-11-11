@@ -12,6 +12,8 @@ import com.example.utiltools.text.dto.TextTransformRequest;
 import com.example.utiltools.text.dto.TextTransformResponse;
 import com.example.utiltools.text.dto.TextTruncateRequest;
 import com.example.utiltools.text.dto.TextTruncateResponse;
+import com.example.utiltools.text.dto.TextWordFrequencyRequest;
+import com.example.utiltools.text.dto.TextWordFrequencyResponse;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -81,5 +83,16 @@ public class TextController {
                     + "TEXT_TRUNCATE and can be replayed.")
     public ApiResponse<TextTruncateResponse> truncate(@Valid @RequestBody TextTruncateRequest request) {
         return ApiResponse.success(auditedOperations.truncate(request), "Text truncated successfully");
+    }
+
+    @PostMapping("/word-frequency")
+    @Operation(summary = "Compute word frequency",
+            description = "Counts tokens with the /stats tokenizer. When caseSensitive is false (the default), tokens and "
+                    + "ignoreWords are folded with Locale.ROOT; ignored words are excluded before counting, and the response "
+                    + "returns totalWords, distinctWords and a bounded topWords list ordered by count descending, then word "
+                    + "ascending, so a journalled result always replays exactly. Every call is journalled as "
+                    + "TEXT_WORD_FREQUENCY and can be replayed.")
+    public ApiResponse<TextWordFrequencyResponse> wordFrequency(@Valid @RequestBody TextWordFrequencyRequest request) {
+        return ApiResponse.success(auditedOperations.wordFrequency(request), "Word frequency computed successfully");
     }
 }

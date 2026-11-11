@@ -10,12 +10,19 @@ import com.example.utiltools.text.dto.TextTransformRequest;
 import com.example.utiltools.text.dto.TextTransformResponse;
 import com.example.utiltools.text.dto.TextTruncateRequest;
 import com.example.utiltools.text.dto.TextTruncateResponse;
+import com.example.utiltools.text.dto.TextWordFrequencyRequest;
+import com.example.utiltools.text.dto.TextWordFrequencyResponse;
 import org.springframework.stereotype.Service;
 
 import java.text.Normalizer;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
@@ -357,6 +364,51 @@ public class TextService {
         int lines = text.replace("\r\n", "\n").replace('\r', '\n').split("\n", -1).length;
         int sentences = countSentences(text);
         return new TextStatsResponse(characters, charactersNoWhitespace, words, lines, sentences);
+    }
+
+    /**
+     * Deterministic word frequency: tokens come from {@link #tokenize(String)}; when
+     * {@code caseSensitive} is {@code false} or absent every token and every ignore word is folded
+     * with {@link Locale#ROOT} lowercasing before counting and matching, so ignoring {@code "Foo"}
+     * also drops {@code foo} and {@code FOO}. Ignored tokens are excluded before counting, so
+     * {@code totalWords} and {@code distinctWords} cover analysed (non-ignored) tokens only, and
+     * {@code topWords} is ordered by count descending, then word ascending via
+     * {@link String#compareTo} — a journalled result always replays exactly. The method reads no
+     * clock, so output is a pure function of the request.
+     */
+    public TextWordFrequencyResponse wordFrequency(TextWordFrequencyRequest request) {
+        int limit = request.limit() == null ? 10 : request.limit();
+        boolean caseSensitive = Boolean.TRUE.equals(request.caseSensitive());
+        Set<String> ignored = new HashSet<>();
+        if (request.ignoreWords() != null) {
+            for (String word : request.ignoreWords()) {
+                ignored.add(foldWord(word, caseSensitive));
+            }
+        }
+        Map<String, Integer> counts = new HashMap<>();
+        for (String token : tokenize(request.text())) {
+            String folded = foldWord(token, caseSensitive);
+            if (!ignored.contains(folded)) {
+                counts.merge(folded, 1, Integer::sum);
+            }
+        }
+        if (counts.isEmpty()) {
+            return new TextWordFrequencyResponse(0, 0, List.of());
+        }
+        int totalWords = counts.values().stream().mapToInt(Integer::intValue).sum();
+        List<TextWordFrequencyResponse.WordCount> topWords = counts.entrySet().stream()
+                .sorted(Comparator.comparingInt((Map.Entry<String, Integer> entry) -> entry.getValue())
+                        .reversed()
+                        .thenComparing(Map.Entry::getKey))
+                .limit(limit)
+                .map(entry -> new TextWordFrequencyResponse.WordCount(entry.getKey(), entry.getValue()))
+                .toList();
+        return new TextWordFrequencyResponse(totalWords, counts.size(), topWords);
+    }
+
+    /** Fold a token or ignore word with {@link Locale#ROOT} lowercasing unless counting is case-sensitive. */
+    private static String foldWord(String word, boolean caseSensitive) {
+        return caseSensitive ? word : word.toLowerCase(Locale.ROOT);
     }
 
     public TextTruncateResponse truncate(TextTruncateRequest request) {
