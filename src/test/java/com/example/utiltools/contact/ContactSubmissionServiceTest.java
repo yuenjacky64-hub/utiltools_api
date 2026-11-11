@@ -136,13 +136,17 @@ class ContactSubmissionServiceTest {
 
         ContactSubmissionResponse retrying = service.retry(submitted.id());
         assertThat(retrying.attempt()).isEqualTo(2);
+        // attempt 2 is admitted at reservation time: DISPATCHING even though worker 1 still holds
+        // attempt 1, with the execution lease re-stamped.
+        assertThat(retrying.status()).isEqualTo(ContactStatus.DISPATCHING);
+        Instant startedAt2 = retrying.currentAttempt().startedAt();
+
+        // The held generation-1 worker now returns: its completion must be fenced out, and
+        // attempt 2 then completes on the freed worker.
+        dispatcher.release().countDown();
         ContactSubmissionResponse delivered = pollUntil(retrying.id(), ContactStatus.DELIVERED);
         Instant deliveredAt = delivered.currentAttempt().completedAt();
-        Instant startedAt2 = delivered.currentAttempt().startedAt();
 
-        // The held generation-1 worker now returns: its completion must be fenced out.
-        dispatcher.release().countDown();
-        Thread.sleep(100);
         ContactSubmissionResponse intact = service.get(submitted.id());
         assertThat(intact.status()).isEqualTo(ContactStatus.DELIVERED);
         assertThat(intact.attempt()).isEqualTo(2);
@@ -220,7 +224,14 @@ class ContactSubmissionServiceTest {
         dispatcher.holdGenerations.add(1);
         ContactSubmissionResponse dispatched = service.submit(request(null, "still going"));
         pollUntil(dispatched.id(), ContactStatus.DISPATCHING);
+        // Admission stamps DISPATCHING at reservation time, before the worker thread reaches
+        // the dispatch seam — wait on the call itself, not the status.
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (dispatcher.calls().isEmpty() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(25);
+        }
         int dispatches = dispatcher.calls().size();
+        assertThat(dispatches).isOne();
 
         assertThatThrownBy(() -> service.retry(dispatched.id()))
                 .isInstanceOf(ContactTransitionConflictException.class)
@@ -281,7 +292,10 @@ class ContactSubmissionServiceTest {
                 .isEqualTo(ContactSubmissionService.CONTACT_DELIVERY_LEASE_EXPIRED);
         assertThat(service.get(submitted.id()).currentAttempt().auditEntryId()).isNull();
 
-        pollUntil(submitted.id(), ContactStatus.DELIVERED); // retry as attempt 2, completed
+        // Retry as attempt 2: admitted DISPATCHING, then the freed worker delivers it.
+        service.retry(submitted.id());
+        dispatcher.release().countDown();
+        pollUntil(submitted.id(), ContactStatus.DELIVERED);
         assertThat(service.get(submitted.id()).currentAttempt().auditEntryId()).isNull();
         AuditEntry succeeded2 = journal.list(10, JournalState.SUCCEEDED).stream()
                 .filter(entry -> entry.id().equals(entry1)).findAny().orElse(null);

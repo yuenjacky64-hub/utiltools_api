@@ -210,8 +210,8 @@ public class ContactSubmissionService {
      * {@code CONTACT_IDEMPOTENCY_CONFLICT} and leaves the original row untouched; a saturated
      * pool answers 429 {@code CONTACT_QUEUE_FULL} with the admission fully rolled back.</p>
      *
-     * @return a snapshot of the accepted submission: {@code QUEUED} while the worker has not
-     *         picked it up yet, {@code DISPATCHING} once it has — never terminal
+     * @return a snapshot of the accepted submission: {@code DISPATCHING} (the attempt is
+     *         admitted and its execution lease stamped the moment its pool slot is reserved)
      */
     public ContactSubmissionResponse submit(ContactSubmissionRequest request) {
         String name = request.name().trim();
@@ -245,10 +245,13 @@ public class ContactSubmissionService {
             if (key != null) {
                 idempotencyIndex.put(key, submission.submissionId);
             }
+            admitAttemptLocked(submission, 1);
             try {
                 executor.execute(() -> runAttempt(submission.submissionId, 1));
             } catch (RejectedExecutionException e) {
-                rollbackAdmissionLocked(submission); // INV-C4: atomic rollback
+                // INV-C4: atomic rollback — close the opened journal entry, drop the row.
+                failQuietly(submission, 1, "CONTACT_QUEUE_FULL");
+                rollbackAdmissionLocked(submission);
                 throw new ContactQueueFullException();
             }
             return snapshot(submission);
@@ -298,8 +301,8 @@ public class ContactSubmissionService {
      * {@link ContactTransitionConflictException} and the row is left untouched.
      *
      * @param submissionId the submission id
-     * @return a snapshot of the re-queued submission: {@code QUEUED} ({@code attempt = N + 1}) or
-     *         already {@code DISPATCHING}
+     * @return a snapshot of the re-queued submission: {@code DISPATCHING} ({@code attempt = N +
+     *         1}) with the execution lease re-stamped at admission
      */
     public ContactSubmissionResponse retry(String submissionId) {
         synchronized (registryLock) {
@@ -324,11 +327,13 @@ public class ContactSubmissionService {
             submission.error = null;
             submission.lastHeartbeatAt = null;
             submission.executionLeaseExpiresAt = null;
+            admitAttemptLocked(submission, nextAttempt);
             try {
                 executor.execute(() -> runAttempt(submission.submissionId, nextAttempt));
             } catch (RejectedExecutionException e) {
                 // INV-C4: roll the re-queue back so the machine is exactly what it was (FAILED,
                 // previous attempt, previous error preserved).
+                failQuietly(submission, nextAttempt, "CONTACT_QUEUE_FULL");
                 submission.attempt = nextAttempt - 1;
                 submission.status = ContactStatus.FAILED;
                 submission.error = previousError;
@@ -468,29 +473,40 @@ public class ContactSubmissionService {
     // ---------------------------------------------------------------------
 
     /**
-     * Worker admission: re-checks the row still exists, is QUEUED, and carries this exact
-     * generation (a late enqueue for an evicted or superseded row is a no-op), then stamps
-     * {@code DISPATCHING} and the execution lease before calling the dispatcher outside the
-     * lock (REQ-06).
+     * Admission stamping (REQ-05 / REQ-06): the moment a slot is reserved the attempt is
+     * {@code DISPATCHING} with its execution lease stamped, so a slot that is still waiting
+     * in the pool can never strand behind a busy worker, and the at-most-{@code
+     * workerCount + queueCapacity} live-attempt gate holds across admission, not just
+     * execution. The attempt's journal entry is opened here and its id stored so the
+     * terminal / reaper close happens exactly once (REQ-08 / INV-C2).
+     *
+     * <p>Called only under {@link #registryLock}.</p>
+     */
+    private void admitAttemptLocked(MutableSubmission submission, int generation) {
+        Instant now = Instant.now(clock);
+        submission.status = ContactStatus.DISPATCHING;
+        submission.startedAt = now;
+        submission.lastHeartbeatAt = now;
+        submission.executionLeaseExpiresAt = now.plusSeconds(executionLeaseSeconds);
+        String entryId = beginQuietly(submission, generation);
+        if (entryId != null) {
+            submission.auditEntryIds.put(generation, entryId);
+        }
+    }
+
+    /**
+     * Worker execution: re-checks that the row still exists and this generation still owns a
+     * live {@code DISPATCHING} attempt (a late task for an evicted, reaped, or superseded
+     * attempt is a no-op), then calls the dispatcher outside the lock (REQ-06 / REQ-07). The
+     * {@code DISPATCHING} stamp and the execution lease were already taken at admission.
      */
     private void runAttempt(String submissionId, int generation) {
-        boolean admitted;
         synchronized (registryLock) {
             MutableSubmission submission = submissions.get(submissionId);
-            if (submission == null || submission.status != ContactStatus.QUEUED
-                    || submission.attempt != generation) {
-                return; // fenced out: evicted or superseded — a late enqueue is a no-op
+            if (submission == null || submission.attempt != generation
+                    || submission.status != ContactStatus.DISPATCHING) {
+                return; // fenced out: evicted, reaped, or superseded — a late task is a no-op
             }
-            Instant now = Instant.now(clock);
-            submission.status = ContactStatus.DISPATCHING;
-            submission.startedAt = now;
-            submission.lastHeartbeatAt = now;
-            submission.executionLeaseExpiresAt = now.plusSeconds(executionLeaseSeconds);
-            beginQuietly(submission, generation);
-            admitted = true;
-        }
-        if (!admitted) {
-            return;
         }
         boolean success;
         String boundedError;
