@@ -90,6 +90,22 @@ class ContactSubmissionServiceTest {
         return pollUntil(id, candidate -> candidate == status);
     }
 
+    /** Polls an arbitrary condition on the same 5s budget as {@link #pollUntil(String, ContactStatus)}. */
+    private static void awaitCondition(java.util.function.Supplier<Boolean> condition) {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (!condition.get()) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw new AssertionError("condition never matched");
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(e);
+            }
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static <T> T readField(Object target, String name) {
         try {
@@ -209,6 +225,10 @@ class ContactSubmissionServiceTest {
         startService(3);
         dispatcher.holdAll = true; // every attempt occupies its slot until released
         ContactSubmissionResponse a = service.submit(request(null, "first"));
+        // Same deterministic-saturation guard: only once the worker has picked up `a`'s task
+        // (one dispatcher call recorded) is the single queue slot free, so `b` fills it for
+        // sure instead of racing the worker and hitting the AbortPolicy under load.
+        awaitCondition(() -> dispatcher.calls().size() >= 1);
         ContactSubmissionResponse b = service.submit(request(null, "second"));
         pollUntil(a.id(), ContactStatus.DISPATCHING);
         pollUntil(b.id(), ContactStatus.DISPATCHING);
@@ -394,6 +414,11 @@ class ContactSubmissionServiceTest {
         dispatcher.failGenerations.clear();
         dispatcher.holdAll = true;
         ContactSubmissionResponse a = service.submit(request(null, "hold one"));
+        // Synchronize saturation deterministically: `x`'s failed attempt 1 already recorded one
+        // dispatcher call, so two calls mean the worker picked up `a`'s task and the single
+        // queue slot is free — `b` fills it for sure instead of racing the worker and hitting
+        // the AbortPolicy under load.
+        awaitCondition(() -> dispatcher.calls().size() >= 2);
         ContactSubmissionResponse b = service.submit(request(null, "hold two"));
         pollUntil(a.id(), ContactStatus.DISPATCHING);
         pollUntil(b.id(), ContactStatus.DISPATCHING);
