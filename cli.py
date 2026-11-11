@@ -4,6 +4,9 @@ Usage::
 
     python3 cli.py check
     python3 cli.py status [--json]
+    python3 cli.py start [--foreground] [--timeout SEC]
+    python3 cli.py run-once
+    python3 cli.py stop [--timeout SEC]
 
 ``check`` is a stand-alone, read-only pre-flight: it validates the resolved
 configuration paths, verifies that ``pi``-hosted models are free tier, reports
@@ -15,9 +18,19 @@ verdict.
 summary, or a single JSON document with ``--json``, and exits 0 once a report is
 rendered (the verdict belongs to ``check``).
 
-``stop`` is the operator's wind-down button: it reads ``<state_root>/maintainer.pid``
-and either signals the daemon (``SIGTERM`` -> ``request_stop()``) or clears the
-stale runtime markers of a dead pid, exiting 0/1 with one explicit message.
+``stop`` is the operator's wind-down button: it probes the instance lock
+first, signals the live lock owner (``SIGTERM`` -> ``request_stop()``), or
+clears the stale runtime markers of a dead pid, exiting 0/1 with one
+explicit message.
+
+``start`` brings the daemon loop up under the instance lock
+(``data/maintainer.lock`` by default): a non-blocking preflight probe refuses
+a second live loop (``maintainer already running (pid N)``), and without
+``--foreground`` the command spawns a foreground child and reports
+``maintainer started (pid N)`` once the child owns the lock. ``run-once``
+runs a single monitor cycle and refuses to run while the daemon holds the
+lock. ``status`` and ``stop`` probe the lock read-only; the lock file, once
+created, is never unlinked.
 
 The repo ships no ``pyproject.toml``/``setup.py``, so ``<repo>/src`` is put on
 ``sys.path`` here exactly as ``tests/conftest.py`` does.
@@ -30,6 +43,7 @@ import math
 import os
 import signal
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -41,6 +55,7 @@ if str(SRC) not in sys.path:
 
 from ai_maintainer import checks, status  # noqa: E402  (import after sys.path bootstrap)
 from ai_maintainer.engine import (  # noqa: E402  (import after sys.path bootstrap)
+    MaintainerEngine,
     RUNTIME_HEARTBEAT_FILE,
     RUNTIME_MARKER_TMP_SUFFIX,
     RUNTIME_PID_FILE,
@@ -48,6 +63,18 @@ from ai_maintainer.engine import (  # noqa: E402  (import after sys.path bootstr
 from ai_maintainer.shutdown import SHUTDOWN_POLL_INTERVAL_SEC  # noqa: E402
 from ai_maintainer.config import MaintainerConfig  # noqa: E402
 from ai_maintainer.memory import MEMORY_DOC_NAME, MemoryStore  # noqa: E402
+from ai_maintainer.tasks.curriculum import TaskCurriculum  # noqa: E402
+from ai_maintainer.util.fs import (  # noqa: E402
+    LOCK_PROBE_FREE,
+    LOCK_PROBE_HELD,
+    LOCK_PROBE_UNAVAILABLE,
+    MaintainerAlreadyRunning,
+    probe_lock,
+    resolve_lock_path,
+)
+
+#: Bounded wait for the spawned daemon to hand the lock over to us.
+DEFAULT_START_TIMEOUT_SEC = 5.0
 
 
 def _repo_root() -> Path:
@@ -96,29 +123,170 @@ def _finite_timeout(raw: str) -> float:
     return value
 
 
-def _run_stop(
-    *, maintainer_root: str | None, state_root: str | None, timeout: float
-) -> int:
-    """Signal the daemon (or clear a dead pid's markers) and report one line."""
+def _lock_path(
+    *,
+    maintainer_root: str | None,
+    state_root: str | None,
+    config_path: str | None,
+) -> Path | None:
+    """The instance-lock path for this invocation's marker dir, or ``None``.
 
-    # Defence in depth for callers that bypass ``build_parser()``: an
-    # unbounded wait here would hang the operator tool (SHOULD_FIX F4).
-    try:
-        wait_sec = float(timeout)
-    except (TypeError, ValueError):
-        print(f"invalid --timeout: {timeout!r}", file=sys.stderr)
-        return 1
-    if not math.isfinite(wait_sec) or wait_sec < 0.0:
-        print(
-            f"invalid --timeout {timeout!r}: must be a finite number of "
-            "seconds >= 0",
-            file=sys.stderr,
-        )
-        return 1
+    The configured ``instance_lock_file`` (default ``data/maintainer.lock``)
+    is resolved against the marker dir the loop would use - ``--state-root``
+    if given, else ``<maintainer-root>/data`` - through ``resolve_lock_path``
+    (INV-LOCK-1), so the CLI and the engine can never drift. A config that
+    fails to load falls back to the built-in default.
+    """
 
     root = Path(maintainer_root) if maintainer_root else _repo_root()
     markers_root = Path(state_root) if state_root else root / "data"
-    pid_path = markers_root / RUNTIME_PID_FILE
+    try:
+        config = MaintainerConfig.load(config_path=config_path, maintainer_root=str(root))
+    except (OSError, ValueError):
+        config = MaintainerConfig()
+    return resolve_lock_path(config.instance_lock_file, state_root=markers_root, repo_root=root)
+
+
+def _build_engine(
+    *,
+    maintainer_root: str | None,
+    state_root: str | None,
+    config_path: str | None,
+) -> MaintainerEngine | None:
+    """Construct the loop engine rooted at this CLI's marker dirs.
+
+    Prints ``error: ...`` and returns ``None`` when the config cannot load.
+    """
+
+    root = Path(maintainer_root) if maintainer_root else _repo_root()
+    markers_root = Path(state_root) if state_root else root / "data"
+    try:
+        config = MaintainerConfig.load(config_path=config_path, maintainer_root=str(root))
+    except (OSError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return None
+    curriculum = TaskCurriculum(specs=[], config=config)
+    return MaintainerEngine(
+        curriculum,
+        config=config,
+        state_root=markers_root,
+        heartbeat_path=markers_root / RUNTIME_HEARTBEAT_FILE,
+    )
+
+
+def _report_already_running(owner_pid: int | None) -> None:
+    """Print the single-source contention message (REQ-03)."""
+
+    print(str(MaintainerAlreadyRunning(owner_pid)), file=sys.stderr)
+
+
+def _run_start(
+    *,
+    maintainer_root: str | None,
+    state_root: str | None,
+    config_path: str | None,
+    foreground: bool,
+    timeout: float,
+) -> int:
+    """Start the daemon loop under the instance lock; refuse when it is held.
+
+    The preflight probe is non-mutating (INV-LOCK-4): a held lock exits 1
+    naming the live owner, without constructing an engine or spawning a
+    child. The default mode spawns a ``--foreground`` child in its own
+    session and reports ``maintainer started (pid N)`` once the child owns
+    the lock; a child that loses the race exits through
+    ``MaintainerAlreadyRunning`` before touching pid, heartbeat, or
+    stop-flag files (INV-LOCK-5).
+    """
+
+    lock_path = _lock_path(
+        maintainer_root=maintainer_root, state_root=state_root, config_path=config_path
+    )
+    preflight = probe_lock(lock_path)
+    if preflight.state == LOCK_PROBE_HELD:
+        _report_already_running(preflight.owner_pid)
+        return 1
+
+    if foreground:
+        engine = _build_engine(
+            maintainer_root=maintainer_root, state_root=state_root, config_path=config_path
+        )
+        if engine is None:
+            return 1
+        try:
+            engine.run_forever()
+        except MaintainerAlreadyRunning as error:
+            _report_already_running(error.owner_pid)
+            return 1
+        return 0
+
+    command = [sys.executable, str(Path(__file__).resolve()), "start", "--foreground"]
+    if maintainer_root:
+        command.extend(["--maintainer-root", maintainer_root])
+    if state_root:
+        command.extend(["--state-root", state_root])
+    if config_path:
+        command.extend(["--config", config_path])
+    child = subprocess.Popen(command, start_new_session=True)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        probe = probe_lock(lock_path)
+        if probe.state == LOCK_PROBE_HELD:
+            owner = probe.owner_pid
+            if owner is not None:
+                print(f"maintainer started (pid {owner})")
+            else:
+                print("maintainer started")
+            return 0
+        if child.poll() is not None:
+            print(f"maintainer failed to start (exit {child.returncode})", file=sys.stderr)
+            return 1
+        time.sleep(0.1)
+
+    # The child was left running: the lock had not been handed over within
+    # the window. The operator can ``stop`` it and probe again.
+    print(f"start timed out after {timeout}s", file=sys.stderr)
+    return 1
+
+
+def _run_run_once(
+    *,
+    maintainer_root: str | None,
+    state_root: str | None,
+    config_path: str | None,
+) -> int:
+    """Run exactly one monitor cycle; refuse while the daemon holds the lock.
+
+    The probe is non-mutating (INV-LOCK-4): ``run-once`` never acquires the
+    lock, never clears the stop flag, and never writes a marker - it is the
+    loop-free way to exercise one cycle without racing a live daemon.
+    """
+
+    probe = probe_lock(
+        _lock_path(
+            maintainer_root=maintainer_root, state_root=state_root, config_path=config_path
+        )
+    )
+    if probe.state == LOCK_PROBE_HELD:
+        owner = probe.owner_pid
+        message = "maintainer already running"
+        if owner is not None:
+            message = f"{message} (pid {owner})"
+        print(f"{message}; run-once needs the daemon stopped", file=sys.stderr)
+        return 1
+
+    engine = _build_engine(
+        maintainer_root=maintainer_root, state_root=state_root, config_path=config_path
+    )
+    if engine is None:
+        return 1
+    result = engine.run_cycle()
+    print(f"run-once: cycle {result.cycle} {result.outcome}")
+    return 0 if result.outcome == "SUCCESS" else 1
+
+
+def _stop_by_pid_file(pid_path: Path, markers_root: Path, wait_sec: float) -> int:
+    """Legacy wind-down for a lock-free (INV-LOCK-3) deployment."""
 
     if not pid_path.exists():
         print(f"maintainer not running (no pid file: {pid_path})")
@@ -130,7 +298,6 @@ def _run_stop(
     except (OSError, ValueError):
         print(f"invalid maintainer pid file: {pid_path}", file=sys.stderr)
         return 1
-
     if pid <= 1 or pid == os.getpid():
         print(f"invalid maintainer pid file: {pid_path}", file=sys.stderr)
         return 1
@@ -145,8 +312,6 @@ def _run_stop(
         print(f"cannot probe maintainer pid {pid}: permission denied", file=sys.stderr)
         return 1
     except OverflowError:
-        # A >2**31 pid passes ``int()`` and ``pid <= 1`` but cannot be a real
-        # pid; report the malformed file instead of a traceback (SHOULD_FIX F5).
         print(f"invalid maintainer pid file: {pid_path}", file=sys.stderr)
         return 1
 
@@ -176,6 +341,154 @@ def _run_stop(
 
     print(f"stop timed out after {wait_sec}s (pid {pid})", file=sys.stderr)
     return 1
+
+
+def _stop_lock_owner(
+    *,
+    lock_path: Path,
+    owner_pid: int | None,
+    pid_path: Path,
+    markers_root: Path,
+    wait_sec: float,
+) -> int:
+    """Signal the lock owner and wait for the lock to free (REQ-04)."""
+
+    pid = owner_pid
+    if pid is None:
+        # The owner has not recorded its pid yet; fall back to the pid
+        # file, keeping the legacy malformed-file verdicts.
+        try:
+            raw = pid_path.read_text(encoding="utf-8").strip()
+            pid = int(raw)
+        except (OSError, ValueError):
+            print(f"invalid maintainer pid file: {pid_path}", file=sys.stderr)
+            return 1
+        if pid <= 1 or pid == os.getpid():
+            print(f"invalid maintainer pid file: {pid_path}", file=sys.stderr)
+            return 1
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        # The owner died between the probe and the signal: the kernel
+        # already dropped the flock, so fall through to the stale branch.
+        return _stop_stale_pid(pid_path, markers_root)
+    except PermissionError:
+        print(f"cannot signal maintainer pid {pid}: permission denied", file=sys.stderr)
+        return 1
+    except OverflowError:
+        print(f"invalid maintainer pid file: {pid_path}", file=sys.stderr)
+        return 1
+
+    deadline = time.monotonic() + wait_sec
+    while time.monotonic() < deadline:
+        if probe_lock(lock_path).state == LOCK_PROBE_FREE:
+            print(f"maintainer stopped (pid {pid})")
+            return 0
+        time.sleep(SHUTDOWN_POLL_INTERVAL_SEC)
+
+    if probe_lock(lock_path).state == LOCK_PROBE_FREE:
+        print(f"maintainer stopped (pid {pid})")
+        return 0
+
+    print(f"stop timed out after {wait_sec}s (pid {pid})", file=sys.stderr)
+    return 1
+
+
+def _stop_stale_pid(pid_path: Path, markers_root: Path) -> int:
+    """Lock-free verdict: a surviving pid file is stale debris (REQ-04)."""
+
+    if not pid_path.exists():
+        print(f"maintainer not running (no pid file: {pid_path})")
+        return 0
+
+    try:
+        raw = pid_path.read_text(encoding="utf-8").strip()
+        pid = int(raw)
+    except (OSError, ValueError):
+        print(f"invalid maintainer pid file: {pid_path}", file=sys.stderr)
+        return 1
+    if pid <= 1 or pid == os.getpid():
+        print(f"invalid maintainer pid file: {pid_path}", file=sys.stderr)
+        return 1
+
+    try:
+        os.kill(pid, 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    except PermissionError:
+        print(f"cannot probe maintainer pid {pid}: permission denied", file=sys.stderr)
+        return 1
+    except OverflowError:
+        print(f"invalid maintainer pid file: {pid_path}", file=sys.stderr)
+        return 1
+
+    _unlink_markers(markers_root)
+    if alive:
+        # The number is live but is not the lock owner - the recycled-pid
+        # STOPPED case: no "dead" claim is made about it.
+        print(f"removed stale runtime markers for pid {pid} (lock not held)")
+    else:
+        print(f"removed stale runtime markers for dead pid {pid}")
+    return 0
+
+
+def _run_stop(
+    *, maintainer_root: str | None, state_root: str | None, timeout: float
+) -> int:
+    """Signal the lock owner (or clear a dead daemon's markers) with one line.
+
+    The instance lock - not the pid file - is the liveness source
+    (INV-LOCK-4): a held lock names the real owner, and a free lock makes any
+    surviving pid file stale, however alive that number's process is.
+    """
+
+    # Defence in depth for callers that bypass ``build_parser()``: an
+    # unbounded wait here would hang the operator tool (SHOULD_FIX F4).
+    try:
+        wait_sec = float(timeout)
+    except (TypeError, ValueError):
+        print(f"invalid --timeout: {timeout!r}", file=sys.stderr)
+        return 1
+    if not math.isfinite(wait_sec) or wait_sec < 0.0:
+        print(
+            f"invalid --timeout {timeout!r}: must be a finite number of "
+            "seconds >= 0",
+            file=sys.stderr,
+        )
+        return 1
+
+    root = Path(maintainer_root) if maintainer_root else _repo_root()
+    markers_root = Path(state_root) if state_root else root / "data"
+    pid_path = markers_root / RUNTIME_PID_FILE
+    lock_path = _lock_path(
+        maintainer_root=maintainer_root, state_root=state_root, config_path=None
+    )
+
+    if lock_path is None:
+        # Lock disabled (INV-LOCK-3): keep the legacy pid-file behaviour.
+        return _stop_by_pid_file(pid_path, markers_root, wait_sec)
+
+    probe = probe_lock(lock_path)
+    if probe.state == LOCK_PROBE_UNAVAILABLE:
+        # Fail closed: do not unlink, do not signal.
+        print(
+            f"cannot probe maintainer lock {lock_path}: permission denied",
+            file=sys.stderr,
+        )
+        return 1
+
+    if probe.state == LOCK_PROBE_HELD:
+        return _stop_lock_owner(
+            lock_path=lock_path,
+            owner_pid=probe.owner_pid,
+            pid_path=pid_path,
+            markers_root=markers_root,
+            wait_sec=wait_sec,
+        )
+
+    return _stop_stale_pid(pid_path, markers_root)
 
 
 def _memory_path(
@@ -509,6 +822,89 @@ def build_parser() -> argparse.ArgumentParser:
         help="maintainer root to read (default: MAINTAINER_ROOT, else repo root)",
     )
 
+    start_parser = subparsers.add_parser(
+        "start",
+        help="start the maintainer daemon loop under the instance lock",
+        description=(
+            "Bring the daemon loop up under the instance lock "
+            "(data/maintainer.lock by default). A held lock exits 1 with "
+            "'maintainer already running (pid N)' and spawns nothing. Without "
+            "--foreground, spawns a foreground child and reports 'maintainer "
+            "started (pid N)' once the child owns the lock, up to --timeout "
+            "seconds. Exits 0 when the daemon is running, 1 on contention, "
+            "a failed child, or a timeout."
+        ),
+    )
+    start_parser.add_argument(
+        "--maintainer-root",
+        default=None,
+        metavar="PATH",
+        dest="maintainer_root",
+        help="maintainer root (default: repo root)",
+    )
+    start_parser.add_argument(
+        "--state-root",
+        default=None,
+        metavar="PATH",
+        dest="state_root",
+        help="directory holding the runtime markers and lock (default: <maintainer_root>/data)",
+    )
+    start_parser.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        help="explicit config.json to read (default: <maintainer_root>/config.json)",
+    )
+    start_parser.add_argument(
+        "--foreground",
+        action="store_true",
+        default=False,
+        dest="foreground",
+        help="run the loop in this process instead of spawning a child",
+    )
+    start_parser.add_argument(
+        "--timeout",
+        type=_finite_timeout,
+        default=DEFAULT_START_TIMEOUT_SEC,
+        metavar="SEC",
+        dest="timeout",
+        help="seconds to wait for the spawned daemon to own the lock "
+        "(default: 5.0)",
+    )
+
+    run_once_parser = subparsers.add_parser(
+        "run-once",
+        help="run a single monitor cycle without the daemon loop",
+        description=(
+            "Run exactly one monitor cycle in this process, without the "
+            "loop, markers, or stop flag. Refuses with 'maintainer already "
+            "running; run-once needs the daemon stopped' while the daemon "
+            "holds the instance lock. Never mutates the lock. Exits 0 on a "
+            "successful cycle, 1 on contention, a config error, or a "
+            "non-successful cycle."
+        ),
+    )
+    run_once_parser.add_argument(
+        "--maintainer-root",
+        default=None,
+        metavar="PATH",
+        dest="maintainer_root",
+        help="maintainer root (default: repo root)",
+    )
+    run_once_parser.add_argument(
+        "--state-root",
+        default=None,
+        metavar="PATH",
+        dest="state_root",
+        help="directory holding the runtime markers and lock (default: <maintainer_root>/data)",
+    )
+    run_once_parser.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        help="explicit config.json to read (default: <maintainer_root>/config.json)",
+    )
+
     stop_parser = subparsers.add_parser(
         "stop",
         help="request a clean wind-down, or clear a dead daemon's runtime markers",
@@ -622,6 +1018,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(status.render_json(payload) if args.as_json else status.format_text(payload))
         return 0
+
+    if args.command == "start":
+        return _run_start(
+            maintainer_root=args.maintainer_root,
+            state_root=args.state_root,
+            config_path=args.config,
+            foreground=args.foreground,
+            timeout=args.timeout,
+        )
+
+    if args.command == "run-once":
+        return _run_run_once(
+            maintainer_root=args.maintainer_root,
+            state_root=args.state_root,
+            config_path=args.config,
+        )
 
     if args.command == "stop":
         return _run_stop(

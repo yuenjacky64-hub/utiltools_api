@@ -60,6 +60,12 @@ DEFAULT_PRIMARY_MODEL: str | None = None
 DEFAULT_SECONDARY_CLI: str | None = None
 DEFAULT_SECONDARY_MODEL: str | None = None
 
+# Instance lock (UTILTOOLS-102 REQ-01). Relative values resolve under the state
+# root the lock protects (``data/maintainer.lock`` by default); ``None``/blank
+# disables the lock. Kept out of ``CONFIG_PATH_FIELDS`` on purpose: those are
+# directories validated by ``validate()``, this is a file created on demand.
+DEFAULT_INSTANCE_LOCK_FILE = "data/maintainer.lock"
+
 # Fail-closed allowlist: an empty set means "no model is known to be free",
 # never "every model is free". Register ids here or tag them with ``:free``.
 FREE_MODEL_IDS: frozenset[str] = frozenset()
@@ -87,6 +93,11 @@ OPTIONAL_CONFIG_PATH_FIELDS: tuple[str, ...] = ("data_dir", "reports_dir")
 CONFIG_PATH_FIELDS: tuple[str, ...] = (
     REQUIRED_CONFIG_PATH_FIELDS + OPTIONAL_CONFIG_PATH_FIELDS
 )
+
+# The instance lock is a *file* created on demand, so it is coerced like a path
+# but deliberately excluded from ``CONFIG_PATH_FIELDS`` (``validate()`` treats
+# those as required/host directories).
+INSTANCE_LOCK_CONFIG_FIELD = "instance_lock_file"
 
 _TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 _FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
@@ -189,6 +200,9 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
                 raise ValueError(f"{key} must be a number") from exc
         elif key == "priority_preemption_enabled":
             coerced[key] = _coerce_bool(key, value)
+        elif key == INSTANCE_LOCK_CONFIG_FIELD:
+            # REQ-01: blank disables the lock, so ``""`` normalises to ``None``.
+            coerced[key] = _coerce_path_text(key, value)
         elif key in CONFIG_PATH_FIELDS:
             coerced[key] = _coerce_path_text(key, value)
         else:
@@ -270,6 +284,10 @@ class MaintainerConfig:
     default_project_root: str | None = None
     data_dir: str | None = None
     reports_dir: str | None = None
+
+    # UTILTOOLS-102 REQ-01: one live maintainer per data directory. ``None`` or
+    # blank disables the lock; a relative value resolves under the state root.
+    instance_lock_file: str | None = DEFAULT_INSTANCE_LOCK_FILE
 
     # Memory retention knobs (UTILTOOLS-76 REQ-03): the memory document is
     # pruned to these maxima at the end of every cycle and on a wind-down.
@@ -362,6 +380,34 @@ class MaintainerConfig:
         """Aging threshold in the unit the clock reports (seconds)."""
 
         return self.prioritization_aging_interval_ms / 1000.0
+
+    def resolve_instance_lock_file(
+        self, state_root: str | Path | None, repo_root: str | Path | None = None
+    ) -> Path | None:
+        """Return the absolute lock file path, or ``None`` when the lock is off.
+
+        The single place where :attr:`instance_lock_file` becomes a usable path
+        (INV-LOCK-3, REQ-01): one ``Path(...)``/``expanduser()`` conversion
+        site per call, so callers never mix raw config strings with filesystem
+        paths. Blank or ``None`` disables the lock and returns ``None``
+        without touching the filesystem. A relative value anchors to
+        ``state_root`` — the data directory the lock protects — which must
+        already be resolved; an absolute value or one with ``~`` anchors to
+        ``repo_root`` when given, else resolves against the process cwd.
+        ``state_root=None`` disables the lock unless the value is absolute or
+        a home-expanded ``~`` path (anchored to ``repo_root`` or cwd).
+        """
+
+        raw = self.instance_lock_file
+        text = "" if raw is None else str(raw).strip()
+        if not text:
+            return None
+        if state_root is not None and not os.path.isabs(text):
+            return Path(state_root).expanduser() / text
+        anchor = Path(repo_root).expanduser() if repo_root is not None else None
+        if anchor is not None:
+            return (anchor / text).expanduser()
+        return Path(text).expanduser()
 
     def validate(self) -> list[str]:
         """Return path issues for this configuration; ``[]`` when all paths are usable.

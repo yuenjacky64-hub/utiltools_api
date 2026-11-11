@@ -29,6 +29,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ai_maintainer import checks
+from ai_maintainer.config import MaintainerConfig
+from ai_maintainer.util.fs import (
+    LOCK_PROBE_HELD,
+    LOCK_PROBE_UNAVAILABLE,
+    probe_lock,
+    resolve_lock_path,
+)
 
 STATUS_DOC_NAME = "maintainer_status.json"
 STATUS_READ_LIMIT = 65536  # bound the read, mirrors checks.SIGNAL_READ_LIMIT
@@ -77,6 +84,61 @@ def resolve_status_doc(
     if state_root is None:
         return None
     return state_root / STATUS_DOC_NAME
+
+
+def _daemon_lock(
+    *,
+    config_path: str | Path | None,
+    maintainer_root: str | Path | None,
+    env: Mapping[str, str] | None,
+) -> dict[str, Any] | None:
+    """Probe the daemon lock non-blockingly (UTILTOOLS-102 REQ-04/05).
+
+    Resolves the lock file exactly the way the CLI and the engine do
+    (INV-LOCK-1), so the report never drifts from the loop it describes.
+    The lock - not the pid file - is the liveness source: only a held lock
+    reports ``RUNNING``; a free or unavailable probe reports ``STOPPED``
+    (INV-LOCK-5). ``path`` is the operator-configured relative lock path,
+    never an absolute one, so the rendered report cannot leak the root.
+    """
+
+    root = (
+        Path(maintainer_root).expanduser()
+        if maintainer_root
+        else Path(__file__).resolve().parents[2]
+    )
+    markers_root = root / "data"
+    try:
+        config = MaintainerConfig.load(
+            config_path=config_path, maintainer_root=str(root)
+        )
+    except (OSError, ValueError):
+        config = MaintainerConfig()
+    lock_path = resolve_lock_path(
+        config.instance_lock_file, state_root=markers_root, repo_root=root
+    )
+    if lock_path is None:
+        # Lock disabled (blank path): the loop cannot run, so it is not live.
+        return {
+            "state": "STOPPED",
+            "pid": None,
+            "path": None,
+            "probe": LOCK_PROBE_UNAVAILABLE,
+            "pid_file_stale": False,
+        }
+    probe = probe_lock(lock_path)
+    held = probe.state == LOCK_PROBE_HELD
+    # A pid file that outlives the lock is by definition not owned by a live
+    # loop (markers are written under the lock and unlinked while held), so a
+    # free lock plus a present pid file is the stale-owner signal (REQ-04).
+    pid_file_stale = (not held) and (markers_root / "maintainer.pid").is_file()
+    return {
+        "state": "RUNNING" if held else "STOPPED",
+        "pid": probe.owner_pid,
+        "path": config.instance_lock_file,
+        "probe": probe.state,
+        "pid_file_stale": pid_file_stale,
+    }
 
 
 def _read_status_doc(path: Path | None) -> dict[str, Any] | None:
@@ -225,6 +287,11 @@ def build_status_payload(
 
     payload: dict[str, Any] = {
         "daemon_status": _daemon_status(status, stale_sec),
+        "daemon_lock": _daemon_lock(
+            config_path=config_path,
+            maintainer_root=maintainer_root,
+            env=env,
+        ),
         "orchestrator_up": _ORCHESTRATOR_UP.get(status.orchestrator),
         "orchestrator_status": status.orchestrator,
         "active_task_id": status.active_task_id,
@@ -285,6 +352,37 @@ def _clean(value: Any, default: str = "unknown") -> str:
     return cleaned or default
 
 
+def _daemon_line(payload: Mapping[str, Any]) -> str:
+    """The ``daemon:`` line (INV-6: rendered from the payload dict only).
+
+    A held lock overrides the document-derived daemon_status: the lock is
+    the liveness source, and the line names the live owner pid plus the
+    configured lock path. When the lock is free the conventional status
+    line is kept, preserving the report layout (label count, §4.5).
+    """
+
+    lock = payload.get("daemon_lock")
+    if isinstance(lock, Mapping) and lock.get("state") == "RUNNING":
+        pid = lock.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            pid = "unknown"
+        return f"daemon: RUNNING (pid {pid}, lock={_clean(lock.get('path'))})"
+    if (
+        isinstance(lock, Mapping)
+        and lock.get("state") == "STOPPED"
+        and lock.get("probe") != LOCK_PROBE_UNAVAILABLE
+        and lock.get("pid_file_stale")
+    ):
+        # A free lock plus a leftover pid file is the stale-owner report:
+        # the daemon is stopped even though a pid number is still on disk.
+        return "daemon: STOPPED (lock free; pid file stale)"
+    return (
+        f"daemon: {_clean(payload.get('daemon_status'))} "
+        f"(source={_clean((payload.get('sources') or {}).get('orchestrator'))}, "
+        f"heartbeat_age={_age_text(payload.get('heartbeat_age_sec'))})"
+    )
+
+
 def format_text(payload: Mapping[str, Any]) -> str:
     """Render the payload for humans. Reads only the dict it is given (INV-6)."""
 
@@ -308,9 +406,7 @@ def format_text(payload: Mapping[str, Any]) -> str:
 
     lines = [
         "maintainer status",
-        f"daemon: {_clean(payload.get('daemon_status'))} "
-        f"(source={_clean((payload.get('sources') or {}).get('orchestrator'))}, "
-        f"heartbeat_age={_age_text(payload.get('heartbeat_age_sec'))})",
+        _daemon_line(payload),
         f"orchestrator: {_clean(payload.get('orchestrator_status'))}",
         f"active task: {_clean(payload.get('active_task_id'))}",
         f"queue: {_clean(payload.get('queue_state'))} "
