@@ -10,6 +10,8 @@ import com.example.utiltools.text.dto.TextTransformRequest;
 import com.example.utiltools.text.dto.TextTransformResponse;
 import com.example.utiltools.text.dto.TextTruncateRequest;
 import com.example.utiltools.text.dto.TextTruncateResponse;
+import com.example.utiltools.text.dto.TextWordFrequencyRequest;
+import com.example.utiltools.text.dto.TextWordFrequencyResponse;
 import com.example.utiltools.text.service.TextService;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validation;
@@ -18,6 +20,7 @@ import jakarta.validation.ValidatorFactory;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -500,5 +503,152 @@ class TextServiceTest {
         assertThatThrownBy(() -> service.truncate(new TextTruncateRequest("abcdef", 5, "12345678", null)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("maxLength must exceed the ellipsis length");
+    }
+
+    @Test
+    @DisplayName("word-frequency - ranks by count descending, then word ascending, and applies the limit")
+    void shouldRankWordsDeterministically() {
+        // counts: apple 3, pear 2, plum 2, fig 1 -> total 8, distinct 4
+        TextWordFrequencyResponse response =
+                service.wordFrequency(new TextWordFrequencyRequest(
+                        "apple pear plum apple pear plum apple fig", 4, null, null));
+
+        assertThat(response.totalWords()).isEqualTo(8);
+        assertThat(response.distinctWords()).isEqualTo(4);
+        assertThat(response.topWords()).extracting(TextWordFrequencyResponse.WordCount::word,
+                TextWordFrequencyResponse.WordCount::count)
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple("apple", 3),
+                        org.assertj.core.groups.Tuple.tuple("pear", 2),
+                        org.assertj.core.groups.Tuple.tuple("plum", 2),
+                        org.assertj.core.groups.Tuple.tuple("fig", 1));
+    }
+
+    @Test
+    @DisplayName("word-frequency - tie on count is broken by word ascending")
+    void shouldBreakTiesByWordAscending() {
+        // zeta, beta, alpha all count 1 -> order alpha, beta, zeta
+        TextWordFrequencyResponse response =
+                service.wordFrequency(new TextWordFrequencyRequest("zeta beta alpha", 3, null, null));
+
+        assertThat(response.topWords()).extracting(TextWordFrequencyResponse.WordCount::word)
+                .containsExactly("alpha", "beta", "zeta");
+    }
+
+    @Test
+    @DisplayName("word-frequency - limit truncates the top list while totals stay whole")
+    void shouldTruncateTopWordsToLimit() {
+        TextWordFrequencyResponse response =
+                service.wordFrequency(new TextWordFrequencyRequest("a b c d e", 2, null, null));
+
+        assertThat(response.totalWords()).isEqualTo(5);
+        assertThat(response.distinctWords()).isEqualTo(5);
+        assertThat(response.topWords()).extracting(TextWordFrequencyResponse.WordCount::word)
+                .containsExactly("a", "b");
+    }
+
+    @Test
+    @DisplayName("word-frequency - case-insensitive default folds tokens before counting")
+    void shouldFoldTokensCaseInsensitivelyByDefault() {
+        TextWordFrequencyResponse response =
+                service.wordFrequency(new TextWordFrequencyRequest("Apple apple APPLE", null, null, null));
+
+        assertThat(response.totalWords()).isEqualTo(3);
+        assertThat(response.distinctWords()).isEqualTo(1);
+        assertThat(response.topWords()).extracting(TextWordFrequencyResponse.WordCount::word,
+                TextWordFrequencyResponse.WordCount::count)
+                .containsExactly(org.assertj.core.groups.Tuple.tuple("apple", 3));
+    }
+
+    @Test
+    @DisplayName("word-frequency - caseSensitive=true keeps each spelling distinct")
+    void shouldCountCaseSensitivelyWhenRequested() {
+        TextWordFrequencyResponse response =
+                service.wordFrequency(new TextWordFrequencyRequest("Apple apple APPLE", null, true, null));
+
+        assertThat(response.totalWords()).isEqualTo(3);
+        assertThat(response.distinctWords()).isEqualTo(3);
+        assertThat(response.topWords()).extracting(TextWordFrequencyResponse.WordCount::word)
+                .containsExactly("APPLE", "Apple", "apple");
+    }
+
+    @Test
+    @DisplayName("word-frequency - ignoreWords are excluded from the totals and counts")
+    void shouldExcludeIgnoreWordsFromTotals() {
+        TextWordFrequencyResponse response =
+                service.wordFrequency(new TextWordFrequencyRequest(
+                        "the cat and the dog and the cat", 10, null, List.of("the")));
+
+        assertThat(response.totalWords()).isEqualTo(5);
+        assertThat(response.distinctWords()).isEqualTo(3);
+        assertThat(response.topWords()).extracting(TextWordFrequencyResponse.WordCount::word,
+                TextWordFrequencyResponse.WordCount::count)
+                .containsExactly(
+                        org.assertj.core.groups.Tuple.tuple("and", 2),
+                        org.assertj.core.groups.Tuple.tuple("cat", 2),
+                        org.assertj.core.groups.Tuple.tuple("dog", 1));
+    }
+
+    @Test
+    @DisplayName("word-frequency - ignoreWords use the same case folding as the tokens")
+    void shouldFoldIgnoreWordsLikeTokens() {
+        // ignoring "The" with the case-insensitive default also drops "the"
+        TextWordFrequencyResponse response =
+                service.wordFrequency(new TextWordFrequencyRequest(
+                        "the cat and the dog", 10, null, List.of("The")));
+
+        assertThat(response.totalWords()).isEqualTo(3);
+        assertThat(response.distinctWords()).isEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("word-frequency - no tokens yields zero totals and an empty list")
+    void shouldReturnZeroTotalsWhenNoTokens() {
+        TextWordFrequencyResponse response =
+                service.wordFrequency(new TextWordFrequencyRequest("   ...  ", null, null, null));
+
+        assertThat(response.totalWords()).isZero();
+        assertThat(response.distinctWords()).isZero();
+        assertThat(response.topWords()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("the word-frequency request validates limit, text bounds and ignoreWords shape")
+    void shouldValidateWordFrequencyRequest() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+
+            assertThat(validator.validate(new TextWordFrequencyRequest(" ", null, null, null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("text is required");
+
+            assertThat(validator.validate(new TextWordFrequencyRequest("abc", 0, null, null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("limit must be at least 1");
+
+            assertThat(validator.validate(new TextWordFrequencyRequest("abc", 101, null, null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("limit must be at most 100");
+
+            assertThat(validator.validate(new TextWordFrequencyRequest("abc", null, null, List.of("   "))))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("ignoreWords entries must not be blank");
+
+            // 1001 entries breaches the 1000-entry bound
+            assertThat(validator.validate(new TextWordFrequencyRequest(
+                    "abc", null, null, java.util.Collections.nCopies(1001, "x"))))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("ignoreWords must contain at most 1000 entries");
+
+            // an entry longer than 100 characters is rejected
+            assertThat(validator.validate(new TextWordFrequencyRequest(
+                    "abc", null, null, List.of("x".repeat(101)))))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("each ignoreWords entry must be at most 100 characters");
+
+            // a boundary-valid request passes
+            assertThat(validator.validate(new TextWordFrequencyRequest(
+                    "abc", 100, true, List.of("x".repeat(100))))).isEmpty();
+        }
     }
 }
