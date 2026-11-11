@@ -69,3 +69,4 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+data/maintainer.lock

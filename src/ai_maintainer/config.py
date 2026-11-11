@@ -60,6 +60,12 @@ DEFAULT_PRIMARY_MODEL: str | None = None
 DEFAULT_SECONDARY_CLI: str | None = None
 DEFAULT_SECONDARY_MODEL: str | None = None
 
+# Instance lock (UTILTOOLS-102 REQ-01). Relative values resolve under the state
+# root the lock protects (``data/maintainer.lock`` by default); ``None``/blank
+# disables the lock. Kept out of ``CONFIG_PATH_FIELDS`` on purpose: those are
+# directories validated by ``validate()``, this is a file created on demand.
+DEFAULT_INSTANCE_LOCK_FILE = "data/maintainer.lock"
+
 # Fail-closed allowlist: an empty set means "no model is known to be free",
 # never "every model is free". Register ids here or tag them with ``:free``.
 FREE_MODEL_IDS: frozenset[str] = frozenset()
@@ -87,6 +93,11 @@ OPTIONAL_CONFIG_PATH_FIELDS: tuple[str, ...] = ("data_dir", "reports_dir")
 CONFIG_PATH_FIELDS: tuple[str, ...] = (
     REQUIRED_CONFIG_PATH_FIELDS + OPTIONAL_CONFIG_PATH_FIELDS
 )
+
+# The instance lock is a *file* created on demand, so it is coerced like a path
+# but deliberately excluded from ``CONFIG_PATH_FIELDS`` (``validate()`` treats
+# those as required/host directories).
+INSTANCE_LOCK_CONFIG_FIELD = "instance_lock_file"
 
 _TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 _FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
@@ -189,6 +200,9 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
                 raise ValueError(f"{key} must be a number") from exc
         elif key == "priority_preemption_enabled":
             coerced[key] = _coerce_bool(key, value)
+        elif key == INSTANCE_LOCK_CONFIG_FIELD:
+            # REQ-01: blank disables the lock, so ``""`` normalises to ``None``.
+            coerced[key] = _coerce_path_text(key, value)
         elif key in CONFIG_PATH_FIELDS:
             coerced[key] = _coerce_path_text(key, value)
         else:
@@ -270,6 +284,10 @@ class MaintainerConfig:
     default_project_root: str | None = None
     data_dir: str | None = None
     reports_dir: str | None = None
+
+    # UTILTOOLS-102 REQ-01: one live maintainer per data directory. ``None`` or
+    # blank disables the lock; a relative value resolves under the state root.
+    instance_lock_file: str | None = DEFAULT_INSTANCE_LOCK_FILE
 
     # Memory retention knobs (UTILTOOLS-76 REQ-03): the memory document is
     # pruned to these maxima at the end of every cycle and on a wind-down.
