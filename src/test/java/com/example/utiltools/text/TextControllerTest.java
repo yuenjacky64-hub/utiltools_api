@@ -458,4 +458,139 @@ class TextControllerTest {
         assertThat(after.result()).isEqualTo(before.result());
         assertThat(journal.size()).isEqualTo(entriesBefore);
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/truncate - a 200 hard cut when wordBoundary=false")
+    void shouldTruncateWithHardCut() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/truncate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                    "text": "Hello, World! This is a longer sentence.",
+                                    "maxLength": 12,
+                                    "ellipsis": "...",
+                                    "wordBoundary": false
+                                }
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Text truncated successfully"))
+                .andExpect(jsonPath("$.data.result").value("Hello, Wo..."))
+                .andExpect(jsonPath("$.data.truncated").value(true))
+                .andExpect(jsonPath("$.data.originalLength").value(40))
+                .andExpect(jsonPath("$.data.length").value(12));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/truncate - a 200 word-boundary cut with the default ellipsis")
+    void shouldTruncateAtWordBoundary() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/truncate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                    "text": "Hello, World! This is a longer sentence.",
+                                    "maxLength": 15,
+                                    "wordBoundary": true
+                                }
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.result").value("Hello, World!…"))
+                .andExpect(jsonPath("$.data.truncated").value(true))
+                .andExpect(jsonPath("$.data.originalLength").value(40))
+                .andExpect(jsonPath("$.data.length").value(14));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/truncate - blank text and a missing or zero maxLength return 400 VALIDATION_ERROR")
+    void shouldRejectInvalidTruncateRequestWith400() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/truncate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "   ", "maxLength": 10}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("text is required")));
+
+        mockMvc.perform(post("/api/v1/utils/text/truncate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "hello"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("maxLength is required")));
+
+        mockMvc.perform(post("/api/v1/utils/text/truncate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "hello", "maxLength": 0}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("maxLength must be at least 1")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/truncate - a maxLength that cannot hold content is journalled FAILED")
+    void shouldRejectMaxLengthNotExceedingEllipsisWithBadRequest() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/truncate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "abcdefghij", "maxLength": 1}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("maxLength must exceed the ellipsis length")));
+
+        mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_TRUNCATE"))
+                .andExpect(jsonPath("$.data[0].state").value("FAILED"))
+                .andExpect(jsonPath("$.data[0].errorCode").value("BAD_REQUEST"));
+    }
+
+    @Test
+    @DisplayName("a truncate call is journalled as TEXT_TRUNCATE and replays as VERIFIED without a new entry")
+    void shouldJournalAndReplayTextTruncate() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/truncate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "Hello, World!", "maxLength": 8, "ellipsis": "...", "wordBoundary": true}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.result").value("Hello..."))
+                .andExpect(jsonPath("$.data.truncated").value(true))
+                .andExpect(jsonPath("$.data.originalLength").value(13))
+                .andExpect(jsonPath("$.data.length").value(8));
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_TRUNCATE"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.result").value("Hello..."))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        AuditEntry before = journal.find(id).orElseThrow();
+        Instant completedAt = before.completedAt();
+        int entriesBefore = journal.size();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("TEXT_TRUNCATE"))
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.result.result").value("Hello..."))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"));
+
+        AuditEntry after = journal.find(id).orElseThrow();
+        assertThat(after.operation()).isEqualTo(OperationType.TEXT_TRUNCATE);
+        assertThat(after.completedAt()).isEqualTo(completedAt);
+        assertThat(after.result()).isEqualTo(before.result());
+        assertThat(journal.size()).isEqualTo(entriesBefore);
+    }
 }
