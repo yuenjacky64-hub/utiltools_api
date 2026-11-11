@@ -43,6 +43,13 @@ from ai_maintainer.concurrency import (
 )
 from ai_maintainer.config import MaintainerConfig
 from ai_maintainer.memory.store import atomic_write_text
+from ai_maintainer.util.fs import (
+    LOCK_PROBE_HELD,
+    InstanceLock,
+    MaintainerAlreadyRunning,
+    probe_lock,
+    resolve_lock_path,
+)
 from ai_maintainer.shutdown import (
     CLEANUP_CLEAR_RUNTIME_MARKERS,
     CLEANUP_PERSIST_TASK_STATE,
@@ -719,6 +726,12 @@ class MaintainerEngine:
         self._state_root: Path | None = (
             Path(state_root) if state_root is not None else None
         )
+        # UTILTOOLS-102 REQ-01/REQ-02: the process-lifetime instance lock is the
+        # authoritative liveness source. ``None`` means the lock is disabled
+        # (no state root, or an empty ``instance_lock_file``; INV-LOCK-3), and
+        # the engine then behaves exactly as before.
+        self._instance_lock: InstanceLock | None = None
+        self._lock_path: Path | None = None
         self._shutdown_audit_path: Path | None = (
             Path(shutdown_audit_path) if shutdown_audit_path is not None else None
         )
@@ -1743,6 +1756,26 @@ class MaintainerEngine:
         :meth:`graceful_shutdown` sequence. The previous handlers are restored
         on the way out, so an embedded caller keeps its own disposition.
         """
+
+        # UTILTOOLS-102 REQ-02: the instance lock is acquired *before* the stop
+        # flag is cleared and before any marker is written, so a daemon child
+        # that loses the start race exits out of ``run_forever`` with the
+        # owner's pid, heartbeat and stop flag untouched (REQ-03). ``finally``
+        # releases on every exit path - normal stop, SIGINT/SIGTERM and an
+        # exception during a cycle - which is what makes the lock the
+        # authoritative liveness source (REQ-01/REQ-04).
+        self._acquire_instance_lock()
+        try:
+            return self._run_forever_locked(
+                interval_sec, install_signals=install_signals
+            )
+        finally:
+            self._release_instance_lock()
+
+    def _run_forever_locked(
+        self, interval_sec: float | None, *, install_signals: bool = True
+    ) -> ShutdownReport:
+        """The cycle loop itself; :meth:`run_forever` owns the instance lock."""
 
         interval = self._interval(interval_sec)
         self._stop.clear()
@@ -2961,6 +2994,72 @@ class MaintainerEngine:
             return None
         return Path(root) / name
 
+    # ------------------------------ UTILTOOLS-102: the instance lock
+
+    def _lock_repo_root(self) -> Path:
+        """Fallback base for ``resolve_lock_path`` (REQ-01, mirrors the CLI)."""
+
+        configured = self._config.maintainer_root
+        if isinstance(configured, str) and configured.strip():
+            try:
+                return Path(configured).expanduser()
+            except (OSError, RuntimeError):  # pragma: no cover - hostile value
+                pass
+        return Path(__file__).resolve().parents[2]
+
+    @property
+    def lock_file(self) -> Path | None:
+        """Resolved instance-lock path, or ``None`` when the lock is disabled.
+
+        INV-LOCK-3: no state root (or an empty ``instance_lock_file``) means
+        the lock is off entirely, so in-process callers that pass no root keep
+        the pre-change behaviour and leave no file behind.
+        """
+
+        if self._state_root is None:
+            return None
+        return resolve_lock_path(
+            self._config.instance_lock_file,
+            state_root=self._state_root,
+            repo_root=self._lock_repo_root(),
+        )
+
+    def _build_instance_lock(self) -> InstanceLock | None:
+        """Resolve and construct (but do not acquire) this run's lock (REQ-01)."""
+
+        path = self.lock_file
+        self._lock_path = path
+        if path is None:
+            return None
+        return InstanceLock(path)
+
+    def _acquire_instance_lock(self) -> InstanceLock | None:
+        """Take the lock for the lifetime of the loop, or raise (REQ-02/REQ-03).
+
+        Contention surfaces as :class:`MaintainerAlreadyRunning` before the
+        engine touches any marker, so the caller can name the live owner and
+        exit non-zero instead of constructing a competing loop. ``None`` means
+        the lock is disabled (INV-LOCK-3).
+        """
+
+        lock = self._build_instance_lock()
+        if lock is not None:
+            lock.acquire()
+        self._instance_lock = lock
+        return lock
+
+    def _release_instance_lock(self) -> None:
+        """Drop the lock; never raises, and idempotent (REQ-02)."""
+
+        lock = self._instance_lock
+        self._instance_lock = None
+        if lock is None:
+            return
+        try:
+            lock.release()
+        except OSError:  # pragma: no cover - defective fd; nothing to keep
+            return
+
     def _write_runtime_markers(self) -> None:
         """Publish ``pid_file`` / ``heartbeat_file``; never raises (INV-MARK-1)."""
 
@@ -3029,6 +3128,10 @@ class MaintainerEngine:
         ``shutdown()`` can book it in ``failed_steps``.
         """
 
+        if not self._may_clear_runtime_markers():
+            # REQ-05: a daemon that no longer owns the markers must not unlink
+            # them. Not an error - nothing was attempted, so nothing failed.
+            return True
         ok = True
         for name in _RUNTIME_MARKER_NAMES:
             path = self._runtime_path(name)
@@ -3041,6 +3144,55 @@ class MaintainerEngine:
             except OSError:
                 ok = False
         return ok
+
+    def _may_clear_runtime_markers(self) -> bool:
+        """Ownership-safe cleanup gate (REQ-05).
+
+        ``maintainer.pid`` and ``maintainer.heartbeat`` are only removed when
+        this process still holds the instance lock *and* the pid file still
+        identifies this process. A successor daemon that started inside the
+        previous owner's shutdown window therefore keeps its files. The
+        "lock object is ``None``" state is not conflated: it means either the
+        lock was never enabled in this engine instance (INV-LOCK-3, legacy
+        unconditional clear) or it was released - in the released case the
+        lock file still exists on disk and a probe settles who owns it.
+        """
+
+        lock = self._instance_lock
+        if lock is not None:
+            # Active: clear only while we still hold the lock and the pid
+            # marker still names this process.
+            return lock.owns() and self._pid_marker_is_ours()
+        lock_file = self.lock_file
+        if lock_file is None or not lock_file.is_file():
+            # INV-LOCK-3: the lock was disabled (or never created) in this
+            # engine's lifetime - the pre-change unconditional clear applies.
+            return True
+        probe = probe_lock(lock_file)
+        if probe.state == LOCK_PROBE_HELD:
+            # The lock was re-acquired after this engine released it: our own
+            # markers may be cleared, a foreign owner's may not.
+            return probe.owner_pid == os.getpid() and self._pid_marker_is_ours()
+        # The lock file exists but is free (or unreadable): this process has
+        # already released the lock and no longer owns the data directory - a
+        # successor may have started in the meantime, so its markers survive
+        # (REQ-05 / DOD-03). LOCK_PROBE_UNAVAILABLE fails closed too.
+        return False
+
+    def _pid_marker_is_ours(self) -> bool:
+        """``True`` when ``maintainer.pid`` still names this process (REQ-05)."""
+
+        path = self._runtime_path(RUNTIME_PID_FILE)
+        if path is None:
+            return False
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            return False
+        try:
+            return int(raw.strip()) == os.getpid()
+        except ValueError:
+            return False
 
     def _prune_memory(self, memory: Any) -> tuple[dict[str, int], str | None]:
         """Trim the store to the configured maxima (INV-PRUNE-3, never raises)."""
