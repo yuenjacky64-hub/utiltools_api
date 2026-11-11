@@ -121,4 +121,19 @@ public class DateTimeController {
         DateTimeWeekResponse result = dateTimeService.week(date);
         return ApiResponse.success(result, "ISO week retrieved successfully");
     }
+
+    @GetMapping("/week-date")
+    @Operation(summary = "Resolve an ISO week back to a calendar date",
+            description = "Resolves an ISO week-year, week and optional day (MONDAY..SUNDAY case-insensitive "
+                    + "or 1..7, default MONDAY) to its calendar date anchored on WeekFields.ISO / January 4, "
+                    + "returning date, ISO week-year, ISO week, day of week, day of year and weekend flag. "
+                    + "Rejects a week that does not exist in that ISO week-year (e.g. 2021-W53). "
+                    + "Read-only: not journalled.")
+    public ApiResponse<DateTimeWeekResponse> weekDate(
+            @RequestParam int year,
+            @RequestParam int week,
+            @RequestParam(value = "day", required = false, defaultValue = "") String day) {
+        DateTimeWeekResponse result = dateTimeService.weekDate(year, week, day);
+        return ApiResponse.success(result, "ISO week date retrieved successfully");
+    }
 }

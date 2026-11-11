@@ -811,6 +811,77 @@ class DateTimeServiceTest {
     }
 
     @Test
+    @DisplayName("Should resolve 2025-W01-MONDAY to 2024-12-30 across the ISO week-year boundary")
+    void shouldResolveIsoWeekCrossingWeekYearBoundary() {
+        DateTimeWeekResponse response = dateTimeService.weekDate(2025, 1, "MONDAY");
+
+        assertThat(response.date()).isEqualTo("2024-12-30");
+        assertThat(response.isoWeekYear()).isEqualTo(2025);
+        assertThat(response.isoWeek()).isEqualTo(1);
+        assertThat(response.dayOfWeek()).isEqualTo("MONDAY");
+        assertThat(response.weekend()).isFalse();
+    }
+
+    @Test
+    @DisplayName("Should resolve 2020-W53-THURSDAY to 2020-12-31 (week 53 only exists in 53-week years)")
+    void shouldResolveWeek53OfA53WeekYear() {
+        DateTimeWeekResponse response = dateTimeService.weekDate(2020, 53, "THURSDAY");
+
+        assertThat(response.date()).isEqualTo("2020-12-31");
+        assertThat(response.isoWeekYear()).isEqualTo(2020);
+        assertThat(response.isoWeek()).isEqualTo(53);
+        assertThat(response.dayOfWeek()).isEqualTo("THURSDAY");
+        assertThat(response.weekend()).isFalse();
+
+        assertThatThrownBy(() -> dateTimeService.weekDate(2021, 53, "THURSDAY"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not exist in week-year 2021");
+    }
+
+    @Test
+    @DisplayName("Should accept case-insensitive day names and 1..7 numbers, defaulting to MONDAY")
+    void shouldAcceptCaseInsensitiveDayNamesAndNumbers() {
+        assertThat(dateTimeService.weekDate(2025, 1, "friday").date()).isEqualTo("2025-01-03");
+        assertThat(dateTimeService.weekDate(2025, 1, "sunday").date()).isEqualTo("2025-01-05");
+        assertThat(dateTimeService.weekDate(2025, 1, "5").date()).isEqualTo("2025-01-03");
+        assertThat(dateTimeService.weekDate(2025, 1, "7").date()).isEqualTo("2025-01-05");
+        assertThat(dateTimeService.weekDate(2025, 1, null).date()).isEqualTo("2024-12-30");
+        assertThat(dateTimeService.weekDate(2025, 1, " ").date()).isEqualTo("2024-12-30");
+
+        DateTimeWeekResponse sunday = dateTimeService.weekDate(2025, 1, "7");
+        assertThat(sunday.dayOfWeek()).isEqualTo("SUNDAY");
+        assertThat(sunday.weekend()).isTrue();
+        assertThat(sunday.dayOfYear()).isEqualTo(5);
+    }
+
+    @Test
+    @DisplayName("Should reject out-of-range years, out-of-range weeks and unknown day tokens with 400")
+    void shouldRejectOutOfRangeYearsWeeksAndUnknownDays() {
+        assertThatThrownBy(() -> dateTimeService.weekDate(0, 1, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("year must be between 1 and 9999");
+        assertThatThrownBy(() -> dateTimeService.weekDate(10000, 1, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("year must be between 1 and 9999");
+        assertThatThrownBy(() -> dateTimeService.weekDate(2025, 0, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("week must be between 1 and 53");
+        assertThatThrownBy(() -> dateTimeService.weekDate(2025, 54, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("week must be between 1 and 53");
+        assertThatThrownBy(() -> dateTimeService.weekDate(2025, 1, "FRIDAYDAY"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("day must be MONDAY..SUNDAY (case-insensitive) or 1..7");
+        assertThatThrownBy(() -> dateTimeService.weekDate(2025, 1, "8"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("day must be MONDAY..SUNDAY (case-insensitive) or 1..7");
+        // 2021 has 52 ISO weeks, so 2021-W53 must be rejected.
+        assertThatThrownBy(() -> dateTimeService.weekDate(2021, 53, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("does not exist in week-year 2021");
+    }
+
+    @Test
     @DisplayName("Should generate an inclusive daily range and echo the resolved request")
     void shouldGenerateInclusiveDailyRange() {
         DateTimeRangeResponse response = dateTimeService.range(
