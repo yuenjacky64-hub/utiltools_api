@@ -955,4 +955,33 @@ class DateTimeServiceTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("outside the supported calendar range");
     }
+
+    @Test
+    @DisplayName("Should enumerate the 9999-12-31 calendar edge without overflowing")
+    void shouldHandleMaximumYearBoundary() {
+        // DOD-07: the last date the request pattern admits still yields its own single point, because the
+        // next stepped point (10 999-12-31) is a valid LocalDate that is simply out of range.
+        DateTimeRangeResponse upperEdge = dateTimeService.range(
+                new DateTimeRangeRequest("9999-12-31", "9999-12-31", "YEARS", 1000, true));
+
+        assertThat(upperEdge.count()).isEqualTo(1);
+        assertThat(upperEdge.dates()).containsExactly("9999-12-31");
+
+        DateTimeRangeResponse lastTwoDays = dateTimeService.range(
+                new DateTimeRangeRequest("9999-12-30", "9999-12-31", "DAYS", 1, true));
+
+        assertThat(lastTwoDays.dates()).containsExactly("9999-12-30", "9999-12-31");
+    }
+
+    @Test
+    @DisplayName("Should truncate a hostile unit name in the rejection message")
+    void shouldAbbreviateUnsupportedUnitEcho() {
+        String hostileUnit = "Z".repeat(200);
+
+        assertThatThrownBy(() -> dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2026-01-05", hostileUnit, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("unit must be one of DAYS, WEEKS, MONTHS, YEARS: " + "Z".repeat(64))
+                .hasMessageNotContaining("Z".repeat(65));
+    }
 }

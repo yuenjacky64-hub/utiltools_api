@@ -1088,6 +1088,26 @@ class DateTimeControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/utils/datetime/range - should return BAD_REQUEST for an unsupported unit")
+    void shouldReturnBadRequestForUnsupportedRangeUnit() throws Exception {
+        String unknownUnit = """
+                {
+                    "startDate": "2026-01-01",
+                    "endDate": "2026-01-05",
+                    "unit": "HOURS"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/range")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(unknownUnit))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers
+                        .containsString("unit must be one of DAYS, WEEKS, MONTHS, YEARS")));
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/datetime/range - should return VALIDATION_ERROR for blank or malformed dates")
     void shouldRejectBlankAndMalformedRangeDates() throws Exception {
         String blankStart = """

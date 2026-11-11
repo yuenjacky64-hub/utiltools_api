@@ -536,7 +536,7 @@ Enumerates the calendar dates between two dates so clients no longer need to loo
 | `endDate` | yes | *(none)* | `yyyy-MM-dd` local date; must not be before `startDate` |
 | `unit` | no | `DAYS` | Case-insensitive `DAYS`, `WEEKS`, `MONTHS` or `YEARS`; blank means `DAYS` |
 | `step` | no | `1` | Whole number `1`–`1000`; point `i` = `startDate.plus(i * step, unit)` |
-| `inclusive` | no | `true` | When `true` the `endDate` is appended when the stepping does not land on it; when `false` the end is exclusive |
+| `inclusive` | no | `true` | Only stepped points are emitted, so `endDate` is never appended: with `true` a stepped point equal to `endDate` is kept, with `false` it is dropped too |
 
 Every point is computed from `startDate`, not from the previous point, so calendar clamping stays anchored to the
 start: with `startDate=2026-01-31` and `unit=MONTHS` the points are `2026-01-31`, `2026-02-28`, `2026-03-31`, … A
@@ -577,9 +577,11 @@ curl -X POST http://localhost:8080/api/v1/utils/datetime/range \
 }
 ```
 
-With `inclusive=false` the `endDate` is dropped unless the stepping lands on it exactly, and `startDate == endDate`
-yields a single point (inclusive) or an empty list (exclusive). A reversed range, an unparseable date, or a `step`
-outside `1`–`1000` returns HTTP 400.
+Only stepped points are ever emitted, so `endDate` is never appended: `startDate=2026-01-01`, `endDate=2026-01-05`,
+`step=3` yields `2026-01-01` and `2026-01-04`, and `2026-01-05` is absent even when `inclusive=true`. A stepped
+point that lands exactly on `endDate` is kept when `inclusive=true` and dropped when `inclusive=false`, so
+`startDate == endDate` yields a single point (inclusive) or an empty list (exclusive). A reversed range, an
+unparseable date, or a `step` outside `1`–`1000` returns HTTP 400.
 
 ---
 
@@ -1417,10 +1419,13 @@ populated only when a cached result is served).
 
 ## 🧾 Operation Journal & Replay Verification
 
-All eighteen journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
-`datetime/shift`, `crypto/hash`, `crypto/base64`, `crypto/url`, `crypto/jwt/decode`, `crypto/uuid`,
-`json/format`, `json/validate`, `json/query`, `json/merge-patch`, `json/pointer`, `text/transform`,
-`text/stats`, `text/replace`, `text/html-entities` — are recorded in a **bounded in-memory journal** so a failed
+All thirty journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+`datetime/shift`, `datetime/duration`, `datetime/business-days`, `datetime/range`, `crypto/hash`,
+`crypto/base64`, `crypto/base32`, `crypto/url`, `crypto/jwt/decode`, `crypto/uuid`, `json/format`,
+`json/validate`, `json/query`, `json/flatten`, `json/unflatten`, `json/merge-patch`, `json/pointer`,
+`json/to-csv`, `json/from-csv`, `json/csv-to-json`, `json/to-ndjson`, `json/from-ndjson`, `json/diff`,
+`text/transform`, `text/stats`, `text/replace`, `text/html-entities` — are recorded in a **bounded
+in-memory journal** so a failed
 hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
 can be verified against the original outcome without ever mutating the original entry.
 `GET /api/v1/utils/datetime/timezones` is read-only catalogue metadata and is not journalled.

@@ -419,7 +419,7 @@ public class DateTimeService {
         } catch (IllegalArgumentException e) {
             // Fall through to the single rejection below so every bad unit reads the same.
         }
-        throw new IllegalArgumentException("unit must be one of DAYS, WEEKS, MONTHS, YEARS: " + raw);
+        throw new IllegalArgumentException("unit must be one of DAYS, WEEKS, MONTHS, YEARS: " + abbreviate(raw));
     }
 
     /** Resolves the optional stride: {@code null} means 1, otherwise 1..1000. */
