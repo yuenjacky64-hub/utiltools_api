@@ -53,7 +53,7 @@ class ContactControllerTest {
                                 ? now : null,
                         status == ContactStatus.FAILED
                                 ? ContactSubmissionService.CONTACT_DISPATCH_FAILED : null,
-                        null, null, null));
+                        null, null, null, null));
     }
 
     @Test

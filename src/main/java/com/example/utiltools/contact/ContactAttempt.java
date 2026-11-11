@@ -21,6 +21,10 @@ import java.time.Instant;
  *   <li>{@code lastHeartbeatAt} / {@code executionLeaseExpiresAt} — the execution lease; present
  *       only while the attempt is {@code DISPATCHING} and omitted from JSON otherwise
  *       (REQ-06 fencing, additive null-omitted like {@code JobAttempt}'s RUNNING lease fields)</li>
+ *   <li>{@code nextRetryAt} — the deterministic automatic-retry schedule; present only while the
+ *       attempt is a retryable {@code FAILED} (dispatcher error or lease expiry, below the
+ *       attempt budget) and omitted from JSON otherwise (REQ-02, additive null-omitted like
+ *       the lease fields)</li>
  * </ul>
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -32,6 +36,7 @@ public record ContactAttempt(
         String error,
         String auditEntryId,
         Instant lastHeartbeatAt,
-        Instant executionLeaseExpiresAt
+        Instant executionLeaseExpiresAt,
+        Instant nextRetryAt
 ) {
 }

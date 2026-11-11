@@ -52,6 +52,15 @@ class ContactSubmissionServiceTest {
         return service;
     }
 
+    /** startService plus explicit backoff base/cap (seconds), for the automatic-retry scans. */
+    private ContactSubmissionService startServiceWithBackoff(int maxAttempts, int baseSeconds,
+            int capSeconds) {
+        dispatcher = new ControllableDispatcher(new CountDownLatch(1));
+        service = new ContactSubmissionService(dispatcher, 1, 1, 0L, maxAttempts, LEASE_SECONDS,
+                1000, 0, clock, baseSeconds * 1000, capSeconds * 1000, 1000);
+        return service;
+    }
+
     private static ContactSubmissionRequest request(String key, String message) {
         return new ContactSubmissionRequest("Ada", "ada@example.com", message, key);
     }
@@ -79,6 +88,22 @@ class ContactSubmissionServiceTest {
 
     private ContactSubmissionResponse pollUntil(String id, ContactStatus status) {
         return pollUntil(id, candidate -> candidate == status);
+    }
+
+    /** Polls an arbitrary condition on the same 5s budget as {@link #pollUntil(String, ContactStatus)}. */
+    private static void awaitCondition(java.util.function.Supplier<Boolean> condition) {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (!condition.get()) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw new AssertionError("condition never matched");
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(e);
+            }
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -200,6 +225,10 @@ class ContactSubmissionServiceTest {
         startService(3);
         dispatcher.holdAll = true; // every attempt occupies its slot until released
         ContactSubmissionResponse a = service.submit(request(null, "first"));
+        // Same deterministic-saturation guard: only once the worker has picked up `a`'s task
+        // (one dispatcher call recorded) is the single queue slot free, so `b` fills it for
+        // sure instead of racing the worker and hitting the AbortPolicy under load.
+        awaitCondition(() -> dispatcher.calls().size() >= 1);
         ContactSubmissionResponse b = service.submit(request(null, "second"));
         pollUntil(a.id(), ContactStatus.DISPATCHING);
         pollUntil(b.id(), ContactStatus.DISPATCHING);
@@ -269,6 +298,153 @@ class ContactSubmissionServiceTest {
                     assertThat(conflict.reason()).contains("exhausted");
                 });
         assertThat(service.get(failed.id()).attempt()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("REQ-06/DOD-01: a due scan dispatches exactly one new generation, never before nextRetryAt, and repeats admit nothing")
+    void dueScanDispatchesExactlyOneGeneration() {
+        startServiceWithBackoff(3, 2, 8);
+        dispatcher.failGenerations.add(1);
+        Instant t0 = clock.instant();
+        ContactSubmissionResponse submitted = service.submit(request(null, "auto retry"));
+        ContactSubmissionResponse failed = pollUntil(submitted.id(), ContactStatus.FAILED);
+        assertThat(failed.currentAttempt().nextRetryAt()).isEqualTo(t0.plusSeconds(2));
+
+        // DOD-02: the scan admits nothing while the schedule is in the future.
+        assertThat(service.retryDueSubmissions(clock.instant())).isZero();
+        assertThat(dispatcher.calls()).containsExactly(1);
+
+        // DOD-02: exactly one dispatch when due; a repeated scan at the same instant adds none.
+        clock.advance(2L);
+        assertThat(service.retryDueSubmissions(clock.instant())).isEqualTo(1);
+        pollUntil(submitted.id(), ContactStatus.DELIVERED);
+        assertThat(dispatcher.calls()).containsExactly(1, 2);
+        assertThat(service.retryDueSubmissions(clock.instant())).isZero();
+    }
+
+    @Test
+    @DisplayName("REQ-06/DOD-03: automatic backoff grows base, base*2, base*4 up to the configured cap")
+    void backoffGrowsExponentiallyUpToCap() {
+        startServiceWithBackoff(4, 2, 3);
+        dispatcher.failGenerations.add(1);
+        dispatcher.failGenerations.add(2);
+        dispatcher.failGenerations.add(3);
+        Instant t0 = clock.instant();
+        ContactSubmissionResponse submitted = service.submit(request(null, "capped"));
+        pollUntil(submitted.id(), ContactStatus.FAILED); // wait for the terminal handler
+
+        clock.advance(2L); // due at t0 + 2s (base)
+        assertThat(service.retryDueSubmissions(clock.instant())).isEqualTo(1);
+        pollUntil(submitted.id(), ContactStatus.FAILED);
+        assertThat(service.get(submitted.id()).currentAttempt().nextRetryAt()).isEqualTo(t0.plusSeconds(5));
+
+        clock.advance(3L); // due at t0 + 5s (base*2 clamped to the 3s cap)
+        assertThat(service.retryDueSubmissions(clock.instant())).isEqualTo(1);
+        pollUntil(submitted.id(), ContactStatus.FAILED);
+        assertThat(service.get(submitted.id()).currentAttempt().nextRetryAt()).isEqualTo(t0.plusSeconds(8));
+
+        clock.advance(3L); // still capped
+        assertThat(service.retryDueSubmissions(clock.instant())).isEqualTo(1);
+        ContactSubmissionResponse delivered = pollUntil(submitted.id(), ContactStatus.DELIVERED);
+        assertThat(delivered.attempt()).isEqualTo(4);
+        assertThat(dispatcher.calls()).containsExactly(1, 2, 3, 4);
+    }
+
+    @Test
+    @DisplayName("REQ-06/DOD-03: at the attempt ceiling no schedule is set and the scan never dispatches")
+    void noDispatchAtAttemptCeiling() {
+        startServiceWithBackoff(3, 2, 8);
+        dispatcher.failGenerations.add(1);
+        dispatcher.failGenerations.add(2);
+        dispatcher.failGenerations.add(3);
+        ContactSubmissionResponse submitted = service.submit(request(null, "doomed auto"));
+        ContactSubmissionResponse failed1 = pollUntil(submitted.id(), ContactStatus.FAILED);
+        assertThat(failed1.currentAttempt().nextRetryAt()).isNotNull();
+
+        clock.advance(2L);
+        assertThat(service.retryDueSubmissions(clock.instant())).isEqualTo(1);
+        pollUntil(submitted.id(), ContactStatus.FAILED);
+
+        clock.advance(4L);
+        assertThat(service.retryDueSubmissions(clock.instant())).isEqualTo(1);
+        ContactSubmissionResponse failed3 = pollUntil(submitted.id(), ContactStatus.FAILED);
+        assertThat(failed3.attempt()).isEqualTo(3);
+        // DOD-01: the attempt budget is exhausted, so no automatic schedule survives.
+        assertThat(failed3.currentAttempt().nextRetryAt()).isNull();
+        assertThat(failed3.currentAttempt().status()).isEqualTo(ContactStatus.FAILED);
+
+        clock.advance(60L);
+        assertThat(service.retryDueSubmissions(clock.instant())).isZero();
+        assertThat(dispatcher.calls()).containsExactly(1, 2, 3);
+    }
+
+    @Test
+    @DisplayName("REQ-06/DOD-04: a manual retry before the schedule clears it, and the due scan admits no second attempt")
+    void manualRetryBeforeScheduleWinsWithoutDoubleDispatch() {
+        startServiceWithBackoff(3, 2, 8);
+        dispatcher.failGenerations.add(1);
+        ContactSubmissionResponse submitted = service.submit(request(null, "raced"));
+        ContactSubmissionResponse failed = pollUntil(submitted.id(), ContactStatus.FAILED);
+        Instant scheduled = failed.currentAttempt().nextRetryAt();
+        assertThat(scheduled).isNotNull();
+
+        // DOD-04: the manual retry clears the pending schedule before admission.
+        clock.advance(2L);
+        ContactSubmissionResponse retried = service.retry(submitted.id());
+        assertThat(retried.attempt()).isEqualTo(2);
+        assertThat(service.get(submitted.id()).currentAttempt().nextRetryAt()).isNull();
+        pollUntil(submitted.id(), ContactStatus.DELIVERED);
+
+        // The scan that would have due-admitted generation 2 now finds nothing to admit.
+        assertThat(service.retryDueSubmissions(clock.instant())).isZero();
+        assertThat(dispatcher.calls()).containsExactly(1, 2);
+    }
+
+    @Test
+    @DisplayName("REQ-04/DOD-05: a saturated pool preserves the FAILED row and a later scan succeeds once capacity frees")
+    void saturatedPoolPreservesFailedRowAndRetriesLater() throws Exception {
+        startServiceWithBackoff(3, 2, 8);
+        dispatcher.failGenerations.add(1);
+        Instant t0 = clock.instant();
+        ContactSubmissionResponse x = service.submit(request(null, "queued for later"));
+        ContactSubmissionResponse failed = pollUntil(x.id(), ContactStatus.FAILED);
+        assertThat(failed.currentAttempt().nextRetryAt()).isEqualTo(t0.plusSeconds(2));
+
+        // Saturate the pool: both slots busy with held attempts.
+        dispatcher.failGenerations.clear();
+        dispatcher.holdAll = true;
+        ContactSubmissionResponse a = service.submit(request(null, "hold one"));
+        // Synchronize saturation deterministically: `x`'s failed attempt 1 already recorded one
+        // dispatcher call, so two calls mean the worker picked up `a`'s task and the single
+        // queue slot is free — `b` fills it for sure instead of racing the worker and hitting
+        // the AbortPolicy under load.
+        awaitCondition(() -> dispatcher.calls().size() >= 2);
+        ContactSubmissionResponse b = service.submit(request(null, "hold two"));
+        pollUntil(a.id(), ContactStatus.DISPATCHING);
+        pollUntil(b.id(), ContactStatus.DISPATCHING);
+
+        clock.advance(2L);
+        // The scan cannot reserve capacity: the row stays FAILED with attempt and error intact
+        // and its schedule pushed to the next backoff slot.
+        assertThat(service.retryDueSubmissions(clock.instant())).isZero();
+        ContactSubmissionResponse preserved = service.get(x.id());
+        assertThat(preserved.status()).isEqualTo(ContactStatus.FAILED);
+        assertThat(preserved.attempt()).isEqualTo(1);
+        assertThat(preserved.currentAttempt().error())
+                .isEqualTo(ContactSubmissionService.CONTACT_DISPATCH_FAILED);
+        assertThat(preserved.currentAttempt().nextRetryAt()).isEqualTo(t0.plusSeconds(4));
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(2);
+
+        // Free a slot: the scan that pushed the schedule now finds it due and admits the
+        // pending automatic retry.
+        dispatcher.release().countDown();
+        pollUntil(a.id(), ContactStatus.DELIVERED);
+        pollUntil(b.id(), ContactStatus.DELIVERED);
+        clock.advance(2L); // due at the pushed slot t0 + 4s
+        assertThat(service.retryDueSubmissions(clock.instant())).isEqualTo(1);
+        pollUntil(x.id(), ContactStatus.DELIVERED);
+        assertThat(service.get(x.id()).attempt()).isEqualTo(2);
+        assertThat(dispatcher.calls()).contains(2);
     }
 
     @Test

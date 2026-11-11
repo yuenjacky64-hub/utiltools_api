@@ -87,6 +87,9 @@ public class ContactSubmissionService {
     public static final int MAX_LIST_LIMIT = 100;
     private static final int DEFAULT_MAX_RETAINED_SUBMISSIONS = 1000;
     private static final int DEFAULT_CLEANUP_INTERVAL_MS = 60_000;
+    private static final int DEFAULT_RETRY_BACKOFF_BASE_MS = 1000;
+    private static final int DEFAULT_RETRY_BACKOFF_MAX_MS = 60_000;
+    private static final int DEFAULT_RETRY_SCAN_INTERVAL_MS = 1000;
     private static final long DRAIN_AWAIT_SECONDS = 30;
 
     private final ContactDispatcher dispatcher;
@@ -98,9 +101,14 @@ public class ContactSubmissionService {
     private final int maxRetainedSubmissions;
     private final long retentionSeconds;
     private final long executionLeaseSeconds;
+    private final int retryBackoffBaseMs;
+    private final int retryBackoffMaxMs;
+    private final int retryScanIntervalMs;
     private final Clock clock;
     /** Optional audit journal; stays absent in test slices and direct construction. */
     private volatile AuditJournalService journal;
+    /** Flipped by {@link #shutdown()}: after it the retry scanner admits nothing more (REQ-05). */
+    private volatile boolean shutdownRefused;
 
     /**
      * Registry: insertion-ordered (admission order), bounded by the retention/cap sweep. All
@@ -131,6 +139,9 @@ public class ContactSubmissionService {
             @Value("${utiltools.contact.execution-lease-seconds:30}") long executionLeaseSeconds,
             @Value("${utiltools.contact.max-retained-submissions:1000}") int maxRetainedSubmissions,
             @Value("${utiltools.contact.cleanup-interval-ms:60000}") int cleanupIntervalMs,
+            @Value("${utiltools.contact.retry-backoff-base-ms:1000}") int retryBackoffBaseMs,
+            @Value("${utiltools.contact.retry-backoff-max-ms:60000}") int retryBackoffMaxMs,
+            @Value("${utiltools.contact.retry-scan-interval-ms:1000}") int retryScanIntervalMs,
             Clock clock) {
         // Delivery (mailing-list / SMTP / API fan-out) is out of scope: the seam is a no-op.
         this((submissionId, generation) -> { },
@@ -141,7 +152,10 @@ public class ContactSubmissionService {
                 executionLeaseSeconds,
                 Math.max(1, maxRetainedSubmissions),
                 cleanupIntervalMs,
-                clock);
+                clock,
+                retryBackoffBaseMs,
+                retryBackoffMaxMs,
+                retryScanIntervalMs);
     }
 
     /**
@@ -154,7 +168,8 @@ public class ContactSubmissionService {
             long retentionSeconds, int maxAttempts, long executionLeaseSeconds, Clock clock) {
         this(dispatcher, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 executionLeaseSeconds, DEFAULT_MAX_RETAINED_SUBMISSIONS, DEFAULT_CLEANUP_INTERVAL_MS,
-                clock);
+                clock, DEFAULT_RETRY_BACKOFF_BASE_MS, DEFAULT_RETRY_BACKOFF_MAX_MS,
+                DEFAULT_RETRY_SCAN_INTERVAL_MS);
     }
 
     /**
@@ -164,7 +179,8 @@ public class ContactSubmissionService {
      */
     public ContactSubmissionService(ContactDispatcher dispatcher, int workerCount, int queueCapacity,
             long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
-            int maxRetainedSubmissions, int cleanupIntervalMs, Clock clock) {
+            int maxRetainedSubmissions, int cleanupIntervalMs, Clock clock,
+            int retryBackoffBaseMs, int retryBackoffMaxMs, int retryScanIntervalMs) {
         this.dispatcher = dispatcher;
         this.workerCount = Math.max(1, workerCount);
         this.queueCapacity = Math.max(1, queueCapacity);
@@ -172,6 +188,16 @@ public class ContactSubmissionService {
         this.maxAttempts = Math.max(1, maxAttempts);
         this.executionLeaseSeconds = executionLeaseSeconds;
         this.maxRetainedSubmissions = Math.max(1, maxRetainedSubmissions);
+        this.retryBackoffBaseMs = retryBackoffBaseMs;
+        this.retryBackoffMaxMs = retryBackoffMaxMs;
+        this.retryScanIntervalMs = retryScanIntervalMs;
+        if (retryBackoffBaseMs <= 0 || retryBackoffMaxMs < retryBackoffBaseMs
+                || retryScanIntervalMs <= 0) {
+            throw new IllegalArgumentException(
+                    "invalid contact retry backoff configuration: base=" + retryBackoffBaseMs
+                            + ", max=" + retryBackoffMaxMs + ", scanInterval="
+                            + retryScanIntervalMs);
+        }
         this.clock = clock;
         this.executor = new ThreadPoolExecutor(workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
                 new ArrayBlockingQueue<>(this.queueCapacity),
@@ -320,6 +346,7 @@ public class ContactSubmissionService {
             reserveAdmissionLocked();
             int nextAttempt = submission.attempt + 1;
             String previousError = submission.error;
+            Instant previousCompletedAt = submission.completedAt;
             submission.attempt = nextAttempt;
             submission.status = ContactStatus.QUEUED;
             submission.startedAt = null;
@@ -327,6 +354,9 @@ public class ContactSubmissionService {
             submission.error = null;
             submission.lastHeartbeatAt = null;
             submission.executionLeaseExpiresAt = null;
+            // REQ-05: clear the pending automatic-retry schedule before admission so a due scan
+            // cannot double-admit the same generation.
+            submission.nextRetryAt = null;
             admitAttemptLocked(submission, nextAttempt);
             try {
                 executor.execute(() -> runAttempt(submission.submissionId, nextAttempt));
@@ -336,7 +366,11 @@ public class ContactSubmissionService {
                 failQuietly(submission, nextAttempt, "CONTACT_QUEUE_FULL");
                 submission.attempt = nextAttempt - 1;
                 submission.status = ContactStatus.FAILED;
+                submission.completedAt = previousCompletedAt;
                 submission.error = previousError;
+                // REQ-05: restore the automatic-retry schedule the manual retry cleared.
+                submission.nextRetryAt = computeNextRetryAt(submission, previousCompletedAt,
+                        previousError);
                 rollbackAdmissionLocked(submission);
                 throw new ContactQueueFullException();
             }
@@ -437,6 +471,7 @@ public class ContactSubmissionService {
      */
     @PreDestroy
     public void shutdown() {
+        shutdownRefused = true;
         executor.shutdown();
         try {
             if (!executor.awaitTermination(DRAIN_AWAIT_SECONDS, TimeUnit.SECONDS)) {
@@ -456,8 +491,143 @@ public class ContactSubmissionService {
                             CONTACT_SUBMISSION_CANCELLED, Instant.now(clock));
                     default -> { } // terminal: nothing to drain
                 }
+                // REQ-05: no automatic retry may ever run after shutdown, so no pending
+                // schedule survives the drain.
+                submission.nextRetryAt = null;
             }
         }
+    }
+
+    // ── Automatic retry (REQ-03) ────────────────────────────────────────────────
+
+    /**
+     * Fixed-delay poller; a due scan runs every {@code utiltools.contact.retry-scan-interval-ms}
+     * and stops after shutdown.
+     */
+    @Scheduled(fixedDelayString = "${utiltools.contact.retry-scan-interval-ms:1000}")
+    void retryScheduled() {
+        // REQ-05: once the drain has started the scanner admits nothing further.
+        if (shutdownRefused) {
+            return;
+        }
+        retryDueSubmissions(Instant.now(clock));
+    }
+
+    /**
+     * One automatic scan: dispatch every retryable FAILED submission whose schedule is due.
+     *
+     * <p>The candidate list is built under {@code registryLock} — at most one automatic retry is
+     * admitted per FAILED generation (INV-R1) — and each admitted row is dispatched outside the
+     * lock so a slow worker can never hold the registry. A candidate that turns out non-eligible
+     * (a competing manual retry already moved it) is simply skipped (INV-R4).
+     *
+     * @param now the scan's clock
+     * @return how many automatic retries were admitted
+     */
+    int retryDueSubmissions(Instant now) {
+        List<MutableSubmission> due;
+        int admitted = 0;
+        synchronized (registryLock) {
+            due = new ArrayList<>();
+            for (MutableSubmission submission : submissions.values()) {
+                if (submission.status == ContactStatus.FAILED
+                        && submission.nextRetryAt != null
+                        && !submission.nextRetryAt.isAfter(now)) {
+                    due.add(submission);
+                }
+            }
+        }
+        for (MutableSubmission submission : due) {
+            try {
+                if (admitAutomaticRetry(submission, now)) {
+                    admitted++;
+                }
+            } catch (ContactQueueFullException e) {
+                // REQ-04: the dispatch pool is saturated. The row stays FAILED with its attempt
+                // and error untouched and the admission was never reserved — just push the
+                // schedule to the next backoff slot so a later scan retries it.
+                synchronized (registryLock) {
+                    if (submission.status == ContactStatus.FAILED
+                            && submission.nextRetryAt != null) {
+                        submission.nextRetryAt = computeNextRetryAt(submission, now,
+                                submission.error);
+                    }
+                }
+            }
+        }
+        return admitted;
+    }
+
+    /**
+     * Admits one automatic retry for a due candidate. Revalidates under {@code registryLock}
+     * (the candidate may have been moved by a manual retry since the scan picked it up) and
+     * restores the row exactly as a failed manual retry does when the executor rejects it
+     * (REQ-04): status stays FAILED, the previous attempt/error/nextRetryAt are restored, the
+     * reserved admission is released, and the attempt's journal entry is closed — no orphaned
+     * audit entry survives.
+     *
+     * @return {@code true} when the attempt was handed to a worker
+     */
+    private boolean admitAutomaticRetry(MutableSubmission submission, Instant now) {
+        int nextAttempt;
+        synchronized (registryLock) {
+            // INV-R4: a competing manual retry already cleared this row's schedule or moved its
+            // generation past the due time — never double-admit it.
+            if (submission.status != ContactStatus.FAILED || submission.nextRetryAt == null
+                    || submission.nextRetryAt.isAfter(now)
+                    || submission.attempt >= submission.maxAttempts) {
+                return false;
+            }
+            reserveAdmissionLocked();
+            nextAttempt = submission.attempt + 1;
+            String previousError = submission.error;
+            Instant previousCompletedAt = submission.completedAt;
+            submission.attempt = nextAttempt;
+            submission.status = ContactStatus.QUEUED;
+            submission.startedAt = null;
+            submission.completedAt = null;
+            submission.error = null;
+            submission.lastHeartbeatAt = null;
+            submission.executionLeaseExpiresAt = null;
+            submission.nextRetryAt = null;
+            admitAttemptLocked(submission, nextAttempt);
+            try {
+                executor.execute(() -> runAttempt(submission.submissionId, nextAttempt));
+            } catch (RejectedExecutionException e) {
+                // REQ-04: roll the re-queue back to the exact pre-admission FAILED shape and
+                // release the admission this scan reserved.
+                failQuietly(submission, nextAttempt, "CONTACT_QUEUE_FULL");
+                submission.attempt = nextAttempt - 1;
+                submission.status = ContactStatus.FAILED;
+                submission.completedAt = previousCompletedAt;
+                submission.error = previousError;
+                // The pool is still saturated: push the schedule to the next backoff slot so a
+                // later scan retries it without burning the attempt.
+                submission.nextRetryAt = computeNextRetryAt(submission, now, previousError);
+                pendingAttempts--;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * REQ-02: deterministic capped exponential backoff for a retryable FAILED attempt:
+     * {@code completedAt + min(retryBackoffMaxMs, retryBackoffBaseMs * 2^(attempt-1))} —
+     * base, base*2, base*4, ... clamped to the configured cap. {@code null} when the row is not
+     * a retryable FAILED attempt: DELIVERED (null error), shutdown-cancelled, or the attempt
+     * budget is exhausted.
+     */
+    private Instant computeNextRetryAt(MutableSubmission submission, Instant completedAt,
+            String error) {
+        if (error == null || CONTACT_SUBMISSION_CANCELLED.equals(error)
+                || submission.attempt >= submission.maxAttempts) {
+            return null;
+        }
+        long delayMs = retryBackoffBaseMs;
+        for (int i = 1; i < submission.attempt && delayMs < retryBackoffMaxMs; i++) {
+            delayMs = Math.min((long) retryBackoffMaxMs, delayMs * 2);
+        }
+        return completedAt.plusMillis(delayMs);
     }
 
     /** Clamps an optional list limit into {@code [1, MAX_LIST_LIMIT]} (jobs' pattern). */
@@ -554,6 +724,11 @@ public class ContactSubmissionService {
         submission.error = error;
         submission.lastHeartbeatAt = null;
         submission.executionLeaseExpiresAt = null;
+        // REQ-02: a retryable FAILED attempt below the budget gets its deterministic schedule;
+        // anything else (DELIVERED, budget-exhausted, shutdown-cancelled) carries none.
+        submission.nextRetryAt = (to == ContactStatus.FAILED)
+                ? computeNextRetryAt(submission, now, error)
+                : null;
         int generation = submission.attempt;
         if (to == ContactStatus.DELIVERED) {
             succeedQuietly(submission, generation);
@@ -618,7 +793,8 @@ public class ContactSubmissionService {
         return new ContactAttempt(submission.attempt, submission.status, submission.startedAt,
                 submission.completedAt, submission.error,
                 submission.auditEntryIds.get(submission.attempt),
-                submission.lastHeartbeatAt, submission.executionLeaseExpiresAt);
+                submission.lastHeartbeatAt, submission.executionLeaseExpiresAt,
+                submission.nextRetryAt);
     }
 
     // ---------------------------------------------------------------------
@@ -742,6 +918,8 @@ public class ContactSubmissionService {
         String error;
         Instant lastHeartbeatAt;
         Instant executionLeaseExpiresAt;
+        /** REQ-02: due time of the next automatic retry, null when none is scheduled. */
+        Instant nextRetryAt;
 
         MutableSubmission(String submissionId, String name, String email, String message,
                 String idempotencyKey, String fingerprint, Instant createdAt, long admissionOrder,
