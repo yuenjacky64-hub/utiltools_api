@@ -293,6 +293,88 @@ class ContactFormStateMachineTest {
         assertThat(script).doesNotContain("innerHTML");
     }
 
+    // ------------------------------------------------------------------ DOD-03
+
+    @Test
+    @DisplayName("the shipped default transport asserts the wire contract and the bounded retry matrix")
+    void wireContractAndRetryMatrixIsAsserted() throws IOException {
+        String page = readClasspath(PAGE_RESOURCE);
+        String script = readClasspath(SCRIPT_RESOURCE);
+
+        // The page ships the hidden live status region; the script manages aria-busy on it.
+        assertThat(page).describedAs("page declares the #contact-status region").contains("id=\"contact-status\"");
+        assertThat(page).contains("aria-live=\"polite\"");
+        assertThat(script).contains("aria-busy");
+
+        JsonNode out = scenarios();
+
+        // One real POST with the exact path, method, headers and body; a 202 success completes.
+        JsonNode wire = out.get("wireSuccess");
+        assertThat(wire.get("attempts").asInt()).isEqualTo(1);
+        assertThat(wire.get("pathOk").asBoolean()).isTrue();
+        assertThat(wire.get("method").asText()).isEqualTo("POST");
+        assertThat(wire.get("contentType").asText()).isEqualTo("application/json");
+        assertThat(wire.get("accept").asText()).isEqualTo("application/json");
+        assertThat(wire.get("body").get("name").asText()).isEqualTo(GOOD_NAME);
+        assertThat(wire.get("body").get("email").asText()).isEqualTo(GOOD_EMAIL);
+        assertThat(wire.get("body").get("message").asText()).isEqualTo(GOOD_MESSAGE);
+        assertThat(wire.get("keyWithinLimit").asBoolean()).isTrue();
+        assertThat(wire.get("state").asText()).isEqualTo(SUCCESS);
+        assertThat(wire.get("successHidden").asBoolean()).isFalse();
+        assertThat(chain(wire.get("audit")))
+                .containsExactly(List.of(SUBMITTED, SUCCESS), List.of(VALIDATING, SUBMITTED), List.of(IDLE, VALIDATING));
+        assertThat(wire.get("delays")).isEmpty();
+        assertThat(wire.get("statusBusy").asText()).isEqualTo("false");
+
+        // One key per submission: stable across its transient retries, kept after the
+        // attempts exhaust, reused on an unchanged resubmission, rotated on a payload change.
+        JsonNode keys = out.get("keyLifecycle");
+        assertThat(keys.get("totalKeys").asInt()).isEqualTo(9);
+        assertThat(keys.get("stableAcrossRetries").asBoolean()).isTrue();
+        assertThat(keys.get("keptAfterExhaust").asBoolean()).isTrue();
+        assertThat(keys.get("reusedOnResubmit").asBoolean()).isTrue();
+        assertThat(keys.get("rotatedOnPayloadChange").asBoolean()).isTrue();
+        assertThat(keys.get("keyLengthsOk").asBoolean()).isTrue();
+
+        // A terminal 409 fails fast: a single attempt, rollback restores the typed values,
+        // the key rotates, and exactly one audit row is appended for submitted -> error.
+        JsonNode conflict = out.get("http409");
+        assertThat(conflict.get("attempts").asInt()).isEqualTo(1);
+        assertThat(conflict.get("state").asText()).isEqualTo(ERROR);
+        assertThat(conflict.get("fields").get("name").asText()).isEqualTo(GOOD_NAME);
+        assertThat(conflict.get("fields").get("email").asText()).isEqualTo(GOOD_EMAIL);
+        assertThat(conflict.get("fields").get("message").asText()).isEqualTo(GOOD_MESSAGE);
+        assertThat(conflict.get("disabled").asBoolean()).isFalse();
+        assertThat(conflict.get("summary").asText()).isNotEmpty();
+        assertThat(conflict.get("storedKeyRotated").asBoolean()).isTrue();
+        assertThat(chain(conflict.get("audit")))
+                .containsExactly(List.of(SUBMITTED, ERROR), List.of(VALIDATING, SUBMITTED), List.of(IDLE, VALIDATING));
+
+        // A 429 with a numeric Retry-After sleeps the bounded seconds then retries and succeeds.
+        JsonNode retry = out.get("http429RetryAfter");
+        assertThat(retry.get("attempts").asInt()).isEqualTo(2);
+        assertThat(retry.get("delays").toString()).isEqualTo("[2000]");
+        assertThat(retry.get("state").asText()).isEqualTo(SUCCESS);
+        assertThat(retry.get("successHidden").asBoolean()).isFalse();
+
+        // Exhausted network failure: three attempts, capped exponential delays, rollback
+        // keeps the typed values, aria-busy is released and retries never append audit rows.
+        JsonNode exhausted = out.get("networkExhausted");
+        assertThat(exhausted.get("attempts").asInt()).isEqualTo(3);
+        assertThat(exhausted.get("delays").toString()).isEqualTo("[500,1000]");
+        assertThat(exhausted.get("state").asText()).isEqualTo(ERROR);
+        assertThat(exhausted.get("fields").get("name").asText()).isEqualTo(GOOD_NAME);
+        assertThat(exhausted.get("fields").get("email").asText()).isEqualTo(GOOD_EMAIL);
+        assertThat(exhausted.get("fields").get("message").asText()).isEqualTo(GOOD_MESSAGE);
+        assertThat(exhausted.get("disabled").asBoolean()).isFalse();
+        assertThat(exhausted.get("summary").asText()).isNotEmpty();
+        assertThat(exhausted.get("statusBusy").asText()).isEqualTo("false");
+        assertThat(exhausted.get("formBusy").asText()).isEqualTo("false");
+        assertThat(exhausted.get("keyStillKept").asBoolean()).isTrue();
+        assertThat(chain(exhausted.get("audit")))
+                .containsExactly(List.of(SUBMITTED, ERROR), List.of(VALIDATING, SUBMITTED), List.of(IDLE, VALIDATING));
+    }
+
     // ------------------------------------------------------------------ harness
 
     /**
@@ -461,8 +543,10 @@ const vm = require('vm');
 
 const source = fs.readFileSync(process.argv[2], 'utf8');
 const KEY = 'utiltools.contact.audit.v1';
+const IKEY = 'utiltools.contact.idempotency.v1';
 
 function element(id) {
+    const attrs = {};
     return {
         id: id,
         value: '',
@@ -472,13 +556,20 @@ function element(id) {
         listeners: [],
         addEventListener: function (type, fn) {
             this.listeners.push({type: type, fn: fn});
+        },
+        setAttribute: function (name, value) {
+            attrs[name] = String(value);
+        },
+        getAttribute: function (name) {
+            return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
         }
     };
 }
 
 function makeDocument() {
     const ids = ['contact-form', 'contact-submit', 'error-summary', 'contact-success',
-        'error-name', 'error-email', 'error-message', 'name', 'email', 'message'];
+        'error-name', 'error-email', 'error-message', 'name', 'email', 'message',
+        'contact-status'];
     const nodes = {};
     ids.forEach(function (id) {
         nodes[id] = element(id);
@@ -499,16 +590,21 @@ function makeStorage(options) {
         data[KEY] = opts.initial;
     }
     let writes = 0;
+    const writeCounts = {};
     return {
         data: data,
         writes: function () {
             return writes;
+        },
+        auditWrites: function () {
+            return writeCounts[KEY] || 0;
         },
         getItem: function (key) {
             return Object.prototype.hasOwnProperty.call(data, key) ? data[key] : null;
         },
         setItem: function (key, value) {
             writes += 1;
+            writeCounts[key] = (writeCounts[key] || 0) + 1;
             if (typeof opts.failAfter === 'number' && writes > opts.failAfter) {
                 const error = new Error('quota');
                 error.name = 'QuotaExceededError';
@@ -533,6 +629,30 @@ function clock() {
 
 function loadContext(doc, storage) {
     const sandbox = {document: doc, localStorage: storage, console: console};
+    // The shipped default transport uses the global fetch when available (and
+    // injects a test transport when the machine is constructed with one).
+    // Provide a fake fetch so the existing bootstrap scenario still passes.
+    sandbox.fetch = function (url, init) {
+        return Promise.resolve({
+            ok: true,
+            status: 202,
+            headers: {get: function () { return null; }},
+            text: function () {
+                return Promise.resolve(JSON.stringify({
+                    success: true,
+                    data: {message: 'Dispatched', taskId: 'fake-task'},
+                    timestamp: new Date().toISOString()
+                }));
+            },
+            json: function () {
+                return Promise.resolve({
+                    success: true,
+                    data: {id: 'sub-fake', status: 'DISPATCHING', deduplicated: false},
+                    timestamp: new Date().toISOString()
+                });
+            }
+        });
+    };
     vm.createContext(sandbox);
     vm.runInContext(source, sandbox, {filename: 'script.js'});
     return sandbox;
@@ -624,7 +744,7 @@ async function main() {
         out.valid.errors = errorTexts(doc);
         out.valid.audit = m.auditRecords().map(summary);
         out.valid.stored = JSON.parse(storage.data[KEY] || '[]').map(summary);
-        out.valid.storageWrites = storage.writes();
+        out.valid.storageWrites = storage.auditWrites();
     }
 
     /* S2: invalid input walks idle -> validating -> error with input preserved. */
@@ -869,6 +989,224 @@ async function main() {
             state: sandbox.contactFormMachine ? sandbox.contactFormMachine.getState() : null,
             audit: sandbox.contactFormMachine ? sandbox.contactFormMachine.auditRecords().map(summary) : [],
             stored: JSON.parse(storage.data[KEY] || '[]').map(summary)
+        };
+    }
+
+    /* S10: the shipped default transport (createContactTransport with a fake fetch)
+     * posts the exact envelope to the submissions endpoint and completes on 202. */
+    {
+        const doc = makeDocument();
+        const storage = makeStorage();
+        const requests = [];
+        const delays = [];
+        const sandbox = loadContext(doc, storage);
+        const factory = sandbox.ContactFormStateMachine;
+        const transport = factory.createContactTransport({
+            fetch: function (path, init) {
+                requests.push({path: path, init: init});
+                return Promise.resolve({
+                    ok: true,
+                    status: 202,
+                    headers: {get: function () { return null; }},
+                    json: function () {
+                        return Promise.resolve({
+                            success: true,
+                            data: {id: 's10', status: 'DISPATCHING', deduplicated: false},
+                            timestamp: '2026-01-01T00:00:00.000Z'
+                        });
+                    }
+                });
+            },
+            sleep: function (ms) {
+                delays.push(ms);
+                return Promise.resolve();
+            }
+        });
+        const m = factory.createContactFormMachine({document: doc, storage: storage, transmit: transport, now: clock()});
+        fill(doc, GOOD[0], GOOD[1], GOOD[2]);
+        m.onSubmit(event());
+        await settle();
+        const req = requests[0];
+        const body = JSON.parse(req.init.body);
+        out.wireSuccess = {
+            attempts: requests.length,
+            pathOk: req.path === factory.CT_SUBMISSIONS_PATH && req.path === '/api/v1/utils/contact/submissions',
+            method: req.init.method,
+            contentType: req.init.headers['Content-Type'],
+            accept: req.init.headers['Accept'],
+            body: {
+                name: body.name,
+                email: body.email,
+                message: body.message,
+                keyLen: body.idempotencyKey.length
+            },
+            keyWithinLimit: body.idempotencyKey.length > 0 && body.idempotencyKey.length <= 128,
+            state: m.getState(),
+            disabled: doc.nodes['contact-submit'].disabled,
+            successHidden: doc.nodes['contact-success'].hidden,
+            fields: values(doc),
+            statusBusy: doc.nodes['contact-status'].getAttribute('aria-busy'),
+            audit: m.auditRecords().map(summary),
+            delays: delays
+        };
+    }
+
+    /* S11: one submission keeps one idempotency key across its transient retries,
+     * keeps it after the attempts exhaust, reuses it on resubmission of an unchanged
+     * payload and rotates it once the payload changes. */
+    {
+        const doc = makeDocument();
+        const storage = makeStorage();
+        const keys = [];
+        const sandbox = loadContext(doc, storage);
+        const factory = sandbox.ContactFormStateMachine;
+        const transport = factory.createContactTransport({
+            fetch: function (path, init) {
+                keys.push(JSON.parse(init.body).idempotencyKey);
+                return Promise.resolve({ok: false, status: 503, headers: {get: function () { return null; }}});
+            },
+            sleep: function () {
+                return Promise.resolve();
+            }
+        });
+        const m = factory.createContactFormMachine({document: doc, storage: storage, transmit: transport, now: clock()});
+        fill(doc, GOOD[0], GOOD[1], GOOD[2]);
+        m.onSubmit(event());
+        await settle();
+        const storedAfterExhaust = storage.data[IKEY] ? JSON.parse(storage.data[IKEY]) : null;
+        m.onSubmit(event());
+        await settle();
+        doc.nodes['message'].value = 'Edited before the resubmission';
+        m.onSubmit(event());
+        await settle();
+        out.keyLifecycle = {
+            totalKeys: keys.length,
+            stableAcrossRetries: keys[0] === keys[1] && keys[1] === keys[2],
+            keptAfterExhaust: storedAfterExhaust !== null && storedAfterExhaust.key === keys[0],
+            reusedOnResubmit: keys[3] === keys[0],
+            rotatedOnPayloadChange: keys[6] !== keys[3],
+            keyLengthsOk: keys.every(function (k) {
+                return k && k.length > 0 && k.length <= 128;
+            })
+        };
+    }
+
+    /* S12: a terminal 409 fails fast - no retry, rollback restores the typed values
+     * and the idempotency key is rotated for the next submission. */
+    {
+        const doc = makeDocument();
+        const storage = makeStorage();
+        const keys = [];
+        const sandbox = loadContext(doc, storage);
+        const factory = sandbox.ContactFormStateMachine;
+        const transport = factory.createContactTransport({
+            fetch: function (path, init) {
+                keys.push(JSON.parse(init.body).idempotencyKey);
+                return Promise.resolve({ok: false, status: 409, headers: {get: function () { return null; }}});
+            },
+            sleep: function () {
+                return Promise.resolve();
+            }
+        });
+        const m = factory.createContactFormMachine({document: doc, storage: storage, transmit: transport, now: clock()});
+        fill(doc, GOOD[0], GOOD[1], GOOD[2]);
+        m.onSubmit(event());
+        await settle();
+        const stored = storage.data[IKEY] ? JSON.parse(storage.data[IKEY]) : null;
+        out.http409 = {
+            attempts: keys.length,
+            state: m.getState(),
+            fields: values(doc),
+            disabled: doc.nodes['contact-submit'].disabled,
+            summary: doc.nodes['error-summary'].textContent,
+            storedKeyRotated: stored !== null && stored.key !== keys[0],
+            audit: m.auditRecords().map(summary)
+        };
+    }
+
+    /* S13: a 429 with a bounded numeric Retry-After is honoured before the next
+     * attempt, then the retry succeeds. */
+    {
+        const doc = makeDocument();
+        const storage = makeStorage();
+        const calls = [];
+        const delays = [];
+        const sandbox = loadContext(doc, storage);
+        const factory = sandbox.ContactFormStateMachine;
+        const transport = factory.createContactTransport({
+            fetch: function (path, init) {
+                calls.push(init.body);
+                if (calls.length === 1) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 429,
+                        headers: {get: function (name) { return name === 'Retry-After' ? '2' : null; }}
+                    });
+                }
+                return Promise.resolve({
+                    ok: true,
+                    status: 202,
+                    headers: {get: function () { return null; }},
+                    json: function () {
+                        return Promise.resolve({
+                            success: true,
+                            data: {id: 's13', status: 'DISPATCHING', deduplicated: false},
+                            timestamp: '2026-01-01T00:00:00.000Z'
+                        });
+                    }
+                });
+            },
+            sleep: function (ms) {
+                delays.push(ms);
+                return Promise.resolve();
+            }
+        });
+        const m = factory.createContactFormMachine({document: doc, storage: storage, transmit: transport, now: clock()});
+        fill(doc, GOOD[0], GOOD[1], GOOD[2]);
+        m.onSubmit(event());
+        await settle();
+        out.http429RetryAfter = {
+            attempts: calls.length,
+            delays: delays,
+            state: m.getState(),
+            successHidden: doc.nodes['contact-success'].hidden
+        };
+    }
+
+    /* S14: repeated network rejections stop after three attempts with capped
+     * exponential delays, roll back to the pending snapshot and release aria-busy. */
+    {
+        const doc = makeDocument();
+        const storage = makeStorage();
+        const calls = [];
+        const delays = [];
+        const sandbox = loadContext(doc, storage);
+        const factory = sandbox.ContactFormStateMachine;
+        const transport = factory.createContactTransport({
+            fetch: function (path, init) {
+                calls.push(init.body);
+                return Promise.reject(new Error('network'));
+            },
+            sleep: function (ms) {
+                delays.push(ms);
+                return Promise.resolve();
+            }
+        });
+        const m = factory.createContactFormMachine({document: doc, storage: storage, transmit: transport, now: clock()});
+        fill(doc, GOOD[0], GOOD[1], GOOD[2]);
+        m.onSubmit(event());
+        await settle();
+        out.networkExhausted = {
+            attempts: calls.length,
+            delays: delays,
+            state: m.getState(),
+            fields: values(doc),
+            disabled: doc.nodes['contact-submit'].disabled,
+            summary: doc.nodes['error-summary'].textContent,
+            statusBusy: doc.nodes['contact-status'].getAttribute('aria-busy'),
+            formBusy: doc.nodes['contact-form'].getAttribute('aria-busy'),
+            keyStillKept: storage.data[IKEY] !== undefined,
+            audit: m.auditRecords().map(summary)
         };
     }
 
