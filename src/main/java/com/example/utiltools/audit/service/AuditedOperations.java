@@ -286,6 +286,8 @@ public class AuditedOperations {
                     "a last-known-good fallback is non-replayable");
             case BATCH_HASH -> throw new ReplayConflictException(null,
                     "batch hashing runs asynchronously and is non-replayable");
+            case CONTACT_SUBMIT -> throw new ReplayConflictException(null,
+                    "a contact submission is queued, fenced and non-replayable");
         };
     }
 

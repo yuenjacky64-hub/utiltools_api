@@ -1,5 +1,9 @@
 package com.example.utiltools.common;
 
+import com.example.utiltools.contact.ContactIdempotencyConflictException;
+import com.example.utiltools.contact.ContactQueueFullException;
+import com.example.utiltools.contact.ContactSubmissionNotFoundException;
+import com.example.utiltools.contact.ContactTransitionConflictException;
 import com.example.utiltools.json.exception.JsonPatchRollbackException;
 import com.example.utiltools.jobs.IdempotencyConflictException;
 import com.example.utiltools.jobs.JobCancellationConflictException;
@@ -143,6 +147,42 @@ public class GlobalExceptionHandler {
         details.put("maxAttempts", ex.maxAttempts());
         ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "JOB_RETRY_CONFLICT", details);
         return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
+    }
+
+    @ExceptionHandler(ContactTransitionConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleContactTransitionConflict(
+            ContactTransitionConflictException ex) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("submissionId", ex.submissionId());
+        details.put("status", ex.status() != null ? ex.status().name() : null);
+        details.put("attempt", ex.attempt());
+        details.put("maxAttempts", ex.maxAttempts());
+        details.put("reason", ex.reason());
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "CONTACT_TRANSITION_CONFLICT", details);
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
+    }
+
+    @ExceptionHandler(ContactIdempotencyConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleContactIdempotencyConflict(
+            ContactIdempotencyConflictException ex) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("idempotencyKey", ex.idempotencyKey());
+        details.put("existingSubmissionId", ex.existingSubmissionId());
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "CONTACT_IDEMPOTENCY_CONFLICT", details);
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
+    }
+
+    @ExceptionHandler(ContactQueueFullException.class)
+    public ResponseEntity<ApiResponse<Void>> handleContactQueueFull(ContactQueueFullException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "CONTACT_QUEUE_FULL", null);
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(response);
+    }
+
+    @ExceptionHandler(ContactSubmissionNotFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleContactSubmissionNotFound(
+            ContactSubmissionNotFoundException ex) {
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "CONTACT_SUBMISSION_NOT_FOUND", null);
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(response);
     }
 
     @ExceptionHandler(Exception.class)
