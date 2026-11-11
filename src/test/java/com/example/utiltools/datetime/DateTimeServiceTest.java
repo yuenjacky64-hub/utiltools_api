@@ -9,6 +9,8 @@ import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
 import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
 import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
+import com.example.utiltools.datetime.dto.DateTimeRangeRequest;
+import com.example.utiltools.datetime.dto.DateTimeRangeResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.dto.DateTimeWeekResponse;
@@ -806,5 +808,180 @@ class DateTimeServiceTest {
         assertThatThrownBy(() -> dateTimeService.week("31/12/2024"))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("yyyy-MM-dd");
+    }
+
+    @Test
+    @DisplayName("Should generate an inclusive daily range and echo the resolved request")
+    void shouldGenerateInclusiveDailyRange() {
+        DateTimeRangeResponse response = dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2026-01-05", null, null, null));
+
+        assertThat(response.startDate()).isEqualTo("2026-01-01");
+        assertThat(response.endDate()).isEqualTo("2026-01-05");
+        assertThat(response.unit()).isEqualTo("DAYS");
+        assertThat(response.step()).isEqualTo(1);
+        assertThat(response.inclusive()).isTrue();
+        assertThat(response.count()).isEqualTo(5);
+        assertThat(response.dates()).containsExactly(
+                "2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05");
+
+        assertThat(dateTimeService.range(new DateTimeRangeRequest("2026-01-01", "2026-01-05", "  ", 2, true))
+                .dates()).containsExactly("2026-01-01", "2026-01-03", "2026-01-05");
+    }
+
+    @Test
+    @DisplayName("Should apply a weekly step and resolve the unit case-insensitively")
+    void shouldApplyWeeklyStep() {
+        DateTimeRangeResponse biweekly = dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-05", "2026-02-02", "weeks", 2, null));
+        assertThat(biweekly.unit()).isEqualTo("WEEKS");
+        assertThat(biweekly.step()).isEqualTo(2);
+        assertThat(biweekly.dates()).containsExactly("2026-01-05", "2026-01-19", "2026-02-02");
+
+        DateTimeRangeResponse weekly = dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-05", "2026-01-26", "Weeks", null, null));
+        assertThat(weekly.dates()).containsExactly(
+                "2026-01-05", "2026-01-12", "2026-01-19", "2026-01-26");
+    }
+
+    @Test
+    @DisplayName("Should clamp month-end points to the start date, not to the previous point")
+    void shouldClampMonthEndRelativeToStartDate() {
+        DateTimeRangeResponse response = dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-31", "2026-05-31", "MONTHS", 1, true));
+
+        assertThat(response.dates()).containsExactly(
+                "2026-01-31", "2026-02-28", "2026-03-31", "2026-04-30", "2026-05-31");
+    }
+
+    @Test
+    @DisplayName("Should clamp leap-day yearly points to 28 February")
+    void shouldGenerateLeapDayYearlyRange() {
+        DateTimeRangeResponse response = dateTimeService.range(
+                new DateTimeRangeRequest("2024-02-29", "2027-02-28", "years", 1, null));
+
+        assertThat(response.unit()).isEqualTo("YEARS");
+        assertThat(response.dates()).containsExactly(
+                "2024-02-29", "2025-02-28", "2026-02-28", "2027-02-28");
+    }
+
+    @Test
+    @DisplayName("Should omit the end date when inclusive is false")
+    void shouldOmitExclusiveEnd() {
+        DateTimeRangeResponse response = dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2026-01-05", "DAYS", 1, false));
+
+        assertThat(response.inclusive()).isFalse();
+        assertThat(response.dates()).containsExactly("2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04");
+    }
+
+    @Test
+    @DisplayName("Should treat startDate == endDate as a single date when inclusive and empty when exclusive")
+    void shouldHandleSingleDayRange() {
+        DateTimeRangeResponse single = dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2026-01-01", null, null, null));
+        assertThat(single.count()).isEqualTo(1);
+        assertThat(single.dates()).containsExactly("2026-01-01");
+
+        DateTimeRangeResponse empty = dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2026-01-01", null, null, false));
+        assertThat(empty.count()).isZero();
+        assertThat(empty.dates()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Should allow exactly 1000 points and reject the 1001st")
+    void shouldBoundTheRangeAtOneThousandPoints() {
+        DateTimeRangeResponse response = dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2028-09-26", "DAYS", 1, true));
+        assertThat(response.count()).isEqualTo(1000);
+        assertThat(response.dates()).hasSize(1000);
+        assertThat(response.dates().get(999)).isEqualTo("2028-09-26");
+
+        assertThatThrownBy(() -> dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2028-09-27", "DAYS", 1, true)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("at most 1000 dates");
+
+        assertThatThrownBy(() -> dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2026-01-02", "DAYS", 0, true)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("step must be between 1 and 1000");
+
+        assertThatThrownBy(() -> dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2026-01-02", "DAYS", 1001, true)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("step must be between 1 and 1000");
+    }
+
+    @Test
+    @DisplayName("Should reject a reversed range and an unsupported unit")
+    void shouldRejectReversedRangeAndUnsupportedUnit() {
+        assertThatThrownBy(() -> dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-05", "2026-01-01", null, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("startDate must not be after endDate");
+
+        assertThatThrownBy(() -> dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2026-01-05", "HOURS", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("unit must be one of DAYS, WEEKS, MONTHS, YEARS");
+
+        assertThatThrownBy(() -> dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2026-01-05", "FORTNIGHTS", null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("unit must be one of DAYS, WEEKS, MONTHS, YEARS");
+    }
+
+    @Test
+    @DisplayName("Should reject a null request, an unparseable date and calendar overflow")
+    void shouldRejectNullRequestUnparseableDateAndOverflow() {
+        assertThatThrownBy(() -> dateTimeService.range(null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("request body is required");
+
+        assertThatThrownBy(() -> dateTimeService.range(
+                new DateTimeRangeRequest(null, "2026-01-05", null, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("startDate must be a valid yyyy-MM-dd date");
+
+        assertThatThrownBy(() -> dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2026-02-30", null, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("endDate must be a valid yyyy-MM-dd date");
+
+        assertThatThrownBy(() -> dateTimeService.range(
+                new DateTimeRangeRequest("+999999999-12-31", "+999999999-12-31", "DAYS", 1, true)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("outside the supported calendar range");
+    }
+
+    @Test
+    @DisplayName("Should enumerate the 9999-12-31 calendar edge without overflowing")
+    void shouldHandleMaximumYearBoundary() {
+        // DOD-07: the last date the request pattern admits still yields its own single point, because the
+        // next stepped point (10 999-12-31) is a valid LocalDate that is simply out of range.
+        DateTimeRangeResponse upperEdge = dateTimeService.range(
+                new DateTimeRangeRequest("9999-12-31", "9999-12-31", "YEARS", 1000, true));
+
+        assertThat(upperEdge.count()).isEqualTo(1);
+        assertThat(upperEdge.dates()).containsExactly("9999-12-31");
+
+        DateTimeRangeResponse lastTwoDays = dateTimeService.range(
+                new DateTimeRangeRequest("9999-12-30", "9999-12-31", "DAYS", 1, true));
+
+        assertThat(lastTwoDays.dates()).containsExactly("9999-12-30", "9999-12-31");
+    }
+
+    @Test
+    @DisplayName("Should truncate a hostile unit name in the rejection message")
+    void shouldAbbreviateUnsupportedUnitEcho() {
+        String hostileUnit = "Z".repeat(200);
+
+        assertThatThrownBy(() -> dateTimeService.range(
+                new DateTimeRangeRequest("2026-01-01", "2026-01-05", hostileUnit, null, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("unit must be one of DAYS, WEEKS, MONTHS, YEARS: " + "Z".repeat(64))
+                .hasMessageNotContaining("Z".repeat(65));
     }
 }
