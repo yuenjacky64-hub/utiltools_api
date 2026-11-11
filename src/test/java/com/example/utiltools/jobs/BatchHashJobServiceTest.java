@@ -5243,7 +5243,7 @@ class BatchHashJobServiceTest {
     @Test
     @DisplayName("auto-failover - a stalled RUNNING job is reaped once into QUEUED attempt 2 and "
             + "completes from its checkpoint")
-    void shouldRedriveStalledJobOnceFromCheckpointWhenBudgetAllows() throws Exception {
+    void shouldAutoFailoverLapsedLeaseToQueuedAttemptTwo() throws Exception {
         AuditJournalService journal = newJournal();
         MutableJobClock clock = new MutableJobClock(LEASE_START);
         LeaseCryptoService crypto = new LeaseCryptoService("stalled");
