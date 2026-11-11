@@ -125,19 +125,31 @@ def _daemon_lock(
             "path": None,
             "probe": LOCK_PROBE_UNAVAILABLE,
             "pid_file_stale": False,
+            "pid_file_value": None,
         }
     probe = probe_lock(lock_path)
     held = probe.state == LOCK_PROBE_HELD
     # A pid file that outlives the lock is by definition not owned by a live
     # loop (markers are written under the lock and unlinked while held), so a
     # free lock plus a present pid file is the stale-owner signal (REQ-04).
-    pid_file_stale = (not held) and (markers_root / "maintainer.pid").is_file()
+    pid_file = markers_root / "maintainer.pid"
+    pid_file_stale = (not held) and pid_file.is_file()
+    # F-02: surface the stale pid value itself, not just its existence, so a
+    # reader can tell whose marker is left behind (best-effort; never raises).
+    pid_file_value: str | None = None
+    if pid_file_stale:
+        try:
+            raw = pid_file.read_text(encoding="utf-8", errors="replace").strip()
+            pid_file_value = raw or None
+        except OSError:
+            pid_file_value = None
     return {
         "state": "RUNNING" if held else "STOPPED",
         "pid": probe.owner_pid,
         "path": config.instance_lock_file,
         "probe": probe.state,
         "pid_file_stale": pid_file_stale,
+        "pid_file_value": pid_file_value,
     }
 
 
@@ -375,6 +387,12 @@ def _daemon_line(payload: Mapping[str, Any]) -> str:
     ):
         # A free lock plus a leftover pid file is the stale-owner report:
         # the daemon is stopped even though a pid number is still on disk.
+        # F-02: name the stale pid value when it is known.
+        stale_value = lock.get("pid_file_value")
+        if isinstance(stale_value, str) and stale_value:
+            return (
+                f"daemon: STOPPED (lock free; pid file stale, pid {stale_value})"
+            )
         return "daemon: STOPPED (lock free; pid file stale)"
     return (
         f"daemon: {_clean(payload.get('daemon_status'))} "
