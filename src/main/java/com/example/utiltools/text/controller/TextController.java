@@ -10,6 +10,8 @@ import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
 import com.example.utiltools.text.dto.TextTransformResponse;
+import com.example.utiltools.text.dto.TextTruncateRequest;
+import com.example.utiltools.text.dto.TextTruncateResponse;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -67,5 +69,17 @@ public class TextController {
     public ApiResponse<TextStatsResponse> stats(@Valid @RequestBody TextStatsRequest request) {
         TextStatsResponse result = auditedOperations.stats(request);
         return ApiResponse.success(result, "Text statistics computed successfully");
+    }
+
+    @PostMapping("/truncate")
+    @Operation(summary = "Truncate text to a maximum length",
+            description = "Bounds the text to at most maxLength code points. When the text is longer, the result is the "
+                    + "truncated prefix plus the ellipsis and is guaranteed never to exceed maxLength code points nor split a "
+                    + "surrogate pair. A null ellipsis defaults to '…'; an empty ellipsis uses no marker. wordBoundary=true "
+                    + "cuts at the last whitespace before the limit and trims trailing space (falling back to a hard cut when "
+                    + "no word boundary fits); wordBoundary=false (the default) hard-cuts. Every call is journalled as "
+                    + "TEXT_TRUNCATE and can be replayed.")
+    public ApiResponse<TextTruncateResponse> truncate(@Valid @RequestBody TextTruncateRequest request) {
+        return ApiResponse.success(auditedOperations.truncate(request), "Text truncated successfully");
     }
 }
