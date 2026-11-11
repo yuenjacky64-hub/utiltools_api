@@ -2135,6 +2135,23 @@ and `failedItems: []`. Partial failure does not disturb the lease: the worker re
 each item it hashes, so an intermittently failing batch keeps the lease alive across items, and a lease nobody
 renews still lapses into `EXECUTION_LEASE_EXPIRED` through the reaper exactly as before.
 
+That reaper can also **redrive** such a job instead of failing it. With
+`utiltools.jobs.max-auto-failovers=N` (`N > 0`; the default `0` disables it) an expired execution lease on a
+`RUNNING` job whose `attempt < maxAttempts`, whose `deadlineAt` has not been reached and whose status is not
+`CANCELLING` is closed as `FAILED` / `EXECUTION_LEASE_EXPIRED` in its attempt history and its audit entry, and the
+job moves to `QUEUED` at `attempt + 1` in the same reaper pass. The failover keeps the job's `checkpoint`,
+`failedItems`, `itemErrors` and `deadlineAt` - so the redriven attempt resumes at the first unprocessed index and
+the total-life bound is not extended - and it keeps the per-client quota and global-capacity reservation without a
+second increment, so no capacity is leaked or double-counted. The snapshot's additive `autoFailovers` field reports
+how many redrives succeeded; a manual `POST …/retry` neither increments nor resets it. The budget is bounded
+twice over: at most `N` auto-failovers per job and never beyond `maxAttempts`. A job that exhausts either budget
+still ends `FAILED` / `EXECUTION_LEASE_EXPIRED` with its reservation released exactly once, a deadline-expired job
+still ends `JOB_DEADLINE_EXCEEDED` without a failover, a `CANCELLING` job still terminalises `CANCELLED`, and a
+failover whose lane hand-off is refused during drain or teardown rolls back to the exact pre-reap `FAILED`
+snapshot, attempt number and error without consuming the budget. Journal accounting stays exactly-once per attempt:
+the lapsed attempt's `BATCH_HASH` entry closes `FAILED` once and is never reopened, and the failover attempt opens
+its own entry only when a worker admits it.
+
 A `RUNNING` worker may also **renew its execution lease** with
 `POST /api/v1/utils/jobs/{jobId}/heartbeat` (no request body). Each successful renewal sets
 `executionLeaseExpiresAt` to `Instant.now(clock)` plus `utiltools.jobs.execution-lease-seconds` (default `30`),
@@ -2192,6 +2209,7 @@ utiltools.jobs.max-attempts=3
 utiltools.jobs.max-active-jobs-per-client=20
 utiltools.jobs.default-deadline-seconds=0
 utiltools.jobs.max-retained-jobs=1000
+utiltools.jobs.max-auto-failovers=0
 ```
 
 | Property | Default | Meaning |
@@ -2204,6 +2222,8 @@ utiltools.jobs.max-retained-jobs=1000
 | `utiltools.jobs.default-deadline-seconds` | `0` | Server default total-life bound (seconds) applied when a request omits `deadlineSeconds`; it covers **queue wait plus execution** and, once `deadlineAt` passes, moves the job to `FAILED` with `JOB_DEADLINE_EXCEEDED` while keeping the checkpoint prefix for a retry. `0` disables the default, so a deploy that never sets it behaves exactly as before. Anything outside `0..3600` fails startup |
 | `utiltools.jobs.max-active-jobs-per-client` | `20` | Ceiling on one client's concurrent **non-terminal** jobs (`QUEUED`, `RUNNING` or `CANCELLING`), keyed by the same identity the rate limiter resolves (see [G](#g-rate-limiting-interaction-explicit-decision)); one more submission answers `429 JOB_QUOTA_EXCEEDED` with `limit` and `activeJobs` in `details`. A slot is released as each job reaches `COMPLETED`, `FAILED` or `CANCELLED` — a `DELETE` on a `RUNNING` job records the cancellation without releasing the slot, which is released once by the terminal `CANCELLED` write. Values below `1` fail startup. Set it at or above `worker-count + queue-capacity` to restore pre-quota (unbounded per client) admission |
 | `utiltools.jobs.max-retained-jobs` | `1000` | Hard cap on retained **terminal** rows (`COMPLETED`, `FAILED`, `CANCELLED`) in the in-memory registry, enforced together with `retention-seconds`: once the cap is exceeded the oldest terminal job by `completedAt` is unregistered (with its idempotency key) so a fast submit/complete churn cannot grow the registry without bound. `QUEUED`, `RUNNING` and `CANCELLING` rows are never evicted, so the registry stays at or below `max-retained-jobs + worker-count + queue-capacity` rows. Values below `1` fail startup |
+
+| `utiltools.jobs.max-auto-failovers` | `0` | Bounded automatic recovery from a lapsed execution lease: `0` keeps today's behaviour (a reaped `RUNNING` job ends `FAILED` / `EXECUTION_LEASE_EXPIRED` and needs `POST …/retry`), `N` lets the reaper redrive such a job as `attempt + 1` from its checkpoint at most `N` times per job. Negative values fail startup. Global - it is not settable per request |
 
 #### F. Fair per-client queue admission (bounded starvation)
 
