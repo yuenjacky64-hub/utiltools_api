@@ -381,34 +381,6 @@ class MaintainerConfig:
 
         return self.prioritization_aging_interval_ms / 1000.0
 
-    def resolve_instance_lock_file(
-        self, state_root: str | Path | None, repo_root: str | Path | None = None
-    ) -> Path | None:
-        """Return the absolute lock file path, or ``None`` when the lock is off.
-
-        The single place where :attr:`instance_lock_file` becomes a usable path
-        (INV-LOCK-3, REQ-01): one ``Path(...)``/``expanduser()`` conversion
-        site per call, so callers never mix raw config strings with filesystem
-        paths. Blank or ``None`` disables the lock and returns ``None``
-        without touching the filesystem. A relative value anchors to
-        ``state_root`` — the data directory the lock protects — which must
-        already be resolved; an absolute value or one with ``~`` anchors to
-        ``repo_root`` when given, else resolves against the process cwd.
-        ``state_root=None`` disables the lock unless the value is absolute or
-        a home-expanded ``~`` path (anchored to ``repo_root`` or cwd).
-        """
-
-        raw = self.instance_lock_file
-        text = "" if raw is None else str(raw).strip()
-        if not text:
-            return None
-        if state_root is not None and not os.path.isabs(text):
-            return Path(state_root).expanduser() / text
-        anchor = Path(repo_root).expanduser() if repo_root is not None else None
-        if anchor is not None:
-            return (anchor / text).expanduser()
-        return Path(text).expanduser()
-
     def validate(self) -> list[str]:
         """Return path issues for this configuration; ``[]`` when all paths are usable.
 

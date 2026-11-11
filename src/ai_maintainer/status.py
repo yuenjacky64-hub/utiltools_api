@@ -110,7 +110,7 @@ def _daemon_lock(
     markers_root = root / "data"
     try:
         config = MaintainerConfig.load(
-            config_path=config_path, maintainer_root=str(root)
+            config_path=config_path, maintainer_root=str(root), env=env
         )
     except (OSError, ValueError):
         config = MaintainerConfig()
