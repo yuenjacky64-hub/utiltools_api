@@ -718,6 +718,14 @@ _CYCLE_STATE_TRANSITIONS: frozenset[tuple[CycleState, CycleState]] = frozenset(
     }
 )
 
+#: States that are only legal *mid-cycle*.  A store restored from a
+#: mid-cycle crash therefore re-enters through IDLE (the edges above are
+#: all legal from IDLE) so the next cycle's first edge is audited instead
+#: of being a silent no-op.
+_CYCLE_IN_FLIGHT_STATES: frozenset[CycleState] = frozenset(
+    {CycleState.RUNNING, CycleState.DIAGNOSING, CycleState.RECOVERING}
+)
+
 
 def _last_persisted_cycle_state(memory: MemoryStore | None) -> CycleState:
     """The state in the newest ``__engine_cycle_state__`` run record.
@@ -1648,12 +1656,18 @@ class MaintainerEngine:
             snapshot = self._capture_snapshot(cycle=cycle, difficulty=difficulty)
             self._register_cycle(cycle, difficulty, snapshot)
             # UTILTOOLS-111 REQ-01/REQ-04: open the state machine for this
-            # cycle.  A cycle the previous forced stop parked in STOPPED
-            # re-enters through the STOPPED -> IDLE edge; the committed
-            # state captured here is the rollback target below.
+            # cycle.  A cycle the previous forced stop parked in STOPPED,
+            # or one restored in-flight by a mid-cycle crash, re-enters
+            # through the ... -> IDLE edge; the committed state captured
+            # here is the rollback target below.
             with self._cycle_state_lock:
                 committed_state = self._cycle_state
                 entering_stopped = committed_state is CycleState.STOPPED
+                # A mid-cycle crash restores RUNNING/DIAGNOSING/RECOVERING;
+                # such a start re-enters through IDLE so the first edge of
+                # the new cycle is recorded in the audit trail instead of
+                # being a silent no-op against the transition table.
+                entering_in_flight = committed_state in _CYCLE_IN_FLIGHT_STATES
             if self._stop.is_set():
                 # Stop published before the body: the forced-stop edge
                 # applies, and the body itself never runs.
@@ -1667,7 +1681,7 @@ class MaintainerEngine:
                     steps=0,
                     outcome=self._outcome_for(self.stop_reason, interrupted=True),
                 )
-            if entering_stopped:
+            if entering_stopped or entering_in_flight:
                 self._transition_cycle_state(CycleState.IDLE, cycle=cycle)
             self._transition_cycle_state(CycleState.RUNNING, cycle=cycle)
             state_moved = True

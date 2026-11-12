@@ -600,7 +600,13 @@ def test_cycle_after_shutdown_starts_cleanly(tmp_path: Path) -> None:
     assert isinstance(result, CycleResult)
     assert result.steps >= 1
     new_events = [event["event"] for event in engine.events[events_before:]]
-    assert [name for name in new_events if name != "STOP_REQUESTED"] == []
+    # A fresh cycle emits its cycle-state lifecycle events (UTILTOOLS-111);
+    # those are the restart trace itself, so tolerate them alongside
+    # STOP_REQUESTED.
+    assert [
+        name for name in new_events
+        if name not in ("STOP_REQUESTED", "CYCLE_STATE_TRANSITION")
+    ] == []
 
     report = engine.run_forever(interval_sec=0.0)
     assert poll_states[0] is EngineState.IDLE  # re-entered from IDLE
