@@ -531,9 +531,10 @@ class ContactSubmissionServiceTest {
         assertThat(repeat.currentAttempt().error())
                 .isEqualTo(ContactSubmissionService.CONTACT_SUBMISSION_CANCELLED);
         assertThat(journal.find(bEntry).orElseThrow().state()).isEqualTo(JournalState.FAILED);
-        assertThat(journal.list(10, JournalState.FAILED).stream())
+        long matchingFailed = journal.list(10, JournalState.FAILED).stream()
                 .filter(entry -> entry.id().equals(bEntry))
-                .hasSize(1);
+                .count();
+        assertThat(matchingFailed).isOne();
 
         // Release the worker: `a` delivers; the late `b` task is dequeued and fenced out.
         dispatcher.release().countDown();
@@ -542,7 +543,7 @@ class ContactSubmissionServiceTest {
         awaitCondition(pool.getQueue()::isEmpty); // `b`'s late task was consumed and dropped
         assertThat(dispatcher.calls()).containsExactly(1); // never driven for `b`
         assertThat(service.get(b.id()).status()).isEqualTo(ContactStatus.CANCELLED);
-        assertThat((Object) readField(service, "pendingAttempts")).isZero();
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(0);
         assertThat(journal.list(10, JournalState.SUCCEEDED)).hasSize(1); // only `a`
         assertThat(journal.list(10, JournalState.PENDING)).isEmpty();
     }
