@@ -7,6 +7,8 @@ import com.example.utiltools.datetime.dto.DateTimeBusinessDaysRequest;
 import com.example.utiltools.datetime.dto.DateTimeBusinessDaysResponse;
 import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
+import com.example.utiltools.datetime.dto.DateTimeCronRequest;
+import com.example.utiltools.datetime.dto.DateTimeCronResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
 import com.example.utiltools.datetime.dto.DateTimeOverlapRequest;
@@ -107,6 +109,17 @@ public class DateTimeController {
     public ApiResponse<DateTimeOverlapResponse> overlap(@Valid @RequestBody DateTimeOverlapRequest request) {
         DateTimeOverlapResponse result = auditedOperations.overlap(request);
         return ApiResponse.success(result, "DateTime overlap calculated successfully");
+    }
+
+    @PostMapping("/cron/next")
+    @Operation(summary = "Expand a cron schedule into its next occurrences",
+            description = "Returns exactly count occurrences strictly after from, computed with Spring's "
+                    + "CronExpression in the requested IANA zone. Accepts 5-field, 6-field and @macro "
+                    + "expressions; occurrences are ordered and DST-aware; count is bounded to 1..100 "
+                    + "(default 5)")
+    public ApiResponse<DateTimeCronResponse> cronNext(@Valid @RequestBody DateTimeCronRequest request) {
+        DateTimeCronResponse result = auditedOperations.cronNext(request);
+        return ApiResponse.success(result, "Cron schedule expanded successfully");
     }
 
     @GetMapping("/current")

@@ -10,6 +10,7 @@ public enum OperationType {
     DATETIME_BUSINESS_DAYS(true),
     DATETIME_RANGE(true),
     DATETIME_OVERLAP(true),
+    DATETIME_CRON_NEXT(true),
     DATETIME_CURRENT(false),
     CRYPTO_HASH(true),
     CRYPTO_BASE64(true),
