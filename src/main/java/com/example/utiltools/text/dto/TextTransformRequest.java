@@ -8,7 +8,7 @@ import jakarta.validation.constraints.Size;
  * Request body for {@code POST /api/v1/utils/text/transform}.
  *
  * @param text      the text to transform; must be non-blank and at most 1000000 characters
- * @param operation one of {@code UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE};
+ * @param operation one of {@code UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE};
  *                  matched case-insensitively, surrounding whitespace is not accepted
  */
 public record TextTransformRequest(
@@ -17,7 +17,7 @@ public record TextTransformRequest(
         String text,
 
         @NotBlank(message = "operation is required")
-        @Pattern(regexp = "(?i)\\b(UPPER|LOWER|TITLE|CAMEL|SNAKE|KEBAB|SLUG|SENTENCE_CASE)\\b",
-                message = "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE")
+        @Pattern(regexp = "(?i)\\b(UPPER|LOWER|TITLE|CAMEL|SNAKE|KEBAB|SLUG|SENTENCE_CASE|REVERSE)\\b",
+                message = "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE")
         String operation
 ) {}
