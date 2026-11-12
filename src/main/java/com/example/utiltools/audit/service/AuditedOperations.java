@@ -61,6 +61,8 @@ import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.service.JsonService;
 import com.example.utiltools.text.dto.TextHtmlEntitiesRequest;
 import com.example.utiltools.text.dto.TextHtmlEntitiesResponse;
+import com.example.utiltools.text.dto.TextNormalizeRequest;
+import com.example.utiltools.text.dto.TextNormalizeResponse;
 import com.example.utiltools.text.dto.TextReplaceRequest;
 import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
@@ -246,6 +248,10 @@ public class AuditedOperations {
         return record(OperationType.TEXT_STATS, request, () -> textService.stats(request));
     }
 
+    public TextNormalizeResponse normalize(TextNormalizeRequest request) {
+        return record(OperationType.TEXT_NORMALIZE, request, () -> textService.normalize(request));
+    }
+
     public TextReplaceResponse replace(TextReplaceRequest request) {
         return record(OperationType.TEXT_REPLACE, request, () -> textService.replace(request));
     }
@@ -300,6 +306,7 @@ public class AuditedOperations {
             case TEXT_TRANSFORM -> textService.transform((TextTransformRequest) request);
             case TEXT_STATS -> textService.stats((TextStatsRequest) request);
             case TEXT_REPLACE -> textService.replace((TextReplaceRequest) request);
+            case TEXT_NORMALIZE -> textService.normalize((TextNormalizeRequest) request);
             case TEXT_HTML_ENTITIES -> textService.htmlEntities((TextHtmlEntitiesRequest) request);
             case TEXT_TRUNCATE -> textService.truncate((TextTruncateRequest) request);
             case TEXT_WORD_FREQUENCY -> textService.wordFrequency((TextWordFrequencyRequest) request);
