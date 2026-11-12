@@ -18,6 +18,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -479,6 +480,156 @@ class ContactSubmissionServiceTest {
         assertThat(journal.list(10, JournalState.SUCCEEDED)).hasSize(1);
         assertThat(journal.list(10, JournalState.FAILED)).hasSize(1);
         assertThat(journal.list(10, JournalState.PENDING)).isEmpty();
+    }
+
+    /**
+     * REQ-01/REQ-02/REQ-03 (DOD-01/03): a queued attempt is cancelled before its worker enters
+     * the dispatcher; the repeat cancel is idempotent with exactly-once journal closure; the
+     * late worker that later dequeues the task is fenced out and never touches the dispatcher
+     * or the counters.
+     */
+    @Test
+    @DisplayName("DOD-01/03: pre-dispatch cancel terminalizes CANCELLED, closes the journal once, and fences the late worker")
+    void preDispatchCancelFencesLateWorker() throws Exception {
+        AuditJournalService journal =
+                new AuditJournalService(new ObjectMapper(), 5_000, 10_000_000, 60L);
+        startService(2);
+        service.setAuditJournal(journal);
+        dispatcher.holdGenerations.add(1); // the lone worker holds generation 1
+        ContactSubmissionResponse a = service.submit(request(null, "worker holder"));
+        pollUntil(a.id(), ContactStatus.DISPATCHING);
+        awaitCondition(() -> dispatcher.calls().size() >= 1);
+
+        // `b` is admitted while the worker is held: it sits in the executor queue, stamped
+        // DISPATCHING at reservation but not yet inside the dispatcher (fence not passed).
+        ContactSubmissionResponse b = service.submit(request(null, "withdraw me"));
+        pollUntil(b.id(), ContactStatus.DISPATCHING);
+        String bEntry = service.get(b.id()).currentAttempt().auditEntryId();
+        assertThat(bEntry).isNotBlank();
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(2);
+
+        // The cancellation wins the fence race: terminal CANCELLED, code stamped, schedule
+        // cleared, and the pending slot released exactly once (2 -> 1).
+        ContactSubmissionResponse cancelled = service.cancel(b.id());
+        assertThat(cancelled.status()).isEqualTo(ContactStatus.CANCELLED);
+        assertThat(cancelled.currentAttempt().error())
+                .isEqualTo(ContactSubmissionService.CONTACT_SUBMISSION_CANCELLED);
+        assertThat(cancelled.currentAttempt().nextRetryAt()).isNull();
+        assertThat(cancelled.currentAttempt().completedAt()).isEqualTo(clock.instant());
+        assertThat(cancelled.message()).isEqualTo("withdraw me");
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(1);
+        AuditEntry closed = journal.find(bEntry).orElseThrow();
+        assertThat(closed.state()).isEqualTo(JournalState.FAILED);
+        assertThat(closed.errorCode())
+                .isEqualTo(ContactSubmissionService.CONTACT_SUBMISSION_CANCELLED);
+        assertThat(service.get(b.id()).currentAttempt().auditEntryId()).isNull();
+
+        // Repeat cancel: idempotent 200 with the same snapshot and zero further writes —
+        // exactly one journal entry exists for `b`, still in its closed state.
+        ContactSubmissionResponse repeat = service.cancel(b.id());
+        assertThat(repeat.status()).isEqualTo(ContactStatus.CANCELLED);
+        assertThat(repeat.currentAttempt().error())
+                .isEqualTo(ContactSubmissionService.CONTACT_SUBMISSION_CANCELLED);
+        assertThat(journal.find(bEntry).orElseThrow().state()).isEqualTo(JournalState.FAILED);
+        assertThat(journal.list(10, JournalState.FAILED).stream())
+                .filter(entry -> entry.id().equals(bEntry))
+                .hasSize(1);
+
+        // Release the worker: `a` delivers; the late `b` task is dequeued and fenced out.
+        dispatcher.release().countDown();
+        pollUntil(a.id(), ContactStatus.DELIVERED);
+        ThreadPoolExecutor pool = readField(service, "executor");
+        awaitCondition(pool.getQueue()::isEmpty); // `b`'s late task was consumed and dropped
+        assertThat(dispatcher.calls()).containsExactly(1); // never driven for `b`
+        assertThat(service.get(b.id()).status()).isEqualTo(ContactStatus.CANCELLED);
+        assertThat((Object) readField(service, "pendingAttempts")).isZero();
+        assertThat(journal.list(10, JournalState.SUCCEEDED)).hasSize(1); // only `a`
+        assertThat(journal.list(10, JournalState.PENDING)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("DOD-02: cancelling while the dispatcher is running is 409 and the attempt still terminalizes normally")
+    void inFlightCancelRefusedAndDispatchCompletes() throws Exception {
+        AuditJournalService journal =
+                new AuditJournalService(new ObjectMapper(), 5_000, 10_000_000, 60L);
+        startService(2);
+        service.setAuditJournal(journal);
+        dispatcher.holdGenerations.add(1);
+        ContactSubmissionResponse submitted = service.submit(request(null, "in flight"));
+        pollUntil(submitted.id(), ContactStatus.DISPATCHING);
+        // The dispatcher call itself is the proof the worker passed the execution-start
+        // fence: from this point cancellation must be refused, not re-queued.
+        awaitCondition(() -> dispatcher.calls().size() >= 1);
+        String entry = service.get(submitted.id()).currentAttempt().auditEntryId();
+        assertThat(journal.find(entry).orElseThrow().state()).isEqualTo(JournalState.PENDING);
+
+        assertThatThrownBy(() -> service.cancel(submitted.id()))
+                .isInstanceOf(ContactTransitionConflictException.class)
+                .satisfies(ex -> {
+                    ContactTransitionConflictException conflict =
+                            (ContactTransitionConflictException) ex;
+                    assertThat(conflict.submissionId()).isEqualTo(submitted.id());
+                    assertThat(conflict.status()).isEqualTo(ContactStatus.DISPATCHING);
+                    assertThat(conflict.reason()).contains("in flight");
+                });
+
+        // The refusal left the row, its counters, and its journal byte-identical.
+        ContactSubmissionResponse intact = service.get(submitted.id());
+        assertThat(intact.status()).isEqualTo(ContactStatus.DISPATCHING);
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(1);
+        assertThat(journal.find(entry).orElseThrow().state()).isEqualTo(JournalState.PENDING);
+
+        // When the dispatcher returns, the attempt still terminalizes normally.
+        dispatcher.release().countDown();
+        ContactSubmissionResponse delivered = pollUntil(submitted.id(), ContactStatus.DELIVERED);
+        assertThat(delivered.currentAttempt().error()).isNull();
+        assertThat(journal.find(entry).orElseThrow().state()).isEqualTo(JournalState.SUCCEEDED);
+    }
+
+    @Test
+    @DisplayName("DOD-04: DELIVERED and FAILED submissions refuse cancellation, row byte-identical")
+    void terminalStatesRefuseCancel() {
+        startService(1);
+        ContactSubmissionResponse delivered = pollUntil(
+                service.submit(request(null, "done")).id(), ContactStatus.DELIVERED);
+        Instant deliveredAt = delivered.currentAttempt().completedAt();
+        assertThatThrownBy(() -> service.cancel(delivered.id()))
+                .isInstanceOf(ContactTransitionConflictException.class)
+                .satisfies(ex -> {
+                    ContactTransitionConflictException conflict =
+                            (ContactTransitionConflictException) ex;
+                    assertThat(conflict.status()).isEqualTo(ContactStatus.DELIVERED);
+                    assertThat(conflict.reason()).contains("terminal");
+                });
+        assertThat(service.get(delivered.id())).isEqualTo(delivered);
+        assertThat(service.get(delivered.id()).currentAttempt().completedAt()).isEqualTo(deliveredAt);
+        assertThat(service.get(delivered.id()).currentAttempt().error()).isNull();
+
+        dispatcher.failGenerations.add(1);
+        ContactSubmissionResponse failed = pollUntil(
+                service.submit(request(null, "doomed")).id(), ContactStatus.FAILED);
+        String failedError = failed.currentAttempt().error();
+        Instant failedAt = failed.currentAttempt().completedAt();
+        assertThatThrownBy(() -> service.cancel(failed.id()))
+                .isInstanceOf(ContactTransitionConflictException.class)
+                .satisfies(ex -> {
+                    ContactTransitionConflictException conflict =
+                            (ContactTransitionConflictException) ex;
+                    assertThat(conflict.status()).isEqualTo(ContactStatus.FAILED);
+                    assertThat(conflict.reason()).contains("terminal");
+                });
+        ContactSubmissionResponse unchanged = service.get(failed.id());
+        assertThat(unchanged.status()).isEqualTo(ContactStatus.FAILED);
+        assertThat(unchanged.currentAttempt().error()).isEqualTo(failedError);
+        assertThat(unchanged.currentAttempt().completedAt()).isEqualTo(failedAt);
+    }
+
+    @Test
+    @DisplayName("REQ-02: cancelling an unknown id answers CONTACT_SUBMISSION_NOT_FOUND")
+    void cancelUnknownIdNotFound() {
+        startService(1);
+        assertThatThrownBy(() -> service.cancel("never-submitted"))
+                .isInstanceOf(ContactSubmissionNotFoundException.class);
     }
 
     /** Per-generation dispatcher behaviour: hold, fail, or complete; counts every call. */

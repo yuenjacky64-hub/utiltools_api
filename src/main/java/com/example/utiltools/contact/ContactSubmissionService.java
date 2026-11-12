@@ -379,6 +379,50 @@ public class ContactSubmissionService {
     }
 
     /**
+     * Pre-dispatch withdrawal (REQ-01 / REQ-02): terminalizes a {@code QUEUED} or a
+     * {@code DISPATCHING} submission whose worker has not yet entered the dispatcher (the
+     * {@code dispatchStarted} fence, REQ-03) to {@code CANCELLED} with
+     * {@code CONTACT_SUBMISSION_CANCELLED}, clears {@code nextRetryAt}, releases
+     * {@code pendingAttempts} exactly once, and closes the attempt's journal entry exactly
+     * once — all in a single {@code registryLock} critical section so cancellation and the
+     * worker's fence write race to exactly one winner. A repeat cancellation of an already
+     * {@code CANCELLED} row is idempotent (no journal or counter write, INV-C-04); an in-flight
+     * dispatch ({@code dispatchStarted} set) or a {@code DELIVERED}/{@code FAILED} row answers
+     * {@link ContactTransitionConflictException} and leaves the row, its counters, and its
+     * journal byte-identical (INV-C-05). An unknown id answers 404 via
+     * {@link ContactSubmissionNotFoundException}.
+     *
+     * @param submissionId the submission id
+     * @return the terminal {@code CANCELLED} snapshot (or the existing {@code CANCELLED}
+     *         snapshot on repeat cancellation)
+     */
+    public ContactSubmissionResponse cancel(String submissionId) {
+        synchronized (registryLock) {
+            MutableSubmission submission = requireSubmissionLocked(submissionId);
+            switch (submission.status) {
+                case CANCELLED:
+                    return snapshot(submission); // idempotent repeat cancel: zero writes
+                case QUEUED, DISPATCHING:
+                    if (submission.status == ContactStatus.DISPATCHING && submission.dispatchStarted) {
+                        // The in-flight dispatch won the fence race; its completion still
+                        // terminalizes DELIVERED / FAILED normally (INV-C-05).
+                        throw new ContactTransitionConflictException(submission.submissionId,
+                                submission.status, submission.attempt, submission.maxAttempts,
+                                "dispatch in flight: cancellation refused");
+                    }
+                    terminalizeLocked(submission, ContactStatus.CANCELLED,
+                            CONTACT_SUBMISSION_CANCELLED, Instant.now(clock));
+                    return snapshot(submission);
+                case DELIVERED, FAILED:
+                    throw new ContactTransitionConflictException(submission.submissionId,
+                            submission.status, submission.attempt, submission.maxAttempts,
+                            "terminal state: cancellation refused");
+            }
+            throw new IllegalStateException("unreachable: all contact statuses handled");
+        }
+    }
+
+    /**
      * Terminalizes attempts whose execution lease has lapsed (REQ-06): a stale {@code DISPATCHING}
      * attempt moves to {@code FAILED} with {@code CONTACT_DELIVERY_LEASE_EXPIRED}, its journal
      * entry is closed exactly once, and its pending counter is released so the admission gate
@@ -487,7 +531,12 @@ public class ContactSubmissionService {
                 switch (submission.status) {
                     case QUEUED -> terminalizeLocked(submission, ContactStatus.CANCELLED,
                             CONTACT_SUBMISSION_CANCELLED, Instant.now(clock));
-                    case DISPATCHING -> terminalizeLocked(submission, ContactStatus.FAILED,
+                    // §5 guard: an in-flight dispatch (fence passed) still failed to deliver,
+                    // so it terminalizes FAILED; a DISPATCHING row whose worker never entered
+                    // the dispatcher is drained like a queued one (CANCELLED).
+                    case DISPATCHING -> terminalizeLocked(submission,
+                            submission.dispatchStarted ? ContactStatus.FAILED
+                                    : ContactStatus.CANCELLED,
                             CONTACT_SUBMISSION_CANCELLED, Instant.now(clock));
                     default -> { } // terminal: nothing to drain
                 }
@@ -655,6 +704,7 @@ public class ContactSubmissionService {
     private void admitAttemptLocked(MutableSubmission submission, int generation) {
         Instant now = Instant.now(clock);
         submission.status = ContactStatus.DISPATCHING;
+        submission.dispatchStarted = false; // new generation: the fence is reset with it
         submission.startedAt = now;
         submission.lastHeartbeatAt = now;
         submission.executionLeaseExpiresAt = now.plusSeconds(executionLeaseSeconds);
@@ -675,8 +725,12 @@ public class ContactSubmissionService {
             MutableSubmission submission = submissions.get(submissionId);
             if (submission == null || submission.attempt != generation
                     || submission.status != ContactStatus.DISPATCHING) {
-                return; // fenced out: evicted, reaped, or superseded — a late task is a no-op
+                return; // fenced out: evicted, reaped, superseded, or cancelled — a late
+                        // task is a no-op and never touches the dispatcher or the counters
             }
+            // REQ-03 fence write: under registryLock, immediately before the dispatcher call,
+            // so cancel and worker start race to exactly one winner (INV-C-01).
+            submission.dispatchStarted = true;
         }
         boolean success;
         String boundedError;
@@ -910,6 +964,12 @@ public class ContactSubmissionService {
         final long admissionOrder;
         final int maxAttempts;
         final Map<Integer, String> auditEntryIds = new HashMap<>();
+        // Per-attempt execution-start fence (REQ-03): read and written only under
+        // registryLock — set by the worker immediately before ContactDispatcher.dispatch
+        // and checked by cancel, so cancellation and worker start race to exactly one
+        // winner (INV-C-01); a fenced loser returns without dispatch and without a
+        // pendingAttempts write (INV-C-02/03).
+        boolean dispatchStarted;
 
         ContactStatus status = ContactStatus.QUEUED;
         int attempt = 1;

@@ -17,6 +17,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -203,5 +204,44 @@ class ContactControllerTest {
         mockMvc.perform(post(BASE + "/{id}/retry", "sub-1"))
                 .andExpect(status().isTooManyRequests())
                 .andExpect(jsonPath("$.error").value("CONTACT_QUEUE_FULL"));
+    }
+
+    @Test
+    @DisplayName("DELETE {id} returns 200 with the CANCELLED snapshot (or the idempotent repeat)")
+    void shouldReturn200ForCancelSnapshot() throws Exception {
+        when(service.cancel("sub-1")).thenReturn(
+                snapshot("sub-1", ContactStatus.CANCELLED, 1, Instant.now()));
+
+        mockMvc.perform(delete(BASE + "/{id}", "sub-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.id").value("sub-1"))
+                .andExpect(jsonPath("$.data.status").value("CANCELLED"));
+    }
+
+    @Test
+    @DisplayName("DELETE {id} answers 404 CONTACT_SUBMISSION_NOT_FOUND for an unknown id")
+    void shouldReturn404ForUnknownCancel() throws Exception {
+        when(service.cancel("unknown")).thenThrow(new ContactSubmissionNotFoundException("unknown"));
+
+        mockMvc.perform(delete(BASE + "/{id}", "unknown"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("CONTACT_SUBMISSION_NOT_FOUND"));
+    }
+
+    @Test
+    @DisplayName("DELETE {id} answers 409 CONTACT_TRANSITION_CONFLICT when the dispatch is in flight")
+    void shouldReturn409ForInFlightCancel() throws Exception {
+        when(service.cancel("sub-1")).thenThrow(new ContactTransitionConflictException("sub-1",
+                ContactStatus.DISPATCHING, 1, 3, "dispatch in flight: cancellation refused"));
+
+        mockMvc.perform(delete(BASE + "/{id}", "sub-1"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("CONTACT_TRANSITION_CONFLICT"))
+                .andExpect(jsonPath("$.details.submissionId").value("sub-1"))
+                .andExpect(jsonPath("$.details.status").value("DISPATCHING"))
+                .andExpect(jsonPath("$.details.attempt").value(1));
     }
 }
