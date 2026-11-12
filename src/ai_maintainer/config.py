@@ -477,7 +477,7 @@ class MaintainerConfig:
             issues.append("opencode_timeout_sec must be <= 3600")
         # UTILTOOLS-112: appended last so path-only and opencode-only results keep
         # their exact ordering; at most one message is emitted.
-        email = (self.email or "").strip()
+        email = "" if self.email is None else str(self.email).strip()
         if email and not EMAIL_PATTERN.match(email):
             issues.append(f"email: invalid format: {email}")
         return issues

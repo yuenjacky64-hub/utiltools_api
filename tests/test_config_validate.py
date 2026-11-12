@@ -254,6 +254,20 @@ def test_validate_accepts_well_formed_email_and_default(tmp_path: Path) -> None:
     assert MaintainerConfig(**kwargs).validate() == []
 
 
+def test_validate_non_str_email_is_reported_not_raised(tmp_path: Path) -> None:
+    """MUST-1: a hostile non-str email (untouched by _coerce_mapping) stays total."""
+
+    kwargs = _all_valid_kwargs(tmp_path)
+    for value in (42, [1, 2], None):
+        issues = MaintainerConfig(**kwargs, email=value).validate()
+        assert isinstance(issues, list)
+        assert all(isinstance(item, str) for item in issues)
+    assert MaintainerConfig(**kwargs, email=42).validate() == [
+        "email: invalid format: 42"
+    ]
+    assert MaintainerConfig(**kwargs, email=None).validate() == []
+
+
 def test_validate_docstring_documents_email_rule() -> None:
     """DOD-03: the docstring message list stays in lockstep with the emitted issue."""
 
