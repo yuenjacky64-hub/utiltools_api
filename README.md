@@ -47,7 +47,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, interval overlap detection, current global time |
 | **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 / UUID v8 generation (`version=V4|V7|V8`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit, and NDJSON / JSON Lines conversion (array <-> line-delimited records) |
-| **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`, `REVERSE`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
+| **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`, `REVERSE`), Unicode normalization (`NFC`, `NFD`, `NFKC`, `NFKD`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
 
 ---
 
@@ -165,6 +165,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/diff` | Compare two JSON documents and report `added`, `removed` and `changed` paths (with old/new values and a pinned `summary`) at any nesting level, journalled as `JSON_DIFF` |
 | `POST` | `/api/v1/utils/json/pointer` | Resolve one RFC 6901 JSON Pointer (`/a/b/0`, `~1` = `/`, `~0` = `~`, `""` = whole document) and report the addressed node with its `valueType`, journalled as `JSON_POINTER` |
 | `POST` | `/api/v1/utils/text/transform` | Apply a deterministic case/format operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`, `REVERSE`) to a string |
+| `POST` | `/api/v1/utils/text/normalize` | Compose or decompose Unicode text with `java.text.Normalizer` in form `NFC`, `NFD`, `NFKC` or `NFKD` (matched case-insensitively), echoing the form, the result, `changed` and the code-point `length`; a result that would exceed the 1,000,000-character bound is rejected with `400 BAD_REQUEST`; journalled as `TEXT_NORMALIZE` |
 | `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
 | `POST` | `/api/v1/utils/text/replace` | Replace every (or, with `all=false`, the first) occurrence of a literal or regex `pattern`, reporting `replacements`, `changed` and code-point `length` |
 | `POST` | `/api/v1/utils/text/html-entities` | `ENCODE` a string for safe HTML embedding (`&`, `<`, `>`, `"`, `'`) or `DECODE` the five named entities plus decimal/hex numeric references, reporting `changed` and code-point `length` |
@@ -1797,6 +1798,45 @@ curl -X POST http://localhost:8080/api/v1/utils/text/transform \
 `length` is the **Unicode code-point count of `result`** (an emoji counts once), and `changed` is
 `true` when `result` differs from the supplied `text`.
 
+#### Normalize
+
+Unicode normalization (composition / decomposition / compatibility conversion) via
+`java.text.Normalizer`, in one of the four forms `NFC`, `NFD`, `NFKC` or `NFKD`. `form` is matched
+case-insensitively, echoed back upper-case; `changed` is `true` when the result differs from the
+supplied `text` and `length` is the code-point count of the result. A normalized result that would
+exceed the 1,000,000-character bound (decomposition can expand the text) is rejected with `400`
+`BAD_REQUEST`, message `normalized result exceeds 1000000 characters`. Blank `text`, an unknown
+form and a whitespace-padded form answer `400 VALIDATION_ERROR`. Every call is journalled as
+`TEXT_NORMALIZE` and can be replayed.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/text/normalize \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "\uFB01le caf\u00E9", "form": "nfkc"}'
+```
+
+```json
+{
+  "success": true,
+  "message": "Text normalized successfully",
+  "data": {
+    "form": "NFKC",
+    "result": "file caf\u00E9",
+    "changed": true,
+    "length": 9
+  },
+  "timestamp": "2026-01-01T00:00:00Z",
+  "requestId": "b1f0c4d2-6d4f-4a1f-8b2c-2f0f3a9d1e77"
+}
+```
+
+| Form | Effect | Example |
+| :--- | :--- | :--- |
+| `NFC` | canonical composition: base letter + combining marks → single precomposed code point | `e\u0301` → `é` (1 code point) |
+| `NFD` | canonical decomposition: precomposed characters → base + combining marks | `é` → `e\u0301` (2 code points) |
+| `NFKC` | compatibility composition: ligatures, full-width and other compatibility characters → canonical form | `\uFB01le` → `file` |
+| `NFKD` | compatibility decomposition: compatibility characters decomposed (and precomposed characters decomposed) | `ＡＢ` (full-width) → `AB` |
+
 #### Statistics
 
 ```bash
@@ -2017,7 +2057,7 @@ appears in `ignoreWords` (after the same case folding) is dropped before countin
 #### Journal & replay
 
 All four endpoints call `AuditedOperations`, so every call is recorded as `TEXT_TRANSFORM`,
-`TEXT_STATS`, `TEXT_REPLACE` or `TEXT_HTML_ENTITIES` in `GET /api/v1/utils/audit/entries`, with the request (redacted like every other
+`TEXT_NORMALIZE`, `TEXT_STATS`, `TEXT_REPLACE` or `TEXT_HTML_ENTITIES` in `GET /api/v1/utils/audit/entries`, with the request (redacted like every other
 operation) and the response. A replace that compiles and reaches `TextService` but then fails — invalid regex,
 an out-of-range `$n` group reference, or the output bound — is recorded as `TEXT_REPLACE` with `state = FAILED`
 and `errorCode = BAD_REQUEST`. A *bean-validation* rejection (blank `text`/`pattern`, absent `replacement`,

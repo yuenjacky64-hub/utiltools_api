@@ -2,6 +2,8 @@ package com.example.utiltools.text;
 
 import com.example.utiltools.text.dto.TextHtmlEntitiesRequest;
 import com.example.utiltools.text.dto.TextHtmlEntitiesResponse;
+import com.example.utiltools.text.dto.TextNormalizeRequest;
+import com.example.utiltools.text.dto.TextNormalizeResponse;
 import com.example.utiltools.text.dto.TextReplaceRequest;
 import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
@@ -78,6 +80,96 @@ class TextServiceTest {
         // combining marks never leave empty or doubled hyphens behind
         assertThat(service.transform(new TextTransformRequest("  Ünïcode — Tèst  ", "SLUG")).result())
                 .isEqualTo("unicode-test");
+    }
+
+    @Test
+    @DisplayName("NFC composes a base letter plus combining mark into the precomposed character")
+    void shouldComposeCombiningCharacterUnderNFC() {
+        // "e" + U+0301 combining acute accent -> single code point é (U+00E9)
+        TextNormalizeResponse response = service.normalize(new TextNormalizeRequest("e\u0301", "NFC"));
+
+        assertThat(response).isEqualTo(new TextNormalizeResponse("NFC", "\u00e9", true, 1));
+    }
+
+    @Test
+    @DisplayName("NFD decomposes a precomposed character into base letter plus combining mark")
+    void shouldDecomposePrecomposedCharacterUnderNFD() {
+        TextNormalizeResponse response = service.normalize(new TextNormalizeRequest("\u00e9", "NFD"));
+
+        assertThat(response).isEqualTo(new TextNormalizeResponse("NFD", "e\u0301", true, 2));
+    }
+
+    @Test
+    @DisplayName("NFKC converts compatibility characters and ligatures to canonical form")
+    void shouldConvertLigatureUnderNFKC() {
+        // "ﬁle" (U+FB01 ligature) -> "file"
+        TextNormalizeResponse response = service.normalize(new TextNormalizeRequest("\ufb01le", "NFKC"));
+
+        assertThat(response).isEqualTo(new TextNormalizeResponse("NFKC", "file", true, 4));
+    }
+
+    @Test
+    @DisplayName("NFKD decomposes full-width compatibility characters to ASCII code points")
+    void shouldDecomposeFullWidthCharactersUnderNFKD() {
+        // full-width "AB" (U+FF21 U+FF22) -> "AB"
+        TextNormalizeResponse response = service.normalize(new TextNormalizeRequest("\uff21\uff22", "NFKD"));
+
+        assertThat(response).isEqualTo(new TextNormalizeResponse("NFKD", "AB", true, 2));
+    }
+
+    @Test
+    @DisplayName("the form is echoed upper-cased and already-normalized text reports changed=false")
+    void shouldEchoFormUpperCasedAndReportNoChange() {
+        assertThat(service.normalize(new TextNormalizeRequest("AB", "nfc")))
+                .isEqualTo(new TextNormalizeResponse("NFC", "AB", false, 2));
+        assertThat(service.normalize(new TextNormalizeRequest("plain text", "NFC")))
+                .isEqualTo(new TextNormalizeResponse("NFC", "plain text", false, 10));
+    }
+
+    @Test
+    @DisplayName("an unknown form fails at the service layer and echoes only the form value")
+    void shouldRejectUnknownForm() {
+        assertThatThrownBy(() -> service.normalize(new TextNormalizeRequest("secret body", "shout")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Unsupported form 'shout'. Allowed values: NFC, NFD, NFKC, NFKD")
+                .hasMessageNotContaining("secret body");
+    }
+
+    @Test
+    @DisplayName("a decomposed result that would exceed the result bound is rejected")
+    void shouldRejectOversizedDecomposedResult() {
+        // Each U+AC02 (Hangul syllable git) decomposes under NFD to three
+        // jamo code points, so 333_334 of them expand past the 1_000_000-character bound.
+        String text = "\uac02".repeat(333_334);
+
+        assertThatThrownBy(() -> service.normalize(new TextNormalizeRequest(text, "NFD")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("normalized result exceeds 1000000 characters");
+    }
+
+    @Test
+    @DisplayName("blank text and an unknown form are rejected by the request contract")
+    void shouldRejectBlankTextAndUnknownForm() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+
+            Set<ConstraintViolation<TextNormalizeRequest>> textViolations =
+                    validator.validate(new TextNormalizeRequest("   ", "NFC"));
+            assertThat(textViolations).hasSize(1);
+            assertThat(textViolations).extracting(ConstraintViolation::getMessage)
+                    .contains("text is required");
+
+            Set<ConstraintViolation<TextNormalizeRequest>> formViolations =
+                    validator.validate(new TextNormalizeRequest("Hello", " "));
+            assertThat(formViolations).extracting(ConstraintViolation::getMessage)
+                    .containsExactlyInAnyOrder("form is required",
+                            "Supported forms: NFC, NFD, NFKC, NFKD");
+
+            Set<ConstraintViolation<TextNormalizeRequest>> unknownFormViolations =
+                    validator.validate(new TextNormalizeRequest("Hello", "NFE"));
+            assertThat(unknownFormViolations).extracting(ConstraintViolation::getMessage)
+                    .containsExactly("Supported forms: NFC, NFD, NFKC, NFKD");
+        }
     }
 
     @Test

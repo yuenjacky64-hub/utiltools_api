@@ -36,6 +36,7 @@ public enum OperationType {
     TEXT_TRANSFORM(true),
     TEXT_STATS(true),
     TEXT_REPLACE(true),
+    TEXT_NORMALIZE(true),
     TEXT_HTML_ENTITIES(true),
     TEXT_TRUNCATE(true),
     TEXT_WORD_FREQUENCY(true),

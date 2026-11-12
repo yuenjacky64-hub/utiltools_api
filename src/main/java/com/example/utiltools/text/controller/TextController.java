@@ -6,6 +6,8 @@ import com.example.utiltools.text.dto.TextHtmlEntitiesRequest;
 import com.example.utiltools.text.dto.TextHtmlEntitiesResponse;
 import com.example.utiltools.text.dto.TextReplaceRequest;
 import com.example.utiltools.text.dto.TextReplaceResponse;
+import com.example.utiltools.text.dto.TextNormalizeRequest;
+import com.example.utiltools.text.dto.TextNormalizeResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
@@ -41,6 +43,18 @@ public class TextController {
     public ApiResponse<TextTransformResponse> transform(@Valid @RequestBody TextTransformRequest request) {
         TextTransformResponse result = auditedOperations.transform(request);
         return ApiResponse.success(result, "Text transformed successfully");
+    }
+
+    @PostMapping("/normalize")
+    @Operation(summary = "Normalize Unicode text (NFC, NFD, NFKC, NFKD)",
+            description = "Applies java.text.Normalizer to the supplied text using the requested normalization form "
+                    + "(matched case-insensitively). The response echoes the form upper-cased plus the result, whether it "
+                    + "changed, and the code-point length of the result. A normalized result that would exceed the "
+                    + "1000000-character bound is rejected with 400 BAD_REQUEST. Every call is journalled as "
+                    + "TEXT_NORMALIZE and can be replayed.")
+    public ApiResponse<TextNormalizeResponse> normalize(@Valid @RequestBody TextNormalizeRequest request) {
+        TextNormalizeResponse result = auditedOperations.normalize(request);
+        return ApiResponse.success(result, "Text normalized successfully");
     }
 
     @PostMapping("/replace")
