@@ -43,7 +43,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 
 | Tool | Base Path | Core Capabilities |
 | :--- | :--- | :--- |
-| **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, current global time |
+| **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, interval overlap detection, current global time |
 | **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 / UUID v8 generation (`version=V4|V7|V8`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit, and NDJSON / JSON Lines conversion (array <-> line-delimited records) |
 | **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`, `REVERSE`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
@@ -143,6 +143,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/datetime/duration` | Parse an ISO-8601 duration into components and total seconds, or format signed seconds/nanos back to canonical ISO-8601 text |
 | `POST` | `/api/v1/utils/datetime/business-days` | Add or subtract a signed number of business days in a target IANA timezone, skipping weekends and an optional ISO `yyyy-MM-dd` holiday list (DST wall-clock preserving) |
 | `POST` | `/api/v1/utils/datetime/range` | Enumerate a bounded, ordered list of `yyyy-MM-dd` dates between two dates with a `DAYS`/`WEEKS`/`MONTHS`/`YEARS` unit, positive `step` (1–1000) and inclusive/exclusive end (max 1000 points) |
+| `POST` | `/api/v1/utils/datetime/overlap` | Report whether two half-open intervals `[startA, endA)` and `[startB, endB)` overlap and by how much: `overlap`, UTC `overlapStart`/`overlapEnd` (null when disjoint) and `overlapMillis` (0 when disjoint); bounds use the same auto-detect grammar as `diff` |
 | `GET` | `/api/v1/utils/datetime/current` | Fetch current time in UTC and target timezone |
 | `GET` | `/api/v1/utils/datetime/timezones` | List IANA timezones with current UTC offsets, optionally filtered by `prefix` |
 | `GET` | `/api/v1/utils/datetime/week-date` | Resolve an ISO week (`year`, `week`, optional `day` = MONDAY..SUNDAY case-insensitive or 1..7, default MONDAY) back to its calendar date via `WeekFields.ISO`; rejects weeks that do not exist in that ISO week-year (e.g. 2021-W53). Read-only: not journalled |
@@ -584,6 +585,46 @@ Only stepped points are ever emitted, so `endDate` is never appended: `startDate
 point that lands exactly on `endDate` is kept when `inclusive=true` and dropped when `inclusive=false`, so
 `startDate == endDate` yields a single point (inclusive) or an empty list (exclusive). A reversed range, an
 unparseable date, or a `step` outside `1`–`1000` returns HTTP 400.
+
+#### H. Detect Overlap Between Two Datetime Intervals
+Given two intervals `[startA, endA)` and `[startB, endB)`, `POST /api/v1/utils/datetime/overlap`
+reports whether the half-open intersection is non-empty and, when it is, its UTC bounds and width in
+milliseconds. Each bound accepts the same auto-detect grammar as `POST /api/v1/utils/datetime/diff`
+(ISO-8601, epoch seconds, epoch millis), and each interval must satisfy `start < end`; a reversed or
+zero-length interval returns HTTP 400. When the intervals are disjoint, the response carries
+`overlap=false`, `null` `overlapStart`/`overlapEnd` and `overlapMillis=0` — an empty intersection is a
+valid result, not an error. The intersection is `max(startA, startB)` to `min(endA, endB)`, so
+touching boundaries (`endA == startB`) are disjoint. The operation is journalled as `DATETIME_OVERLAP`
+and is deterministic, so audit replay of a succeeded entry reports `VERIFIED`.
+
+```bash
+curl -X POST https://localhost:8080/api/v1/utils/datetime/overlap \
+  -H "Content-Type: application/json" \
+  -d '{
+        "startA": "2024-10-01T00:00:00Z",
+        "endA":   "2024-10-05T00:00:00Z",
+        "startB": "2024-10-03T00:00:00Z",
+        "endB":   "2024-10-07T00:00:00Z"
+      }'
+```
+
+```json
+{
+  "status": "SUCCESS",
+  "message": "DateTime overlap calculated successfully",
+  "data": {
+    "overlap": true,
+    "overlapStart": "2024-10-03T00:00:00Z",
+    "overlapEnd": "2024-10-05T00:00:00Z",
+    "overlapMillis": 172800000
+  },
+  "error": null
+}
+```
+
+When the intervals do not overlap (for example `startB=2024-10-05T00:00:00Z`, `endB=2024-10-07T00:00:00Z`
+against the interval above, which only touches at `2024-10-05T00:00:00Z`), the `data` object is
+`{ "overlap": false, "overlapStart": null, "overlapEnd": null, "overlapMillis": 0 }`.
 
 ---
 
@@ -1421,8 +1462,8 @@ populated only when a cached result is served).
 
 ## 🧾 Operation Journal & Replay Verification
 
-All thirty-one journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
-`datetime/shift`, `datetime/duration`, `datetime/business-days`, `datetime/range`, `crypto/hash`,
+All thirty-two journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+`datetime/shift`, `datetime/duration`, `datetime/business-days`, `datetime/range`, `datetime/overlap`, `crypto/hash`,
 `crypto/base64`, `crypto/base32`, `crypto/url`, `crypto/jwt/decode`, `crypto/uuid`, `json/format`,
 `json/validate`, `json/query`, `json/flatten`, `json/unflatten`, `json/merge-patch`, `json/pointer`,
 `json/to-csv`, `json/from-csv`, `json/csv-to-json`, `json/to-ndjson`, `json/from-ndjson`, `json/diff`,

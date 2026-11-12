@@ -9,6 +9,8 @@ import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
+import com.example.utiltools.datetime.dto.DateTimeOverlapRequest;
+import com.example.utiltools.datetime.dto.DateTimeOverlapResponse;
 import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
 import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
 import com.example.utiltools.datetime.dto.DateTimeRangeRequest;
@@ -92,6 +94,19 @@ public class DateTimeController {
     public ApiResponse<DateTimeRangeResponse> range(@Valid @RequestBody DateTimeRangeRequest request) {
         DateTimeRangeResponse result = auditedOperations.range(request);
         return ApiResponse.success(result, "Date range generated successfully");
+    }
+
+    @PostMapping("/overlap")
+    @Operation(summary = "Detect the overlap of two datetime intervals",
+            description = "Treats both intervals as half-open [start, end). When they intersect, the "
+                    + "response carries the UTC intersection bounds and its duration in milliseconds; when "
+                    + "they are disjoint (including the adjacent case endA == startB) it carries "
+                    + "overlap=false, null bounds and overlapMillis=0. Each bound accepts the same "
+                    + "ISO-8601 and epoch seconds/millis auto-detected inputs as /datetime/diff; an "
+                    + "interval whose end is not strictly after its start returns 400 BAD_REQUEST")
+    public ApiResponse<DateTimeOverlapResponse> overlap(@Valid @RequestBody DateTimeOverlapRequest request) {
+        DateTimeOverlapResponse result = auditedOperations.overlap(request);
+        return ApiResponse.success(result, "DateTime overlap calculated successfully");
     }
 
     @GetMapping("/current")
