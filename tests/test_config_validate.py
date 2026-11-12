@@ -231,3 +231,31 @@ def test_validate_never_raises_on_hostile_paths() -> None:
     assert "path could not be expanded: " in MaintainerConfig(
         maintainer_root="~utiltools75-no-such-user/x"
     ).validate()[0]
+
+
+# --- UTILTOOLS-112: email ---------------------------------------------------
+
+
+def test_validate_flags_malformed_email(tmp_path: Path) -> None:
+    """REQ-02: a non-empty email failing the format check yields exactly one issue."""
+
+    kwargs = _all_valid_kwargs(tmp_path)
+    for value in ("not-an-email", "a@b", "@b.co", "a b@c.co"):
+        issues = MaintainerConfig(**kwargs, email=value).validate()
+        assert issues == [f"email: invalid format: {value}"]
+
+
+def test_validate_accepts_well_formed_email_and_default(tmp_path: Path) -> None:
+    """REQ-02 / REQ-03: a valid email or the empty default emits no email issue."""
+
+    kwargs = _all_valid_kwargs(tmp_path)
+    for value in ("a@b.co", "ops@example.com", "first.last@sub.domain.org"):
+        assert MaintainerConfig(**kwargs, email=value).validate() == []
+    assert MaintainerConfig(**kwargs).validate() == []
+
+
+def test_validate_docstring_documents_email_rule() -> None:
+    """DOD-03: the docstring message list stays in lockstep with the emitted issue."""
+
+    doc = MaintainerConfig.validate.__doc__ or ""
+    assert "email: invalid format: <email>" in doc
