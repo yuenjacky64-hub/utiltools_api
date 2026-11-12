@@ -12,7 +12,9 @@ import com.example.utiltools.crypto.dto.JwtDecodeRequest;
 import com.example.utiltools.crypto.dto.JwtDecodeResponse;
 import com.example.utiltools.crypto.dto.UrlRequest;
 import com.example.utiltools.crypto.dto.UrlResponse;
+import com.example.utiltools.crypto.dto.UuidInspectResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
+import com.example.utiltools.crypto.service.CryptoService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -29,9 +31,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class CryptoController {
 
     private final AuditedOperations auditedOperations;
+    private final CryptoService cryptoService;
 
-    public CryptoController(AuditedOperations auditedOperations) {
+    public CryptoController(AuditedOperations auditedOperations, CryptoService cryptoService) {
         this.auditedOperations = auditedOperations;
+        this.cryptoService = cryptoService;
     }
 
     @PostMapping("/hash")
@@ -81,5 +85,13 @@ public class CryptoController {
             @RequestParam(value = "version", required = false, defaultValue = "V4") String version) {
         UuidResponse result = auditedOperations.uuid(count, compact, version);
         return ApiResponse.success(result, "UUIDs generated successfully");
+    }
+
+    @GetMapping("/uuid/inspect")
+    @Operation(summary = "Inspect an existing UUID", description = "Validates an existing UUID in canonical (8-4-4-4-12) or compact (32-hex) form, case-insensitively, and reports the normalised canonical and compact forms, version (0-15), variant (RFC_4122/NCS/MICROSOFT/FUTURE) and, for version 7, the 48-bit unixTimestampMillis; read-only, not journalled")
+    public ApiResponse<UuidInspectResponse> uuidInspect(
+            @RequestParam(value = "value", required = false) String value) {
+        UuidInspectResponse result = cryptoService.inspectUuid(value);
+        return ApiResponse.success(result, "UUID inspected successfully");
     }
 }
