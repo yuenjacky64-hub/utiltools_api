@@ -19,6 +19,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping
@@ -65,6 +66,13 @@ DEFAULT_SECONDARY_MODEL: str | None = None
 # disables the lock. Kept out of ``CONFIG_PATH_FIELDS`` on purpose: those are
 # directories validated by ``validate()``, this is a file created on demand.
 DEFAULT_INSTANCE_LOCK_FILE = "data/maintainer.lock"
+
+# Contact email for maintainer reports (UTILTOOLS-112 REQ-01). Empty by default;
+# when set it is format-checked by ``validate()`` (reportable, not fatal).
+DEFAULT_EMAIL: str = ""
+# Deliberately minimal format check (not RFC 5322): local part without
+# ``@``/whitespace, one ``@``, domain containing at least one dot.
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # Fail-closed allowlist: an empty set means "no model is known to be free",
 # never "every model is free". Register ids here or tag them with ``:free``.
@@ -289,6 +297,10 @@ class MaintainerConfig:
     # blank disables the lock; a relative value resolves under the state root.
     instance_lock_file: str | None = DEFAULT_INSTANCE_LOCK_FILE
 
+    # Contact email for maintainer reports (UTILTOOLS-112 REQ-01): empty by
+    # default; a non-empty value is format-checked by ``validate()``.
+    email: str = DEFAULT_EMAIL
+
     # Memory retention knobs (UTILTOOLS-76 REQ-03): the memory document is
     # pruned to these maxima at the end of every cycle and on a wind-down.
     memory_max_runs: int = DEFAULT_MEMORY_MAX_RUNS
@@ -407,6 +419,9 @@ class MaintainerConfig:
           >= 60`` / ``... must be <= 3600`` - appended once, after the path
           fields, when the knob is not a positive ``int`` or falls outside the
           inclusive ``[60, 3600]`` second range (UTILTOOLS-90 REQ-01, REQ-02)
+        * ``email: invalid format: <email>`` - appended once, after the path
+          fields, when a non-empty ``email`` fails the minimal ``EMAIL_PATTERN``
+          format check; the empty default emits nothing (UTILTOOLS-112 REQ-02)
 
         Every filesystem or proxy call sits behind a guard, so the method is
         total: for any field content it returns a ``list[str]`` and never raises.
@@ -460,6 +475,11 @@ class MaintainerConfig:
             issues.append("opencode_timeout_sec must be >= 60")
         elif opencode_timeout > 3600:
             issues.append("opencode_timeout_sec must be <= 3600")
+        # UTILTOOLS-112: appended last so path-only and opencode-only results keep
+        # their exact ordering; at most one message is emitted.
+        email = "" if self.email is None else str(self.email).strip()
+        if email and not EMAIL_PATTERN.match(email):
+            issues.append(f"email: invalid format: {email}")
         return issues
 
     @classmethod
