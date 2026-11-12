@@ -144,10 +144,15 @@ final class MaintenanceSchedulingPropertiesTest {
     private static MaintenanceSchedulingProperties bind(Map<String, Object> source, int expectPoolSize,
             String expectPrefix, int expectAwait, String failingProperty) {
         Binder binder = new Binder(new MapConfigurationPropertySource(source));
-        MaintenanceSchedulingProperties properties = binder
-                .bind("utiltools.scheduling", MaintenanceSchedulingProperties.class,
-                        MaintenanceSchedulingProperties.defaults())
-                .get();
+        BindResult<MaintenanceSchedulingProperties> result = binder.bind("utiltools.scheduling",
+                MaintenanceSchedulingProperties.class);
+        MaintenanceSchedulingProperties properties;
+        if (result.isBound()) {
+            properties = result.get();
+        } else {
+            // no utiltools.scheduling.* values supplied: the documented defaults apply
+            properties = MaintenanceSchedulingProperties.defaults();
+        }
         if (failingProperty == null) {
             assertThat(properties.poolSize()).isEqualTo(expectPoolSize);
             assertThat(properties.threadNamePrefix()).isEqualTo(expectPrefix);
