@@ -4,6 +4,8 @@ import com.example.utiltools.text.dto.TextReplaceRequest;
 import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextHtmlEntitiesRequest;
 import com.example.utiltools.text.dto.TextHtmlEntitiesResponse;
+import com.example.utiltools.text.dto.TextNormalizeRequest;
+import com.example.utiltools.text.dto.TextNormalizeResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
@@ -48,6 +50,8 @@ public class TextService {
     private static final int DEFAULT_REGEX_TIMEOUT_MS = 200;
 
     private static final String ALLOWED_OPERATIONS = "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE";
+
+    private static final String ALLOWED_FORMS = "NFC, NFD, NFKC, NFKD";
 
     private static final Pattern SENTENCE_SEPARATORS = Pattern.compile("[.!?]+");
 
@@ -111,6 +115,25 @@ public class TextService {
         boolean changed = !result.equals(text);
         int length = result.codePointCount(0, result.length());
         return new TextTransformResponse(operation, result, changed, length);
+    }
+
+    public TextNormalizeResponse normalize(TextNormalizeRequest request) {
+        String text = request.text();
+        String form = request.form().trim().toUpperCase(Locale.ROOT);
+        String result = switch (form) {
+            case "NFC" -> Normalizer.normalize(text, Normalizer.Form.NFC);
+            case "NFD" -> Normalizer.normalize(text, Normalizer.Form.NFD);
+            case "NFKC" -> Normalizer.normalize(text, Normalizer.Form.NFKC);
+            case "NFKD" -> Normalizer.normalize(text, Normalizer.Form.NFKD);
+            default -> throw new IllegalArgumentException("Unsupported form '" + request.form()
+                    + "'. Allowed values: " + ALLOWED_FORMS);
+        };
+        if (result.length() > MAX_RESULT_CHARS) {
+            throw new IllegalArgumentException("normalized result exceeds " + MAX_RESULT_CHARS + " characters");
+        }
+        boolean changed = !result.equals(text);
+        int length = result.codePointCount(0, result.length());
+        return new TextNormalizeResponse(form, result, changed, length);
     }
 
     public TextReplaceResponse replace(TextReplaceRequest request) {

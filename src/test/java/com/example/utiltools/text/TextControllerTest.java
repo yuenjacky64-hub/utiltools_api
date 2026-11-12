@@ -265,6 +265,151 @@ class TextControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/utils/text/normalize - should normalize under all four supported forms")
+    void shouldNormalizeAllFourForms() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/normalize")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "e\u0301", "form": "NFC"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.form").value("NFC"))
+                .andExpect(jsonPath("$.data.result").value("\u00e9"))
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.length").value(1));
+
+        mockMvc.perform(post("/api/v1/utils/text/normalize")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "\u00e9", "form": "NFD"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.form").value("NFD"))
+                .andExpect(jsonPath("$.data.result").value("e\u0301"))
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.length").value(2));
+
+        mockMvc.perform(post("/api/v1/utils/text/normalize")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "\ufb01le caf\u00e9", "form": "nfkc"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.form").value("NFKC"))
+                .andExpect(jsonPath("$.data.result").value("file caf\u00e9"))
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.length").value(9));
+
+        mockMvc.perform(post("/api/v1/utils/text/normalize")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "\uff21\uff22", "form": "NFKD"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.form").value("NFKD"))
+                .andExpect(jsonPath("$.data.result").value("AB"))
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.length").value(2));
+
+        // already-normalized input reports changed=false
+        mockMvc.perform(post("/api/v1/utils/text/normalize")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "plain text", "form": "NFC"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.form").value("NFC"))
+                .andExpect(jsonPath("$.data.result").value("plain text"))
+                .andExpect(jsonPath("$.data.changed").value(false))
+                .andExpect(jsonPath("$.data.length").value(10));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/normalize - blank text, unknown and padded forms return 400 VALIDATION_ERROR")
+    void shouldRejectInvalidNormalizeRequestWith400ValidationError() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/normalize")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "   ", "form": "NFC"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.message").value("Validation failed"))
+                .andExpect(jsonPath("$.details", hasItem("text is required")));
+
+        mockMvc.perform(post("/api/v1/utils/text/normalize")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "hi", "form": "NFE"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("Supported forms: NFC, NFD, NFKC, NFKD")));
+
+        mockMvc.perform(post("/api/v1/utils/text/normalize")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "hi", "form": " nfc "}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("Supported forms: NFC, NFD, NFKC, NFKD")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/normalize - a decomposed result past the bound returns 400 BAD_REQUEST")
+    void shouldRejectOversizedNormalizedResultWith400BadRequest() throws Exception {
+        // 333_334 Hangul syllables expand to 1_000_002 jamo code points under NFD.
+        String text = "\uac02".repeat(333_334);
+
+        mockMvc.perform(post("/api/v1/utils/text/normalize")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"text\": \"%s\", \"form\": \"NFD\"}".formatted(text)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("normalized result exceeds 1000000 characters")));
+    }
+
+    @Test
+    @DisplayName("a normalize call is journalled as TEXT_NORMALIZE and replays as VERIFIED")
+    void shouldJournalAndReplayTextNormalize() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/normalize")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "\ufb01le caf\u00e9", "form": "NFKC"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.result").value("file caf\u00e9"));
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_NORMALIZE"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.result").value("file caf\u00e9"))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        AuditEntry before = journal.find(id).orElseThrow();
+        Instant completedAt = before.completedAt();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("TEXT_NORMALIZE"))
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.result.result").value("file caf\u00e9"))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"));
+
+        AuditEntry after = journal.find(id).orElseThrow();
+        assertThat(after.operation()).isEqualTo(OperationType.TEXT_NORMALIZE);
+        assertThat(after.completedAt()).isEqualTo(completedAt);
+        assertThat(after.result()).isEqualTo(before.result());
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/text/replace - should replace a regex with group references")
     void shouldReplaceTextRegexEnvelope() throws Exception {
         String body = """
