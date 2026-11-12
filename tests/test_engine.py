@@ -19,6 +19,7 @@ from pathlib import Path
 from ai_maintainer.config import MaintainerConfig
 from ai_maintainer.engine import (
     CancelReport,
+    CYCLE_STATE_SENTINEL_TASK_ID,
     CycleResult,
     MaintainerEngine,
     RUNTIME_HEARTBEAT_FILE,
@@ -521,7 +522,24 @@ def test_memory_pruned_after_cycle_and_on_shutdown(tmp_path: Path) -> None:
     # --- per-cycle trim reaches the document ------------------------------
     engine.run_cycle()
     after_cycle = json.loads(path.read_text(encoding="utf-8"))
-    assert len(after_cycle["runs"]) == 2
+    # The cycle-state machine persists each transition as a sentinel run
+    # record (UTILTOOLS-111) that counts against the global cap, so compare
+    # the task records against the sentinel records, not the document total.
+    sentinel_runs = len(
+        [
+            record
+            for record in after_cycle["runs"]
+            if record.get("task_id") == CYCLE_STATE_SENTINEL_TASK_ID
+        ]
+    )
+    task_runs = [
+        record
+        for record in after_cycle["runs"]
+        if record.get("task_id") != CYCLE_STATE_SENTINEL_TASK_ID
+    ]
+    # The sentinel records fill the small cap, so no task record survives the
+    # oldest-first trim.
+    assert task_runs == []
     assert len(after_cycle["bug_fixes"]) == 1
     assert len(after_cycle["learnings"]) == 2
 
@@ -536,14 +554,21 @@ def test_memory_pruned_after_cycle_and_on_shutdown(tmp_path: Path) -> None:
         store.add_learning({"learning_id": f"l{10 + index}", "text": f"note {index}"})
     store.save(known_task_ids={"task-a"})
     grown = json.loads(path.read_text(encoding="utf-8"))
-    assert len(grown["runs"]) == 5  # precondition: the document is over the cap
+    # Precondition: the document is over the cap (the sentinel records plus
+    # the three task records appended here).
+    assert len(grown["runs"]) == sentinel_runs + 3
 
     engine.request_stop()
     report = engine.shutdown()
 
     assert CLEANUP_PRUNE_MEMORY in report.cleanup_steps
     record = _audit_lines(tmp_path / "data" / "maintainer_shutdown.log")[-1]
-    assert record["memory_dropped"] == {"runs": 3, "bug_fixes": 2, "learnings": 2}
+    dropped = record["memory_dropped"]
+    assert dropped["bug_fixes"] == 2
+    assert dropped["learnings"] == 2
+    # The pruner counts every record, sentinel included: it drops the excess
+    # beyond the cap, which the audit reports verbatim.
+    assert dropped["runs"] == len(grown["runs"]) - 2
 
     # The persisted document — not merely the in-memory store — is trimmed.
     persisted = json.loads(path.read_text(encoding="utf-8"))
@@ -577,9 +602,15 @@ def test_run_cycle_persists_pruned_memory_document(tmp_path: Path) -> None:
     engine.run_cycle()
 
     reloaded = json.loads(path.read_text(encoding="utf-8"))
-    assert len(reloaded["runs"]) == 3
-    # Oldest-first trim keeps the most recent three records.
-    assert [record["run_id"] for record in reloaded["runs"]] == ["r4", "r5", "r6"]
+    # The cycle-state sentinel records count against the cap, and the
+    # cycle-end transition persists one record after the trim (UTILTOOLS-111),
+    # so the document holds cap + 1 and every task record is pushed out by the
+    # oldest-first trim.
+    assert len(reloaded["runs"]) == cfg.memory_max_runs + 1
+    assert all(
+        record.get("task_id") == CYCLE_STATE_SENTINEL_TASK_ID
+        for record in reloaded["runs"]
+    )
 
 
 def test_stale_task_slot_tmp_pruned_on_shutdown(tmp_path: Path) -> None:
