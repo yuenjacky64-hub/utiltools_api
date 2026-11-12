@@ -1528,8 +1528,8 @@ class DateTimeControllerTest {
     void shouldKeepCronWallClockAcrossDstTransition() throws Exception {
         String body = """
                 {
-                    "expression": "0 0 9 * * *",
-                    "from": "2026-03-06T00:00:00Z",
+                    "expression": "0 0 2 * * *",
+                    "from": "2026-03-07T12:00:00Z",
                     "timeZone": "America/New_York",
                     "count": 3
                 }
@@ -1539,15 +1539,16 @@ class DateTimeControllerTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.data.runs[0].localDateTime").value("2026-03-06T09:00:00-05:00"))
-                .andExpect(jsonPath("$.data.runs[1].localDateTime").value("2026-03-07T09:00:00-05:00"))
-                .andExpect(jsonPath("$.data.runs[2].localDateTime").value("2026-03-08T09:00:00-04:00"))
-                .andExpect(jsonPath("$.data.runs[0].utcIsoInstant").value("2026-03-06T14:00:00Z"))
-                .andExpect(jsonPath("$.data.runs[2].utcIsoInstant").value("2026-03-08T13:00:00Z"));
+                .andExpect(jsonPath("$.data.runs[0].localDateTime").value("2026-03-08T03:00:00-04:00"))
+                .andExpect(jsonPath("$.data.runs[1].localDateTime").value("2026-03-09T02:00:00-04:00"))
+                .andExpect(jsonPath("$.data.runs[2].localDateTime").value("2026-03-10T02:00:00-04:00"))
+                .andExpect(jsonPath("$.data.runs[0].utcIsoInstant").value("2026-03-08T07:00:00Z"))
+                .andExpect(jsonPath("$.data.runs[1].utcIsoInstant").value("2026-03-09T06:00:00Z"))
+                .andExpect(jsonPath("$.data.runs[2].utcIsoInstant").value("2026-03-10T06:00:00Z"));
     }
 
     @Test
-    @DisplayName("POST /api/v1/utils/datetime/cron/next - rejects invalid expression, zone, from and count with 400")
+    @DisplayName("POST /api/v1/utils/datetime/cron/next - rejects invalid expression, zone, from, count and unsatisfiable schedule with 400")
     void cronNextInvalidInputsReturn400() throws Exception {
         int before = auditJournal.size();
         String[] serviceLevelBodies = {
@@ -1563,6 +1564,11 @@ class DateTimeControllerTest {
                 """
                 { "expression": "0 0 12 * * *", "from": "not-a-time", "timeZone": "UTC", "count": 3 }
                 """,
+                // Parses fine but never matches a real date; must map to the 400 path,
+                // never escape as an INTERNAL_ERROR 500.
+                """
+                { "expression": "0 0 0 31 2 *", "from": "2026-01-01T00:00:00Z", "timeZone": "UTC", "count": 3 }
+                """,
         };
         for (String content : serviceLevelBodies) {
             mockMvc.perform(post("/api/v1/utils/datetime/cron/next")
@@ -1574,7 +1580,7 @@ class DateTimeControllerTest {
         }
 
         // Bean-validation rejections stop before the audit journal and surface as
-        // VALIDATION_ERROR; the four service-level failures each journal a FAILED entry.
+        // VALIDATION_ERROR; the five service-level failures each journal a FAILED entry.
         String[] validationBodies = {
                 """
                 { "expression": "0 0 12 * * *", "from": "2026-01-01T00:00:00Z", "timeZone": "UTC", "count": 101 }
@@ -1596,7 +1602,7 @@ class DateTimeControllerTest {
                     .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
         }
 
-        assertThat(auditJournal.size()).isEqualTo(before + 4);
+        assertThat(auditJournal.size()).isEqualTo(before + 5);
     }
 
     @Test

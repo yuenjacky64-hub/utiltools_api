@@ -1519,8 +1519,9 @@ populated only when a cached result is served).
 
 ## 🧾 Operation Journal & Replay Verification
 
-All thirty-two journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
-`datetime/shift`, `datetime/duration`, `datetime/business-days`, `datetime/range`, `datetime/overlap`, `crypto/hash`,
+All thirty-three journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+`datetime/shift`, `datetime/duration`, `datetime/business-days`, `datetime/range`, `datetime/overlap`,
+`datetime/cron-next`, `crypto/hash`,
 `crypto/base64`, `crypto/base32`, `crypto/url`, `crypto/jwt/decode`, `crypto/uuid`, `json/format`,
 `json/validate`, `json/query`, `json/flatten`, `json/unflatten`, `json/merge-patch`, `json/pointer`,
 `json/to-csv`, `json/from-csv`, `json/csv-to-json`, `json/to-ndjson`, `json/from-ndjson`, `json/diff`,

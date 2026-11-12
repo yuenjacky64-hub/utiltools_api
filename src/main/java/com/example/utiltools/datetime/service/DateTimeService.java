@@ -167,8 +167,8 @@ public class DateTimeService {
      * 6-field and {@code @} macro expressions.
      *
      * @throws IllegalArgumentException when the expression is unparseable, when the schedule
-     *         exceeds the representable instant range, or when the resolved count falls
-     *         outside {@code 1..100}
+     *         is unsatisfiable (no occurrence exists after {@code from}, e.g. an impossible
+     *         date combination), or when the resolved count falls outside {@code 1..100}
      */
     public DateTimeCronResponse cronNext(DateTimeCronRequest request) {
         int count = request.count() == null ? 5 : request.count();
@@ -189,19 +189,22 @@ public class DateTimeService {
         // Expand on the zone's wall clock, then resolve each run through the zone rules so a
         // schedule crossing a DST transition keeps the requested wall-clock time.
         LocalDateTime cursor = fromInstant.atZone(zoneId).toLocalDateTime();
-        try {
-            for (int i = 0; i < count; i++) {
-                LocalDateTime next = cron.next(cursor);
-                ZonedDateTime zoned = next.atZone(zoneId);
-                Instant instant = zoned.toInstant();
-                runs.add(new DateTimeCronResponse.DateTimeCronOccurrence(
-                        DateTimeFormatter.ISO_INSTANT.format(instant),
-                        DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(zoned.toOffsetDateTime()),
-                        instant.toEpochMilli()));
-                cursor = next;
+        for (int i = 0; i < count; i++) {
+            LocalDateTime next = cron.next(cursor);
+            if (next == null) {
+                // cron.next returns null when the parsed fields never match a real date
+                // (e.g. "0 0 0 31 2 *"); map that terminal state to the 400 path instead
+                // of letting a NullPointerException surface as INTERNAL_ERROR.
+                throw new IllegalArgumentException("Cron schedule has no occurrence after from "
+                        + "(unsatisfiable schedule: " + abbreviate(parseable) + ")");
             }
-        } catch (ArithmeticException e) {
-            throw new IllegalArgumentException("Cron schedule exceeds the representable range", e);
+            ZonedDateTime zoned = next.atZone(zoneId);
+            Instant instant = zoned.toInstant();
+            runs.add(new DateTimeCronResponse.DateTimeCronOccurrence(
+                    DateTimeFormatter.ISO_INSTANT.format(instant),
+                    DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(zoned.toOffsetDateTime()),
+                    instant.toEpochMilli()));
+            cursor = next;
         }
         return new DateTimeCronResponse(trimmed, request.from(), zoneId.getId(), count,
                 List.copyOf(runs));

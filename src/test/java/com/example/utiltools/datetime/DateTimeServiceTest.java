@@ -1206,7 +1206,7 @@ class DateTimeServiceTest {
 
     @Test
     @DisplayName("Should treat a 5-field cron expression as seconds-zero and default the zone to UTC")
-    void shouldExpandFiveFieldCronWithDefaultZone() {
+    void cronNext5FieldExpansion() {
         DateTimeCronResponse response = dateTimeService.cronNext(
                 new DateTimeCronRequest("0 12 * * *", "2026-01-01T00:00:00Z", null, 2));
 
@@ -1247,23 +1247,32 @@ class DateTimeServiceTest {
     @Test
     @DisplayName("Should keep the wall-clock hour across the DST spring-forward transition")
     void cronNextDstBoundaryWallClock() {
-        // US DST 2026 starts on Sunday 2026-03-08: 09:00 NY is EST (-05:00) through 03-07
-        // and EDT (-04:00) from 03-08, so the UTC instants drift one hour while the
-        // wall clock stays at 09:00.
+        // US DST 2026 starts on Sunday 2026-03-08: clocks jump 02:00 EST -> 03:00 EDT, so
+        // the daily 02:00 run on the spring-forward day has no wall-clock instant. The
+        // expansion resolves it through ZonedDateTime (nonexistent 02:00 -> 03:00 at the
+        // post-gap offset -04:00), and later runs stay pinned to the 02:00 wall clock
+        // instead of drifting by the offset change.
         DateTimeCronResponse response = dateTimeService.cronNext(
-                new DateTimeCronRequest("0 0 9 * * *", "2026-03-06T00:00:00Z", "America/New_York", 3));
+                new DateTimeCronRequest("0 0 2 * * *", "2026-03-07T12:00:00Z", "America/New_York", 3));
 
-        assertThat(response.runs().get(0).utcIsoInstant()).isEqualTo("2026-03-06T14:00:00Z");
-        assertThat(response.runs().get(0).localDateTime()).isEqualTo("2026-03-06T09:00:00-05:00");
-        assertThat(response.runs().get(1).utcIsoInstant()).isEqualTo("2026-03-07T14:00:00Z");
-        assertThat(response.runs().get(1).localDateTime()).isEqualTo("2026-03-07T09:00:00-05:00");
-        assertThat(response.runs().get(2).utcIsoInstant()).isEqualTo("2026-03-08T13:00:00Z");
-        assertThat(response.runs().get(2).localDateTime()).isEqualTo("2026-03-08T09:00:00-04:00");
+        assertThat(response.runs()).hasSize(3);
+        assertThat(response.runs().get(0).utcIsoInstant()).isEqualTo("2026-03-08T07:00:00Z");
+        assertThat(response.runs().get(0).localDateTime()).isEqualTo("2026-03-08T03:00:00-04:00");
+        assertThat(response.runs().get(1).utcIsoInstant()).isEqualTo("2026-03-09T06:00:00Z");
+        assertThat(response.runs().get(1).localDateTime()).isEqualTo("2026-03-09T02:00:00-04:00");
+        assertThat(response.runs().get(2).utcIsoInstant()).isEqualTo("2026-03-10T06:00:00Z");
+        assertThat(response.runs().get(2).localDateTime()).isEqualTo("2026-03-10T02:00:00-04:00");
+        // utcIsoInstant stays strictly increasing across the transition
+        long previous = Long.MIN_VALUE;
+        for (DateTimeCronResponse.DateTimeCronOccurrence run : response.runs()) {
+            assertThat(run.epochMillis()).isGreaterThan(previous);
+            previous = run.epochMillis();
+        }
     }
 
     @Test
     @DisplayName("Should default the cron occurrence count to 5 when omitted")
-    void shouldDefaultCronCountToFive() {
+    void cronNextDefaultCount5() {
         DateTimeCronResponse response = dateTimeService.cronNext(
                 new DateTimeCronRequest("0 0 12 * * *", "2026-01-01T00:00:00Z", "UTC", null));
 
@@ -1273,8 +1282,13 @@ class DateTimeServiceTest {
     }
 
     @Test
-    @DisplayName("Should reject a wrong field count, invalid expression, unknown zone, unparseable from and out-of-bounds count")
-    void shouldRejectInvalidCronInputs() {
+    @DisplayName("Should reject unparseable cron expressions with a 400-path IllegalArgumentException")
+    void cronNextInvalidExpressionReturns400() {
+        assertThatThrownBy(() -> dateTimeService.cronNext(
+                new DateTimeCronRequest("99 0 12 * * *", "2026-01-01T00:00:00Z", "UTC", 3)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid cron expression");
+
         assertThatThrownBy(() -> dateTimeService.cronNext(
                 new DateTimeCronRequest("0 12 * *", "2026-01-01T00:00:00Z", "UTC", 3)))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -1284,16 +1298,28 @@ class DateTimeServiceTest {
                 new DateTimeCronRequest("61 0 12 * * *", "2026-01-01T00:00:00Z", "UTC", 3)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Invalid cron expression");
+    }
 
+    @Test
+    @DisplayName("Should reject an unknown IANA timezone with a 400-path IllegalArgumentException")
+    void cronNextUnknownTimezone() {
         assertThatThrownBy(() -> dateTimeService.cronNext(
                 new DateTimeCronRequest("0 0 12 * * *", "2026-01-01T00:00:00Z", "Mars/Olympus", 3)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Unknown or invalid timezone");
+    }
 
+    @Test
+    @DisplayName("Should reject an unparseable from value with a 400-path IllegalArgumentException")
+    void cronNextUnparseableFrom() {
         assertThatThrownBy(() -> dateTimeService.cronNext(
                 new DateTimeCronRequest("0 0 12 * * *", "not-a-time", "UTC", 3)))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
 
+    @Test
+    @DisplayName("Should reject a count outside 1..100 with a 400-path IllegalArgumentException")
+    void cronNextCountOutOfBounds() {
         assertThatThrownBy(() -> dateTimeService.cronNext(
                 new DateTimeCronRequest("0 0 12 * * *", "2026-01-01T00:00:00Z", "UTC", 0)))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -1303,5 +1329,17 @@ class DateTimeServiceTest {
                 new DateTimeCronRequest("0 0 12 * * *", "2026-01-01T00:00:00Z", "UTC", 101)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("count must be between 1 and 100");
+    }
+
+    @Test
+    @DisplayName("Should reject an unsatisfiable cron schedule (no occurrence after from) with a 400-path IllegalArgumentException")
+    void cronNextUnsatisfiableScheduleThrows() {
+        // "0 0 0 31 2 *" parses fine (fields are individually valid) but never matches a
+        // real date: CronExpression.next() returns null, and DateTimeService maps that
+        // terminal state to the 400 path instead of leaking an NPE into INTERNAL_ERROR.
+        assertThatThrownBy(() -> dateTimeService.cronNext(
+                new DateTimeCronRequest("0 0 0 31 2 *", "2026-01-01T00:00:00Z", "UTC", 3)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("no occurrence after from");
     }
 }
