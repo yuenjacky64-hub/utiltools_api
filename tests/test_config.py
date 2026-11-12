@@ -321,3 +321,43 @@ def test_validate_accepts_valid_opencode_timeouts(
             maintainer_root=tmp_path,
             env={"MAINTAINER_OPENCODE_TIMEOUT_SEC": "ten minutes"},
         )
+
+
+# --- UTILTOOLS-112: email ---------------------------------------------------
+
+
+def test_email_defaults_to_empty_string() -> None:
+    """REQ-01 / REQ-03: the field default is ``""`` and the value round-trips."""
+
+    assert config_module.DEFAULT_EMAIL == ""
+    assert MaintainerConfig().email == ""
+    assert MaintainerConfig(email="a@b.co").email == "a@b.co"
+
+
+def test_email_flows_through_config_json_and_env_layers(
+    tmp_path: Path, empty_must_config: None
+) -> None:
+    """REQ-01 / REQ-03: the key is accepted from every layer, unchanged, no coercion."""
+
+    _write_config(tmp_path, {"email": "json@example.com"})
+    from_json = MaintainerConfig.load(maintainer_root=tmp_path, env={})
+    assert from_json.email == "json@example.com"
+
+    from_env = MaintainerConfig.load(
+        maintainer_root=tmp_path,
+        env={"MAINTAINER_EMAIL": "env@example.com"},
+    )
+    assert from_env.email == "env@example.com"
+
+    from_alias = MaintainerConfig.load(
+        maintainer_root=tmp_path,
+        env={"AI_MAINTAINER_EMAIL": "alias@example.com"},
+    )
+    assert from_alias.email == "alias@example.com"
+
+    overridden = MaintainerConfig.load(
+        maintainer_root=tmp_path,
+        env={"MAINTAINER_EMAIL": "env@example.com"},
+        email="override@example.com",
+    )
+    assert overridden.email == "override@example.com"
