@@ -12,6 +12,9 @@ import java.util.Set;
  *   <li>{@code DISPATCHING -> FAILED} (dispatcher threw, or the execution lease expired and the
  *       reaper terminalized the attempt)</li>
  *   <li>{@code QUEUED -> CANCELLED} (shutdown drain)</li>
+ *   <li>{@code DISPATCHING -> CANCELLED} (pre-dispatch withdrawal: only reachable before the
+ *       worker enters the dispatcher — the service's {@code dispatchStarted} fence is the runtime
+ *       witness; an in-flight dispatch still terminalizes {@code DELIVERED}/{@code FAILED})</li>
  *   <li>{@code FAILED -> QUEUED} (bounded retry: only while the attempt counter is below
  *       {@code maxAttempts}; increments the counter, so {@code QUEUED} is reachable this way only)</li>
  * </ul>
@@ -46,7 +49,7 @@ public enum ContactStatus {
     public boolean allows(ContactStatus from, ContactStatus to) {
         return switch (from) {
             case QUEUED -> to == DISPATCHING || to == CANCELLED;
-            case DISPATCHING -> to == DELIVERED || to == FAILED;
+            case DISPATCHING -> to == DELIVERED || to == FAILED || to == CANCELLED;
             case FAILED -> to == QUEUED; // bounded retry, enforced by the service's attempt counter
             case DELIVERED, CANCELLED -> false;
         };
