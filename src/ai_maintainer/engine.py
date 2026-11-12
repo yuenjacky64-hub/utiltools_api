@@ -652,6 +652,108 @@ class LeaseAuditReporter:
         return write_shutdown_audit(self._path, payload, clock=self._clock)
 
 
+# --------------------------------------------------------------------------- #
+# UTILTOOLS-111: intra-cycle state machine (REQ-01 .. REQ-05)
+# --------------------------------------------------------------------------- #
+
+#: Run-record sentinel in the MemoryStore ``runs`` collection that marks a
+#: cycle-state record (REQ-02).  Real task ids never collide with it.
+CYCLE_STATE_SENTINEL_TASK_ID = "__engine_cycle_state__"
+
+
+class CycleState(Enum):
+    """Intra-cycle states the engine walks on every ``run_cycle`` (REQ-01).
+
+    IDLE is the resting state; RUNNING and DIAGNOSING cover the work window
+    (a task adopted into the cycle is diagnosed before its first step is
+    committed); RECOVERING is reserved for a future post-stop recovery
+    hook; STOPPED is where a stop/interrupted cycle parks.  Legal edges:
+
+    - IDLE      -> RUNNING
+    - RUNNING   -> DIAGNOSING
+    - DIAGNOSING-> RUNNING
+    - RUNNING   -> RECOVERING
+    - DIAGNOSING-> RECOVERING
+    - RECOVERING-> RUNNING   (a committed step clears the recovery window)
+    - IDLE      -> STOPPED   (stop before any work)
+    - RUNNING   -> STOPPED   (stop mid-cycle)
+    - DIAGNOSING-> STOPPED
+    - RECOVERING-> STOPPED
+    - RUNNING   -> IDLE      (cycle end, no open window)
+    - DIAGNOSING-> IDLE      (cycle end after a completed/last task)
+    - RECOVERING-> IDLE
+    - STOPPED   -> IDLE      (the next cycle restarts from rest)
+
+    Cycle end (``_run_cycle_body``) closes into IDLE from any resting source
+    state, so the IDLE edge is legal from RUNNING and DIAGNOSING as well,
+    and a stop observed while RECOVERING takes the RECOVERING->STOPPED edge.
+    """
+
+    IDLE = "IDLE"
+    RUNNING = "RUNNING"
+    DIAGNOSING = "DIAGNOSING"
+    RECOVERING = "RECOVERING"
+    STOPPED = "STOPPED"
+
+
+#: Legal ``(from_state, to_state)`` edges.  Rollback never consults this
+#: table: the rollback target is by construction a previously committed
+#: state (REQ-04).
+_CYCLE_STATE_TRANSITIONS: frozenset[tuple[CycleState, CycleState]] = frozenset(
+    {
+        (CycleState.IDLE, CycleState.RUNNING),
+        (CycleState.RUNNING, CycleState.DIAGNOSING),
+        (CycleState.DIAGNOSING, CycleState.RUNNING),
+        (CycleState.RUNNING, CycleState.RECOVERING),
+        (CycleState.DIAGNOSING, CycleState.RECOVERING),
+        (CycleState.RECOVERING, CycleState.RUNNING),
+        (CycleState.IDLE, CycleState.STOPPED),
+        (CycleState.RUNNING, CycleState.STOPPED),
+        (CycleState.DIAGNOSING, CycleState.STOPPED),
+        (CycleState.RECOVERING, CycleState.STOPPED),
+        (CycleState.RUNNING, CycleState.IDLE),
+        (CycleState.DIAGNOSING, CycleState.IDLE),
+        (CycleState.RECOVERING, CycleState.IDLE),
+        (CycleState.STOPPED, CycleState.IDLE),
+    }
+)
+
+#: States that are only legal *mid-cycle*.  A store restored from a
+#: mid-cycle crash therefore re-enters through IDLE (the edges above are
+#: all legal from IDLE) so the next cycle's first edge is audited instead
+#: of being a silent no-op.
+_CYCLE_IN_FLIGHT_STATES: frozenset[CycleState] = frozenset(
+    {CycleState.RUNNING, CycleState.DIAGNOSING, CycleState.RECOVERING}
+)
+
+
+def _last_persisted_cycle_state(memory: MemoryStore | None) -> CycleState:
+    """The state in the newest ``__engine_cycle_state__`` run record.
+
+    The newest record wins (oldest-first ``runs`` order); missing records or
+    unknown values degrade to :attr:`CycleState.IDLE` so pre-existing store
+    documents need no migration.
+    """
+
+    if memory is None:
+        return CycleState.IDLE
+    try:
+        runs = memory.records().get("runs") or ()
+    except Exception:
+        return CycleState.IDLE
+    state = CycleState.IDLE
+    for record in runs:
+        if not isinstance(record, dict):
+            continue
+        if record.get("task_id") != CYCLE_STATE_SENTINEL_TASK_ID:
+            continue
+        try:
+            state = CycleState[str(record.get("state"))]
+        except KeyError:
+            continue
+    return state
+
+
 class MaintainerEngine:
     """Runs maintainer cycles, preempting lower-priority monitoring."""
 
@@ -737,6 +839,20 @@ class MaintainerEngine:
         )
         self._shutdown_lock = threading.Lock()
         self._shutdown_report: ShutdownReport | None = None
+        # UTILTOOLS-111 REQ-01/REQ-05: intra-cycle state machine.  The plain
+        # Lock guards the read-modify-write of the state field so two
+        # concurrent cycles can never interleave a transition; it is only
+        # ever taken alongside ``_lock`` in the fixed order
+        # ``_lock`` -> ``_cycle_state_lock`` -> MemoryStore write lock, and
+        # it is never held while either is acquired.
+        self._cycle_state = CycleState.IDLE
+        self._last_committed_state = CycleState.IDLE
+        self._cycle_state_lock = threading.Lock()
+        # REQ-02: resume from the last persisted state so a crashed or
+        # restarted engine restarts where the previous process parked it
+        # (defaults to IDLE for stores without sentinel records).
+        if memory is not None:
+            self.restore_cycle_state()
         # UTILTOOLS-80: ``graceful_shutdown()`` guard. Never held across the
         # ``shutdown()`` call below it, and ``_shutdown_lock`` is never taken
         # while it is held (INV-SHUT-7: ``_shutdown_lock`` is a plain Lock).
@@ -867,6 +983,141 @@ class MaintainerEngine:
 
         with self._lock:
             return self._memory
+
+
+    # ---------------------------------------------------------------- cycle state (UTILTOOLS-111)
+
+    @property
+    def cycle_state(self) -> CycleState:
+        """Current intra-cycle state (REQ-01).
+
+        Read of the state field under ``_cycle_state_lock``: transitions
+        update it under the same lock, so a reader never observes a
+        half-applied read-modify-write from a concurrent cycle.
+        """
+
+        with self._cycle_state_lock:
+            return self._cycle_state
+
+    def restore_cycle_state(self) -> CycleState:
+        """Recover the last persisted cycle state from the memory store.
+
+        Crashed or restarted engines resume where the previous process
+        parked: the newest ``__engine_cycle_state__`` run record wins,
+        defaulting to :attr:`CycleState.IDLE` when the store is missing or
+        has no sentinel records (pre-existing documents need no migration).
+        Restoring is not itself a transition, so it writes no audit event
+        and persists nothing.
+        """
+
+        # A store built by the constructor (fresh process) still holds an
+        # empty in-memory view of the document; refresh so the disk state is
+        # what the restore actually reads (REQ-02).
+        with self._lock:
+            memory = self._memory
+        if memory is not None:
+            memory.refresh_from_disk()
+        state = _last_persisted_cycle_state(memory)
+        with self._cycle_state_lock:
+            self._cycle_state = state
+            self._last_committed_state = state
+        return state
+
+    def _transition_cycle_state(self, new: CycleState, *, cycle: int) -> bool:
+        """Move the machine to ``new`` when that edge is legal (REQ-01/03/05).
+
+        Read-modify-write is one ``_cycle_state_lock`` section so two
+        concurrent cycles cannot interleave; the audit event goes to the
+        existing ``_events`` deque (REQ-03).  The commit model (REQ-02)
+        follows: the state field is updated first, the run record is
+        appended to the store second, and ``_last_committed_state`` only
+        advances when the record actually reached the store.  Illegal
+        transitions are silent no-ops that return ``False``.
+        """
+
+        with self._cycle_state_lock:
+            old = self._cycle_state
+            if (old, new) not in _CYCLE_STATE_TRANSITIONS:
+                return False
+            self._cycle_state = new
+        with self._lock:
+            self._events.append(
+                {
+                    "event": "CYCLE_STATE_TRANSITION",
+                    "from_state": old.value,
+                    "to_state": new.value,
+                    "cycle": cycle,
+                }
+            )
+        if self._persist_cycle_state(new, cycle=cycle):
+            with self._cycle_state_lock:
+                self._last_committed_state = new
+        return True
+
+    def _rollback_cycle_state(self, state: CycleState, *, cycle: int) -> None:
+        """Restore a previously committed state (REQ-04).
+
+        Used only by ``run_cycle``'s unhandled-exception path: the target
+        was captured under ``_cycle_state_lock`` at cycle start and is a
+        persisted state by construction, so no transition-table check is
+        consulted.  The restoration is audited and persisted so the next
+        process restarts from the same known-good point.
+        """
+
+        with self._cycle_state_lock:
+            self._cycle_state = state
+        with self._lock:
+            self._events.append(
+                {
+                    "event": "CYCLE_STATE_ROLLBACK",
+                    "to_state": state.value,
+                    "cycle": cycle,
+                }
+            )
+        self._persist_cycle_state(state, cycle=cycle)
+
+    def _persist_cycle_state(self, state: CycleState, *, cycle: int) -> bool:
+        """Append the transition record to the store and save (REQ-02).
+
+        Never raises: a store that cannot be written is logged and the
+        in-memory state remains authoritative so the cycle is not aborted.
+        Returns whether the record reached the on-disk document.
+        """
+
+        memory = self.memory
+        if memory is None:
+            return False
+        add_run = getattr(memory, "add_run", None)
+        save = getattr(memory, "save", None)
+        if not callable(add_run) or not callable(save):
+            return False
+        try:
+            add_run(
+                {
+                    # ``run_id`` is a required ``runs`` field (store
+                    # validation: RUN_MISSING_FIELD / duplicate ids), so the
+                    # sentinel record carries a unique id alongside the
+                    # plan's ``{task_id, state, cycle}`` core.
+                    "run_id": f"{CYCLE_STATE_SENTINEL_TASK_ID}-{uuid.uuid4().hex}",
+                    "task_id": CYCLE_STATE_SENTINEL_TASK_ID,
+                    "state": state.value,
+                    "cycle": cycle,
+                },
+                cycle=cycle,
+            )
+            # ``save()`` writes the merged document even when it reports
+            # validation issues, so reaching this point *is* "the record
+            # reached the on-disk document"; only a raised store error
+            # aborts the commit.
+            save()
+            return True
+        except Exception:
+            LOG.warning(
+                "cycle state %s (cycle %s) not persisted: store error",
+                state.value,
+                cycle,
+            )
+            return False
 
     def install_watcher(self, watcher: "Any | None") -> None:
         """Install the REQ-02 watcher view (``None`` uninstalls it).
@@ -1353,6 +1604,11 @@ class MaintainerEngine:
         snapshot: CycleSnapshot | None = None
         cycle: int | None = None
         committed = False
+        # UTILTOOLS-111: whether the state machine moved this cycle.  An
+        # uncommitted exit rolls the snapshot back over the whole document,
+        # which would blank the machine's own sentinel; the finally re-asserts
+        # it only when a transition/rollback actually ran (see DOD-03).
+        state_moved = False
         try:
             if not self._framework_idle():
                 # Read the counter under the same lock ``_next_cycle_id`` uses
@@ -1399,7 +1655,44 @@ class MaintainerEngine:
                 )
             snapshot = self._capture_snapshot(cycle=cycle, difficulty=difficulty)
             self._register_cycle(cycle, difficulty, snapshot)
-            result = self._run_cycle_body(cycle=cycle)
+            # UTILTOOLS-111 REQ-01/REQ-04: open the state machine for this
+            # cycle.  A cycle the previous forced stop parked in STOPPED,
+            # or one restored in-flight by a mid-cycle crash, re-enters
+            # through the ... -> IDLE edge; the committed state captured
+            # here is the rollback target below.
+            with self._cycle_state_lock:
+                committed_state = self._cycle_state
+                entering_stopped = committed_state is CycleState.STOPPED
+                # A mid-cycle crash restores RUNNING/DIAGNOSING/RECOVERING;
+                # such a start re-enters through IDLE so the first edge of
+                # the new cycle is recorded in the audit trail instead of
+                # being a silent no-op against the transition table.
+                entering_in_flight = committed_state in _CYCLE_IN_FLIGHT_STATES
+            if self._stop.is_set():
+                # Stop published before the body: the forced-stop edge
+                # applies, and the body itself never runs.
+                self._transition_cycle_state(CycleState.STOPPED, cycle=cycle)
+                state_moved = True
+                return CycleResult(
+                    cycle=cycle,
+                    monitored=None,
+                    priority=None,
+                    preempted=None,
+                    steps=0,
+                    outcome=self._outcome_for(self.stop_reason, interrupted=True),
+                )
+            if entering_stopped or entering_in_flight:
+                self._transition_cycle_state(CycleState.IDLE, cycle=cycle)
+            self._transition_cycle_state(CycleState.RUNNING, cycle=cycle)
+            state_moved = True
+            try:
+                result = self._run_cycle_body(cycle=cycle)
+            except Exception:
+                # UTILTOOLS-111 REQ-04: an unhandled body failure rolls the
+                # machine back to the last committed state captured at cycle
+                # start before the exception propagates.
+                self._rollback_cycle_state(committed_state, cycle=cycle)
+                raise
             committed = True
             return result
         finally:
@@ -1408,6 +1701,13 @@ class MaintainerEngine:
                     self._restore_snapshot(
                         snapshot, trusted_cycle=cycle, committed=committed
                     )
+                    if not committed and state_moved:
+                        # UTILTOOLS-111 DOD-03: the uncommitted restore above
+                        # rolled the document back over the machine's own
+                        # sentinel.  Re-assert the current state so crash
+                        # recovery reads the state the machine actually parked
+                        # in, not the pre-cycle one.
+                        self._persist_cycle_state(self.cycle_state, cycle=cycle)
                     self._deregister_cycle(cycle)
                 if token is not None:
                     self._gate.release(token)
@@ -2466,6 +2766,9 @@ class MaintainerEngine:
                         reported_skips.add(incoming.name)
                         continue
                     self._adopt(incoming, cycle=cycle)
+                    # UTILTOOLS-111 REQ-01: a task adopted this cycle opens
+                    # the diagnosis window.
+                    self._transition_cycle_state(CycleState.DIAGNOSING, cycle=cycle)
                 elif (
                     incoming is not None
                     and incoming is not mine
@@ -2478,6 +2781,9 @@ class MaintainerEngine:
                     self._preempt(incoming, previous, cycle=cycle)
                     preempted_name = previous.name
                     self._adopt(incoming, cycle=cycle)
+                    # UTILTOOLS-111 REQ-01: a preempted adoption re-opens
+                    # the diagnosis window for the incoming task.
+                    self._transition_cycle_state(CycleState.DIAGNOSING, cycle=cycle)
                 task = self._monitored_by_cycle.get(cycle)
                 if task is None:
                     break
@@ -2554,6 +2860,9 @@ class MaintainerEngine:
                     self._record_cycle_outcome(
                         "BLOCKED", task, cycle=cycle, error=error
                     )
+                    # UTILTOOLS-111 REQ-01: a step that raises enters the
+                    # recovery window for the remaining steps.
+                    self._transition_cycle_state(CycleState.RECOVERING, cycle=cycle)
                     steps += 1
                     continue
                 task.progress = max(task.progress, next_progress)
@@ -2567,11 +2876,22 @@ class MaintainerEngine:
                     self._record_cycle_outcome("COMPLETED", task, cycle=cycle)
                 else:
                     self._record_cycle_outcome("PROGRESS", task, cycle=cycle)
+                # UTILTOOLS-111 REQ-01: a committed step clears the
+                # diagnosis/recovery window and closes the step.
+                self._transition_cycle_state(CycleState.RUNNING, cycle=cycle)
             steps += 1
 
         # REQ-03: every memory record is now updated, so validate the store and
         # persist it before the cycle report is built. Never raises.
         self._finish_cycle(cycle)
+
+        # UTILTOOLS-111 REQ-01: a cycle interrupted by a stop/cancel
+        # parks in STOPPED (the forced-stop edge); a completed cycle
+        # returns to IDLE.
+        if interrupted:
+            self._transition_cycle_state(CycleState.STOPPED, cycle=cycle)
+        else:
+            self._transition_cycle_state(CycleState.IDLE, cycle=cycle)
 
         with self._lock:
             memory_installed = self._memory is not None
