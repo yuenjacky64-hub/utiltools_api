@@ -1,0 +1,603 @@
+08:51:43.676 [main] INFO org.springframework.test.context.support.AnnotationConfigContextLoaderUtils -- Could not detect default configuration classes for test class [com.example.utiltools.crypto.CryptoControllerTest]: CryptoControllerTest does not declare any static, non-private, non-final, nested classes annotated with @Configuration.
+08:51:44.014 [main] INFO org.springframework.boot.test.context.SpringBootTestContextBootstrapper -- Found @SpringBootConfiguration com.example.utiltools.UtiltoolsApiApplication for test class com.example.utiltools.crypto.CryptoControllerTest
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:51:44.549Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.crypto.CryptoControllerTest        : Starting CryptoControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:51:44.550Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.crypto.CryptoControllerTest        : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:51:46.462Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:51:46.463Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:51:46.465Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:51:46.497Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:51:46.505Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.crypto.CryptoControllerTest        : Started CryptoControllerTest in 2.434 seconds (process running for 6.633)
+Mockito is currently self-attaching to enable the inline-mock-maker. This will no longer work in future releases of the JDK. Please add Mockito as an agent to your build what is described in Mockito's documentation: https://javadoc.io/doc/org.mockito/mockito-core/latest/org/mockito/Mockito.html#0.3
+OpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended
+WARNING: A Java agent has been loaded dynamically (/root/.m2/repository/net/bytebuddy/byte-buddy-agent/1.15.11/byte-buddy-agent-1.15.11.jar)
+WARNING: If a serviceability tool is in use, please run with -XX:+EnableDynamicAgentLoading to hide this warning
+WARNING: If a serviceability tool is not in use, please run with -Djdk.instrument.traceUsage for more information
+WARNING: Dynamic loading of agents will be disallowed by default in a future release
+2026-11-12T08:51:48.708Z  INFO 6990 --- [utiltools-api] [           main] t.c.s.AnnotationConfigContextLoaderUtils : Could not detect default configuration classes for test class [com.example.utiltools.contact.ContactControllerTest]: ContactControllerTest does not declare any static, non-private, non-final, nested classes annotated with @Configuration.
+2026-11-12T08:51:48.793Z  INFO 6990 --- [utiltools-api] [           main] .b.t.c.SpringBootTestContextBootstrapper : Found @SpringBootConfiguration com.example.utiltools.UtiltoolsApiApplication for test class com.example.utiltools.contact.ContactControllerTest
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:51:48.853Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.contact.ContactControllerTest      : Starting ContactControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:51:48.854Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.contact.ContactControllerTest      : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:51:50.171Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:51:50.172Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:51:50.174Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:51:50.202Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.contact.ContactControllerTest      : Started ContactControllerTest in 1.398 seconds (process running for 10.33)
+2026-11-12T08:52:51.831Z  WARN 6990 --- [utiltools-api] [           main] s.c.a.AnnotationConfigApplicationContext : Exception encountered during context initialization - cancelling refresh attempt: org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'textService' defined in com.example.utiltools.text.TextServiceConfigTest$TextServiceConfig: Failed to instantiate [com.example.utiltools.text.service.TextService]: Factory method 'textService' threw exception with message: utiltools.text.regex-timeout-ms must be in 1..60000, got 0
+2026-11-12T08:52:51.892Z  WARN 6990 --- [utiltools-api] [           main] s.c.a.AnnotationConfigApplicationContext : Exception encountered during context initialization - cancelling refresh attempt: org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'textService' defined in com.example.utiltools.text.TextServiceConfigTest$TextServiceConfig: Failed to instantiate [com.example.utiltools.text.service.TextService]: Factory method 'textService' threw exception with message: utiltools.text.regex-timeout-ms must be in 1..60000, got 60001
+2026-11-12T08:52:52.698Z  INFO 6990 --- [utiltools-api] [           main] t.c.s.AnnotationConfigContextLoaderUtils : Could not detect default configuration classes for test class [com.example.utiltools.text.TextControllerTest]: TextControllerTest does not declare any static, non-private, non-final, nested classes annotated with @Configuration.
+2026-11-12T08:52:52.805Z  INFO 6990 --- [utiltools-api] [           main] .b.t.c.SpringBootTestContextBootstrapper : Found @SpringBootConfiguration com.example.utiltools.UtiltoolsApiApplication for test class com.example.utiltools.text.TextControllerTest
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:52:52.929Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.text.TextControllerTest    : Starting TextControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:52:52.929Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.text.TextControllerTest    : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:52:53.508Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:52:53.510Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:52:53.511Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:52:53.522Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:52:53.525Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.text.TextControllerTest    : Started TextControllerTest in 0.707 seconds (process running for 73.653)
+2026-11-12T08:52:54.959Z  INFO 6990 --- [utiltools-api] [           main] .b.t.c.SpringBootTestContextBootstrapper : Found @SpringBootConfiguration com.example.utiltools.UtiltoolsApiApplication for test class com.example.utiltools.jobs.BatchJobControllerTest
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:52:55.004Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.jobs.BatchJobControllerTest        : Starting BatchJobControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:52:55.004Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.jobs.BatchJobControllerTest        : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:52:55.715Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:52:55.715Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:52:55.716Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:52:55.730Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.jobs.BatchJobControllerTest        : Started BatchJobControllerTest in 0.767 seconds (process running for 75.858)
+2026-11-12T08:52:56.112Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=1
+2026-11-12T08:52:56.335Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.349Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.364Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.377Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:52:56.393Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.411Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:52:56.430Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.434Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.443Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:52:56.494Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.518Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.533Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.564Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.578Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.596Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.603Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=1
+2026-11-12T08:52:56.604Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:52:56.625Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:52:56.632Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=1
+2026-11-12T08:52:56.649Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=1
+2026-11-12T08:52:56.663Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.667Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.691Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.705Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.758Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:06.764Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.777Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:06.801Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.816Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:06.829Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.862Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:06.876Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.889Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.894Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.919Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.934Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.947Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.955Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.984Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:06.987Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:07.005Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.009Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.044Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.094Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=1
+2026-11-12T08:53:17.096Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.097Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.097Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.101Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.105Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.120Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.185Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.209Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.524Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:17.527Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=2
+2026-11-12T08:53:17.541Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=105
+2026-11-12T08:53:17.548Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.559Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.588Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.602Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.613Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.624Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.636Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.647Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.658Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.668Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.679Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.690Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.701Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.711Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.724Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.736Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.747Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.757Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.768Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.779Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.790Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.802Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.813Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=1
+2026-11-12T08:53:17.824Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.835Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.846Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.857Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.868Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.879Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.890Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.901Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.914Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.924Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.925Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.939Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.946Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=2
+2026-11-12T08:53:17.962Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.978Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:17.984Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:18.010Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.015Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.025Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:18.051Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.054Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=1
+2026-11-12T08:53:18.070Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:18.085Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.112Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.137Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:18.157Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.163Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.178Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.192Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.222Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.237Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.243Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.255Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=3
+2026-11-12T08:53:18.256Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:18.281Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.296Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:18.308Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.322Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.345Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.358Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.380Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.383Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=3
+2026-11-12T08:53:18.395Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.414Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.440Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.454Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.478Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.484Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.486Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.489Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.502Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.504Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.505Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.538Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.542Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.544Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=3
+2026-11-12T08:53:18.551Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.577Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.592Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.604Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.617Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.639Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:18.672Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.685Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.709Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.720Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.733Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.735Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=1
+2026-11-12T08:53:18.739Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=3
+2026-11-12T08:53:18.745Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.745Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.761Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.774Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.787Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:18.790Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:18.804Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.817Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.831Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.833Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.840Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.843Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.846Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=1
+2026-11-12T08:53:18.853Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.853Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.865Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.880Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.884Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.903Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=0
+2026-11-12T08:53:18.905Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.908Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=false, forced=0, failed=2
+2026-11-12T08:53:18.914Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.925Z  INFO 6990 --- [utiltools-api] [ol-182-thread-1] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=1
+2026-11-12T08:53:18.926Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.jobs.BatchHashJobService   : batch-hash drain: terminated=true, forced=0, failed=0
+2026-11-12T08:53:18.995Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:18.996Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:18.996Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:19.055Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:19.056Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:19.056Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:19.099Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:19.099Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:19.099Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:19.169Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:19.169Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:19.170Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:53:19.190Z  INFO 6990 --- [utiltools-api] [           main] t.c.s.AnnotationConfigContextLoaderUtils : Could not detect default configuration classes for test class [com.example.utiltools.resilience.ResilienceControllerTest]: ResilienceControllerTest does not declare any static, non-private, non-final, nested classes annotated with @Configuration.
+2026-11-12T08:53:19.230Z  INFO 6990 --- [utiltools-api] [           main] .b.t.c.SpringBootTestContextBootstrapper : Found @SpringBootConfiguration com.example.utiltools.UtiltoolsApiApplication for test class com.example.utiltools.resilience.ResilienceControllerTest
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:19.255Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.r.ResilienceControllerTest         : Starting ResilienceControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:19.255Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.r.ResilienceControllerTest         : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:19.598Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:19.598Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:19.598Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:19.604Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:19.606Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.r.ResilienceControllerTest         : Started ResilienceControllerTest in 0.373 seconds (process running for 99.734)
+2026-11-12T08:53:19.722Z  INFO 6990 --- [utiltools-api] [           main] t.c.s.AnnotationConfigContextLoaderUtils : Could not detect default configuration classes for test class [com.example.utiltools.resilience.FingerprintResilienceControllerTest]: FingerprintResilienceControllerTest does not declare any static, non-private, non-final, nested classes annotated with @Configuration.
+2026-11-12T08:53:19.736Z  INFO 6990 --- [utiltools-api] [           main] .b.t.c.SpringBootTestContextBootstrapper : Found @SpringBootConfiguration com.example.utiltools.UtiltoolsApiApplication for test class com.example.utiltools.resilience.FingerprintResilienceControllerTest
+2026-11-12T08:53:20.080Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.080Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.083Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 2 ms
+2026-11-12T08:53:20.117Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.117Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.117Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.120Z  WARN 6990 --- [utiltools-api] [           main] c.e.utiltools.ratelimit.RateLimitFilter  : rate limiter failed, failing open: java.lang.IllegalStateException: boom
+2026-11-12T08:53:20.136Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.136Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.136Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.136Z  WARN 6990 --- [utiltools-api] [           main] c.e.utiltools.ratelimit.RateLimitFilter  : rate limiter failed, failing open: java.lang.IllegalStateException: boom
+2026-11-12T08:53:20.155Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.155Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.155Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.169Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.169Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.170Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.191Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.191Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.191Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.212Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.215Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.215Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.233Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.233Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.233Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.337Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.337Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.338Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.349Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.349Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.349Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.363Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.364Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.364Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.365Z  WARN 6990 --- [utiltools-api] [           main] c.e.u.r.RateLimitStatusController        : rate limit status failed, failing open: java.lang.IllegalStateException: bucket store unavailable
+2026-11-12T08:53:20.378Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.378Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.378Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.390Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.390Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.390Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.404Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.404Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.405Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:53:20.419Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.419Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.419Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.433Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.433Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.435Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 2 ms
+2026-11-12T08:53:20.445Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.445Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.446Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.458Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.458Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.458Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.470Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.470Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.471Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:53:20.487Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.487Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.487Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.499Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.499Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.499Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:20.511Z  INFO 6990 --- [utiltools-api] [           main] o.s.mock.web.MockServletContext          : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:20.511Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:20.511Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:20.596Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.ratelimit.RateLimitConfigTest      : Starting RateLimitConfigTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:20.596Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.ratelimit.RateLimitConfigTest      : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:21.701Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.ratelimit.RateLimitConfigTest      : Started RateLimitConfigTest in 1.144 seconds (process running for 101.829)
+2026-11-12T08:53:21.766Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:21.818Z  WARN 6990 --- [utiltools-api] [           main] s.c.a.AnnotationConfigApplicationContext : Exception encountered during context initialization - cancelling refresh attempt: org.springframework.boot.context.properties.ConfigurationPropertiesBindException: Error creating bean with name 'utiltools.ratelimit.costs-com.example.utiltools.ratelimit.RateLimitCostProperties': Could not bind properties to 'RateLimitCostProperties' : prefix=utiltools.ratelimit.costs, ignoreInvalidFields=false, ignoreUnknownFields=true
+2026-11-12T08:53:21.834Z  WARN 6990 --- [utiltools-api] [           main] s.c.a.AnnotationConfigApplicationContext : Exception encountered during context initialization - cancelling refresh attempt: org.springframework.boot.context.properties.ConfigurationPropertiesBindException: Error creating bean with name 'utiltools.ratelimit.costs-com.example.utiltools.ratelimit.RateLimitCostProperties': Could not bind properties to 'RateLimitCostProperties' : prefix=utiltools.ratelimit.costs, ignoreInvalidFields=false, ignoreUnknownFields=true
+2026-11-12T08:53:23.353Z  INFO 6990 --- [utiltools-api] [           main] t.c.s.AnnotationConfigContextLoaderUtils : Could not detect default configuration classes for test class [com.example.utiltools.json.JsonControllerTest]: JsonControllerTest does not declare any static, non-private, non-final, nested classes annotated with @Configuration.
+2026-11-12T08:53:23.379Z  INFO 6990 --- [utiltools-api] [           main] .b.t.c.SpringBootTestContextBootstrapper : Found @SpringBootConfiguration com.example.utiltools.UtiltoolsApiApplication for test class com.example.utiltools.json.JsonControllerTest
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:23.413Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.json.JsonControllerTest    : Starting JsonControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:23.413Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.json.JsonControllerTest    : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:23.724Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:23.724Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:23.724Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:23.732Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:23.734Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.json.JsonControllerTest    : Started JsonControllerTest in 0.35 seconds (process running for 103.862)
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:23.817Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.json.JsonControllerTest    : Starting JsonControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:23.818Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.json.JsonControllerTest    : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:24.247Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:24.247Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:24.248Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:53:24.260Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:24.261Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.json.JsonControllerTest    : Started JsonControllerTest in 0.477 seconds (process running for 104.389)
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:24.558Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.json.JsonControllerTest    : Starting JsonControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:24.558Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.json.JsonControllerTest    : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:24.779Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:24.779Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:24.780Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:53:24.784Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:24.785Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.json.JsonControllerTest    : Started JsonControllerTest in 0.258 seconds (process running for 104.913)
+2026-11-12T08:53:25.566Z  WARN 6990 --- [utiltools-api] [           main] c.e.u.audit.service.AuditReplayService   : replay lease heartbeat could not be scheduled for a2a71536-16e7-46f9-8b80-36f06f68a9ee: replay lease heartbeat failed: scheduler unavailable
+2026-11-12T08:53:25.784Z  WARN 6990 --- [utiltools-api] [           main] c.e.u.audit.service.AuditReplayService   : replay lease renewal failed for e64535e1-add2-45fa-8366-5a4d0b58b58c: replay lease renewal failed: journal unavailable
+2026-11-12T08:53:26.074Z  INFO 6990 --- [utiltools-api] [           main] t.c.s.AnnotationConfigContextLoaderUtils : Could not detect default configuration classes for test class [com.example.utiltools.audit.AuditControllerTest]: AuditControllerTest does not declare any static, non-private, non-final, nested classes annotated with @Configuration.
+2026-11-12T08:53:26.109Z  INFO 6990 --- [utiltools-api] [           main] .b.t.c.SpringBootTestContextBootstrapper : Found @SpringBootConfiguration com.example.utiltools.UtiltoolsApiApplication for test class com.example.utiltools.audit.AuditControllerTest
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:26.190Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.audit.AuditControllerTest  : Starting AuditControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:26.190Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.audit.AuditControllerTest  : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:26.384Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:26.384Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:26.384Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:26.391Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:26.394Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.audit.AuditControllerTest  : Started AuditControllerTest in 0.231 seconds (process running for 106.522)
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:26.447Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.audit.AuditControllerTest  : Starting AuditControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:26.447Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.audit.AuditControllerTest  : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:26.615Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:26.615Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:26.615Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:26.619Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:26.620Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.audit.AuditControllerTest  : Started AuditControllerTest in 0.196 seconds (process running for 106.748)
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:26.689Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.audit.AuditControllerTest  : Starting AuditControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:26.689Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.audit.AuditControllerTest  : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:27.032Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:27.032Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:27.033Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:53:27.037Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:27.039Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.audit.AuditControllerTest  : Started AuditControllerTest in 0.377 seconds (process running for 107.167)
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:27.251Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.audit.AuditControllerTest  : Starting AuditControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:27.251Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.audit.AuditControllerTest  : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:27.458Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:27.458Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:27.459Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:53:27.462Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:27.463Z  INFO 6990 --- [utiltools-api] [           main] c.e.utiltools.audit.AuditControllerTest  : Started AuditControllerTest in 0.266 seconds (process running for 107.591)
+2026-11-12T08:53:27.479Z  INFO 6990 --- [utiltools-api] [           main] .b.t.c.SpringBootTestContextBootstrapper : Found @SpringBootConfiguration com.example.utiltools.UtiltoolsApiApplication for test class com.example.utiltools.audit.AuditQuarantineStatusTest
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:27.494Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.audit.AuditQuarantineStatusTest    : Starting AuditQuarantineStatusTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:27.494Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.audit.AuditQuarantineStatusTest    : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:27.697Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:27.698Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:27.698Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:27.702Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:27.703Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.audit.AuditQuarantineStatusTest    : Started AuditQuarantineStatusTest in 0.222 seconds (process running for 107.831)
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:27.777Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.audit.AuditQuarantineStatusTest    : Starting AuditQuarantineStatusTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:27.777Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.audit.AuditQuarantineStatusTest    : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:27.964Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:27.964Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:27.965Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:53:27.969Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:27.971Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.audit.AuditQuarantineStatusTest    : Started AuditQuarantineStatusTest in 0.251 seconds (process running for 108.099)
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:28.000Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.audit.AuditQuarantineStatusTest    : Starting AuditQuarantineStatusTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:28.000Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.audit.AuditQuarantineStatusTest    : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:28.158Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:28.158Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:28.158Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:28.162Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:28.162Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.audit.AuditQuarantineStatusTest    : Started AuditQuarantineStatusTest in 0.177 seconds (process running for 108.29)
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:28.189Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.audit.AuditQuarantineStatusTest    : Starting AuditQuarantineStatusTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:28.189Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.audit.AuditQuarantineStatusTest    : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:28.435Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:28.436Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:28.438Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:53:28.448Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:28.451Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.audit.AuditQuarantineStatusTest    : Started AuditQuarantineStatusTest in 0.276 seconds (process running for 108.579)
+2026-11-12T08:53:28.484Z  INFO 6990 --- [utiltools-api] [           main] t.c.s.AnnotationConfigContextLoaderUtils : Could not detect default configuration classes for test class [com.example.utiltools.UtiltoolsApiApplicationTests]: UtiltoolsApiApplicationTests does not declare any static, non-private, non-final, nested classes annotated with @Configuration.
+2026-11-12T08:53:28.508Z  INFO 6990 --- [utiltools-api] [           main] .b.t.c.SpringBootTestContextBootstrapper : Found @SpringBootConfiguration com.example.utiltools.UtiltoolsApiApplication for test class com.example.utiltools.UtiltoolsApiApplicationTests
+2026-11-12T08:53:28.530Z  INFO 6990 --- [utiltools-api] [           main] t.c.s.AnnotationConfigContextLoaderUtils : Could not detect default configuration classes for test class [com.example.utiltools.datetime.DateTimeControllerTest]: DateTimeControllerTest does not declare any static, non-private, non-final, nested classes annotated with @Configuration.
+2026-11-12T08:53:28.563Z  INFO 6990 --- [utiltools-api] [           main] .b.t.c.SpringBootTestContextBootstrapper : Found @SpringBootConfiguration com.example.utiltools.UtiltoolsApiApplication for test class com.example.utiltools.datetime.DateTimeControllerTest
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:28.610Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.datetime.DateTimeControllerTest    : Starting DateTimeControllerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:28.610Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.datetime.DateTimeControllerTest    : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:28.854Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:28.854Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:28.854Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 0 ms
+2026-11-12T08:53:28.858Z  INFO 6990 --- [utiltools-api] [           main] o.s.s.config.TaskSchedulerRouter         : No TaskScheduler/ScheduledExecutorService bean found for scheduled processing
+2026-11-12T08:53:28.861Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.datetime.DateTimeControllerTest    : Started DateTimeControllerTest in 0.293 seconds (process running for 108.989)
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+
+ :: Spring Boot ::                (v3.4.2)
+
+2026-11-12T08:53:29.417Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.common.GlobalExceptionHandlerTest  : Starting GlobalExceptionHandlerTest using Java 21.0.12.1 with PID 6990 (started by root in /home/aiteam/workspace/utiltools_api)
+2026-11-12T08:53:29.418Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.common.GlobalExceptionHandlerTest  : No active profile set, falling back to 1 default profile: "default"
+2026-11-12T08:53:29.505Z  INFO 6990 --- [utiltools-api] [           main] o.s.b.t.m.w.SpringBootMockServletContext : Initializing Spring TestDispatcherServlet ''
+2026-11-12T08:53:29.505Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Initializing Servlet ''
+2026-11-12T08:53:29.506Z  INFO 6990 --- [utiltools-api] [           main] o.s.t.web.servlet.TestDispatcherServlet  : Completed initialization in 1 ms
+2026-11-12T08:53:29.509Z  INFO 6990 --- [utiltools-api] [           main] c.e.u.common.GlobalExceptionHandlerTest  : Started GlobalExceptionHandlerTest in 0.105 seconds (process running for 109.637)
+EXIT=0
