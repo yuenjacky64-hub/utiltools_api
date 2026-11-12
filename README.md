@@ -184,7 +184,7 @@ utiltools_api/
 | `GET` | `/api/v1/utils/contact/submissions/{id}` | Fetch one submission snapshot: `QUEUED` / `DISPATCHING` / `DELIVERED` / `FAILED` / `CANCELLED`; `404` `CONTACT_SUBMISSION_NOT_FOUND` |
 | `GET` | `/api/v1/utils/contact/submissions` | List submission snapshots newest first; optional `limit` (default `20`, clamped to `1..100`) |
 | `POST` | `/api/v1/utils/contact/submissions/{id}/retry` | Requeue a `FAILED` attempt as `attempt+1` (`200`); `409` `CONTACT_TRANSITION_CONFLICT` for any illegal transition |
-| `DELETE` | `/api/v1/utils/contact/submissions/{id}` | Withdraw a submission before the dispatcher starts: `200` with the `CANCELLED` snapshot (repeat cancels are idempotent); `404` `CONTACT_SUBMISSION_NOT_FOUND`, `409` `CONTACT_TRANSITION_CONFLICT` while dispatch is in flight or the row is terminal (`DELIVERED` / `FAILED` / `CANCELLED`) |
+| `DELETE` | `/api/v1/utils/contact/submissions/{id}` | Withdraw a submission before the dispatcher starts: `200` with the `CANCELLED` snapshot; `404` `CONTACT_SUBMISSION_NOT_FOUND`; `409` `CONTACT_TRANSITION_CONFLICT` while dispatch is in flight or the row is terminal (`DELIVERED` / `FAILED`). A repeat cancel of an already-`CANCELLED` row is idempotent and re-answers `200` with its `CANCELLED` snapshot |
 
 ---
 
@@ -2597,9 +2597,10 @@ retries up to `maxAttempts`), plus the terminal `CANCELLED` state:
   `CONTACT_SUBMISSION_CANCELLED`, `nextRetryAt` is cleared, and the `CONTACT_SUBMIT` journal entry is
   closed **exactly once**. Cancellation and the worker's execution start race under the same registry
   lock; exactly one side wins, so a fenced worker never invokes the dispatcher after a withdrawal.
-- `409` `CONTACT_TRANSITION_CONFLICT` answers a cancel while the dispatcher is running or against any
-  terminal row (`DELIVERED`, `FAILED`, `CANCELLED`); an in-flight attempt still terminalizes
-  `DELIVERED` or `FAILED` when the dispatcher returns. `CANCELLED` is terminal and can never retry.
+- `409` `CONTACT_TRANSITION_CONFLICT` answers a cancel while the dispatcher is running or against a
+  terminal row (`DELIVERED`, `FAILED`); an in-flight attempt still terminalizes
+  `DELIVERED` or `FAILED` when the dispatcher returns. A repeat cancel of an already-`CANCELLED` row is
+  idempotent and re-answers `200` with its snapshot. `CANCELLED` is terminal and can never retry.
 
 ---
 
