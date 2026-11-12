@@ -8,6 +8,7 @@ import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.dto.JwtDecodeRequest;
 import com.example.utiltools.crypto.dto.JwtDecodeResponse;
+import com.example.utiltools.crypto.dto.UuidInspectResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
 import com.example.utiltools.crypto.dto.UrlRequest;
 import com.example.utiltools.crypto.dto.UrlResponse;
@@ -395,6 +396,58 @@ public class CryptoService {
             result.add(compact ? uuid.toString().replace("-", "") : uuid.toString());
         }
         return new UuidResponse(count, result, resolvedVersion);
+    }
+
+    /**
+     * Validates and decodes an existing UUID. The input may be given in either the canonical
+     * {@code 8-4-4-4-12} or the compact 32-hex form, case-insensitively, and surrounding
+     * whitespace is trimmed. Blank input and any string whose hex digits are not exactly 32 —
+     * including misplaced hyphens — are rejected with an {@link IllegalArgumentException}.
+     *
+     * <p>Reported fields: the normalised lowercase {@code canonical} form, the lowercase
+     * {@code compact} form, the version nibble (0-15), the variant per RFC 4122/9562
+     * ({@code RFC_4122}, {@code NCS}, {@code MICROSOFT} or {@code FUTURE}) and, only for version 7,
+     * the 48-bit unix-millisecond prefix as {@code unixTimestampMillis} (otherwise {@code null}).
+     *
+     * <p>Read-only: this method never writes an audit journal entry.
+     */
+    public UuidInspectResponse inspectUuid(String value) {
+        String raw = value == null ? "" : value.trim();
+        if (raw.isBlank()) {
+            throw new IllegalArgumentException(
+                    "value must be a UUID in canonical (8-4-4-4-12) or compact (32-hex) form");
+        }
+        String compact = raw.replace("-", "").toLowerCase(Locale.ROOT);
+        if (compact.length() != 32
+                || !compact.chars().allMatch(c -> Character.digit(c, 16) >= 0)) {
+            throw new IllegalArgumentException(
+                    "value must be a valid UUID in canonical (8-4-4-4-12) or compact (32-hex) form");
+        }
+        if (raw.indexOf('-') >= 0
+                && !raw.matches("^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")) {
+            throw new IllegalArgumentException(
+                    "value must be a valid UUID in canonical (8-4-4-4-12) or compact (32-hex) form");
+        }
+        long mostSignificantBits = Long.parseUnsignedLong(compact, 0, 16, 16);
+        long leastSignificantBits = Long.parseUnsignedLong(compact, 16, 32, 16);
+        int version = (int) ((mostSignificantBits >>> 12) & 0xF);
+        String variant = uuidVariantName((int) ((leastSignificantBits >>> 60) & 0xF));
+        Long unixTimestampMillis = version == 7 ? (mostSignificantBits >>> 16) : null;
+        return new UuidInspectResponse(
+                new UUID(mostSignificantBits, leastSignificantBits).toString(),
+                compact,
+                version,
+                variant,
+                unixTimestampMillis);
+    }
+
+    private static String uuidVariantName(int variantNibble) {
+        return switch (variantNibble) {
+            case 8, 9, 10, 11 -> "RFC_4122";
+            case 2, 3 -> "MICROSOFT";
+            case 0, 1 -> "NCS";
+            default -> "FUTURE";
+        };
     }
 
     public UUID generateUuidV7() {

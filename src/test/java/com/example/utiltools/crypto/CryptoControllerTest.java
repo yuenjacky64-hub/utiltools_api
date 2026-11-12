@@ -289,6 +289,64 @@ class CryptoControllerTest {
     }
 
     @Test
+    @DisplayName("GET /api/v1/utils/crypto/uuid/inspect - shouldInspectCanonicalV4")
+    void shouldInspectCanonicalV4() throws Exception {
+        String body = mockMvc.perform(get("/api/v1/utils/crypto/uuid/inspect")
+                        .param("value", "550e8400-e29b-41d4-a716-446655440000"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.canonical").value("550e8400-e29b-41d4-a716-446655440000"))
+                .andExpect(jsonPath("$.data.compact").value("550e8400e29b41d4a716446655440000"))
+                .andExpect(jsonPath("$.data.version").value(4))
+                .andExpect(jsonPath("$.data.variant").value("RFC_4122"))
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+
+        JsonNode data = objectMapper.readTree(body).path("data");
+        assertThat(data.has("unixTimestampMillis")).isTrue();
+        assertThat(data.path("unixTimestampMillis").isNull()).isTrue();
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/crypto/uuid/inspect - shouldRejectInvalidInspectInputAsBadRequest")
+    void shouldRejectInvalidInspectInputAsBadRequest() throws Exception {
+        for (String value : List.of(
+                "   ",
+                "550e8400e29b41d4a71644665544000",
+                "550e8400e29b41d4a71644665544000g",
+                "550e8-400e29b41d4a716446655440000",
+                "550e8400-e29b-41d4-a716-44665544000")) {
+            mockMvc.perform(get("/api/v1/utils/crypto/uuid/inspect").param("value", value))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.success").value(false))
+                    .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+        }
+
+        mockMvc.perform(get("/api/v1/utils/crypto/uuid/inspect"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+    }
+
+    @Test
+    @DisplayName("GET /api/v1/utils/crypto/uuid/inspect - shouldNotJournalInspectCall")
+    void shouldNotJournalInspectCall() throws Exception {
+        int before = journal.list(200, null).size();
+
+        mockMvc.perform(get("/api/v1/utils/crypto/uuid/inspect")
+                        .param("value", "550e8400e29b41d4a716446655440000"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.version").value(4));
+
+        mockMvc.perform(get("/api/v1/utils/crypto/uuid/inspect")
+                        .param("value", "550e8400e29b41d4a71644665544000"))
+                .andExpect(status().isBadRequest());
+
+        assertThat(journal.list(200, null).size()).isEqualTo(before);
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/crypto/hash - should reject blank content")
     void shouldRejectBlankContent() throws Exception {
         String body = """
