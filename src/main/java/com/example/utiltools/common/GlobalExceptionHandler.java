@@ -12,6 +12,7 @@ import com.example.utiltools.jobs.JobQueueFullException;
 import com.example.utiltools.jobs.JobQuotaExceededException;
 import com.example.utiltools.jobs.JobRetryConflictException;
 import com.example.utiltools.resilience.CircuitBreakerOpenException;
+import com.example.utiltools.text.exception.RegexTimeoutException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -41,6 +42,14 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleIllegalArgumentException(IllegalArgumentException ex) {
         ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "BAD_REQUEST", null);
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+    }
+
+    @ExceptionHandler(RegexTimeoutException.class)
+    public ResponseEntity<ApiResponse<Void>> handleRegexTimeout(RegexTimeoutException ex) {
+        // Only the configured timeout is surfaced, never caller text: the 422 body stays bounded.
+        ApiResponse<Void> response = ApiResponse.error(ex.getMessage(), "REGEX_TIMEOUT",
+                Map.of("timeoutMs", ex.timeoutMs()));
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY).body(response);
     }
 
     @ExceptionHandler(JsonPatchRollbackException.class)

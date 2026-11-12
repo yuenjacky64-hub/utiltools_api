@@ -314,6 +314,27 @@ class TextControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/utils/text/replace - catastrophic backtracking aborts the 200 ms default budget: 422 REGEX_TIMEOUT journalled FAILED (DOD-03)")
+    void shouldAnswerRegexTimeoutAs422AndJournalFailed() throws Exception {
+        String body = objectMapper.writeValueAsString(
+                java.util.Map.of("text", "a".repeat(8000) + "b", "pattern", "(a+)+$", "replacement", "X"));
+
+        mockMvc.perform(post("/api/v1/utils/text/replace")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("REGEX_TIMEOUT"))
+                .andExpect(jsonPath("$.details.timeoutMs").value(200));
+
+        mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_REPLACE"))
+                .andExpect(jsonPath("$.data[0].state").value("FAILED"))
+                .andExpect(jsonPath("$.data[0].errorCode").value("REGEX_TIMEOUT"));
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/text/replace - blank text, absent replacement and oversized fields return 400 VALIDATION_ERROR")
     void shouldRejectInvalidReplaceWithValidationError() throws Exception {
         mockMvc.perform(post("/api/v1/utils/text/replace")
