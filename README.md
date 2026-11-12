@@ -26,6 +26,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
   - [5. Batch Hash Jobs (async)](#5-batch-hash-jobs-async)
   - [6. Contact Submissions (async)](#6-contact-submissions-async)
 - [Rate Limiting](#-rate-limiting)
+- [Maintenance Scheduler](#-maintenance-scheduler)
 - [Operation Journal & Replay Verification](#-operation-journal--replay-verification)
 - [Unified Response & Error Handling](#-unified-response--error-handling)
 - [Interactive API Documentation (Swagger UI)](#-interactive-api-documentation-swagger-ui)
@@ -186,6 +187,7 @@ utiltools_api/
 | `GET` | `/api/v1/utils/contact/submissions` | List submission snapshots newest first; optional `limit` (default `20`, clamped to `1..100`) |
 | `POST` | `/api/v1/utils/contact/submissions/{id}/retry` | Requeue a `FAILED` attempt as `attempt+1` (`200`); `409` `CONTACT_TRANSITION_CONFLICT` for any illegal transition |
 | `DELETE` | `/api/v1/utils/contact/submissions/{id}` | Withdraw a submission before the dispatcher starts: `200` with the `CANCELLED` snapshot; `404` `CONTACT_SUBMISSION_NOT_FOUND`; `409` `CONTACT_TRANSITION_CONFLICT` while dispatch is in flight or the row is terminal (`DELIVERED` / `FAILED`). A repeat cancel of an already-`CANCELLED` row is idempotent and re-answers `200` with its `CANCELLED` snapshot |
+| `GET` | `/api/v1/utils/maintenance/scheduler` | Read-only scheduler status: configured `poolSize`, `threadNamePrefix`, `awaitTerminationSeconds`, plus live `activeThreadCount`, `completedTaskCount`, `queueDepth`; never schedules, cancels, or mutates a maintenance pass |
 
 ---
 
@@ -2720,6 +2722,63 @@ Setting all four `utiltools.ratelimit.costs.*` values to `1` restores unit-value
 > requests-per-window` aggregate capacity, and limits are not shared across instances. Distributed
 > limiting (Redis/Bucket4j/gateway) is out of scope. Excluded from limiting: `/actuator`,
 > `/v3/api-docs`, `/swagger-ui`.
+
+---
+
+## 🧵 Maintenance Scheduler
+
+The service runs eight background maintenance passes (`@Scheduled`, all with a fixed delay): the
+audit journal reaper, the batch-hash job retention/lease reapers, the contact-submission reaper and
+retry pass, rate-limit idle-bucket eviction, and the resilience probe-lease and fallback sweeps.
+All of them run on **one shared, bounded scheduler pool** (`taskScheduler`, a
+`ThreadPoolTaskScheduler` of daemon threads named `maintenance-1` … `maintenance-N`) instead of
+Spring's default single-threaded scheduler, so a slow pass occupies one lane and every other pass
+keeps its fixed-delay cadence. A blocked pass merely occupies one thread of the pool; it cannot
+head-of-line-block the rest. A fixed-delay task still cannot overlap its own previous execution —
+while a pass is running its next firing is deferred and the backlog is coalesced into one.
+Independent passes share only the pool's capacity, never a per-task slot.
+
+### Configuration (`application.properties`)
+
+| Property | Default | Purpose |
+| :--- | :--- | :--- |
+| `utiltools.scheduling.pool-size` | `8` | Lanes in the shared pool; validated to `1..64` (one lane per maintenance pass by default) |
+| `utiltools.scheduling.thread-name-prefix` | `maintenance-` | Worker thread name prefix, appended with a 1-based counter; must be non-blank |
+| `utiltools.scheduling.await-termination-seconds` | `30` | Seconds to wait for in-flight passes at JVM exit; validated to `>= 0` |
+
+**Startup validation:** out-of-range or malformed values fail fast with a clear configuration
+error before the app starts — e.g. `pool-size=0` or `pool-size=65` (must be `1..64`), a blank
+`thread-name-prefix`, or a negative `await-termination-seconds` (must be `>= 0`).
+
+**Graceful shutdown:** at JVM exit the pool waits up to
+`utiltools.scheduling.await-termination-seconds` for in-flight passes to finish before forcing
+termination; maintenance threads are daemons, so a zero grace period never blocks JVM exit either.
+
+### Scheduler status endpoint
+
+`GET /api/v1/utils/maintenance/scheduler` (read-only) reports the live scheduler state:
+
+```json
+{
+  "poolSize": 8,
+  "threadNamePrefix": "maintenance-",
+  "awaitTerminationSeconds": 30,
+  "activeThreadCount": 2,
+  "completedTaskCount": 147,
+  "queueDepth": 0
+}
+```
+
+| Field | Meaning |
+| :--- | :--- |
+| `poolSize` | Configured lane count |
+| `threadNamePrefix` | Configured worker thread name prefix |
+| `awaitTerminationSeconds` | Configured shutdown grace period |
+| `activeThreadCount` | Threads currently executing a maintenance pass |
+| `completedTaskCount` | Total pass executions completed since startup |
+| `queueDepth` | Passes currently waiting for a free lane |
+
+The route is strictly read-only: it schedules, cancels, and mutates no maintenance pass.
 
 ---
 
