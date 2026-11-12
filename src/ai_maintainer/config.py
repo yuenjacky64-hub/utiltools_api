@@ -42,6 +42,12 @@ DEFAULT_STALE_RECOVERY_GRACE_SEC = 60.0
 # Upper bound a graceful wind-down waits for an in-flight cycle (clock units).
 DEFAULT_MAX_SHUTDOWN_WAIT_SEC = 300.0
 
+# Count-based retention for the per-cycle ``RUN-*.md`` reports (UTILTOOLS-125
+# REQ-01). The reports directory keeps at most this many cycle reports; older
+# ones are pruned oldest-first. The ledgers in the same directory are never
+# part of the count and are never removed.
+DEFAULT_MAX_REPORT_FILES = 500
+
 # Count-based retention for the three memory collections (UTILTOOLS-76 REQ-03).
 DEFAULT_MEMORY_MAX_RUNS = 500
 DEFAULT_MEMORY_MAX_BUG_FIXES = 500
@@ -184,6 +190,7 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
             "max_fingerprint_buckets",
             "max_concurrent_cycles",
             "opencode_timeout_sec",
+            "max_report_files",
         ):
             if isinstance(value, bool):
                 raise ValueError(f"{key} must be an integer")
@@ -301,6 +308,10 @@ class MaintainerConfig:
     # default; a non-empty value is format-checked by ``validate()``.
     email: str = DEFAULT_EMAIL
 
+    # Cycle-report retention (UTILTOOLS-125 REQ-01): at most this many
+    # ``RUN-*.md`` reports are kept in the reports directory.
+    max_report_files: int = DEFAULT_MAX_REPORT_FILES
+
     # Memory retention knobs (UTILTOOLS-76 REQ-03): the memory document is
     # pruned to these maxima at the end of every cycle and on a wind-down.
     memory_max_runs: int = DEFAULT_MEMORY_MAX_RUNS
@@ -386,6 +397,13 @@ class MaintainerConfig:
             limit = getattr(self, name)
             if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
                 raise ValueError(f"{name} must be >= 1")
+        report_limit = self.max_report_files
+        if (
+            not isinstance(report_limit, int)
+            or isinstance(report_limit, bool)
+            or report_limit < 1
+        ):
+            raise ValueError("max_report_files must be a positive integer")
 
     @property
     def aging_threshold_seconds(self) -> float:
@@ -480,6 +498,15 @@ class MaintainerConfig:
         email = "" if self.email is None else str(self.email).strip()
         if email and not EMAIL_PATTERN.match(email):
             issues.append(f"email: invalid format: {email}")
+        # UTILTOOLS-125 REQ-01: a non-positive report limit would invert pruning;
+        # appended once more so the earlier messages keep their ordering.
+        report_limit = self.max_report_files
+        if (
+            isinstance(report_limit, bool)
+            or not isinstance(report_limit, int)
+            or report_limit < 1
+        ):
+            issues.append("max_report_files must be a positive integer")
         return issues
 
     @classmethod
