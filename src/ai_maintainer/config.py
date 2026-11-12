@@ -51,6 +51,14 @@ DEFAULT_MEMORY_MAX_LEARNINGS = 500
 # restores the historical one-at-a-time admission.
 DEFAULT_MAX_CONCURRENT_CYCLES = 2
 
+# Autonomous commit budget (UTILTOOLS-126 REQ-02 / REQ-05). ``0`` - the
+# default - and every negative value are the documented *bypass*: no autonomous
+# commit is refused. A positive value caps autonomous commits per rolling
+# 3600-second window; the counter is the durable ledger
+# (``<data_dir>/commit_ledger.json``) so the cap survives restarts, crashes and
+# concurrent ``PatchManager`` instances instead of resetting with a process.
+DEFAULT_MAX_COMMITS_PER_HOUR = 0
+
 # Wall-clock budget for one OpenCode runner invocation (UTILTOOLS-90 REQ-01).
 # Ten minutes by default; ``validate()`` accepts the inclusive range
 # ``[60, 3600]`` seconds.
@@ -183,6 +191,7 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
             "fingerprint_quarantine_threshold",
             "max_fingerprint_buckets",
             "max_concurrent_cycles",
+            "max_commits_per_hour",
             "opencode_timeout_sec",
         ):
             if isinstance(value, bool):
@@ -279,6 +288,10 @@ class MaintainerConfig:
     stale_recovery_grace_sec: float = DEFAULT_STALE_RECOVERY_GRACE_SEC
     max_shutdown_wait_sec: float = DEFAULT_MAX_SHUTDOWN_WAIT_SEC
     max_concurrent_cycles: int = DEFAULT_MAX_CONCURRENT_CYCLES
+    # UTILTOOLS-126 REQ-02 / REQ-05: ``<= 0`` is a legal bypass (no refusals, no
+    # counting), so ``validate()`` never reports this knob; only the *type* is
+    # guarded (see ``__post_init__``).
+    max_commits_per_hour: int = DEFAULT_MAX_COMMITS_PER_HOUR
     # Deliberate exception to the ``__post_init__`` convention: this knob is
     # ``validate()``-only so out-of-range values stay constructible and are
     # reportable through ``validate()`` instead of raising at build time.
@@ -356,6 +369,12 @@ class MaintainerConfig:
         concurrent = self.max_concurrent_cycles
         if not isinstance(concurrent, int) or isinstance(concurrent, bool) or concurrent < 1:
             raise ValueError("max_concurrent_cycles must be >= 1")
+        # UTILTOOLS-126 REQ-05: only the *type* is guarded. ``0`` and negative
+        # values are the documented bypass, so they must stay constructible (and
+        # ``validate()`` must stay silent about them).
+        commit_budget = self.max_commits_per_hour
+        if not isinstance(commit_budget, int) or isinstance(commit_budget, bool):
+            raise ValueError("max_commits_per_hour must be an integer")
         stale_timeout = self.stale_timeout_sec
         if (
             isinstance(stale_timeout, bool)
