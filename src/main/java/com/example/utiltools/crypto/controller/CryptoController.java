@@ -10,6 +10,8 @@ import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.dto.JwtDecodeRequest;
 import com.example.utiltools.crypto.dto.JwtDecodeResponse;
+import com.example.utiltools.crypto.dto.UrlParseRequest;
+import com.example.utiltools.crypto.dto.UrlParseResponse;
 import com.example.utiltools.crypto.dto.UrlRequest;
 import com.example.utiltools.crypto.dto.UrlResponse;
 import com.example.utiltools.crypto.dto.UuidInspectResponse;
@@ -64,6 +66,19 @@ public class CryptoController {
     public ApiResponse<UrlResponse> url(@Valid @RequestBody UrlRequest request) {
         UrlResponse result = auditedOperations.url(request);
         return ApiResponse.success(result, "URL operation completed successfully");
+    }
+
+    @PostMapping("/url/parse")
+    @Operation(summary = "Parse a URL into its components",
+            description = "Decomposes an absolute or relative hierarchical URL into scheme, userInfo, host, port, "
+                    + "raw path, raw query, fragment, and an ordered, duplicate-preserving decoded query-parameter "
+                    + "list. '+' decodes as space, empty values stay empty strings, absent components are null, and "
+                    + "userInfo/path/query/fragment are returned still percent-encoded. At most 128 query parameters "
+                    + "are accepted. Opaque URIs, malformed URIs, illegal ports, bad percent escapes, invalid UTF-8 "
+                    + "or more than 128 query parameters return 400 BAD_REQUEST.")
+    public ApiResponse<UrlParseResponse> parseUrl(@Valid @RequestBody UrlParseRequest request) {
+        UrlParseResponse result = auditedOperations.parseUrl(request);
+        return ApiResponse.success(result, "URL parse completed successfully");
     }
 
     @PostMapping("/jwt/decode")
