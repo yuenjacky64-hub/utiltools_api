@@ -9,6 +9,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -22,7 +23,7 @@ import jakarta.validation.Valid;
 import java.util.List;
 
 /**
- * HTTP intake for the contact form's network seam (REQ-01): four thin routes over
+ * HTTP intake for the contact form's network seam (REQ-01): five thin routes over
  * {@link ContactSubmissionService}, each wrapped in the standard {@link ApiResponse} envelope with
  * the jobs-style {@code @Operation} + explicit error {@code @ApiResponses} metadata.
  *
@@ -109,5 +110,28 @@ public class ContactController {
     public ResponseEntity<ApiResponse<ContactSubmissionResponse>> retry(
             @PathVariable("id") String id) {
         return ResponseEntity.ok(ApiResponse.success(service.retry(id)));
+    }
+
+    @DeleteMapping("/{id}")
+    @Operation(
+            summary = "Withdraw a contact submission before dispatch starts",
+            description = "Terminalizes a QUEUED or not-yet-dispatching submission to CANCELLED "
+                    + "with CONTACT_SUBMISSION_CANCELLED. A repeat cancellation is idempotent (200, "
+                    + "the existing CANCELLED snapshot); an in-flight dispatch or a terminal "
+                    + "DELIVERED / FAILED row is 409 and leaves the row untouched.",
+            responses = {
+                    @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "200",
+                            description = "Cancelled, or already-cancelled (idempotent) snapshot"),
+                    @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "404",
+                            description = "CONTACT_SUBMISSION_NOT_FOUND",
+                            content = @Content(schema = @Schema(implementation = ApiResponse.class))),
+                    @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "409",
+                            description = "CONTACT_TRANSITION_CONFLICT: the dispatch is in flight "
+                                    + "or the submission is terminal (DELIVERED / FAILED)",
+                            content = @Content(schema = @Schema(implementation = ApiResponse.class)))
+            })
+    public ResponseEntity<ApiResponse<ContactSubmissionResponse>> cancel(
+            @PathVariable("id") String id) {
+        return ResponseEntity.ok(ApiResponse.success(service.cancel(id)));
     }
 }

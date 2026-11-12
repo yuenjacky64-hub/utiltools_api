@@ -26,6 +26,11 @@ import java.time.Instant;
  *       attempt budget) and omitted from JSON otherwise (REQ-02, additive null-omitted like
  *       the lease fields)</li>
  * </ul>
+ *
+ * <p>The execution-start fence for the {@code DISPATCHING -> CANCELLED} withdrawal edge is
+ * internal service bookkeeping (the attempt row's {@code dispatchStarted} flag, written under
+ * {@code registryLock} immediately before dispatch); it is deliberately not part of this
+ * serialized view, so the JSON shape is unchanged.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ContactAttempt(

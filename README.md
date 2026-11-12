@@ -24,6 +24,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
   - [3. JSON & Data Processor Utility](#3-json--data-processor-utility)
   - [4. Text Transformation & Statistics Utility](#4-text-transformation--statistics-utility)
   - [5. Batch Hash Jobs (async)](#5-batch-hash-jobs-async)
+  - [6. Contact Submissions (async)](#6-contact-submissions-async)
 - [Rate Limiting](#-rate-limiting)
 - [Operation Journal & Replay Verification](#-operation-journal--replay-verification)
 - [Unified Response & Error Handling](#-unified-response--error-handling)
@@ -179,6 +180,11 @@ utiltools_api/
 | `POST` | `/api/v1/utils/audit/entries/{id}/replay` | Replay a deterministic SUCCEEDED entry and verify the outcome |
 | `POST` | `/api/v1/utils/audit/verify` | Sweep-verify up to `limit` (default `20`, clamped to `max-entries`) SUCCEEDED entries in one pass and report per-entry `VERIFIED` / `MISMATCH` / `FAILED` / `SKIPPED` |
 | `GET` | `/api/v1/utils/audit/reaps` | List reaper tombstones (newest first) with optional `limit` (default `50`, clamped to `max-entries`) and `reason` filter; read-only |
+| `POST` | `/api/v1/utils/contact/submissions` | Admit a contact submission into the bounded dispatch pool; `202` with a snapshot whose `status` is `QUEUED`; `409` `CONTACT_IDEMPOTENCY_CONFLICT` on a reused-key payload mismatch, `429` `CONTACT_QUEUE_FULL` when the pool is saturated |
+| `GET` | `/api/v1/utils/contact/submissions/{id}` | Fetch one submission snapshot: `QUEUED` / `DISPATCHING` / `DELIVERED` / `FAILED` / `CANCELLED`; `404` `CONTACT_SUBMISSION_NOT_FOUND` |
+| `GET` | `/api/v1/utils/contact/submissions` | List submission snapshots newest first; optional `limit` (default `20`, clamped to `1..100`) |
+| `POST` | `/api/v1/utils/contact/submissions/{id}/retry` | Requeue a `FAILED` attempt as `attempt+1` (`200`); `409` `CONTACT_TRANSITION_CONFLICT` for any illegal transition |
+| `DELETE` | `/api/v1/utils/contact/submissions/{id}` | Withdraw a submission before the dispatcher starts: `200` with the `CANCELLED` snapshot; `404` `CONTACT_SUBMISSION_NOT_FOUND`; `409` `CONTACT_TRANSITION_CONFLICT` while dispatch is in flight or the row is terminal (`DELIVERED` / `FAILED`). A repeat cancel of an already-`CANCELLED` row is idempotent and re-answers `200` with its `CANCELLED` snapshot |
 
 ---
 
@@ -2569,6 +2575,32 @@ As with polling, listing reflects only what the registry still holds: `COMPLETED
 jobs disappear once `utiltools.jobs.retention-seconds` elapses, so the list is a live view, not a history log.
 It is deliberately bounded (default `20`, ceiling `100`) and not paginated — for the full history use
 `GET /api/v1/utils/audit/entries`.
+
+---
+
+### 6. Contact Submissions (async)
+
+Contact submissions are admitted into a bounded dispatch pool and delivered by an in-JVM executor pool.
+A submission's lifecycle is `QUEUED` → `DISPATCHING` → `DELIVERED` / `FAILED` (with bounded automatic
+retries up to `maxAttempts`), plus the terminal `CANCELLED` state:
+
+- `POST /api/v1/utils/contact/submissions` admits a submission with `202`; `409`
+  `CONTACT_IDEMPOTENCY_CONFLICT` on a reused-key payload mismatch, `429` `CONTACT_QUEUE_FULL` when the
+  pool is saturated.
+- `GET /api/v1/utils/contact/submissions` lists snapshots newest first (optional `limit`, default `20`,
+  clamped to `1..100`); `GET .../submissions/{id}` fetches one snapshot, `404`
+  `CONTACT_SUBMISSION_NOT_FOUND` for unknown ids.
+- `POST .../submissions/{id}/retry` requeues a `FAILED` attempt as `attempt+1`; `409`
+  `CONTACT_TRANSITION_CONFLICT` for any illegal transition.
+- `DELETE .../submissions/{id}` withdraws a submission **before dispatch**: a successful (or repeated)
+  cancel returns `200` with the `CANCELLED` snapshot — the attempt's error is
+  `CONTACT_SUBMISSION_CANCELLED`, `nextRetryAt` is cleared, and the `CONTACT_SUBMIT` journal entry is
+  closed **exactly once**. Cancellation and the worker's execution start race under the same registry
+  lock; exactly one side wins, so a fenced worker never invokes the dispatcher after a withdrawal.
+- `409` `CONTACT_TRANSITION_CONFLICT` answers a cancel while the dispatcher is running or against a
+  terminal row (`DELIVERED`, `FAILED`); an in-flight attempt still terminalizes
+  `DELIVERED` or `FAILED` when the dispatcher returns. A repeat cancel of an already-`CANCELLED` row is
+  idempotent and re-answers `200` with its snapshot. `CANCELLED` is terminal and can never retry.
 
 ---
 
