@@ -10,6 +10,9 @@ import com.example.utiltools.crypto.dto.JwtDecodeRequest;
 import com.example.utiltools.crypto.dto.JwtDecodeResponse;
 import com.example.utiltools.crypto.dto.UuidInspectResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
+import com.example.utiltools.crypto.dto.UrlParseRequest;
+import com.example.utiltools.crypto.dto.UrlParseResponse;
+import com.example.utiltools.crypto.dto.UrlQueryParameter;
 import com.example.utiltools.crypto.dto.UrlRequest;
 import com.example.utiltools.crypto.dto.UrlResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -21,6 +24,8 @@ import org.springframework.stereotype.Service;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.ByteArrayOutputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CharsetDecoder;
@@ -368,6 +373,118 @@ public class CryptoService {
             return value - 'a' + 10;
         }
         return -1;
+    }
+
+    public UrlParseResponse parseUrl(UrlParseRequest request) {
+        if (request == null || request.url() == null || request.url().isBlank()) {
+            throw new IllegalArgumentException("url is required");
+        }
+        URI uri;
+        try {
+            uri = new URI(request.url());
+        } catch (URISyntaxException e) {
+            throw new IllegalArgumentException("Malformed URL: " + e.getReason(), e);
+        }
+        if (uri.isOpaque()) {
+            throw new IllegalArgumentException("Opaque URIs are not supported: " + request.url());
+        }
+        int rawPort = uri.getPort();
+        // java.net.URI parses the port digits without a range check, so validate it here.
+        if (rawPort > 65535) {
+            throw new IllegalArgumentException("Illegal port number: " + rawPort);
+        }
+        String rawUserInfo = uri.getRawUserInfo();
+        String rawPath = uri.getRawPath();
+        String rawQuery = uri.getRawQuery();
+        String rawFragment = uri.getRawFragment();
+        // Every raw component is validated before any component is emitted, so a malformed escape
+        // or an undecodable byte sequence can never yield a partially decoded result.
+        validateRawComponent(rawUserInfo);
+        validateRawComponent(rawPath);
+        validateRawComponent(rawFragment);
+        List<UrlQueryParameter> parameters = parseQueryParameters(rawQuery);
+        return new UrlParseResponse(
+                uri.getScheme(),
+                emptyToNull(rawUserInfo),
+                uri.getHost(),
+                rawPort >= 0 ? Integer.valueOf(rawPort) : null,
+                emptyToNull(rawPath),
+                emptyToNull(rawQuery),
+                emptyToNull(rawFragment),
+                parameters);
+    }
+
+    private List<UrlQueryParameter> parseQueryParameters(String rawQuery) {
+        if (rawQuery == null || rawQuery.isEmpty()) {
+            return List.of();
+        }
+        List<UrlQueryParameter> parameters = new ArrayList<>();
+        for (String pair : rawQuery.split("&", -1)) {
+            if (pair.isEmpty()) {
+                // "a=1&&b=2" and a trailing "&" carry no parameter.
+                continue;
+            }
+            int separator = pair.indexOf('=');
+            String rawName = separator < 0 ? pair : pair.substring(0, separator);
+            // A key without "=" (e.g. "?flag") keeps an empty-string value, like "?q=" does.
+            String rawValue = separator < 0 ? "" : pair.substring(separator + 1);
+            parameters.add(new UrlQueryParameter(
+                    decodeUtf8(percentDecode(rawName, true), "Invalid UTF-8 sequence in query parameter name"),
+                    decodeUtf8(percentDecode(rawValue, true), "Invalid UTF-8 sequence in query parameter value")));
+        }
+        return List.copyOf(parameters);
+    }
+
+    private void validateRawComponent(String rawComponent) {
+        if (rawComponent == null) {
+            return;
+        }
+        decodeUtf8(percentDecode(rawComponent, false), "Invalid UTF-8 sequence in URL component");
+    }
+
+    private static byte[] percentDecode(String raw, boolean plusAsSpace) {
+        byte[] bytes = raw.getBytes(StandardCharsets.UTF_8);
+        ByteArrayOutputStream decoded = new ByteArrayOutputStream(bytes.length);
+        int index = 0;
+        while (index < bytes.length) {
+            int value = bytes[index] & 0xFF;
+            if (value == '%') {
+                if (index + 2 >= bytes.length) {
+                    throw new IllegalArgumentException(
+                            "Invalid percent-encoding at index " + index + ": truncated escape sequence");
+                }
+                int high = hexValue(bytes[index + 1]);
+                int low = hexValue(bytes[index + 2]);
+                if (high < 0 || low < 0) {
+                    throw new IllegalArgumentException(
+                            "Invalid percent-encoding at index " + index + ": expected two hexadecimal digits");
+                }
+                decoded.write((high << 4) | low);
+                index += 3;
+            } else if (value == '+' && plusAsSpace) {
+                decoded.write(' ');
+                index++;
+            } else {
+                decoded.write(value);
+                index++;
+            }
+        }
+        return decoded.toByteArray();
+    }
+
+    private static String decodeUtf8(byte[] bytes, String message) {
+        CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT);
+        try {
+            return decoder.decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException e) {
+            throw new IllegalArgumentException(message + ": " + e.getMessage(), e);
+        }
+    }
+
+    private static String emptyToNull(String value) {
+        return value == null || value.isEmpty() ? null : value;
     }
 
     public UuidResponse generateUuids(int count, boolean compact) {

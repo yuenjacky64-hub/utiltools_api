@@ -8,6 +8,9 @@ import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.dto.JwtDecodeRequest;
 import com.example.utiltools.crypto.dto.JwtDecodeResponse;
+import com.example.utiltools.crypto.dto.UrlParseRequest;
+import com.example.utiltools.crypto.dto.UrlParseResponse;
+import com.example.utiltools.crypto.dto.UrlQueryParameter;
 import com.example.utiltools.crypto.dto.UrlRequest;
 import com.example.utiltools.crypto.dto.UrlResponse;
 import com.example.utiltools.crypto.dto.UuidInspectResponse;
@@ -161,6 +164,116 @@ class CryptoServiceTest {
         assertThatThrownBy(() -> cryptoService.url(new UrlRequest("ENCODE", "abc", "SEGMENT")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Invalid mode");
+    }
+
+    @Test
+    @DisplayName("Should decompose an absolute URL with userInfo, port, duplicate parameters and fragment")
+    void shouldParseUrlComponents() {
+        UrlParseResponse response = cryptoService.parseUrl(new UrlParseRequest(
+                "https://alice:s3cr3t@example.com:8443/a/b%20c?tag=one&tag=two&flag&empty=&q=a+b#frag"));
+
+        assertThat(response.scheme()).isEqualTo("https");
+        assertThat(response.userInfo()).isEqualTo("alice:s3cr3t");
+        assertThat(response.host()).isEqualTo("example.com");
+        assertThat(response.port()).isEqualTo(8443);
+        assertThat(response.path()).isEqualTo("/a/b%20c");
+        assertThat(response.query()).isEqualTo("tag=one&tag=two&flag&empty=&q=a+b");
+        assertThat(response.fragment()).isEqualTo("frag");
+        assertThat(response.parameters()).containsExactly(
+                new UrlQueryParameter("tag", "one"),
+                new UrlQueryParameter("tag", "two"),
+                new UrlQueryParameter("flag", ""),
+                new UrlQueryParameter("empty", ""),
+                new UrlQueryParameter("q", "a b"));
+    }
+
+    @Test
+    @DisplayName("Should return null for absent components and an empty parameter list")
+    void shouldParseAbsoluteUrlWithoutOptionalComponents() {
+        UrlParseResponse response = cryptoService.parseUrl(new UrlParseRequest("https://example.com"));
+
+        assertThat(response.scheme()).isEqualTo("https");
+        assertThat(response.userInfo()).isNull();
+        assertThat(response.host()).isEqualTo("example.com");
+        assertThat(response.port()).isNull();
+        assertThat(response.path()).isNull();
+        assertThat(response.query()).isNull();
+        assertThat(response.fragment()).isNull();
+        assertThat(response.parameters()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Should parse a relative hierarchical URL")
+    void shouldParseRelativeUrl() {
+        UrlParseResponse response = cryptoService.parseUrl(new UrlParseRequest("/api/v1/items?limit=10&limit=20"));
+
+        assertThat(response.scheme()).isNull();
+        assertThat(response.userInfo()).isNull();
+        assertThat(response.host()).isNull();
+        assertThat(response.port()).isNull();
+        assertThat(response.path()).isEqualTo("/api/v1/items");
+        assertThat(response.query()).isEqualTo("limit=10&limit=20");
+        assertThat(response.fragment()).isNull();
+        assertThat(response.parameters()).containsExactly(
+                new UrlQueryParameter("limit", "10"),
+                new UrlQueryParameter("limit", "20"));
+    }
+
+    @Test
+    @DisplayName("Should decode '+' as space and '%2B' as a literal plus")
+    void shouldDistinguishPlusFromEncodedPlus() {
+        UrlParseResponse response = cryptoService.parseUrl(new UrlParseRequest("/search?a=1+2&b=x%2By&c=%C3%A9"));
+
+        assertThat(response.parameters()).containsExactly(
+                new UrlQueryParameter("a", "1 2"),
+                new UrlQueryParameter("b", "x+y"),
+                new UrlQueryParameter("c", "\u00e9"));
+    }
+
+    @Test
+    @DisplayName("Should return an empty parameter list for empty and missing queries")
+    void shouldParseEmptyAndMissingQuery() {
+        UrlParseResponse withEmptyQuery = cryptoService.parseUrl(new UrlParseRequest("/path?"));
+        assertThat(withEmptyQuery.query()).isNull();
+        assertThat(withEmptyQuery.parameters()).isEmpty();
+
+        UrlParseResponse withSeparatorOnly = cryptoService.parseUrl(new UrlParseRequest("/path?&&"));
+        assertThat(withSeparatorOnly.parameters()).isEmpty();
+
+        UrlParseResponse withoutQuery = cryptoService.parseUrl(new UrlParseRequest("/path#frag"));
+        assertThat(withoutQuery.query()).isNull();
+        assertThat(withoutQuery.fragment()).isEqualTo("frag");
+        assertThat(withoutQuery.parameters()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Should reject malformed URLs, opaque URIs, illegal ports, bad escapes and invalid UTF-8")
+    void shouldRejectMalformedUrlParse() {
+        for (String malformed : List.of(
+                "https://example.com/a b",
+                "https://exa mple.com/",
+                "https://example.com:99999999/path",
+                "mailto:alice@example.com",
+                "urn:isbn:0451450523")) {
+            assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest(malformed)))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+
+        assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest("/path?a=%2")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Malformed URL");
+        assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest("/path?a=%ZZ")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Malformed URL");
+        assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest("/path/caf%C3")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid UTF-8 sequence");
+        assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest("/path?a=%FF")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid UTF-8 sequence");
+        assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest("  ")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("url is required");
     }
 
     @Test
