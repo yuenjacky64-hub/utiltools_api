@@ -34,6 +34,24 @@ the existing cross-process ``ai_maintainer.memory.locking.file_lock``.
     ``max_commits_per_hour``; the *only* way to get an unlimited budget is the
     explicit ``max_commits_per_hour <= 0`` bypass.
 
+``INV-COMMIT-5`` (a state transition is only reported once it is on disk)
+    ``_write_locked`` never swallows an ``OSError``: a reservation, a
+    ``committed`` receipt or a ``cancelled`` release that did not reach the disk
+    raises :class:`CommitLedgerWriteError`. Consequently ``reserve`` hands out a
+    token *only* for a persisted entry, and ``consume``/``release`` return
+    ``True`` *only* for a transition the next check will see. An unwritable
+    ledger (ENOSPC / EROFS / EACCES on ``data/``) therefore denies the commit -
+    it can never be read as "no cap" (REQ-02, REQ-05).
+
+``INV-COMMIT-6`` (a section never runs without the OS lock)
+    ``file_lock`` *degrades*: an unopenable lock file is reported once as
+    ``MEMORY_LOCK_UNAVAILABLE`` and the block then runs unserialised. That
+    degradation is right for the memory store (an in-process lock still
+    serialises) and wrong for the commit budget (the whole threat is a second
+    *process*). :meth:`CommitLedger._section` therefore probes the lock file
+    before entering and verifies the lock is actually held after entering, and
+    raises :class:`CommitLedgerLockUnavailable` instead of running degraded.
+
 The lock target is the ledger path, so ``file_lock`` locks the sibling
 ``.commit_ledger.json.lock`` (never the ledger inode: writes are
 ``tmp + os.replace``). ``util.fs.InstanceLock`` is deliberately *not* used here -
@@ -47,6 +65,7 @@ import json
 import logging
 import os
 import re
+import stat
 import subprocess
 import time
 import uuid
@@ -54,16 +73,25 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
-from ai_maintainer.memory.locking import file_lock
+from ai_maintainer.memory.locking import file_lock, lock_path
+
+try:  # POSIX: the primitive that makes "is the section serialised?" answerable
+    import fcntl
+except ImportError:  # pragma: no cover - platform dependent
+    fcntl = None  # type: ignore[assignment]
 
 __all__ = [
     "CommitBudgetExhausted",
     "CommitLedger",
+    "CommitLedgerCorrupt",
+    "CommitLedgerLockUnavailable",
+    "CommitLedgerWriteError",
     "CommitPolicyRefused",
     "CommitVerificationFailed",
-    "CommitLedgerCorrupt",
     "LEDGER_CORRUPT",
+    "LEDGER_LOCK_UNAVAILABLE",
     "LEDGER_NAME",
+    "LEDGER_WRITE_FAILED",
     "LEDGER_WINDOW_SEC",
     "MAINTAINER_COMMIT_TRAILER",
     "PatchManager",
@@ -107,6 +135,12 @@ _TRAILER_PATTERN = re.compile(
 #: Log/issue code for a quarantined ledger (one line per incident).
 LEDGER_CORRUPT = "COMMIT_LEDGER_CORRUPT"
 
+#: Log/issue code for a ledger that could not be persisted (fail-closed write).
+LEDGER_WRITE_FAILED = "COMMIT_LEDGER_WRITE_FAILED"
+
+#: Log/issue code for a section that would have run without the OS lock.
+LEDGER_LOCK_UNAVAILABLE = "COMMIT_LEDGER_LOCK_UNAVAILABLE"
+
 #: ``<ledger>.quarantined.<epoch-ms>`` - matching the memory store's convention.
 QUARANTINE_TAG = "quarantined"
 
@@ -132,6 +166,23 @@ class CommitLedgerCorrupt(Exception):
     """The ledger exists but could not be read as a ledger document."""
 
 
+class CommitLedgerWriteError(RuntimeError):
+    """The ledger could not be persisted, so no transition happened on disk.
+
+    Raised by every mutating section whose ``tmp`` + ``fsync`` + ``os.replace``
+    failed (``INV-COMMIT-5``). Callers must treat it as "the budget is
+    unavailable": no token, no receipt, no release - never as "budget granted".
+    """
+
+
+class CommitLedgerLockUnavailable(RuntimeError):
+    """The cross-process lock could not be taken for a ledger section.
+
+    Raised instead of running the read-modify-write unserialised
+    (``INV-COMMIT-6``): an unverifiable lock is the last-slot race re-opened.
+    """
+
+
 class CommitBudgetExhausted(RuntimeError):
     """The hourly autonomous-commit cap refuses another commit."""
 
@@ -150,12 +201,24 @@ def resolve_data_dir(config: Any) -> Path:
     ``config.data_dir`` wins when set; otherwise the ledger sits under
     ``<config.maintainer_root>/data`` (the state root the instance lock and the
     lease audit already use) and, with no root either, under ``./data``.
+
+    A ``data_dir`` that is set but *blank* (whitespace-only) is a configuration
+    mistake, not an instruction: it is reported once and then resolved like an
+    unset directory, so a ledger silently drifting to another root is at least
+    visible in the log.
     """
 
     raw = getattr(config, "data_dir", None)
-    text = None if raw is None else str(raw).strip()
+    raw_text = "" if raw is None else str(raw)
+    text = raw_text.strip()
     if text:
         return Path(text).expanduser()
+    if raw_text:
+        LOG.warning(
+            "config.data_dir is blank/whitespace-only (%r); the commit ledger "
+            "falls back to the maintainer data directory",
+            raw_text,
+        )
     root = getattr(config, "maintainer_root", None)
     root_text = None if root is None else str(root).strip()
     base = Path(root_text).expanduser() if root_text else Path.cwd()
@@ -351,6 +414,11 @@ class CommitLedger:
         is the documented bypass: a token is always returned, the entry is still
         written so the flow's ``consume``/``release`` stay symmetric, but the
         count never refuses anything.
+
+        The token is returned **after** the append reached the disk: if the
+        write fails the section raises :class:`CommitLedgerWriteError` and no
+        token exists, because a reservation the next check cannot read would
+        grant a slot for free (``INV-COMMIT-5``, REQ-02).
         """
 
         with self._section():
@@ -365,7 +433,7 @@ class CommitLedger:
             if not bypass and self._used(entries) >= int(limit):
                 # Persist the prune/reconcile result: the reconciliation must
                 # not re-add the same git commits on the next check.
-                self._write_locked(entries)
+                self._persist_before_refusal(entries)
                 return None
             entry = {
                 "ts": now,
@@ -376,13 +444,40 @@ class CommitLedger:
                 "commit_sha": None,
             }
             entries.append(entry)
+            # Raises CommitLedgerWriteError when the entry did not land: a
+            # token for an unpersisted reservation is the fail-open bug this
+            # invariant exists to prevent.
             self._write_locked(entries)
             return str(entry["token"])
+
+    def _persist_before_refusal(self, entries: list[dict[str, Any]]) -> None:
+        """Persist the pruned/reconciled window before refusing a reservation.
+
+        The refusal is already the cap-safe answer, so a write failure here is
+        reported and *not* raised: the only consequence is that the same git
+        commits are reconciled (and re-pruned) again on the next check. Nothing
+        is granted by this path either way.
+        """
+
+        try:
+            self._write_locked(entries)
+        except CommitLedgerWriteError as error:
+            LOG.error(
+                "%s: could not persist the pruned ledger before refusing a "
+                "reservation (%s)",
+                LEDGER_WRITE_FAILED,
+                error,
+            )
 
     # -- REQ-03: consume / release ---------------------------------------
 
     def consume(self, token: str, commit_sha: str | None) -> bool:
-        """Turn a ``reserved`` entry into ``committed``; ``False`` if unknown."""
+        """Turn a ``reserved`` entry into ``committed``; ``False`` if unknown.
+
+        ``True`` means the receipt is on disk: the ``_write_locked`` call
+        raises :class:`CommitLedgerWriteError` rather than letting a lost
+        ``committed`` transition be reported as durable (``INV-COMMIT-5``).
+        """
 
         with self._section():
             now = self._now()
@@ -396,7 +491,12 @@ class CommitLedger:
             return False
 
     def release(self, token: str, reason: str = "") -> bool:
-        """Cancel a ``reserved`` entry so its slot frees immediately (REQ-03)."""
+        """Cancel a ``reserved`` entry so its slot frees immediately (REQ-03).
+
+        ``True`` means the ``cancelled`` transition is on disk; a failed write
+        raises :class:`CommitLedgerWriteError`, and the slot then stays counted
+        until its lease expires (over-counting, never under-counting).
+        """
 
         with self._section():
             now = self._now()
@@ -419,6 +519,10 @@ class CommitLedger:
         Returns the number of entries added (``0`` when git is unavailable or
         nothing is missing). Runs at ``reserve`` time too, so a commit that
         landed just before a crash still consumes a slot on the next check.
+
+        A ledger write that fails raises :class:`CommitLedgerWriteError`; the
+        ``reserve`` call that triggered the reconciliation then refuses (or
+        raises) instead of counting against a window it could not update.
         """
 
         with self._section():
@@ -437,18 +541,88 @@ class CommitLedger:
         except (TypeError, ValueError):  # pragma: no cover - defensive
             return time.time()
 
-    def _section(self):
-        """``file_lock`` over the ledger's sibling lock file.
+    def _section(self) -> Any:
+        """``file_lock`` over the ledger's sibling lock file, *verified*.
 
-        The parent directory is created first: ``file_lock`` opens
-        ``.<name>.lock`` beside the target and *swallows* an ``OSError`` when it
-        cannot (``MEMORY_LOCK_UNAVAILABLE``). For the budget that degradation is
-        not acceptable, so a directory that cannot be created raises here
-        instead of silently running unserialised.
+        ``file_lock`` degrades: when it cannot open ``.<name>.lock`` it reports
+        ``MEMORY_LOCK_UNAVAILABLE`` once and yields **unserialised**. That is
+        right for the memory store (an in-process lock still serialises) and
+        wrong for the commit budget, where the threat is a second *process*
+        (``INV-COMMIT-6``). So the section:
+
+        1. creates the parent directory and opens the lock file exactly the way
+           ``file_lock`` does (``O_CREAT | O_NOFOLLOW``, ``0o600``), requiring a
+           regular file - a planted symlink (``ELOOP``), a full disk or an
+           exhausted descriptor table raises
+           :class:`CommitLedgerLockUnavailable`;
+        2. opens a *second* descriptor on the same lock file inside the section
+           and requires its non-blocking ``flock`` to fail: with ``flock`` locks
+           being per open-file-description, failure proves the section's own
+           descriptor holds the OS lock. If the probe acquires the lock, the
+           section is running unserialised and raises instead of continuing.
+
+        Step 2 is skipped only when the platform has no ``flock`` at all (no
+        ``fcntl``): there the lock is genuinely unavailable, and raising would
+        reject every commit instead of capping it.
         """
 
         self._ensure_dir()
-        return _locked(self._path, self._lock_timeout)
+        lock_file = lock_path(self._path)
+        self._probe_lock_file(lock_file)
+        return _guarded_section(self, lock_file)
+
+    def _probe_lock_file(self, lock_file: Path) -> None:
+        """Open ``lock_file`` the way ``file_lock`` will, failing closed on OSError."""
+
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(lock_file, flags, 0o600)
+        except OSError as error:
+            self._raise_lock_unavailable(lock_file, error)
+            return  # pragma: no cover - _raise_lock_unavailable always raises
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                self._raise_lock_unavailable(
+                    lock_file, OSError(f"{lock_file} is not a regular file")
+                )
+        finally:
+            os.close(descriptor)
+
+    def _assert_lock_held(self, lock_file: Path) -> None:
+        """Raise unless this section really holds the OS lock on ``lock_file``."""
+
+        if fcntl is None:  # pragma: no cover - platform dependent
+            return
+        try:
+            descriptor = os.open(lock_file, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as error:
+            self._raise_lock_unavailable(lock_file, error)
+            return  # pragma: no cover - always raises above
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return  # held by the section's descriptor: serialised
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            self._raise_lock_unavailable(
+                lock_file,
+                OSError("the section's lock is not held; refusing to run unserialised"),
+            )
+        finally:
+            os.close(descriptor)
+
+    def _raise_lock_unavailable(self, lock_file: Path, error: OSError) -> None:
+        LOG.error(
+            "%s: cannot take the commit-ledger lock %s (%s: %s)",
+            LEDGER_LOCK_UNAVAILABLE,
+            lock_file,
+            type(error).__name__,
+            error,
+        )
+        raise CommitLedgerLockUnavailable(
+            f"commit ledger lock unavailable for {lock_file}: "
+            f"{type(error).__name__}: {error}"
+        ) from error
 
     def _ensure_dir(self) -> None:
         parent = self._path.parent
@@ -619,6 +793,16 @@ class CommitLedger:
         return kept
 
     def _expired(self, entry: Mapping[str, Any], now: float) -> bool:
+        """True when a ``reserved`` entry may be reclaimed by another process.
+
+        Lease age alone is the reclaim rule (REQ-03: "older than a bounded
+        lease **or** owned by a dead pid"), so an owner whose verification runs
+        longer than ``RESERVATION_LEASE_SEC`` can lose a slot it still intends
+        to use. That is the cap-safe direction - the alternative (trusting a
+        live pid forever) let a recycled pid wedge the budget permanently - and
+        the owner's ``consume``/``release`` then simply finds its entry gone.
+        """
+
         if now - float(entry.get("ts", 0.0)) > self._lease_sec:
             return True
         return not _pid_alive(entry.get("pid"))
@@ -634,7 +818,14 @@ class CommitLedger:
         )
 
     def _write_locked(self, entries: list[dict[str, Any]]) -> None:
-        """Publish ``entries`` atomically (``tmp`` + ``os.replace``)."""
+        """Publish ``entries`` atomically (``tmp`` + ``fsync`` + ``os.replace``).
+
+        A write that does not land raises :class:`CommitLedgerWriteError`
+        instead of returning: reporting a reservation, a ``committed`` receipt
+        or a ``cancelled`` release that never reached the disk would grant a
+        slot the next check cannot see, and an unwritable ledger would quietly
+        become an unlimited budget (``INV-COMMIT-5``, REQ-02, REQ-05).
+        """
 
         payload = json.dumps({"entries": entries}, indent=2, sort_keys=True) + "\n"
         tmp = self._path.with_name(f".{self._path.name}.tmp")
@@ -646,16 +837,21 @@ class CommitLedger:
                 os.fsync(handle.fileno())
             os.replace(tmp, self._path)
         except OSError as error:
-            LOG.warning(
-                "%s: commit ledger write failed: %s (%s)",
-                LEDGER_CORRUPT,
+            LOG.error(
+                "%s: commit ledger write failed: %s (%s: %s)",
+                LEDGER_WRITE_FAILED,
                 self._path,
                 type(error).__name__,
+                error,
             )
             try:
                 tmp.unlink()
             except OSError:  # pragma: no cover - defensive
                 pass
+            raise CommitLedgerWriteError(
+                f"commit ledger write failed for {self._path}: "
+                f"{type(error).__name__}: {error}"
+            ) from error
 
 
 @contextmanager
@@ -663,6 +859,21 @@ def _locked(target: Path, timeout: float | None) -> Iterator[None]:
     """``file_lock(target)`` with the ``TimeoutError`` contract kept verbatim."""
 
     with file_lock(target, timeout=timeout):
+        yield
+
+
+@contextmanager
+def _guarded_section(ledger: CommitLedger, lock_file: Path) -> Iterator[None]:
+    """``_locked`` plus the post-condition that the OS lock is really held.
+
+    ``file_lock`` swallows a failing lock-file ``open`` and yields unserialised
+    (``MEMORY_LOCK_UNAVAILABLE``), so entering the block is not proof of
+    exclusion. ``CommitLedger._assert_lock_held`` closes that gap by observing
+    the lock from a second descriptor (``INV-COMMIT-6``).
+    """
+
+    with _locked(ledger.path, ledger._lock_timeout):
+        ledger._assert_lock_held(lock_file)
         yield
 
 
@@ -783,16 +994,23 @@ class PatchManager:
         Every non-committing outcome releases the reservation so the slot is not
         burned (REQ-03):
 
-        * ``policy(message)`` false -> ``CommitPolicyRefused``,
+        * ``policy(message)`` false -> ``CommitPolicyRefused``;
+          ``policy`` *raising* releases too (``RELEASE_POLICY_REFUSED``) and
+          re-raises,
         * ``commit_fn`` raises (commit subprocess failure, abort of any kind) ->
           the exception is re-raised after the release,
         * ``commit_fn`` returns ``None`` (non-committing review path) ->
           ``None`` is returned after the release,
         * ``verify_fn(sha)`` false (test-verification failure) ->
-          ``CommitVerificationFailed``.
+          ``CommitVerificationFailed``; ``verify_fn`` *raising* releases too
+          (``RELEASE_TEST_VERIFICATION``) and re-raises.
 
         Only a sha that survived policy and verification is consumed, with the
-        sha recorded on the ledger entry.
+        sha recorded on the ledger entry. Every release goes through
+        :meth:`_release_after_failure`, so a ledger that cannot be written on a
+        failing path never masks the exception being reported; the leaked
+        reservation then expires with its lease (over-counting, never
+        under-counting).
         """
 
         message = self.commit_message(task_id, summary, body)
@@ -802,9 +1020,18 @@ class PatchManager:
                 f"hourly commit cap reached: {self.max_commits_per_hour} per "
                 f"{int(self._ledger.window_sec)}s"
             )
-        if policy is not None and not policy(message):
-            self.release(token, RELEASE_POLICY_REFUSED)
-            raise CommitPolicyRefused(f"commit policy refused the message: {summary!r}")
+        if policy is not None:
+            try:
+                allowed = policy(message)
+            except BaseException:
+                # A predicate that raises is a refusal, not a slot holder.
+                self._release_after_failure(token, RELEASE_POLICY_REFUSED)
+                raise
+            if not allowed:
+                self._release_after_failure(token, RELEASE_POLICY_REFUSED)
+                raise CommitPolicyRefused(
+                    f"commit policy refused the message: {summary!r}"
+                )
         try:
             sha = commit_fn(message)
         except BaseException as error:
@@ -813,15 +1040,47 @@ class PatchManager:
                 if isinstance(error, (KeyboardInterrupt, SystemExit))
                 else RELEASE_COMMIT_FAILED
             )
-            self.release(token, reason)
+            self._release_after_failure(token, reason)
             raise
         if sha is None:
-            self.release(token, RELEASE_NON_COMMITTING_REVIEW)
+            self._release_after_failure(token, RELEASE_NON_COMMITTING_REVIEW)
             return None
         sha = str(sha)
-        if verify_fn is not None and not verify_fn(sha):
-            self.release(token, RELEASE_TEST_VERIFICATION)
-            raise CommitVerificationFailed(f"verification failed for commit {sha}")
+        if verify_fn is not None:
+            try:
+                verified = bool(verify_fn(sha))
+            except BaseException:
+                # The commit exists but was never verified: the slot must not
+                # stay reserved (a raising verifier wedged the budget before).
+                self._release_after_failure(token, RELEASE_TEST_VERIFICATION)
+                raise
+            if not verified:
+                self._release_after_failure(token, RELEASE_TEST_VERIFICATION)
+                raise CommitVerificationFailed(
+                    f"verification failed for commit {sha}"
+                )
         self.consume(token, sha)
         return sha
+
+    def _release_after_failure(self, token: str, reason: str) -> bool:
+        """Release ``token`` on a failing path without masking the failure.
+
+        The caller already has an exception (or a ``None``) to report, so a
+        ledger write failure here is logged and swallowed: the entry stays
+        ``reserved`` on disk and is reclaimed when its lease expires
+        (``RESERVATION_LEASE_SEC``), which over-counts the window - the
+        cap-safe direction.
+        """
+
+        try:
+            return self.release(token, reason)
+        except CommitLedgerWriteError as error:
+            LOG.error(
+                "%s: could not release reservation %s (%s): %s",
+                LEDGER_WRITE_FAILED,
+                token,
+                reason,
+                error,
+            )
+            return False
 

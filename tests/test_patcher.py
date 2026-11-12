@@ -18,6 +18,15 @@ Covers task-brief REQ-01 .. REQ-05 with one test per Definition-of-Done row:
   ``max_commits_per_hour <= 0`` bypass survives (REQ-05).
 * ``test_max_commits_per_hour_config`` - DOD-06: the new knob flows through the
   five config layers with a ``0`` default and a legal bypass (REQ-05).
+* ``test_ledger_write_failure_never_grants_a_slot`` - REQ-02/REQ-05: a ledger
+  that cannot be persisted denies the slot instead of granting one
+  (``INV-COMMIT-5``): ``reserve`` raises and ``consume``/``release`` never
+  report a transition the disk does not have.
+* ``test_raising_policy_and_verifier_release_the_slot`` - REQ-03: a predicate or
+  verifier that *raises* releases the reservation like one that returns false.
+* ``test_section_refuses_unserialised_execution`` - REQ-02: a planted lock-file
+  symlink and a section that would run without the OS lock both fail closed
+  (``INV-COMMIT-6``) instead of re-opening the last-slot race.
 
 Every test points ``data_dir`` at ``tmp_path`` (never the repo's ``data/``) and
 drives the lease/window edges with an injected clock, so nothing sleeps and
@@ -27,7 +36,9 @@ reconciliation tests is a throwaway repo under ``tmp_path``.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
 import subprocess
 import threading
@@ -37,9 +48,12 @@ import pytest
 
 from ai_maintainer.config import MaintainerConfig
 from ai_maintainer.patcher import PatchManager
+import ai_maintainer.patcher.patch_manager as patch_manager_module
 from ai_maintainer.patcher.patch_manager import (
     LEDGER_CORRUPT,
+    LEDGER_LOCK_UNAVAILABLE,
     LEDGER_NAME,
+    LEDGER_WRITE_FAILED,
     LEDGER_WINDOW_SEC,
     MAINTAINER_COMMIT_TRAILER,
     RELEASE_COMMIT_FAILED,
@@ -52,6 +66,8 @@ from ai_maintainer.patcher.patch_manager import (
     STATUS_RESERVED,
     CommitBudgetExhausted,
     CommitLedger,
+    CommitLedgerLockUnavailable,
+    CommitLedgerWriteError,
     CommitPolicyRefused,
     CommitVerificationFailed,
     commit_message_with_trailer,
@@ -603,3 +619,162 @@ def test_ledger_reuses_cross_process_lock_file(tmp_path: Path) -> None:
     assert ledger.committed_sha(TASK) == ["1" * 40]
     assert ledger.consume(token, "2" * 40) is False, "a consumed token is not reusable"
     assert CommitBudgetExhausted is not None  # exported for callers
+
+
+# ---------------------------------------------------------------------------
+# INV-COMMIT-5 / REQ-02 + REQ-05: an unwritable ledger denies, never grants
+# ---------------------------------------------------------------------------
+
+
+def test_ledger_write_failure_never_grants_a_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    data_dir = tmp_path / "data"
+    config = make_config(data_dir, limit=1)
+    manager = PatchManager(config, clock=Clock())
+    real_replace = os.replace
+    broken = {"on": True, "allow": 0}
+
+    def exploding_replace(src, dst, *args, **kwargs):
+        if broken["on"] and str(dst) == str(data_dir / LEDGER_NAME):
+            if broken["allow"] > 0:
+                broken["allow"] -= 1
+            else:
+                raise OSError(28, "No space left on device")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", exploding_replace)
+    with caplog.at_level(logging.ERROR):
+        for _ in range(3):
+            with pytest.raises(CommitLedgerWriteError):
+                manager.reserve(TASK)
+    assert LEDGER_WRITE_FAILED in caplog.text
+
+    # Nothing was persisted, so nothing may be implied: no entry file, no
+    # leftover tmp file, and definitely no token handed back to the caller.
+    assert not (data_dir / LEDGER_NAME).exists()
+    assert not (data_dir / f".{LEDGER_NAME}.tmp").exists()
+    assert manager.snapshot()["used"] == 0
+
+    # The same rule holds for the transitions: a receipt/release that did not
+    # land must not be reported as durable.
+    broken["on"] = False
+    token = manager.reserve(TASK)
+    assert token is not None
+    broken["on"] = True
+    with pytest.raises(CommitLedgerWriteError):
+        manager.consume(token, "a" * 40)
+    with pytest.raises(CommitLedgerWriteError):
+        manager.release(token, "abort")
+    broken["on"] = False
+    # The reservation is still the only state on disk: it still consumes the
+    # slot (over-counting beats a phantom receipt).
+    assert manager.snapshot()["used"] == 1
+    assert entries_by_status(data_dir, STATUS_RESERVED)[0]["token"] == token
+    assert entries_by_status(data_dir, STATUS_COMMITTED) == []
+
+    # A release that fails inside ``commit`` never masks the commit failure
+    # itself. (A second slot keeps the reservation above from refusing it.)
+    wider = PatchManager(make_config(data_dir, limit=2), clock=Clock())
+
+    def explode(_message: str) -> str:
+        raise RuntimeError("commit subprocess failed")
+
+    broken["on"] = True
+    broken["allow"] = 1  # the reservation write lands, the release write does not
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError, match="commit subprocess failed"):
+            wider.commit(task_id=TASK, summary="commit fails", commit_fn=explode)
+    assert "could not release reservation" in caplog.text
+    broken["on"] = False
+    # The unreleased slot is still counted on disk - over-counting, never a
+    # phantom receipt - so the failed release cannot grant a free commit.
+    assert len(entries_by_status(data_dir, STATUS_RESERVED)) == 2
+    assert entries_by_status(data_dir, STATUS_CANCELLED) == []
+    assert entries_by_status(data_dir, STATUS_COMMITTED) == []
+
+
+# ---------------------------------------------------------------------------
+# REQ-03: a *raising* predicate or verifier releases the slot too
+# ---------------------------------------------------------------------------
+
+
+def test_raising_policy_and_verifier_release_the_slot(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    config = make_config(data_dir, limit=1)
+    manager = PatchManager(config, clock=Clock())
+
+    def exploding_policy(_message: str) -> bool:
+        raise RuntimeError("policy crashed")
+
+    with pytest.raises(RuntimeError, match="policy crashed"):
+        manager.commit(
+            task_id=TASK,
+            summary="policy raises",
+            commit_fn=lambda message: "a" * 40,
+            policy=exploding_policy,
+        )
+    assert manager.snapshot()["used"] == 0, "a raising policy must not burn a slot"
+    assert (
+        entries_by_status(data_dir, STATUS_CANCELLED)[-1]["reason"]
+        == RELEASE_POLICY_REFUSED
+    )
+    assert entries_by_status(data_dir, STATUS_RESERVED) == []
+
+    def exploding_verifier(_sha: str) -> bool:
+        raise RuntimeError("verify subprocess timed out")
+
+    with pytest.raises(RuntimeError, match="verify subprocess timed out"):
+        manager.commit(
+            task_id=TASK,
+            summary="verify raises",
+            commit_fn=lambda message: "b" * 40,
+            verify_fn=exploding_verifier,
+        )
+    assert manager.snapshot()["used"] == 0, "a raising verifier must not wedge the cap"
+    assert (
+        entries_by_status(data_dir, STATUS_CANCELLED)[-1]["reason"]
+        == RELEASE_TEST_VERIFICATION
+    )
+    assert entries_by_status(data_dir, STATUS_RESERVED) == []
+
+    # The single slot is genuinely free again.
+    token = manager.reserve(TASK)
+    assert token is not None
+    assert manager.release(token, "unit-test") is True
+
+
+# ---------------------------------------------------------------------------
+# INV-COMMIT-6 / REQ-02: no section may run without the OS lock
+# ---------------------------------------------------------------------------
+
+
+def test_section_refuses_unserialised_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    ledger = CommitLedger(data_dir / LEDGER_NAME, clock=Clock())
+    lock_file = data_dir / f".{LEDGER_NAME}.lock"
+
+    # A planted symlink at the lock path: ``file_lock`` would swallow the ELOOP
+    # and yield unserialised; the budget must refuse instead.
+    os.symlink(data_dir / "planted-target", lock_file)
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(CommitLedgerLockUnavailable):
+            ledger.reserve(TASK, limit=1)
+    assert LEDGER_LOCK_UNAVAILABLE in caplog.text
+    assert not (data_dir / LEDGER_NAME).exists()
+    lock_file.unlink()
+
+    # And if ``file_lock`` still yields without the OS lock (its documented
+    # degradation), the post-condition check refuses the section rather than
+    # letting two processes read-modify-write the same window.
+    @contextlib.contextmanager
+    def degraded_lock(target: Path, timeout: float | None):
+        yield
+
+    monkeypatch.setattr(patch_manager_module, "_locked", degraded_lock)
+    with pytest.raises(CommitLedgerLockUnavailable):
+        ledger.reserve(TASK, limit=1)
+    assert not (data_dir / LEDGER_NAME).exists()

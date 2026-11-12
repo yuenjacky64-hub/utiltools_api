@@ -9,6 +9,8 @@ from __future__ import annotations
 from ai_maintainer.patcher.patch_manager import (
     CommitBudgetExhausted,
     CommitLedger,
+    CommitLedgerLockUnavailable,
+    CommitLedgerWriteError,
     CommitPolicyRefused,
     CommitVerificationFailed,
     MAINTAINER_COMMIT_TRAILER,
@@ -21,6 +23,8 @@ from ai_maintainer.patcher.patch_manager import (
 __all__ = [
     "CommitBudgetExhausted",
     "CommitLedger",
+    "CommitLedgerLockUnavailable",
+    "CommitLedgerWriteError",
     "CommitPolicyRefused",
     "CommitVerificationFailed",
     "MAINTAINER_COMMIT_TRAILER",
