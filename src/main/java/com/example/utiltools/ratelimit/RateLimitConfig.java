@@ -13,7 +13,6 @@ import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.Ordered;
-import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
 
 /**
@@ -23,7 +22,6 @@ import org.springframework.scheduling.annotation.Scheduled;
  */
 @Configuration
 @EnableConfigurationProperties({RateLimitProperties.class, RateLimitCostProperties.class})
-@EnableScheduling
 public class RateLimitConfig {
 
     /** After Boot's encoding filter, before Spring MVC dispatch. */
