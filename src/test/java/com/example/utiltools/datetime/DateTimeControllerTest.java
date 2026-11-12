@@ -1453,4 +1453,204 @@ class DateTimeControllerTest {
         assertThat(after.state()).isEqualTo(JournalState.SUCCEEDED);
         assertThat(after.result()).isEqualTo(journalEntry.result());
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/cron/next - returns an exact ordered UTC sequence")
+    void shouldReturnCronNextSequence() throws Exception {
+        String body = """
+                {
+                    "expression": "0 0 12 * * *",
+                    "from": "2026-01-01T00:00:00Z",
+                    "timeZone": "UTC",
+                    "count": 3
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/cron/next")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.expression").value("0 0 12 * * *"))
+                .andExpect(jsonPath("$.data.timeZone").value("UTC"))
+                .andExpect(jsonPath("$.data.count").value(3))
+                .andExpect(jsonPath("$.data.runs.length()").value(3))
+                .andExpect(jsonPath("$.data.runs[0].utcIsoInstant").value("2026-01-01T12:00:00Z"))
+                .andExpect(jsonPath("$.data.runs[1].utcIsoInstant").value("2026-01-02T12:00:00Z"))
+                .andExpect(jsonPath("$.data.runs[2].utcIsoInstant").value("2026-01-03T12:00:00Z"))
+                .andExpect(jsonPath("$.data.runs[0].localDateTime").value("2026-01-01T12:00:00Z"))
+                .andExpect(jsonPath("$.data.runs[0].epochMillis")
+                        .value(Instant.parse("2026-01-01T12:00:00Z").toEpochMilli()));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/cron/next - accepts 5-field expressions and @ macros")
+    void shouldAcceptFiveFieldAndMacroCronExpressions() throws Exception {
+        String fiveField = """
+                {
+                    "expression": "0 12 * * *",
+                    "from": "2026-01-01T00:00:00Z"
+                }
+                """;
+
+        MvcResult first = mockMvc.perform(post("/api/v1/utils/datetime/cron/next")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(fiveField))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.timeZone").value("UTC"))
+                .andExpect(jsonPath("$.data.count").value(5))
+                .andExpect(jsonPath("$.data.runs[0].utcIsoInstant").value("2026-01-01T12:00:00Z"))
+                .andReturn();
+        JsonNode firstRuns = objectMapper.readTree(first.getResponse().getContentAsString())
+                .get("data").get("runs");
+        for (int i = 1; i < firstRuns.size(); i++) {
+            assertThat(firstRuns.get(i).get("epochMillis").asLong())
+                    .isGreaterThan(firstRuns.get(i - 1).get("epochMillis").asLong());
+        }
+
+        String macro = """
+                {
+                    "expression": "@daily",
+                    "from": "2026-01-01T00:00:00Z",
+                    "count": 2
+                }
+                """;
+        mockMvc.perform(post("/api/v1/utils/datetime/cron/next")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(macro))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.runs[0].utcIsoInstant").value("2026-01-02T00:00:00Z"))
+                .andExpect(jsonPath("$.data.runs[1].utcIsoInstant").value("2026-01-03T00:00:00Z"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/cron/next - keeps the wall clock across a DST transition")
+    void shouldKeepCronWallClockAcrossDstTransition() throws Exception {
+        String body = """
+                {
+                    "expression": "0 0 9 * * *",
+                    "from": "2026-03-06T00:00:00Z",
+                    "timeZone": "America/New_York",
+                    "count": 3
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/cron/next")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.runs[0].localDateTime").value("2026-03-06T09:00:00-05:00"))
+                .andExpect(jsonPath("$.data.runs[1].localDateTime").value("2026-03-07T09:00:00-05:00"))
+                .andExpect(jsonPath("$.data.runs[2].localDateTime").value("2026-03-08T09:00:00-04:00"))
+                .andExpect(jsonPath("$.data.runs[0].utcIsoInstant").value("2026-03-06T14:00:00Z"))
+                .andExpect(jsonPath("$.data.runs[2].utcIsoInstant").value("2026-03-08T13:00:00Z"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/cron/next - rejects invalid expression, zone, from and count with 400")
+    void shouldRejectInvalidCronInputs() throws Exception {
+        int before = auditJournal.size();
+        String[] serviceLevelBodies = {
+                """
+                { "expression": "61 0 12 * * *", "from": "2026-01-01T00:00:00Z", "timeZone": "UTC", "count": 3 }
+                """,
+                """
+                { "expression": "0 0 12 *", "from": "2026-01-01T00:00:00Z", "timeZone": "UTC", "count": 3 }
+                """,
+                """
+                { "expression": "0 0 12 * * *", "from": "2026-01-01T00:00:00Z", "timeZone": "Mars/Olympus", "count": 3 }
+                """,
+                """
+                { "expression": "0 0 12 * * *", "from": "not-a-time", "timeZone": "UTC", "count": 3 }
+                """,
+        };
+        for (String content : serviceLevelBodies) {
+            mockMvc.perform(post("/api/v1/utils/datetime/cron/next")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(content))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.success").value(false))
+                    .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+        }
+
+        // Bean-validation rejections stop before the audit journal and surface as
+        // VALIDATION_ERROR; the four service-level failures each journal a FAILED entry.
+        String[] validationBodies = {
+                """
+                { "expression": "0 0 12 * * *", "from": "2026-01-01T00:00:00Z", "timeZone": "UTC", "count": 101 }
+                """,
+                """
+                { "expression": "0 0 12 * * *", "from": "2026-01-01T00:00:00Z", "timeZone": "UTC", "count": 0 }
+                """,
+                """
+                { "expression": "", "from": "2026-01-01T00:00:00Z" }
+                """,
+        };
+
+        for (String content : validationBodies) {
+            mockMvc.perform(post("/api/v1/utils/datetime/cron/next")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(content))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.success").value(false))
+                    .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+        }
+
+        assertThat(auditJournal.size()).isEqualTo(before + 4);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/cron/next - is journalled as DATETIME_CRON_NEXT and replays as VERIFIED")
+    void shouldJournalAndReplayCronNext() throws Exception {
+        String body = """
+                {
+                    "expression": "0 0 12 * * *",
+                    "from": "2026-01-01T00:00:00Z",
+                    "timeZone": "UTC",
+                    "count": 2
+                }
+                """;
+
+        int before = auditJournal.size();
+
+        mockMvc.perform(post("/api/v1/utils/datetime/cron/next")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.runs[0].utcIsoInstant").value("2026-01-01T12:00:00Z"));
+
+        assertThat(auditJournal.size()).isEqualTo(before + 1);
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("DATETIME_CRON_NEXT"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.runs[0].utcIsoInstant").value("2026-01-01T12:00:00Z"))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        JsonNode storedResult = entry.get("result");
+        AuditEntry journalEntry = auditJournal.find(id).orElseThrow();
+        assertThat(OperationType.DATETIME_CRON_NEXT.isDeterministic()).isTrue();
+        assertThat(journalEntry.state()).isEqualTo(JournalState.SUCCEEDED);
+
+        MvcResult replay = mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("DATETIME_CRON_NEXT"))
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"))
+                .andReturn();
+
+        JsonNode replayedResult = objectMapper.readTree(replay.getResponse().getContentAsString())
+                .get("data").get("result");
+        assertThat(replayedResult).isEqualTo(storedResult);
+
+        // Replay must not append a second journal entry.
+        assertThat(auditJournal.size()).isEqualTo(before + 1);
+        AuditEntry after = auditJournal.find(id).orElseThrow();
+        assertThat(after.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(after.result()).isEqualTo(journalEntry.result());
+    }
 }

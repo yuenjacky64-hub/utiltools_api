@@ -21,6 +21,8 @@ import com.example.utiltools.datetime.dto.DateTimeBusinessDaysRequest;
 import com.example.utiltools.datetime.dto.DateTimeBusinessDaysResponse;
 import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
+import com.example.utiltools.datetime.dto.DateTimeCronRequest;
+import com.example.utiltools.datetime.dto.DateTimeCronResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
 import com.example.utiltools.datetime.dto.DateTimeOverlapRequest;
@@ -138,6 +140,10 @@ public class AuditedOperations {
 
     public DateTimeOverlapResponse overlap(DateTimeOverlapRequest request) {
         return record(OperationType.DATETIME_OVERLAP, request, () -> dateTimeService.overlap(request));
+    }
+
+    public DateTimeCronResponse cronNext(DateTimeCronRequest request) {
+        return record(OperationType.DATETIME_CRON_NEXT, request, () -> dateTimeService.cronNext(request));
     }
 
     public DateTimeDurationResponse duration(DateTimeDurationRequest request) {
@@ -280,6 +286,7 @@ public class AuditedOperations {
             case DATETIME_BUSINESS_DAYS -> dateTimeService.businessDays((DateTimeBusinessDaysRequest) request);
             case DATETIME_RANGE -> dateTimeService.range((DateTimeRangeRequest) request);
             case DATETIME_OVERLAP -> dateTimeService.overlap((DateTimeOverlapRequest) request);
+            case DATETIME_CRON_NEXT -> dateTimeService.cronNext((DateTimeCronRequest) request);
             case DATETIME_CURRENT -> dateTimeService.getCurrentTime(timeZoneOf(request));
             case CRYPTO_HASH -> cryptoService.hash((HashRequest) request);
             case CRYPTO_BASE64 -> cryptoService.base64((Base64Request) request);
