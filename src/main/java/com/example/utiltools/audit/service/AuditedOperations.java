@@ -12,6 +12,8 @@ import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.dto.JwtDecodeRequest;
 import com.example.utiltools.crypto.dto.JwtDecodeResponse;
+import com.example.utiltools.crypto.dto.UrlParseRequest;
+import com.example.utiltools.crypto.dto.UrlParseResponse;
 import com.example.utiltools.crypto.dto.UrlRequest;
 import com.example.utiltools.crypto.dto.UrlResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
@@ -172,6 +174,10 @@ public class AuditedOperations {
         return record(OperationType.CRYPTO_URL, request, () -> cryptoService.url(request));
     }
 
+    public UrlParseResponse parseUrl(UrlParseRequest request) {
+        return record(OperationType.CRYPTO_URL_PARSE, request, () -> cryptoService.parseUrl(request));
+    }
+
     public UuidResponse uuid(int count, boolean compact, String version) {
         Map<String, Object> request = new LinkedHashMap<>();
         request.put("count", count);
@@ -292,6 +298,7 @@ public class AuditedOperations {
             case CRYPTO_BASE64 -> cryptoService.base64((Base64Request) request);
             case CRYPTO_BASE32 -> cryptoService.base32((Base32Request) request);
             case CRYPTO_URL -> cryptoService.url((UrlRequest) request);
+            case CRYPTO_URL_PARSE -> cryptoService.parseUrl((UrlParseRequest) request);
             case CRYPTO_UUID -> cryptoService.generateUuids(intOf(request, "count"), booleanOf(request, "compact"),
                     stringOf(request, "version"));
             case CRYPTO_JWT_DECODE -> cryptoService.jwtDecode((JwtDecodeRequest) request);

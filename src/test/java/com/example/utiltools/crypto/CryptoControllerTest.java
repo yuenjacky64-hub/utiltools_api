@@ -15,6 +15,7 @@ import com.example.utiltools.json.service.JsonService;
 import com.example.utiltools.text.service.TextService;
 import com.example.utiltools.resilience.ResilienceConfig;
 import com.example.utiltools.crypto.controller.CryptoController;
+import com.example.utiltools.crypto.dto.UrlParseResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
 import com.example.utiltools.crypto.service.CryptoService;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -27,6 +28,7 @@ import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -63,6 +65,9 @@ class CryptoControllerTest {
 
     @Autowired
     private AuditedOperations auditedOperations;
+
+    @Autowired
+    private RequestMappingHandlerMapping handlerMapping;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -542,6 +547,207 @@ class CryptoControllerTest {
                                 """))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/url/parse - should return URL components and decoded parameters")
+    void shouldParseUrlViaController() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/url/parse")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                    "url": "https://alice:s3cr3t@example.com:8443/a/b?tag=one&tag=two&empty=&q=a+b#frag"
+                                }
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("URL parse completed successfully"))
+                .andExpect(jsonPath("$.data.scheme").value("https"))
+                .andExpect(jsonPath("$.data.userInfo").value("alice:s3cr3t"))
+                .andExpect(jsonPath("$.data.host").value("example.com"))
+                .andExpect(jsonPath("$.data.port").value(8443))
+                .andExpect(jsonPath("$.data.path").value("/a/b"))
+                .andExpect(jsonPath("$.data.query").value("tag=one&tag=two&empty=&q=a+b"))
+                .andExpect(jsonPath("$.data.fragment").value("frag"))
+                .andExpect(jsonPath("$.data.parameters.length()").value(4))
+                .andExpect(jsonPath("$.data.parameters[0].name").value("tag"))
+                .andExpect(jsonPath("$.data.parameters[0].value").value("one"))
+                .andExpect(jsonPath("$.data.parameters[1].name").value("tag"))
+                .andExpect(jsonPath("$.data.parameters[1].value").value("two"))
+                .andExpect(jsonPath("$.data.parameters[2].name").value("empty"))
+                .andExpect(jsonPath("$.data.parameters[2].value").value(""))
+                .andExpect(jsonPath("$.data.parameters[3].value").value("a b"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url/parse")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"url": "/api/v1/items"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.scheme").doesNotExist())
+                .andExpect(jsonPath("$.data.host").doesNotExist())
+                .andExpect(jsonPath("$.data.port").doesNotExist())
+                .andExpect(jsonPath("$.data.path").value("/api/v1/items"))
+                .andExpect(jsonPath("$.data.parameters.length()").value(0));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/url/parse - malformed input returns 400 BAD_REQUEST, never 500")
+    void shouldReturnBadRequestForUrlParse() throws Exception {
+        for (String url : List.of(
+                "https://example.com/a b",
+                "https://example.com:99999999/path",
+                "mailto:alice@example.com",
+                "/path?a=%2",
+                "/path/caf%C3%",
+                "/path?a=%FF")) {
+            String body = objectMapper.writeValueAsString(Map.of("url", url));
+            mockMvc.perform(post("/api/v1/utils/crypto/url/parse")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(body))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+        }
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url/parse")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"url": "   "}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url/parse")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"url": "%s"}
+                                """.formatted("x".repeat(8193))))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+
+        // An over-cap query list is rejected, never truncated.
+        mockMvc.perform(post("/api/v1/utils/crypto/url/parse")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(Map.of("url", urlWithParameters(129)))))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/url/parse - journal and replay are SUCCEEDED and VERIFIED")
+    void shouldJournalAndReplayUrlParseOperation() throws Exception {
+        int before = (int) journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_URL_PARSE)
+                .count();
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url/parse")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"url": "https://example.com/a?b=1&b=2#frag"}
+                                """))
+                .andExpect(status().isOk());
+
+        AuditEntry entry = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_URL_PARSE)
+                .findFirst()
+                .orElseThrow();
+        assertThat(entry.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entry.replayable()).isTrue();
+        assertThat(entry.result().path("host").asText()).isEqualTo("example.com");
+        assertThat(entry.result().path("parameters")).hasSize(2);
+
+        String replayBody = mockMvc.perform(post("/api/v1/utils/audit/entries/" + entry.id() + "/replay"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value(ReplayState.VERIFIED.name()))
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+
+        JsonNode replayed = objectMapper.readTree(replayBody).path("data");
+        assertThat(replayed.path("state").asText()).isEqualTo(JournalState.SUCCEEDED.name());
+        assertThat(replayed.path("completedAt").asText()).isEqualTo(entry.completedAt().toString());
+        UrlParseResponse original = objectMapper.treeToValue(entry.result(), UrlParseResponse.class);
+        UrlParseResponse replayedResult = objectMapper.treeToValue(replayed.path("result"), UrlParseResponse.class);
+        assertThat(replayedResult).isEqualTo(original);
+        assertThat(replayedResult.parameters()).hasSize(2);
+
+        List<AuditEntry> after = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_URL_PARSE)
+                .toList();
+        assertThat(after).hasSize(before + 1);
+        AuditEntry stored = after.stream().filter(e -> e.id().equals(entry.id())).findFirst().orElseThrow();
+        assertThat(stored.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(stored.result()).isEqualTo(entry.result());
+        assertThat(stored.completedAt()).isEqualTo(entry.completedAt());
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/url/parse - a maximal 8192-char, 128-parameter URL stays replayable")
+    void shouldKeepMaximalUrlParseReplayable() throws Exception {
+        String url = maximalUrlParseUrl();
+        assertThat(url).hasSize(8192);
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url/parse")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(Map.of("url", url))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.parameters.length()").value(128));
+
+        AuditEntry entry = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_URL_PARSE)
+                .findFirst()
+                .orElseThrow();
+        assertThat(entry.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entry.replayable()).isTrue();
+        assertThat(entry.result().path("parameters")).hasSize(128);
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/" + entry.id() + "/replay"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value(ReplayState.VERIFIED.name()))
+                .andExpect(jsonPath("$.data.result.parameters.length()").value(128));
+    }
+
+    private static String maximalUrlParseUrl() {
+        String prefix = "/deep/path?";
+        List<String> pairs = new ArrayList<>();
+        for (int i = 0; i < 128; i++) {
+            pairs.add("k" + i + "=" + "v".repeat(56));
+        }
+        String url = prefix + String.join("&", pairs);
+        int pad = 8192 - url.length();
+        assertThat(pad).isGreaterThanOrEqualTo(0);
+        pairs.set(pairs.size() - 1, pairs.get(pairs.size() - 1) + "v".repeat(pad));
+        return prefix + String.join("&", pairs);
+    }
+
+    private static String urlWithParameters(int count) {
+        StringBuilder url = new StringBuilder("/path?");
+        for (int i = 0; i < count; i++) {
+            if (i > 0) {
+                url.append('&');
+            }
+            url.append('p').append(i).append('=').append(i);
+        }
+        return url.toString();
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/url/parse - is its own route, distinct from /url")
+    void shouldExposeUrlParseAsItsOwnRoute() {
+        Set<String> parsePatterns = handlerMapping.getHandlerMethods().entrySet().stream()
+                .filter(e -> e.getValue().getMethod().getName().equals("parseUrl"))
+                .map(e -> e.getKey().getPatternValues().toString())
+                .collect(Collectors.toSet());
+        Set<String> urlPatterns = handlerMapping.getHandlerMethods().entrySet().stream()
+                .filter(e -> e.getValue().getMethod().getName().equals("url"))
+                .map(e -> e.getKey().getPatternValues().toString())
+                .collect(Collectors.toSet());
+
+        assertThat(parsePatterns).containsExactly("[/api/v1/utils/crypto/url/parse]");
+        assertThat(urlPatterns).containsExactly("[/api/v1/utils/crypto/url]");
+        assertThat(handlerMapping.getHandlerMethods().entrySet().stream()
+                .filter(e -> e.getValue().getMethod().getName().equals("parseUrl"))
+                .count()).isEqualTo(1);
     }
 
     @Test

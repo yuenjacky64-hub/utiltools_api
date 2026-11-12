@@ -153,6 +153,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-256, SHA-512, MD5) or HMAC |
 | `POST` | `/api/v1/utils/crypto/base64` | Encode or decode standard / URL-safe Base64 strings |
 | `POST` | `/api/v1/utils/crypto/url` | Percent-encode or decode a URL component, path segment list or form value (`COMPONENT`, `PATH`, `FORM`) |
+| `POST` | `/api/v1/utils/crypto/url/parse` | Decompose a URL into `scheme`, `userInfo`, `host`, `port`, `path`, raw `query`, `fragment` and an ordered, duplicate-preserving list of decoded query `parameters` (absent components are `null`) |
 | `POST` | `/api/v1/utils/crypto/jwt/decode` | Decode a compact JWT into `algorithm`, `type`, `header` and `payload` without verifying the signature (`verified` is always `false`) |
 | `GET` | `/api/v1/utils/crypto/uuid` | Generate random UUID v4 list (standard or compact 32-hex) |
 | `GET` | `/api/v1/utils/crypto/uuid/inspect` | Validate and inspect an existing UUID (`value` = canonical `8-4-4-4-12` or compact 32-hex, case-insensitive, trimmed) returning `canonical`, `compact`, `version`, `variant` (`RFC_4122` / `NCS` / `MICROSOFT` / `FUTURE`) and, for UUIDv7 only, `unixTimestampMillis` (48-bit millisecond prefix); read-only — no journal entry |
@@ -921,7 +922,74 @@ request, the entry is replayable: `POST /api/v1/utils/audit/entries/{id}/replay`
 answers `replay.state = VERIFIED` without rewriting the entry's original `state`, `result` or `completedAt`, and
 without appending a second journal entry.
 
-#### F. JWT Decode (decode-only)
+#### F. URL Decompose & Query Parse
+`POST /api/v1/utils/crypto/url/parse` is the decomposition counterpart of the percent-encode/decode endpoint: it
+splits a URL into its components and decodes its query string into an ordered parameter list.
+
+```json
+{
+  "url": "https://alice:s3cr3t@example.com:8443/a/b?tag=one&tag=two&empty=&q=a+b#frag"
+}
+```
+
+```json
+{
+  "success": true,
+  "message": "URL parse completed successfully",
+  "data": {
+    "scheme": "https",
+    "userInfo": "alice:s3cr3t",
+    "host": "example.com",
+    "port": 8443,
+    "path": "/a/b",
+    "query": "tag=one&tag=two&empty=&q=a+b",
+    "fragment": "frag",
+    "parameters": [
+      {"name": "tag", "value": "one"},
+      {"name": "tag", "value": "two"},
+      {"name": "empty", "value": ""},
+      {"name": "q", "value": "a b"}
+    ]
+  },
+  "timestamp": "2026-11-12T20:15:32.981204112Z"
+}
+```
+
+**Component rules:** absent components are `null` — `scheme`, `userInfo`, `port`, `query` and `fragment` are often
+`null`, and `path` is `null` when the URL has no path (`https://example.com`). Relative hierarchical URLs work and
+return `null` for `scheme`, `userInfo`, `host` and `port` (`/api/v1/items?page=2` → `path = "/api/v1/items"`).
+Every component is returned **raw**: `userInfo`, `path`, `query` and `fragment` are still percent-encoded exactly as
+they appeared in `url` (`/a%20b?q=a%2Bb` → `path = "/a%20b"`, `query = "q=a%2Bb"`). Only the `parameters` list is
+decoded, and re-encoding a decoded name or value before comparing it with `query` is the caller's job.
+
+**Parameter rules:** `parameters` preserves duplicate keys and encounter order, decoding as `FORM` does — `+`
+becomes a space and `%2B` becomes `+`, so `?q=a+b` yields `a b` while `?q=a%2Bb` yields `a+b`. A key without an
+`=` keeps an empty-string value (`?flag` → `{"name": "flag", "value": ""}`), `?q=` keeps `""`, and a URL with no
+query returns an empty list. Empty pairs (`?a=1&&b=2`, a trailing `&`) are separators, not parameters, and never
+consume the budget. At most 128 query parameters are accepted; a URL with a 129th is rejected rather than
+truncated, so the response and its journal entry are always the whole query string or nothing.
+
+**Rejections:** opaque URIs (`mailto:alice@example.com`, `urn:isbn:...`), malformed syntax, ports outside
+`0..65535`, truncated (`%2`) or non-hex (`%ZZ`) escapes and percent sequences that are not valid UTF-8 are all
+rejected with HTTP `400` and error `BAD_REQUEST` — never a partial result. A blank `url` or one longer than `8192`
+characters fails bean validation first with error `VALIDATION_ERROR`; more than 128 query parameters is a
+`BAD_REQUEST` too.
+
+**Security note:** `url` is **journalled verbatim** — the request, and therefore any credential in the `userInfo`
+component (`https://alice:s3cr3t@example.com/…`), is stored in the in-memory journal row for that call and is
+visible through the audit read endpoints (`GET /api/v1/utils/audit/entries`). The journal's redaction is
+key-name-based and cannot recognise a secret embedded in a URL string, so strip or replace `userInfo` before
+calling this endpoint if the credential must not be recorded.
+
+**Journal & replay:** each call is recorded as a `CRYPTO_URL_PARSE` entry that moves `PENDING` →
+`SUCCEEDED`/`FAILED`. Because the response is a pure function of `url`, the entry is replayable:
+`POST /api/v1/utils/audit/entries/{id}/replay` re-runs the same parse and answers `replay.state = VERIFIED` with an
+identical response, without rewriting the entry's original `state`, `result` or `completedAt` and without appending
+a second journal entry. Because the request is bounded (8192 characters, 128 parameters) the journalled response is
+bounded too: no new truncation path is involved, since over-cap input is rejected up front instead of being stored
+short.
+
+#### G. JWT Decode (decode-only)
 `POST /api/v1/utils/crypto/jwt/decode` turns a compact JWS/JWT into its header and claims, so you can inspect
 a token while debugging without pulling a JWT library into the client. It is **decode-only**: the signature is
 never verified, no key is ever supplied, and `verified` is always `false`. Never use the decoded claims for an
@@ -1521,10 +1589,10 @@ populated only when a cached result is served).
 
 ## 🧾 Operation Journal & Replay Verification
 
-All thirty-three journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+All thirty-four journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
 `datetime/shift`, `datetime/duration`, `datetime/business-days`, `datetime/range`, `datetime/overlap`,
 `datetime/cron-next`, `crypto/hash`,
-`crypto/base64`, `crypto/base32`, `crypto/url`, `crypto/jwt/decode`, `crypto/uuid`, `json/format`,
+`crypto/base64`, `crypto/base32`, `crypto/url`, `crypto/url/parse`, `crypto/jwt/decode`, `crypto/uuid`, `json/format`,
 `json/validate`, `json/query`, `json/flatten`, `json/unflatten`, `json/merge-patch`, `json/pointer`,
 `json/to-csv`, `json/from-csv`, `json/csv-to-json`, `json/to-ndjson`, `json/from-ndjson`, `json/diff`,
 `text/transform`, `text/stats`, `text/replace`, `text/html-entities`, `text/word-frequency` — are recorded in a **bounded
