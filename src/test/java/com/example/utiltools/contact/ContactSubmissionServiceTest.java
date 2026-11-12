@@ -53,6 +53,14 @@ class ContactSubmissionServiceTest {
         return service;
     }
 
+    /** startService plus an explicit redrive budget (REQ-04), for the redrive-ceiling cases. */
+    private ContactSubmissionService startServiceWithRedrives(int maxAttempts, int maxRedrives) {
+        dispatcher = new ControllableDispatcher(new CountDownLatch(1));
+        service = new ContactSubmissionService(dispatcher, 1, 1, 0L, maxAttempts, LEASE_SECONDS,
+                1000, 0, clock, 1000, 60_000, 1000, maxRedrives);
+        return service;
+    }
+
     /** startService plus explicit backoff base/cap (seconds), for the automatic-retry scans. */
     private ContactSubmissionService startServiceWithBackoff(int maxAttempts, int baseSeconds,
             int capSeconds) {
@@ -116,6 +124,21 @@ class ContactSubmissionServiceTest {
         } catch (ReflectiveOperationException e) {
             throw new AssertionError(e);
         }
+    }
+
+    /** White-box write used only to reach a transient registry state (QUEUED) from a test. */
+    private static void setField(Object target, String name, Object value) {
+        try {
+            Field field = target.getClass().getDeclaredField(name);
+            field.setAccessible(true);
+            field.set(target, value);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static AuditJournalService newJournal() {
+        return new AuditJournalService(new ObjectMapper(), 5_000, 10_000_000, 60L);
     }
 
     @Test
@@ -282,12 +305,12 @@ class ContactSubmissionServiceTest {
     }
 
     @Test
-    @DisplayName("INV-04: retry after the attempt budget is exhausted answers CONTACT_TRANSITION_CONFLICT")
+    @DisplayName("INV-04/REQ-01: a budget-exhausted failure is DEAD_LETTERED, so retry answers CONTACT_TRANSITION_CONFLICT")
     void exhaustedBudgetRefusesRetry() {
         startService(1);
         dispatcher.failGenerations.add(1);
         ContactSubmissionResponse failed = pollUntil(
-                service.submit(request(null, "doomed")).id(), ContactStatus.FAILED);
+                service.submit(request(null, "doomed")).id(), ContactStatus.DEAD_LETTERED);
         assertThat(failed.attempt()).isEqualTo(1);
 
         assertThatThrownBy(() -> service.retry(failed.id()))
@@ -295,10 +318,11 @@ class ContactSubmissionServiceTest {
                 .satisfies(ex -> {
                     ContactTransitionConflictException conflict =
                             (ContactTransitionConflictException) ex;
-                    assertThat(conflict.status()).isEqualTo(ContactStatus.FAILED);
-                    assertThat(conflict.reason()).contains("exhausted");
+                    assertThat(conflict.status()).isEqualTo(ContactStatus.DEAD_LETTERED);
+                    assertThat(conflict.reason()).contains("FAILED");
                 });
         assertThat(service.get(failed.id()).attempt()).isEqualTo(1);
+        assertThat(service.get(failed.id()).status()).isEqualTo(ContactStatus.DEAD_LETTERED);
     }
 
     @Test
@@ -368,11 +392,12 @@ class ContactSubmissionServiceTest {
 
         clock.advance(4L);
         assertThat(service.retryDueSubmissions(clock.instant())).isEqualTo(1);
-        ContactSubmissionResponse failed3 = pollUntil(submitted.id(), ContactStatus.FAILED);
+        // REQ-02: the attempt budget is exhausted, so the third failure is quarantined with no
+        // automatic schedule left for the scanner to pick up.
+        ContactSubmissionResponse failed3 = pollUntil(submitted.id(), ContactStatus.DEAD_LETTERED);
         assertThat(failed3.attempt()).isEqualTo(3);
-        // DOD-01: the attempt budget is exhausted, so no automatic schedule survives.
         assertThat(failed3.currentAttempt().nextRetryAt()).isNull();
-        assertThat(failed3.currentAttempt().status()).isEqualTo(ContactStatus.FAILED);
+        assertThat(failed3.currentAttempt().status()).isEqualTo(ContactStatus.DEAD_LETTERED);
 
         clock.advance(60L);
         assertThat(service.retryDueSubmissions(clock.instant())).isZero();
@@ -590,7 +615,9 @@ class ContactSubmissionServiceTest {
     @Test
     @DisplayName("DOD-04: DELIVERED and FAILED submissions refuse cancellation, row byte-identical")
     void terminalStatesRefuseCancel() {
-        startService(1);
+        // A budget above the first attempt keeps the failure retryable (FAILED), which is the
+        // state this test is about; a ceiling failure would be DEAD_LETTERED instead (REQ-02).
+        startService(3);
         ContactSubmissionResponse delivered = pollUntil(
                 service.submit(request(null, "done")).id(), ContactStatus.DELIVERED);
         Instant deliveredAt = delivered.currentAttempt().completedAt();
@@ -631,6 +658,328 @@ class ContactSubmissionServiceTest {
         startService(1);
         assertThatThrownBy(() -> service.cancel("never-submitted"))
                 .isInstanceOf(ContactSubmissionNotFoundException.class);
+    }
+
+    // ── Dead-letter quarantine + redrive (REQ-02 … REQ-05) ──────────────────────
+
+    @Test
+    @DisplayName("REQ-02/DOD-02: an attempt-ceiling dispatch failure quarantines DEAD_LETTERED with one closed CONTACT_DEAD_LETTERED entry")
+    void attemptCeilingFailureDeadLetters() {
+        AuditJournalService journal = newJournal();
+        startService(1);
+        service.setAuditJournal(journal);
+        dispatcher.failGenerations.add(1);
+        Instant t0 = clock.instant();
+
+        ContactSubmissionResponse submitted = service.submit(request("k-quarantine", "quarantine me"));
+        ContactSubmissionResponse dead = pollUntil(submitted.id(), ContactStatus.DEAD_LETTERED);
+
+        assertThat(dead.attempt()).isEqualTo(1);
+        assertThat(dead.maxAttempts()).isEqualTo(1);
+        // The original bounded error and completion time survive; the execution stamps do not.
+        assertThat(dead.currentAttempt().error())
+                .isEqualTo(ContactSubmissionService.CONTACT_DISPATCH_FAILED);
+        assertThat(dead.currentAttempt().completedAt()).isEqualTo(t0);
+        assertThat(dead.currentAttempt().startedAt()).isNull();
+        assertThat(dead.currentAttempt().lastHeartbeatAt()).isNull();
+        assertThat(dead.currentAttempt().executionLeaseExpiresAt()).isNull();
+        assertThat(dead.currentAttempt().nextRetryAt()).isNull();
+        assertThat(dead.currentAttempt().auditEntryId()).isNull();
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(0);
+
+        // Exactly one CONTACT_SUBMIT entry, closed once with the quarantine detail.
+        assertThat(journal.list(10, JournalState.FAILED)).hasSize(1);
+        assertThat(journal.list(10, JournalState.FAILED).get(0).errorCode())
+                .isEqualTo(ContactSubmissionService.CONTACT_DEAD_LETTERED);
+        assertThat(journal.list(10, JournalState.SUCCEEDED)).isEmpty();
+        assertThat(journal.list(10, JournalState.PENDING)).isEmpty();
+
+        // REQ-06: an idempotent duplicate answers the existing DEAD_LETTERED snapshot, no dispatch.
+        int dispatches = dispatcher.calls().size();
+        ContactSubmissionResponse duplicate = service.submit(request("k-quarantine", "quarantine me"));
+        assertThat(duplicate.id()).isEqualTo(dead.id());
+        assertThat(duplicate.status()).isEqualTo(ContactStatus.DEAD_LETTERED);
+        assertThat(dispatcher.calls()).hasSize(dispatches);
+    }
+
+    @Test
+    @DisplayName("REQ-02/DOD-02: a lease expiry at the ceiling quarantines DEAD_LETTERED keeping CONTACT_DELIVERY_LEASE_EXPIRED")
+    void leaseExpiryAtCeilingDeadLetters() {
+        AuditJournalService journal = newJournal();
+        startService(1);
+        service.setAuditJournal(journal);
+        dispatcher.holdGenerations.add(1);
+        ContactSubmissionResponse submitted = service.submit(request(null, "stalled at the ceiling"));
+        pollUntil(submitted.id(), ContactStatus.DISPATCHING);
+
+        clock.advance(LEASE_SECONDS + 1L);
+        assertThat(service.reapStaleDispatching()).isEqualTo(1);
+
+        ContactSubmissionResponse dead = service.get(submitted.id());
+        assertThat(dead.status()).isEqualTo(ContactStatus.DEAD_LETTERED);
+        assertThat(dead.currentAttempt().error())
+                .isEqualTo(ContactSubmissionService.CONTACT_DELIVERY_LEASE_EXPIRED);
+        assertThat(dead.currentAttempt().completedAt()).isEqualTo(clock.instant());
+        assertThat(dead.currentAttempt().nextRetryAt()).isNull();
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(0);
+        assertThat(journal.list(10, JournalState.FAILED).get(0).errorCode())
+                .isEqualTo(ContactSubmissionService.CONTACT_DEAD_LETTERED);
+        assertThat(journal.list(10, JournalState.PENDING)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("REQ-02/DOD-02: a shutdown-cancelled in-flight failure at the ceiling stays FAILED, never DEAD_LETTERED")
+    void shutdownCancelledFailureAtCeilingStaysFailed() throws Exception {
+        AuditJournalService journal = newJournal();
+        startServiceWithRedrives(2, 3);
+        service.setAuditJournal(journal);
+        dispatcher.failGenerations.add(1);
+        ContactSubmissionResponse failed = pollUntil(
+                service.submit(request(null, "drain me")).id(), ContactStatus.FAILED);
+        assertThat(failed.attempt()).isEqualTo(1);
+
+        // White-box: rebuild an in-flight generation 2 that has already passed the dispatch fence,
+        // so the drain's ``DISPATCHING -> FAILED(CONTACT_SUBMISSION_CANCELLED)`` branch runs at the
+        // attempt ceiling — the one failure shape that must never be quarantined.
+        Object row = ((Map<String, Object>) readField(service, "submissions")).get(failed.id());
+        setField(row, "attempt", 2);
+        setField(row, "status", ContactStatus.DISPATCHING);
+        setField(row, "dispatchStarted", true);
+        setField(row, "error", (String) null);
+        setField(row, "completedAt", (Instant) null);
+        setField(row, "startedAt", clock.instant());
+        setField(row, "lastHeartbeatAt", clock.instant());
+        setField(row, "executionLeaseExpiresAt", clock.instant().plusSeconds(LEASE_SECONDS));
+
+        service.shutdown(); // drain: an in-flight dispatch force-fails as CONTACT_SUBMISSION_CANCELLED
+
+        ContactSubmissionResponse drained = service.get(failed.id());
+        assertThat(drained.status()).isEqualTo(ContactStatus.FAILED);
+        assertThat(drained.attempt()).isEqualTo(2);
+        assertThat(drained.currentAttempt().error())
+                .isEqualTo(ContactSubmissionService.CONTACT_SUBMISSION_CANCELLED);
+        assertThat(drained.currentAttempt().nextRetryAt()).isNull();
+        assertThat(drained.currentAttempt().executionLeaseExpiresAt()).isNull();
+        // Only the original attempt-1 entry exists, closed once with its retryable failure code.
+        assertThat(journal.list(10, JournalState.FAILED)).hasSize(1);
+        assertThat(journal.list(10, JournalState.FAILED).get(0).errorCode())
+                .isEqualTo(ContactSubmissionService.CONTACT_DISPATCH_FAILED);
+    }
+
+    @Test
+    @DisplayName("REQ-03/DOD-03: redrive requeues attempt+1 with an extended budget, a fresh lease and a new journal entry")
+    void redriveRequeuesDeadLetteredAsNextAttempt() {
+        AuditJournalService journal = newJournal();
+        startService(1);
+        service.setAuditJournal(journal);
+        dispatcher.failGenerations.add(1);
+        ContactSubmissionResponse dead = pollUntil(
+                service.submit(request(null, "redrive me")).id(), ContactStatus.DEAD_LETTERED);
+        String deadEntry = journal.list(10, JournalState.FAILED).get(0).id();
+
+        // REQ-01: retry and DELETE both refuse the quarantined row and leave it byte-identical.
+        assertThatThrownBy(() -> service.retry(dead.id()))
+                .isInstanceOf(ContactTransitionConflictException.class)
+                .satisfies(ex -> {
+                    ContactTransitionConflictException conflict =
+                            (ContactTransitionConflictException) ex;
+                    assertThat(conflict.status()).isEqualTo(ContactStatus.DEAD_LETTERED);
+                    assertThat(conflict.reason()).contains("may only be retried while FAILED");
+                });
+        assertThatThrownBy(() -> service.cancel(dead.id()))
+                .isInstanceOf(ContactTransitionConflictException.class);
+        assertThat(service.get(dead.id())).isEqualTo(dead);
+
+        // REQ-03: legal only from DEAD_LETTERED -> QUEUED/DISPATCHING as attempt+1.
+        Instant admitAt = clock.instant();
+        ContactSubmissionResponse requeued = service.redrive(dead.id());
+        assertThat(requeued.status()).isEqualTo(ContactStatus.DISPATCHING);
+        assertThat(requeued.attempt()).isEqualTo(2);
+        assertThat(requeued.maxAttempts()).isEqualTo(2);
+        assertThat(requeued.currentAttempt().error()).isNull();
+        assertThat(requeued.currentAttempt().completedAt()).isNull();
+        assertThat(requeued.currentAttempt().nextRetryAt()).isNull();
+        assertThat(requeued.currentAttempt().startedAt()).isEqualTo(admitAt);
+        assertThat(requeued.currentAttempt().lastHeartbeatAt()).isEqualTo(admitAt);
+        assertThat(requeued.currentAttempt().executionLeaseExpiresAt())
+                .isEqualTo(admitAt.plusSeconds(LEASE_SECONDS));
+        assertThat(requeued.currentAttempt().auditEntryId()).isNotBlank();
+        assertThat(requeued.currentAttempt().auditEntryId()).isNotEqualTo(deadEntry);
+
+        // The requeued attempt dispatches as generation 2 and delivers.
+        ContactSubmissionResponse delivered = pollUntil(dead.id(), ContactStatus.DELIVERED);
+        assertThat(delivered.attempt()).isEqualTo(2);
+        assertThat(delivered.currentAttempt().error()).isNull();
+        assertThat(dispatcher.calls()).containsExactly(1, 2);
+        assertThat(journal.find(deadEntry).orElseThrow().state()).isEqualTo(JournalState.FAILED);
+        assertThat(journal.find(deadEntry).orElseThrow().errorCode())
+                .isEqualTo(ContactSubmissionService.CONTACT_DEAD_LETTERED);
+        assertThat(journal.list(10, JournalState.SUCCEEDED)).hasSize(1);
+        assertThat(journal.list(10, JournalState.PENDING)).isEmpty();
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(0);
+    }
+
+    @Test
+    @DisplayName("REQ-03/DOD-03: redrive answers CONTACT_TRANSITION_CONFLICT for FAILED, QUEUED, DISPATCHING, DELIVERED and CANCELLED rows")
+    void redriveRefusedOutsideDeadLettered() throws Exception {
+        startServiceWithRedrives(3, 3);
+        dispatcher.failGenerations.add(1);
+        ContactSubmissionResponse failed = pollUntil(
+                service.submit(request(null, "retryable")).id(), ContactStatus.FAILED);
+        assertRedriveRefused(failed.id(), ContactStatus.FAILED);
+
+        dispatcher.failGenerations.clear();
+        ContactSubmissionResponse delivered = pollUntil(
+                service.submit(request(null, "done")).id(), ContactStatus.DELIVERED);
+        assertRedriveRefused(delivered.id(), ContactStatus.DELIVERED);
+
+        // A held worker leaves the next row admitted-but-not-started, so the in-flight shape and
+        // the transient QUEUED shape are both reachable deterministically.
+        dispatcher.holdAll = true;
+        ContactSubmissionResponse holder = service.submit(request(null, "hold the worker"));
+        awaitCondition(() -> dispatcher.calls().size() >= 3);
+        ContactSubmissionResponse pendingRow = service.submit(request(null, "not started yet"));
+        pollUntil(pendingRow.id(), ContactStatus.DISPATCHING);
+        assertRedriveRefused(pendingRow.id(), ContactStatus.DISPATCHING);
+
+        Map<String, Object> submissions = readField(service, "submissions");
+        Object row = submissions.get(pendingRow.id());
+        setField(row, "status", ContactStatus.QUEUED);
+        assertRedriveRefused(pendingRow.id(), ContactStatus.QUEUED);
+        setField(row, "status", ContactStatus.DISPATCHING);
+
+        assertThat(service.cancel(pendingRow.id()).status()).isEqualTo(ContactStatus.CANCELLED);
+        assertRedriveRefused(pendingRow.id(), ContactStatus.CANCELLED);
+
+        dispatcher.release().countDown();
+        pollUntil(holder.id(), ContactStatus.DELIVERED);
+
+        assertThatThrownBy(() -> service.redrive("never-submitted"))
+                .isInstanceOf(ContactSubmissionNotFoundException.class);
+    }
+
+    private void assertRedriveRefused(String id, ContactStatus expected) {
+        ContactSubmissionResponse before = service.get(id);
+        assertThatThrownBy(() -> service.redrive(id))
+                .isInstanceOf(ContactTransitionConflictException.class)
+                .satisfies(ex -> {
+                    ContactTransitionConflictException conflict =
+                            (ContactTransitionConflictException) ex;
+                    assertThat(conflict.submissionId()).isEqualTo(id);
+                    assertThat(conflict.status()).isEqualTo(expected);
+                    assertThat(conflict.reason()).contains("may only be redriven while DEAD_LETTERED");
+                });
+        assertThat(service.get(id)).isEqualTo(before);
+    }
+
+    @Test
+    @DisplayName("REQ-04/DOD-04: the redrive budget is per submission; an exhausted budget refuses further redrives")
+    void redriveBudgetExhaustionRefusesFurtherRedrives() {
+        AuditJournalService journal = newJournal();
+        startServiceWithRedrives(1, 1);
+        service.setAuditJournal(journal);
+        dispatcher.failGenerations.add(1);
+        ContactSubmissionResponse first = pollUntil(
+                service.submit(request(null, "doomed once")).id(), ContactStatus.DEAD_LETTERED);
+
+        dispatcher.failGenerations.add(2);
+        ContactSubmissionResponse requeued = service.redrive(first.id());
+        assertThat(requeued.attempt()).isEqualTo(2);
+        assertThat(requeued.maxAttempts()).isEqualTo(2);
+
+        ContactSubmissionResponse second = pollUntil(first.id(), ContactStatus.DEAD_LETTERED);
+        assertThat(second.attempt()).isEqualTo(2);
+        assertThat(second.currentAttempt().error())
+                .isEqualTo(ContactSubmissionService.CONTACT_DISPATCH_FAILED);
+        assertThat(second.currentAttempt().nextRetryAt()).isNull();
+
+        assertThatThrownBy(() -> service.redrive(first.id()))
+                .isInstanceOf(ContactTransitionConflictException.class)
+                .satisfies(ex -> {
+                    ContactTransitionConflictException conflict =
+                            (ContactTransitionConflictException) ex;
+                    assertThat(conflict.status()).isEqualTo(ContactStatus.DEAD_LETTERED);
+                    assertThat(conflict.attempt()).isEqualTo(2);
+                    assertThat(conflict.maxAttempts()).isEqualTo(2);
+                    assertThat(conflict.reason()).contains("exhausted its 1 redrives");
+                });
+        assertThat(service.get(first.id())).isEqualTo(second);
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(0);
+        assertThat(journal.list(10, JournalState.FAILED)).hasSize(2);
+        assertThat(journal.list(10, JournalState.PENDING)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("REQ-05/DOD-05: a rejected redrive restores the exact DEAD_LETTERED row and leaves no orphaned audit entry")
+    void rejectedRedriveRestoresDeadLetteredSnapshot() {
+        AuditJournalService journal = newJournal();
+        startService(1);
+        service.setAuditJournal(journal);
+        dispatcher.failGenerations.add(1);
+        ContactSubmissionResponse dead = pollUntil(
+                service.submit(request("k-rollback", "rollback me")).id(), ContactStatus.DEAD_LETTERED);
+        ContactSubmissionResponse before = service.get(dead.id());
+        String deadEntry = journal.list(10, JournalState.FAILED).get(0).id();
+
+        // The pool can no longer accept work: the redrive's executor.execute is rejected.
+        ThreadPoolExecutor pool = readField(service, "executor");
+        pool.shutdownNow();
+
+        assertThatThrownBy(() -> service.redrive(dead.id()))
+                .isInstanceOf(ContactQueueFullException.class);
+
+        assertThat(service.get(dead.id())).isEqualTo(before);
+        Map<String, Object> submissions = readField(service, "submissions");
+        Map<String, String> index = readField(service, "idempotencyIndex");
+        assertThat(submissions).containsKey(dead.id());
+        assertThat(index).containsEntry("k-rollback", dead.id());
+        assertThat((Object) readField(submissions.get(dead.id()), "redrives")).isEqualTo(0);
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(0);
+        // The entry the rejected redrive opened was closed exactly once with CONTACT_QUEUE_FULL:
+        // no orphaned PENDING entry, and the quarantined attempt's entry is untouched.
+        assertThat(journal.list(10, JournalState.PENDING)).isEmpty();
+        assertThat(journal.list(10, JournalState.FAILED)).hasSize(2);
+        assertThat(journal.find(deadEntry).orElseThrow().errorCode())
+                .isEqualTo(ContactSubmissionService.CONTACT_DEAD_LETTERED);
+        assertThat(journal.list(10, JournalState.FAILED).stream()
+                .map(AuditEntry::errorCode)).contains("CONTACT_QUEUE_FULL");
+    }
+
+    @Test
+    @DisplayName("REQ-03/REQ-07: a late worker from the quarantined generation cannot overwrite the redriven attempt")
+    void lateWorkerAfterRedriveIsFenced() throws Exception {
+        AuditJournalService journal = newJournal();
+        startService(1);
+        service.setAuditJournal(journal);
+        dispatcher.holdGenerations.add(1);
+        ContactSubmissionResponse submitted = service.submit(request(null, "stale worker"));
+        pollUntil(submitted.id(), ContactStatus.DISPATCHING);
+        awaitCondition(() -> dispatcher.calls().size() >= 1);
+
+        clock.advance(LEASE_SECONDS + 1L);
+        assertThat(service.reapStaleDispatching()).isEqualTo(1);
+        ContactSubmissionResponse dead = service.get(submitted.id());
+        assertThat(dead.status()).isEqualTo(ContactStatus.DEAD_LETTERED);
+
+        ContactSubmissionResponse requeued = service.redrive(submitted.id());
+        assertThat(requeued.attempt()).isEqualTo(2);
+        assertThat(requeued.status()).isEqualTo(ContactStatus.DISPATCHING);
+
+        // The held generation-1 worker now returns: its completion is fenced out, and the
+        // redriven generation 2 then delivers on the freed worker.
+        dispatcher.release().countDown();
+        ContactSubmissionResponse delivered = pollUntil(submitted.id(), ContactStatus.DELIVERED);
+        assertThat(delivered.attempt()).isEqualTo(2);
+        assertThat(delivered.currentAttempt().error()).isNull();
+        assertThat(delivered.currentAttempt().startedAt())
+                .isEqualTo(requeued.currentAttempt().startedAt());
+        assertThat(dispatcher.calls()).containsExactly(1, 2);
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(0);
+        assertThat(journal.list(10, JournalState.SUCCEEDED)).hasSize(1);
+        assertThat(journal.list(10, JournalState.FAILED)).hasSize(1);
+        assertThat(journal.list(10, JournalState.FAILED).get(0).errorCode())
+                .isEqualTo(ContactSubmissionService.CONTACT_DEAD_LETTERED);
+        assertThat(journal.list(10, JournalState.PENDING)).isEmpty();
     }
 
     /** Per-generation dispatcher behaviour: hold, fail, or complete; counts every call. */

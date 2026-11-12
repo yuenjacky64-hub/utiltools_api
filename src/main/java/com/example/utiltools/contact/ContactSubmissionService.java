@@ -82,6 +82,11 @@ public class ContactSubmissionService {
     /** Bounded code stamped on the attempts a shutdown drain cancels or force-fails. */
     public static final String CONTACT_SUBMISSION_CANCELLED = "CONTACT_SUBMISSION_CANCELLED";
 
+    /** Audit failure detail stamped when an attempt-ceiling failure is quarantined as
+     *  {@code DEAD_LETTERED}: it closes the attempt's {@code CONTACT_SUBMIT} entry exactly
+     *  once (INV-C2), distinct from the bounded row error the attempt already carries. */
+    public static final String CONTACT_DEAD_LETTERED = "CONTACT_DEAD_LETTERED";
+
     static final int MAX_ERROR_TEXT = 200;
     public static final int DEFAULT_LIST_LIMIT = 20;
     public static final int MAX_LIST_LIMIT = 100;
@@ -90,6 +95,7 @@ public class ContactSubmissionService {
     private static final int DEFAULT_RETRY_BACKOFF_BASE_MS = 1000;
     private static final int DEFAULT_RETRY_BACKOFF_MAX_MS = 60_000;
     private static final int DEFAULT_RETRY_SCAN_INTERVAL_MS = 1000;
+    private static final int DEFAULT_MAX_REDRIVES = 3;
     private static final long DRAIN_AWAIT_SECONDS = 30;
 
     private final ContactDispatcher dispatcher;
@@ -104,6 +110,8 @@ public class ContactSubmissionService {
     private final int retryBackoffBaseMs;
     private final int retryBackoffMaxMs;
     private final int retryScanIntervalMs;
+    /** Bounded operator redrive budget per submission; {@code 0} disables redrive. */
+    private final int maxRedrives;
     private final Clock clock;
     /** Optional audit journal; stays absent in test slices and direct construction. */
     private volatile AuditJournalService journal;
@@ -142,6 +150,7 @@ public class ContactSubmissionService {
             @Value("${utiltools.contact.retry-backoff-base-ms:1000}") int retryBackoffBaseMs,
             @Value("${utiltools.contact.retry-backoff-max-ms:60000}") int retryBackoffMaxMs,
             @Value("${utiltools.contact.retry-scan-interval-ms:1000}") int retryScanIntervalMs,
+            @Value("${utiltools.contact.max-redrives:3}") int maxRedrives,
             Clock clock) {
         // Delivery (mailing-list / SMTP / API fan-out) is out of scope: the seam is a no-op.
         this((submissionId, generation) -> { },
@@ -155,7 +164,8 @@ public class ContactSubmissionService {
                 clock,
                 retryBackoffBaseMs,
                 retryBackoffMaxMs,
-                retryScanIntervalMs);
+                retryScanIntervalMs,
+                maxRedrives);
     }
 
     /**
@@ -169,7 +179,7 @@ public class ContactSubmissionService {
         this(dispatcher, workerCount, queueCapacity, retentionSeconds, maxAttempts,
                 executionLeaseSeconds, DEFAULT_MAX_RETAINED_SUBMISSIONS, DEFAULT_CLEANUP_INTERVAL_MS,
                 clock, DEFAULT_RETRY_BACKOFF_BASE_MS, DEFAULT_RETRY_BACKOFF_MAX_MS,
-                DEFAULT_RETRY_SCAN_INTERVAL_MS);
+                DEFAULT_RETRY_SCAN_INTERVAL_MS, DEFAULT_MAX_REDRIVES);
     }
 
     /**
@@ -181,6 +191,21 @@ public class ContactSubmissionService {
             long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
             int maxRetainedSubmissions, int cleanupIntervalMs, Clock clock,
             int retryBackoffBaseMs, int retryBackoffMaxMs, int retryScanIntervalMs) {
+        this(dispatcher, workerCount, queueCapacity, retentionSeconds, maxAttempts,
+                executionLeaseSeconds, maxRetainedSubmissions, cleanupIntervalMs, clock,
+                retryBackoffBaseMs, retryBackoffMaxMs, retryScanIntervalMs, DEFAULT_MAX_REDRIVES);
+    }
+
+    /**
+     * Test-visible constructor with the redrive budget explicit: {@code maxRedrives} bounds the
+     * per-submission operator {@link #redrive} path (REQ-04); a negative value is rejected at
+     * construction like the backoff configuration.
+     */
+    public ContactSubmissionService(ContactDispatcher dispatcher, int workerCount, int queueCapacity,
+            long retentionSeconds, int maxAttempts, long executionLeaseSeconds,
+            int maxRetainedSubmissions, int cleanupIntervalMs, Clock clock,
+            int retryBackoffBaseMs, int retryBackoffMaxMs, int retryScanIntervalMs,
+            int maxRedrives) {
         this.dispatcher = dispatcher;
         this.workerCount = Math.max(1, workerCount);
         this.queueCapacity = Math.max(1, queueCapacity);
@@ -191,12 +216,18 @@ public class ContactSubmissionService {
         this.retryBackoffBaseMs = retryBackoffBaseMs;
         this.retryBackoffMaxMs = retryBackoffMaxMs;
         this.retryScanIntervalMs = retryScanIntervalMs;
+        this.maxRedrives = maxRedrives;
         if (retryBackoffBaseMs <= 0 || retryBackoffMaxMs < retryBackoffBaseMs
                 || retryScanIntervalMs <= 0) {
             throw new IllegalArgumentException(
                     "invalid contact retry backoff configuration: base=" + retryBackoffBaseMs
                             + ", max=" + retryBackoffMaxMs + ", scanInterval="
                             + retryScanIntervalMs);
+        }
+        if (maxRedrives < 0) {
+            throw new IllegalArgumentException(
+                    "invalid contact redrive configuration: utiltools.contact.max-redrives="
+                            + maxRedrives + " must be non-negative");
         }
         this.clock = clock;
         this.executor = new ThreadPoolExecutor(workerCount, workerCount, 0L, TimeUnit.MILLISECONDS,
@@ -326,6 +357,11 @@ public class ContactSubmissionService {
      * {@code null} until the next admission. Anything else (or a retry with no room left) throws
      * {@link ContactTransitionConflictException} and the row is left untouched.
      *
+     * <p>REQ-01: a {@code DEAD_LETTERED} row is not retryable — once the attempt budget is spent
+     * the {@code status != FAILED} guard below answers 409, and the only way out of the quarantine
+     * is the bounded operator {@link #redrive} path. A rejected admission restores the exact
+     * pre-admission snapshot and keeps the row (REQ-05).</p>
+     *
      * @param submissionId the submission id
      * @return a snapshot of the re-queued submission: {@code DISPATCHING} ({@code attempt = N +
      *         1}) with the execution lease re-stamped at admission
@@ -347,6 +383,9 @@ public class ContactSubmissionService {
             int nextAttempt = submission.attempt + 1;
             String previousError = submission.error;
             Instant previousCompletedAt = submission.completedAt;
+            Instant previousStartedAt = submission.startedAt;
+            Instant previousHeartbeatAt = submission.lastHeartbeatAt;
+            Instant previousLeaseExpiresAt = submission.executionLeaseExpiresAt;
             submission.attempt = nextAttempt;
             submission.status = ContactStatus.QUEUED;
             submission.startedAt = null;
@@ -361,17 +400,103 @@ public class ContactSubmissionService {
             try {
                 executor.execute(() -> runAttempt(submission.submissionId, nextAttempt));
             } catch (RejectedExecutionException e) {
-                // INV-C4: roll the re-queue back so the machine is exactly what it was (FAILED,
-                // previous attempt, previous error preserved).
+                // REQ-05: roll the re-queue back to the exact pre-admission snapshot — the row,
+                // its idempotency mapping, and its journal bookkeeping all survive, only the
+                // reserved admission slot is released.
                 failQuietly(submission, nextAttempt, "CONTACT_QUEUE_FULL");
                 submission.attempt = nextAttempt - 1;
                 submission.status = ContactStatus.FAILED;
                 submission.completedAt = previousCompletedAt;
                 submission.error = previousError;
+                submission.startedAt = previousStartedAt;
+                submission.lastHeartbeatAt = previousHeartbeatAt;
+                submission.executionLeaseExpiresAt = previousLeaseExpiresAt;
                 // REQ-05: restore the automatic-retry schedule the manual retry cleared.
                 submission.nextRetryAt = computeNextRetryAt(submission, previousCompletedAt,
                         previousError);
-                rollbackAdmissionLocked(submission);
+                releaseAdmissionLocked();
+                throw new ContactQueueFullException();
+            }
+            return snapshot(submission);
+        }
+    }
+
+    /**
+     * Bounded, audited operator redrive out of the quarantine (REQ-03 / REQ-04 / REQ-05): legal
+     * only from {@code DEAD_LETTERED} and only while the per-submission redrive budget
+     * ({@code utiltools.contact.max-redrives}) is not spent. Atomically extends
+     * {@code maxAttempts} to the prior {@code attempt + 1}, admits the row as
+     * {@code attempt + 1} / {@code DISPATCHING} with a fresh execution lease, opens a new
+     * {@code CONTACT_SUBMIT} journal entry, increments the redrive count, and submits the attempt
+     * to the dispatch pool — all in one {@code registryLock} critical section, so a fence-reset
+     * redrive can never interleave with a late worker from the quarantined generation.
+     *
+     * <p>Checks run in a fixed order so a 409 never consumes an admission slot: unknown id (404),
+     * not {@code DEAD_LETTERED} (409), exhausted redrive budget (409), saturated pool (429). A
+     * rejected admission restores the exact pre-admission {@code DEAD_LETTERED} snapshot — status,
+     * attempt, {@code maxAttempts}, error, {@code completedAt}, execution stamps,
+     * {@code nextRetryAt}, and the redrive count — closes the entry it just opened, and releases
+     * only the reserved slot, so the quarantined row, its idempotency mapping, and its audit
+     * history all survive (REQ-05).</p>
+     *
+     * @param submissionId the submission id
+     * @return a snapshot of the re-queued submission: {@code DISPATCHING} ({@code attempt = N + 1},
+     *         {@code maxAttempts = N + 1})
+     */
+    public ContactSubmissionResponse redrive(String submissionId) {
+        synchronized (registryLock) {
+            MutableSubmission submission = requireSubmissionLocked(submissionId);
+            if (submission.status != ContactStatus.DEAD_LETTERED) {
+                throw new ContactTransitionConflictException(submission.submissionId, submission.status,
+                        submission.attempt, submission.maxAttempts,
+                        "may only be redriven while DEAD_LETTERED");
+            }
+            if (submission.redrives >= maxRedrives) {
+                throw new ContactTransitionConflictException(submission.submissionId, submission.status,
+                        submission.attempt, submission.maxAttempts,
+                        "has exhausted its " + maxRedrives + " redrives");
+            }
+            reserveAdmissionLocked();
+            int previousAttempt = submission.attempt;
+            int previousMaxAttempts = submission.maxAttempts;
+            String previousError = submission.error;
+            Instant previousCompletedAt = submission.completedAt;
+            Instant previousStartedAt = submission.startedAt;
+            Instant previousHeartbeatAt = submission.lastHeartbeatAt;
+            Instant previousLeaseExpiresAt = submission.executionLeaseExpiresAt;
+            Instant previousNextRetryAt = submission.nextRetryAt;
+            int previousRedrives = submission.redrives;
+            int nextAttempt = previousAttempt + 1;
+            // REQ-03: the redrive extends the budget by exactly one attempt, so the quarantined
+            // row is admissible again as attempt+1 (and only once).
+            submission.maxAttempts = nextAttempt;
+            submission.attempt = nextAttempt;
+            submission.status = ContactStatus.QUEUED;
+            submission.startedAt = null;
+            submission.completedAt = null;
+            submission.error = null;
+            submission.lastHeartbeatAt = null;
+            submission.executionLeaseExpiresAt = null;
+            submission.nextRetryAt = null;
+            admitAttemptLocked(submission, nextAttempt);
+            submission.redrives = previousRedrives + 1;
+            try {
+                executor.execute(() -> runAttempt(submission.submissionId, nextAttempt));
+            } catch (RejectedExecutionException e) {
+                // REQ-05: close the entry this redrive just opened, then restore the exact
+                // pre-admission DEAD_LETTERED snapshot and release only the reserved slot.
+                failQuietly(submission, nextAttempt, "CONTACT_QUEUE_FULL");
+                submission.status = ContactStatus.DEAD_LETTERED;
+                submission.attempt = previousAttempt;
+                submission.maxAttempts = previousMaxAttempts;
+                submission.error = previousError;
+                submission.completedAt = previousCompletedAt;
+                submission.startedAt = previousStartedAt;
+                submission.lastHeartbeatAt = previousHeartbeatAt;
+                submission.executionLeaseExpiresAt = previousLeaseExpiresAt;
+                submission.nextRetryAt = previousNextRetryAt;
+                submission.redrives = previousRedrives;
+                releaseAdmissionLocked();
                 throw new ContactQueueFullException();
             }
             return snapshot(submission);
@@ -413,7 +538,7 @@ public class ContactSubmissionService {
                     terminalizeLocked(submission, ContactStatus.CANCELLED,
                             CONTACT_SUBMISSION_CANCELLED, Instant.now(clock));
                     return snapshot(submission);
-                case DELIVERED, FAILED:
+                case DELIVERED, FAILED, DEAD_LETTERED:
                     throw new ContactTransitionConflictException(submission.submissionId,
                             submission.status, submission.attempt, submission.maxAttempts,
                             "terminal state: cancellation refused");
@@ -483,9 +608,10 @@ public class ContactSubmissionService {
     }
 
     private int evictExpiredLocked(Instant now) {
-        // Completed rows only (DELIVERED / FAILED / CANCELLED), oldest admission first: a row is
-        // evictable once its retention window has lapsed or the registry sits over the cap
-        // (INV-C6). Live QUEUED/DISPATCHING rows are never dropped.
+        // Completed rows only (DELIVERED / FAILED / CANCELLED / DEAD_LETTERED), oldest admission
+        // first: a row is evictable once its retention window has lapsed or the registry sits
+        // over the cap (INV-C6). Live QUEUED/DISPATCHING rows are never dropped; a dead-lettered
+        // row is a completed row and so is evictable.
         Instant retentionCutoff = now.minusSeconds(Math.max(0, retentionSeconds));
         int evicted = 0;
         java.util.Iterator<MutableSubmission> it = submissions.values().iterator();
@@ -653,7 +779,7 @@ public class ContactSubmissionService {
                 // The pool is still saturated: push the schedule to the next backoff slot so a
                 // later scan retries it without burning the attempt.
                 submission.nextRetryAt = computeNextRetryAt(submission, now, previousError);
-                pendingAttempts--;
+                releaseAdmissionLocked();
             }
         }
         return true;
@@ -767,25 +893,47 @@ public class ContactSubmissionService {
     /**
      * The single funnel every terminal transition takes (INV-C1): stamp under the lock, close
      * the attempt's journal entry exactly once, and release the pending counter.
+     *
+     * <p>REQ-02 quarantine upgrade: a <em>retryable</em> failure ({@code CONTACT_DISPATCH_FAILED}
+     * or {@code CONTACT_DELIVERY_LEASE_EXPIRED}) that has reached {@code maxAttempts} commits
+     * {@code DEAD_LETTERED} instead of resting in {@code FAILED} forever — inside this same
+     * critical section, with the original bounded error preserved, the execution stamps cleared,
+     * and the generation's {@code CONTACT_SUBMIT} entry closed exactly once with the
+     * {@code CONTACT_DEAD_LETTERED} failure detail. A shutdown-cancelled failure
+     * ({@code CONTACT_SUBMISSION_CANCELLED}) never upgrades and stays {@code FAILED}.</p>
      */
     private void terminalizeLocked(MutableSubmission submission, ContactStatus to, String error,
             Instant now) {
-        if (!submission.status.allows(submission.status, to)) {
-            throw new IllegalStateException("Illegal contact transition " + submission.status + " -> " + to);
+        boolean deadLettered = to == ContactStatus.FAILED
+                && (CONTACT_DISPATCH_FAILED.equals(error)
+                        || CONTACT_DELIVERY_LEASE_EXPIRED.equals(error))
+                && submission.attempt >= submission.maxAttempts;
+        ContactStatus target = deadLettered ? ContactStatus.DEAD_LETTERED : to;
+        if (!submission.status.allows(submission.status, target)) {
+            throw new IllegalStateException(
+                    "Illegal contact transition " + submission.status + " -> " + target);
         }
-        submission.status = to;
+        submission.status = target;
         submission.completedAt = now;
         submission.error = error;
         submission.lastHeartbeatAt = null;
         submission.executionLeaseExpiresAt = null;
         // REQ-02: a retryable FAILED attempt below the budget gets its deterministic schedule;
-        // anything else (DELIVERED, budget-exhausted, shutdown-cancelled) carries none.
-        submission.nextRetryAt = (to == ContactStatus.FAILED)
+        // anything else (DELIVERED, budget-exhausted, quarantined, shutdown-cancelled) carries
+        // none.
+        submission.nextRetryAt = (target == ContactStatus.FAILED)
                 ? computeNextRetryAt(submission, now, error)
                 : null;
+        if (deadLettered) {
+            // The execution started stamp belongs to the quarantined attempt: clear it so the
+            // dead-lettered snapshot carries only the original bounded error and completion time.
+            submission.startedAt = null;
+        }
         int generation = submission.attempt;
-        if (to == ContactStatus.DELIVERED) {
+        if (target == ContactStatus.DELIVERED) {
             succeedQuietly(submission, generation);
+        } else if (deadLettered) {
+            failQuietly(submission, generation, CONTACT_DEAD_LETTERED);
         } else {
             failQuietly(submission, generation, error);
         }
@@ -813,6 +961,17 @@ public class ContactSubmissionService {
         if (submission.idempotencyKey != null) {
             idempotencyIndex.remove(submission.idempotencyKey, submission.submissionId);
         }
+        pendingAttempts--;
+    }
+
+    /**
+     * REQ-05: the row-preserving admission rollback — releases only the reservation made by
+     * {@link #reserveAdmissionLocked()} for a submission that already existed. Unlike
+     * {@link #rollbackAdmissionLocked(MutableSubmission)} it never removes the row or its
+     * idempotency mapping, so a rejected {@code retry()} / {@code redrive()} leaves the durable
+     * submission exactly as it was.
+     */
+    private void releaseAdmissionLocked() {
         pendingAttempts--;
     }
 
@@ -962,7 +1121,15 @@ public class ContactSubmissionService {
         final String fingerprint;
         final Instant createdAt;
         final long admissionOrder;
-        final int maxAttempts;
+        /**
+         * {@code final} at first admission (REQ-04); {@link #redrive} is the only other writer
+         * and extends it to {@code attempt + 1} under {@link #registryLock} when admitting the
+         * post-redrive attempt.
+         */
+        int maxAttempts;
+        /** Bounded operator redrive count (REQ-04): 0 at construction, incremented only when a
+         *  redrive is *admitted*, under {@link #registryLock}. */
+        int redrives;
         final Map<Integer, String> auditEntryIds = new HashMap<>();
         // Per-attempt execution-start fence (REQ-03): read and written only under
         // registryLock — set by the worker immediately before ContactDispatcher.dispatch
