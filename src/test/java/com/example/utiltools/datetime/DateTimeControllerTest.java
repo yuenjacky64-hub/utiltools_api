@@ -1548,7 +1548,7 @@ class DateTimeControllerTest {
 
     @Test
     @DisplayName("POST /api/v1/utils/datetime/cron/next - rejects invalid expression, zone, from and count with 400")
-    void shouldRejectInvalidCronInputs() throws Exception {
+    void cronNextInvalidInputsReturn400() throws Exception {
         int before = auditJournal.size();
         String[] serviceLevelBodies = {
                 """
@@ -1601,7 +1601,7 @@ class DateTimeControllerTest {
 
     @Test
     @DisplayName("POST /api/v1/utils/datetime/cron/next - is journalled as DATETIME_CRON_NEXT and replays as VERIFIED")
-    void shouldJournalAndReplayCronNext() throws Exception {
+    void cronNextJournalledAndReplaysVerified() throws Exception {
         String body = """
                 {
                     "expression": "0 0 12 * * *",

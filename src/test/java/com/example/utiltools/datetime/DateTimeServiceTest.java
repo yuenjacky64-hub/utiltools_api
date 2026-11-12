@@ -1187,7 +1187,7 @@ class DateTimeServiceTest {
 
     @Test
     @DisplayName("Should expand a 6-field cron expression into an exact ordered UTC sequence")
-    void shouldExpandCronSequenceInUtc() {
+    void cronNextExactSequenceUtc() {
         DateTimeCronResponse response = dateTimeService.cronNext(
                 new DateTimeCronRequest("0 0 12 * * *", "2026-01-01T00:00:00Z", "UTC", 3));
 
@@ -1246,7 +1246,7 @@ class DateTimeServiceTest {
 
     @Test
     @DisplayName("Should keep the wall-clock hour across the DST spring-forward transition")
-    void shouldExpandCronAcrossDstSpringForward() {
+    void cronNextDstBoundaryWallClock() {
         // US DST 2026 starts on Sunday 2026-03-08: 09:00 NY is EST (-05:00) through 03-07
         // and EDT (-04:00) from 03-08, so the UTC instants drift one hour while the
         // wall clock stays at 09:00.
