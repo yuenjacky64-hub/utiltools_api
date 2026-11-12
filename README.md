@@ -44,7 +44,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 
 | Tool | Base Path | Core Capabilities |
 | :--- | :--- | :--- |
-| **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, interval overlap detection, current global time |
+| **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, interval overlap detection, cron next-run planning, current global time |
 | **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 / UUID v8 generation (`version=V4|V7|V8`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit, and NDJSON / JSON Lines conversion (array <-> line-delimited records) |
 | **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`, `REVERSE`), Unicode normalization (`NFC`, `NFD`, `NFKC`, `NFKD`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
@@ -145,6 +145,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/datetime/business-days` | Add or subtract a signed number of business days in a target IANA timezone, skipping weekends and an optional ISO `yyyy-MM-dd` holiday list (DST wall-clock preserving) |
 | `POST` | `/api/v1/utils/datetime/range` | Enumerate a bounded, ordered list of `yyyy-MM-dd` dates between two dates with a `DAYS`/`WEEKS`/`MONTHS`/`YEARS` unit, positive `step` (1–1000) and inclusive/exclusive end (max 1000 points) |
 | `POST` | `/api/v1/utils/datetime/overlap` | Report whether two half-open intervals `[startA, endA)` and `[startB, endB)` overlap and by how much: `overlap`, UTC `overlapStart`/`overlapEnd` (null when disjoint) and `overlapMillis` (0 when disjoint); bounds use the same auto-detect grammar as `diff` |
+| `POST` | `/api/v1/utils/datetime/cron/next` | Expand a cron expression (5-field, 6-field with seconds, or a Spring `@` macro such as `@daily`) into exactly `count` (1–100, default 5) occurrences strictly after `from` in the requested IANA `timeZone` (default UTC); each run carries its UTC ISO instant, ISO-offset local date-time and `epochMillis`, ordered and DST-aware |
 | `GET` | `/api/v1/utils/datetime/current` | Fetch current time in UTC and target timezone |
 | `GET` | `/api/v1/utils/datetime/timezones` | List IANA timezones with current UTC offsets, optionally filtered by `prefix` |
 | `GET` | `/api/v1/utils/datetime/week-date` | Resolve an ISO week (`year`, `week`, optional `day` = MONDAY..SUNDAY case-insensitive or 1..7, default MONDAY) back to its calendar date via `WeekFields.ISO`; rejects weeks that do not exist in that ISO week-year (e.g. 2021-W53). Read-only: not journalled |
@@ -633,6 +634,54 @@ curl -X POST https://localhost:8080/api/v1/utils/datetime/overlap \
 When the intervals do not overlap (for example `startB=2024-10-05T00:00:00Z`, `endB=2024-10-07T00:00:00Z`
 against the interval above, which only touches at `2024-10-05T00:00:00Z`), the `data` object is
 `{ "overlap": false, "overlapStart": null, "overlapEnd": null, "overlapMillis": 0 }`.
+
+### Cron Next-Run Planning
+
+Given a cron `expression` and an anchor `from`, `POST /api/v1/utils/datetime/cron/next` expands
+the schedule into exactly `count` occurrences strictly after `from`, computed with Spring's
+`CronExpression` in the requested IANA `timeZone`.
+
+- **Expression forms:** 6-field (`seconds minutes hours day-of-month month day-of-week`, e.g.
+  `0 0 12 * * *`), 5-field (the same without seconds; seconds default to `0`, e.g. `0 12 * * *`),
+  and Spring macros such as `@daily`, `@hourly`, `@midnight`. Non-Spring dialects (Quartz 7-field,
+  `L`, `#`, `?`) are rejected.
+- **Bounds:** `expression` is non-blank and at most 128 characters; `from` uses the same
+  auto-detect grammar as `diff`; `timeZone` is optional and defaults to `UTC`; `count` is optional,
+  defaults to `5` and must be `1..100`. Invalid values return the standard `400 BAD_REQUEST`
+  envelope.
+- **DST-aware ordering:** each occurrence is resolved through `ZonedDateTime` in the requested
+  zone, so a wall-clock hour survives DST transitions (the UTC instants drift, the local time
+  does not). Runs are strictly increasing.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/utils/datetime/cron/next \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expression": "0 0 12 * * *",
+    "from":       "2026-01-01T00:00:00Z",
+    "timeZone":   "UTC",
+    "count":      3
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Cron schedule expanded successfully",
+  "data": {
+    "expression": "0 0 12 * * *",
+    "from": "2026-01-01T00:00:00Z",
+    "timeZone": "UTC",
+    "count": 3,
+    "runs": [
+      { "utcIsoInstant": "2026-01-01T12:00:00Z", "localDateTime": "2026-01-01T12:00:00Z", "epochMillis": 1767268800000 },
+      { "utcIsoInstant": "2026-01-02T12:00:00Z", "localDateTime": "2026-01-02T12:00:00Z", "epochMillis": 1767355200000 },
+      { "utcIsoInstant": "2026-01-03T12:00:00Z", "localDateTime": "2026-01-03T12:00:00Z", "epochMillis": 1767441600000 }
+    ]
+  }
+}
+```
 
 ---
 
@@ -1470,8 +1519,9 @@ populated only when a cached result is served).
 
 ## 🧾 Operation Journal & Replay Verification
 
-All thirty-two journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
-`datetime/shift`, `datetime/duration`, `datetime/business-days`, `datetime/range`, `datetime/overlap`, `crypto/hash`,
+All thirty-three journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+`datetime/shift`, `datetime/duration`, `datetime/business-days`, `datetime/range`, `datetime/overlap`,
+`datetime/cron-next`, `crypto/hash`,
 `crypto/base64`, `crypto/base32`, `crypto/url`, `crypto/jwt/decode`, `crypto/uuid`, `json/format`,
 `json/validate`, `json/query`, `json/flatten`, `json/unflatten`, `json/merge-patch`, `json/pointer`,
 `json/to-csv`, `json/from-csv`, `json/csv-to-json`, `json/to-ndjson`, `json/from-ndjson`, `json/diff`,

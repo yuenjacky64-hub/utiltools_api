@@ -5,6 +5,8 @@ import com.example.utiltools.datetime.dto.DateTimeBusinessDaysRequest;
 import com.example.utiltools.datetime.dto.DateTimeBusinessDaysResponse;
 import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
+import com.example.utiltools.datetime.dto.DateTimeCronRequest;
+import com.example.utiltools.datetime.dto.DateTimeCronResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
 import com.example.utiltools.datetime.dto.DateTimeOverlapRequest;
@@ -18,12 +20,14 @@ import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.dto.DateTimeWeekResponse;
 import com.example.utiltools.datetime.dto.TimeZoneInfo;
 import com.example.utiltools.datetime.dto.TimeZoneListResponse;
+import org.springframework.scheduling.support.CronExpression;
 import org.springframework.stereotype.Service;
 
 import java.time.DateTimeException;
 import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
@@ -154,6 +158,79 @@ public class DateTimeService {
                 amount,
                 unit
         );
+    }
+
+    /**
+     * Expands a cron expression into exactly {@code count} occurrences strictly after
+     * {@code from}. Computed with Spring's {@link CronExpression} in the requested IANA
+     * zone, so DST transitions keep the wall-clock hour correct. Accepts 5-field,
+     * 6-field and {@code @} macro expressions.
+     *
+     * @throws IllegalArgumentException when the expression is unparseable, when the schedule
+     *         is unsatisfiable (no occurrence exists after {@code from}, e.g. an impossible
+     *         date combination), or when the resolved count falls outside {@code 1..100}
+     */
+    public DateTimeCronResponse cronNext(DateTimeCronRequest request) {
+        int count = request.count() == null ? 5 : request.count();
+        if (count < 1 || count > 100) {
+            throw new IllegalArgumentException("count must be between 1 and 100");
+        }
+        Instant fromInstant = parseInstant(request.from());
+        ZoneId zoneId = parseZoneId(request.timeZone());
+        String trimmed = request.expression().trim();
+        String parseable = normalizeCronExpression(trimmed);
+        CronExpression cron;
+        try {
+            cron = CronExpression.parse(parseable);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid cron expression: " + abbreviate(parseable), e);
+        }
+        List<DateTimeCronResponse.DateTimeCronOccurrence> runs = new ArrayList<>(count);
+        // Expand on the zone's wall clock, then resolve each run through the zone rules so a
+        // schedule crossing a DST transition keeps the requested wall-clock time.
+        LocalDateTime cursor = fromInstant.atZone(zoneId).toLocalDateTime();
+        for (int i = 0; i < count; i++) {
+            LocalDateTime next = cron.next(cursor);
+            if (next == null) {
+                // cron.next returns null when the parsed fields never match a real date
+                // (e.g. "0 0 0 31 2 *"); map that terminal state to the 400 path instead
+                // of letting a NullPointerException surface as INTERNAL_ERROR.
+                throw new IllegalArgumentException("Cron schedule has no occurrence after from "
+                        + "(unsatisfiable schedule: " + abbreviate(parseable) + ")");
+            }
+            ZonedDateTime zoned = next.atZone(zoneId);
+            Instant instant = zoned.toInstant();
+            runs.add(new DateTimeCronResponse.DateTimeCronOccurrence(
+                    DateTimeFormatter.ISO_INSTANT.format(instant),
+                    DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(zoned.toOffsetDateTime()),
+                    instant.toEpochMilli()));
+            cursor = next;
+        }
+        return new DateTimeCronResponse(trimmed, request.from(), zoneId.getId(), count,
+                List.copyOf(runs));
+    }
+
+    /**
+     * Maps a caller-supplied cron expression onto Spring's 6-field grammar. 5-field
+     * expressions (minute hour day-of-month month day-of-week) default the seconds
+     * field to {@code 0}; {@code @} macros are passed through unchanged.
+     *
+     * @throws IllegalArgumentException for an empty or wrong-field-count expression
+     */
+    private String normalizeCronExpression(String expression) {
+        String trimmed = expression.trim();
+        if (trimmed.startsWith("@")) {
+            return trimmed;
+        }
+        String[] parts = trimmed.isEmpty() ? new String[0] : trimmed.split("\\s+");
+        if (parts.length == 5) {
+            return "0 " + trimmed;
+        }
+        if (parts.length != 6) {
+            throw new IllegalArgumentException(
+                    "Cron expression must have 5 or 6 fields or start with '@'");
+        }
+        return trimmed;
     }
 
     /**
