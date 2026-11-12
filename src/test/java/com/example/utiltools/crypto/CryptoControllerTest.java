@@ -624,6 +624,13 @@ class CryptoControllerTest {
                                 """.formatted("x".repeat(8193))))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+
+        // An over-cap query list is rejected, never truncated.
+        mockMvc.perform(post("/api/v1/utils/crypto/url/parse")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(Map.of("url", urlWithParameters(129)))))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
     }
 
     @Test
@@ -672,6 +679,56 @@ class CryptoControllerTest {
         assertThat(stored.state()).isEqualTo(JournalState.SUCCEEDED);
         assertThat(stored.result()).isEqualTo(entry.result());
         assertThat(stored.completedAt()).isEqualTo(entry.completedAt());
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/url/parse - a maximal 8192-char, 128-parameter URL stays replayable")
+    void shouldKeepMaximalUrlParseReplayable() throws Exception {
+        String url = maximalUrlParseUrl();
+        assertThat(url).hasSize(8192);
+
+        mockMvc.perform(post("/api/v1/utils/crypto/url/parse")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(Map.of("url", url))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.parameters.length()").value(128));
+
+        AuditEntry entry = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_URL_PARSE)
+                .findFirst()
+                .orElseThrow();
+        assertThat(entry.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entry.replayable()).isTrue();
+        assertThat(entry.result().path("parameters")).hasSize(128);
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/" + entry.id() + "/replay"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value(ReplayState.VERIFIED.name()))
+                .andExpect(jsonPath("$.data.result.parameters.length()").value(128));
+    }
+
+    private static String maximalUrlParseUrl() {
+        String prefix = "/deep/path?";
+        List<String> pairs = new ArrayList<>();
+        for (int i = 0; i < 128; i++) {
+            pairs.add("k" + i + "=" + "v".repeat(56));
+        }
+        String url = prefix + String.join("&", pairs);
+        int pad = 8192 - url.length();
+        assertThat(pad).isGreaterThanOrEqualTo(0);
+        pairs.set(pairs.size() - 1, pairs.get(pairs.size() - 1) + "v".repeat(pad));
+        return prefix + String.join("&", pairs);
+    }
+
+    private static String urlWithParameters(int count) {
+        StringBuilder url = new StringBuilder("/path?");
+        for (int i = 0; i < count; i++) {
+            if (i > 0) {
+                url.append('&');
+            }
+            url.append('p').append(i).append('=').append(i);
+        }
+        return url.toString();
     }
 
     @Test

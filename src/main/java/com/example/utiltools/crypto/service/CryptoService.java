@@ -63,6 +63,10 @@ public class CryptoService {
         }
     }
 
+    // Bounds the journalled result tree: the 8192-char request cap bounds the parameter count but not
+    // the bytes the decoded list adds, so the count is capped here too and over-cap requests are rejected.
+    private static final int URL_PARSE_MAX_PARAMETERS = 128;
+
     private static final String UUID_VERSION_V4 = "V4";
     private static final String UUID_VERSION_V7 = "V7";
     private static final String UUID_VERSION_V8 = "V8";
@@ -428,6 +432,11 @@ public class CryptoService {
             String rawName = separator < 0 ? pair : pair.substring(0, separator);
             // A key without "=" (e.g. "?flag") keeps an empty-string value, like "?q=" does.
             String rawValue = separator < 0 ? "" : pair.substring(separator + 1);
+            if (parameters.size() == URL_PARSE_MAX_PARAMETERS) {
+                // Reject rather than truncate: truncating would silently break the duplicate/order contract.
+                throw new IllegalArgumentException(
+                        "url must not contain more than " + URL_PARSE_MAX_PARAMETERS + " query parameters");
+            }
             parameters.add(new UrlQueryParameter(
                     decodeUtf8(percentDecode(rawName, true), "Invalid UTF-8 sequence in query parameter name"),
                     decodeUtf8(percentDecode(rawValue, true), "Invalid UTF-8 sequence in query parameter value")));

@@ -958,22 +958,36 @@ splits a URL into its components and decodes its query string into an ordered pa
 **Component rules:** absent components are `null` — `scheme`, `userInfo`, `port`, `query` and `fragment` are often
 `null`, and `path` is `null` when the URL has no path (`https://example.com`). Relative hierarchical URLs work and
 return `null` for `scheme`, `userInfo`, `host` and `port` (`/api/v1/items?page=2` → `path = "/api/v1/items"`).
+Every component is returned **raw**: `userInfo`, `path`, `query` and `fragment` are still percent-encoded exactly as
+they appeared in `url` (`/a%20b?q=a%2Bb` → `path = "/a%20b"`, `query = "q=a%2Bb"`). Only the `parameters` list is
+decoded, and re-encoding a decoded name or value before comparing it with `query` is the caller's job.
 
 **Parameter rules:** `parameters` preserves duplicate keys and encounter order, decoding as `FORM` does — `+`
 becomes a space and `%2B` becomes `+`, so `?q=a+b` yields `a b` while `?q=a%2Bb` yields `a+b`. A key without an
 `=` keeps an empty-string value (`?flag` → `{"name": "flag", "value": ""}`), `?q=` keeps `""`, and a URL with no
-query returns an empty list.
+query returns an empty list. Empty pairs (`?a=1&&b=2`, a trailing `&`) are separators, not parameters, and never
+consume the budget. At most 128 query parameters are accepted; a URL with a 129th is rejected rather than
+truncated, so the response and its journal entry are always the whole query string or nothing.
 
 **Rejections:** opaque URIs (`mailto:alice@example.com`, `urn:isbn:...`), malformed syntax, ports outside
 `0..65535`, truncated (`%2`) or non-hex (`%ZZ`) escapes and percent sequences that are not valid UTF-8 are all
 rejected with HTTP `400` and error `BAD_REQUEST` — never a partial result. A blank `url` or one longer than `8192`
-characters fails bean validation first with error `VALIDATION_ERROR`.
+characters fails bean validation first with error `VALIDATION_ERROR`; more than 128 query parameters is a
+`BAD_REQUEST` too.
+
+**Security note:** `url` is **journalled verbatim** — the request, and therefore any credential in the `userInfo`
+component (`https://alice:s3cr3t@example.com/…`), is stored in the in-memory journal row for that call and is
+visible through the audit read endpoints (`GET /api/v1/utils/audit/entries`). The journal's redaction is
+key-name-based and cannot recognise a secret embedded in a URL string, so strip or replace `userInfo` before
+calling this endpoint if the credential must not be recorded.
 
 **Journal & replay:** each call is recorded as a `CRYPTO_URL_PARSE` entry that moves `PENDING` →
 `SUCCEEDED`/`FAILED`. Because the response is a pure function of `url`, the entry is replayable:
 `POST /api/v1/utils/audit/entries/{id}/replay` re-runs the same parse and answers `replay.state = VERIFIED` with an
 identical response, without rewriting the entry's original `state`, `result` or `completedAt` and without appending
-a second journal entry.
+a second journal entry. Because the request is bounded (8192 characters, 128 parameters) the journalled response is
+bounded too: no new truncation path is involved, since over-cap input is rejected up front instead of being stored
+short.
 
 #### G. JWT Decode (decode-only)
 `POST /api/v1/utils/crypto/jwt/decode` turns a compact JWS/JWT into its header and claims, so you can inspect

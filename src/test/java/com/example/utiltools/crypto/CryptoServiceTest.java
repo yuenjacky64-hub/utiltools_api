@@ -277,6 +277,35 @@ class CryptoServiceTest {
     }
 
     @Test
+    @DisplayName("Should accept 128 query parameters and reject 129 without truncating")
+    void shouldRejectUrlWithTooManyQueryParameters() {
+        UrlParseResponse response = cryptoService.parseUrl(new UrlParseRequest(urlWithParameters(128)));
+
+        assertThat(response.parameters()).hasSize(128);
+        assertThat(response.parameters().get(0)).isEqualTo(new UrlQueryParameter("p0", "0"));
+        assertThat(response.parameters().get(127)).isEqualTo(new UrlQueryParameter("p127", "127"));
+
+        // Empty pairs ("a=1&&b=2", a trailing "&") are not parameters and must not consume the budget.
+        assertThat(cryptoService.parseUrl(new UrlParseRequest(urlWithParameters(128) + "&&")).parameters())
+                .hasSize(128);
+
+        assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest(urlWithParameters(129))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("more than 128 query parameters");
+    }
+
+    private static String urlWithParameters(int count) {
+        StringBuilder url = new StringBuilder("/path?");
+        for (int i = 0; i < count; i++) {
+            if (i > 0) {
+                url.append('&');
+            }
+            url.append('p').append(i).append('=').append(i);
+        }
+        return url.toString();
+    }
+
+    @Test
     @DisplayName("Should throw IllegalArgumentException when unsupported algorithm is provided")
     void shouldThrowOnUnsupportedAlgorithm() {
         HashRequest request = new HashRequest("INVALID-ALG", "Hello World", null);
