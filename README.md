@@ -151,6 +151,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/crypto/url` | Percent-encode or decode a URL component, path segment list or form value (`COMPONENT`, `PATH`, `FORM`) |
 | `POST` | `/api/v1/utils/crypto/jwt/decode` | Decode a compact JWT into `algorithm`, `type`, `header` and `payload` without verifying the signature (`verified` is always `false`) |
 | `GET` | `/api/v1/utils/crypto/uuid` | Generate random UUID v4 list (standard or compact 32-hex) |
+| `GET` | `/api/v1/utils/crypto/uuid/inspect` | Validate and inspect an existing UUID (`value` = canonical `8-4-4-4-12` or compact 32-hex, case-insensitive, trimmed) returning `canonical`, `compact`, `version`, `variant` (`RFC_4122` / `NCS` / `MICROSOFT` / `FUTURE`) and, for UUIDv7 only, `unixTimestampMillis` (48-bit millisecond prefix); read-only — no journal entry |
 | `POST` | `/api/v1/utils/json/format` | Pretty-print or minify JSON strings |
 | `POST` | `/api/v1/utils/json/validate` | Check JSON syntax validity and report exact syntax error line/col |
 | `POST` | `/api/v1/utils/json/query` | Evaluate JSONPath queries and extract matching nodes |

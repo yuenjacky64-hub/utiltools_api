@@ -10,6 +10,7 @@ import com.example.utiltools.crypto.dto.JwtDecodeRequest;
 import com.example.utiltools.crypto.dto.JwtDecodeResponse;
 import com.example.utiltools.crypto.dto.UrlRequest;
 import com.example.utiltools.crypto.dto.UrlResponse;
+import com.example.utiltools.crypto.dto.UuidInspectResponse;
 import com.example.utiltools.crypto.dto.UuidResponse;
 import com.example.utiltools.crypto.service.CryptoService;
 import org.junit.jupiter.api.BeforeEach;
@@ -194,6 +195,67 @@ class CryptoServiceTest {
         UuidResponse compact = cryptoService.generateUuids(2, true);
         assertThat(compact.count()).isEqualTo(2);
         assertThat(compact.uuids().getFirst()).matches("^[0-9a-f]{32}$");
+    }
+
+    @Test
+    @DisplayName("Should inspect canonical and compact UUIDs and report version, variant and normalised forms")
+    void shouldInspectCanonicalAndCompactUuids() {
+        UuidInspectResponse canonical = cryptoService.inspectUuid("550e8400-e29b-41d4-a716-446655440000");
+        assertThat(canonical.canonical()).isEqualTo("550e8400-e29b-41d4-a716-446655440000");
+        assertThat(canonical.compact()).isEqualTo("550e8400e29b41d4a716446655440000");
+        assertThat(canonical.version()).isEqualTo(4);
+        assertThat(canonical.variant()).isEqualTo("RFC_4122");
+        assertThat(canonical.unixTimestampMillis()).isNull();
+
+        UuidInspectResponse upperCompact = cryptoService.inspectUuid("  550E8400E29B41D4A716446655440000  ");
+        assertThat(upperCompact).isEqualTo(canonical);
+
+        UuidInspectResponse ncs = cryptoService.inspectUuid("ffffffff-0000-1000-0000-000000000000");
+        assertThat(ncs.version()).isEqualTo(1);
+        assertThat(ncs.variant()).isEqualTo("NCS");
+    }
+
+    @Test
+    @DisplayName("shouldInspectV7RecoversMillisPrefix")
+    void shouldInspectV7RecoversMillisPrefix() {
+        CryptoService fixedClockService = new CryptoService(
+                Clock.fixed(Instant.ofEpochMilli(FIXED_CLOCK_MILLIS), ZoneOffset.UTC));
+        String compactV7 = fixedClockService.generateUuids(1, true, "V7").uuids().getFirst();
+
+        UuidInspectResponse inspect = fixedClockService.inspectUuid(compactV7);
+        assertThat(inspect.version()).isEqualTo(7);
+        assertThat(inspect.variant()).isEqualTo("RFC_4122");
+        assertThat(inspect.unixTimestampMillis()).isEqualTo(FIXED_CLOCK_MILLIS);
+        assertThat(inspect.compact()).isEqualTo(compactV7);
+        assertThat(inspect.canonical())
+                .isEqualTo(compactV7.substring(0, 8) + "-"
+                        + compactV7.substring(8, 12) + "-"
+                        + compactV7.substring(12, 16) + "-"
+                        + compactV7.substring(16, 20) + "-"
+                        + compactV7.substring(20));
+    }
+
+    @Test
+    @DisplayName("Should reject blank, 31-hex, non-hex and misplaced-hyphen UUID inspect inputs")
+    void shouldRejectInvalidInspectInputs() {
+        assertThatThrownBy(() -> cryptoService.inspectUuid(null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("value must be a UUID in canonical (8-4-4-4-12) or compact (32-hex) form");
+        for (String invalid : List.of("", "   ")) {
+            assertThatThrownBy(() -> cryptoService.inspectUuid(invalid))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessage("value must be a UUID in canonical (8-4-4-4-12) or compact (32-hex) form");
+        }
+        for (String invalid : List.of(
+                "550e8400e29b41d4a71644665544000",
+                "550e8400e29b41d4a7164466554400001",
+                "550e8400e29b41d4a71644665544000g",
+                "550e8-400e29b41d4a716446655440000",
+                "550e8400-e29b-41d4-a716-44665544000")) {
+            assertThatThrownBy(() -> cryptoService.inspectUuid(invalid))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessage("value must be a valid UUID in canonical (8-4-4-4-12) or compact (32-hex) form");
+        }
     }
 
     @Test
