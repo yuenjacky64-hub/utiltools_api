@@ -22,7 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TextTransformRequestValidationTest {
 
     private static final String SUPPORTED_OPERATIONS_MESSAGE =
-            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE";
+            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE";
 
     private static final String TEXT_TOO_LONG_MESSAGE = "text must be at most 1000000 characters";
 
@@ -34,10 +34,11 @@ class TextTransformRequestValidationTest {
     private static final String KEBAB = "KEBAB";
     private static final String SLUG = "SLUG";
     private static final String SENTENCE_CASE = "SENTENCE_CASE";
+    private static final String REVERSE = "REVERSE";
 
     /** Mirrors {@code TextService}'s {@code switch} labels: an accepted value must land on one of them. */
     private static final List<String> SWITCH_LABELS =
-            List.of(UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE);
+            List.of(UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE);
 
     @Test
     @DisplayName("text of exactly 1000000 characters passes @Size, 1000001 is rejected, null stays @NotBlank-only")
@@ -83,8 +84,8 @@ class TextTransformRequestValidationTest {
     }
 
     @Test
-    @DisplayName("all eight operations pass validation in lower, mixed and upper case and survive the service normalisation")
-    void shouldAcceptAllEightOperationsInAnyCase() {
+    @DisplayName("all nine operations pass validation in lower, mixed and upper case and survive the service normalisation")
+    void shouldAcceptAllNineOperationsInAnyCase() {
         try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
             Validator validator = factory.getValidator();
 
@@ -126,6 +127,21 @@ class TextTransformRequestValidationTest {
             assertThat(validator.validate(new TextTransformRequest("hello", null)))
                     .extracting(ConstraintViolation::getMessage)
                     .containsExactly("operation is required");
+        }
+    }
+
+    @Test
+    @DisplayName("an unrecognized value with the REVERSE prefix is rejected with the updated supported-operations message")
+    void shouldRejectReversePrefixValue() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+            Set<ConstraintViolation<TextTransformRequest>> violations =
+                    validator.validate(new TextTransformRequest("hello", "REVERSED"));
+
+            assertThat(violations)
+                    .hasSize(1)
+                    .extracting(ConstraintViolation::getMessage)
+                    .containsExactly(SUPPORTED_OPERATIONS_MESSAGE);
         }
     }
 

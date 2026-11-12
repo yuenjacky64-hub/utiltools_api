@@ -38,7 +38,7 @@ import java.util.regex.PatternSyntaxException;
 @Service
 public class TextService {
 
-    private static final String ALLOWED_OPERATIONS = "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE";
+    private static final String ALLOWED_OPERATIONS = "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE";
 
     private static final Pattern SENTENCE_SEPARATORS = Pattern.compile("[.!?]+");
 
@@ -61,6 +61,7 @@ public class TextService {
     private static final String KEBAB = "KEBAB";
     private static final String SLUG = "SLUG";
     private static final String SENTENCE_CASE = "SENTENCE_CASE";
+    private static final String REVERSE = "REVERSE";
 
     public TextTransformResponse transform(TextTransformRequest request) {
         String text = request.text();
@@ -74,6 +75,7 @@ public class TextService {
             case KEBAB -> joinTransformed(text, "-", TextService::lowerCase);
             case SLUG -> slug(text);
             case SENTENCE_CASE -> sentenceCase(text);
+            case REVERSE -> reverseByCodePoints(text);
             default -> throw new IllegalArgumentException("Unsupported operation '" + request.operation()
                     + "'. Allowed values: " + ALLOWED_OPERATIONS);
         };
@@ -582,6 +584,20 @@ public class TextService {
             newSentence = true;
             cursor = separators.end();
         }
+    }
+
+    /**
+     * Reverses the input code point by code point so multi-byte characters (e.g. emoji) stay
+     * intact instead of having their UTF-16 surrogate halves swapped. Locale.ROOT only, so a
+     * journalled result always replays exactly.
+     */
+    private static String reverseByCodePoints(String text) {
+        int[] codePoints = text.codePoints().toArray();
+        StringBuilder reversed = new StringBuilder(text.length());
+        for (int i = codePoints.length - 1; i >= 0; i--) {
+            reversed.appendCodePoint(codePoints[i]);
+        }
+        return reversed.toString();
     }
 
     /** Copies one separator-free segment, upper-casing its first letter/digit when starting a sentence. */
