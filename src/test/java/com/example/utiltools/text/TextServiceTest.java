@@ -49,6 +49,8 @@ class TextServiceTest {
                 .isEqualTo(new TextTransformResponse("SLUG", "hello-world", true, 11));
         assertThat(service.transform(new TextTransformRequest("Hello, World!", "SENTENCE_CASE")))
                 .isEqualTo(new TextTransformResponse("SENTENCE_CASE", "Hello, world!", true, 13));
+        assertThat(service.transform(new TextTransformRequest("Hello, World!", "REVERSE")))
+                .isEqualTo(new TextTransformResponse("REVERSE", "!dlroW ,olleH", true, 13));
 
         // case-insensitive operation, echoed back upper-case
         assertThat(service.transform(new TextTransformRequest("Hello, World!", " snake ")))
@@ -113,7 +115,7 @@ class TextServiceTest {
                     validator.validate(new TextTransformRequest("Hello", " "));
             assertThat(operationViolations).extracting(ConstraintViolation::getMessage)
                     .containsExactlyInAnyOrder("operation is required",
-                            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE");
+                            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE");
 
             Set<ConstraintViolation<TextStatsRequest>> statsViolations =
                     validator.validate(new TextStatsRequest(""));
@@ -127,8 +129,37 @@ class TextServiceTest {
     void shouldRejectUnknownOperation() {
         assertThatThrownBy(() -> service.transform(new TextTransformRequest("secret body", "shout")))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("Unsupported operation 'shout'. Allowed values: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE")
+                .hasMessage("Unsupported operation 'shout'. Allowed values: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE")
                 .hasMessageNotContaining("secret body");
+    }
+
+    @Test
+    @DisplayName("REVERSE reverses a simple ASCII string and an empty string unchanged")
+    void shouldReverseSimpleAndEmptyText() {
+        assertThat(service.transform(new TextTransformRequest("hello", "REVERSE")))
+                .isEqualTo(new TextTransformResponse("REVERSE", "olleh", true, 5));
+
+        assertThat(service.transform(new TextTransformRequest("", "REVERSE")))
+                .isEqualTo(new TextTransformResponse("REVERSE", "", false, 0));
+
+        // case-insensitive operation, echoed back upper-case
+        assertThat(service.transform(new TextTransformRequest("abc", "reverse")).operation())
+                .isEqualTo("REVERSE");
+    }
+
+    @Test
+    @DisplayName("REVERSE reverses at code-point granularity without splitting emoji surrogate pairs")
+    void shouldReversePreserveSurrogatePairs() {
+        TextTransformResponse response = service.transform(new TextTransformRequest("Hello 🌍", "REVERSE"));
+
+        assertThat(response.operation()).isEqualTo("REVERSE");
+        assertThat(response.result()).isEqualTo("🌍 olleH");
+        assertThat(response.changed()).isTrue();
+        assertThat(response.length()).isEqualTo(7);
+
+        // the emoji stays one intact code point (0x1F30D) leading the result: no isolated surrogates
+        int[] codePoints = response.result().codePoints().toArray();
+        assertThat(codePoints).containsExactly(0x1F30D, ' ', 'o', 'l', 'l', 'e', 'H');
     }
 
     @Test

@@ -44,7 +44,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class TextControllerTest {
 
     private static final String SUPPORTED_OPERATIONS_MESSAGE =
-            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE";
+            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE";
 
     @Autowired
     private MockMvc mockMvc;
@@ -131,6 +131,25 @@ class TextControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/utils/text/transform - reverses text and echoes the normalised operation")
+    void shouldTransformToReverse() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/transform")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {
+                                    "text": "hello",
+                                    "operation": "REVERSE"
+                                }
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.operation").value("REVERSE"))
+                .andExpect(jsonPath("$.data.result").value("olleh"))
+                .andExpect(jsonPath("$.data.changed").value(true))
+                .andExpect(jsonPath("$.data.length").value(5));
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/text/transform - an unsupported operation is rejected by bean validation")
     void shouldRejectUnsupportedOperationWith400ValidationError() throws Exception {
         mockMvc.perform(post("/api/v1/utils/text/transform")
@@ -153,7 +172,7 @@ class TextControllerTest {
     @Test
     @DisplayName("POST /api/v1/utils/text/transform - every supported operation is accepted")
     void shouldAcceptEverySupportedOperation() throws Exception {
-        String[] operations = {"UPPER", "LOWER", "TITLE", "CAMEL", "SNAKE", "KEBAB", "SLUG", "SENTENCE_CASE"};
+        String[] operations = {"UPPER", "LOWER", "TITLE", "CAMEL", "SNAKE", "KEBAB", "SLUG", "SENTENCE_CASE", "REVERSE"};
 
         for (String operation : operations) {
             mockMvc.perform(post("/api/v1/utils/text/transform")
