@@ -1299,4 +1299,158 @@ class DateTimeControllerTest {
 
         assertThat(auditJournal.size()).isEqualTo(before);
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/overlap - reports the half-open intersection in the ApiResponse envelope")
+    void shouldCalculateDateTimeOverlap() throws Exception {
+        String body = """
+                {
+                    "startA": "2024-10-01T00:00:00Z",
+                    "endA": "2024-10-05T00:00:00Z",
+                    "startB": "2024-10-03T00:00:00Z",
+                    "endB": "2024-10-07T00:00:00Z"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/overlap")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("DateTime overlap calculated successfully"))
+                .andExpect(jsonPath("$.data.overlap").value(true))
+                .andExpect(jsonPath("$.data.overlapStart").value("2024-10-03T00:00:00Z"))
+                .andExpect(jsonPath("$.data.overlapEnd").value("2024-10-05T00:00:00Z"))
+                .andExpect(jsonPath("$.data.overlapMillis").value(2L * 24 * 60 * 60 * 1000));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/overlap - reports null bounds and zero millis for disjoint or adjacent intervals")
+    void shouldReportDisjointDateTimeOverlap() throws Exception {
+        String disjoint = """
+                {
+                    "startA": "2024-10-01T00:00:00Z",
+                    "endA": "2024-10-02T00:00:00Z",
+                    "startB": "2024-10-03T00:00:00Z",
+                    "endB": "2024-10-04T00:00:00Z"
+                }
+                """;
+        String adjacent = """
+                {
+                    "startA": "2024-10-01T00:00:00Z",
+                    "endA": "2024-10-02T00:00:00Z",
+                    "startB": "2024-10-02T00:00:00Z",
+                    "endB": "2024-10-03T00:00:00Z"
+                }
+                """;
+
+        for (String payload : new String[] {disjoint, adjacent}) {
+            mockMvc.perform(post("/api/v1/utils/datetime/overlap")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(payload))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.success").value(true))
+                    .andExpect(jsonPath("$.data.overlap").value(false))
+                    .andExpect(jsonPath("$.data.overlapStart", org.hamcrest.Matchers.nullValue()))
+                    .andExpect(jsonPath("$.data.overlapEnd", org.hamcrest.Matchers.nullValue()))
+                    .andExpect(jsonPath("$.data.overlapMillis").value(0L));
+        }
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/overlap - rejects reversed or zero-length intervals with 400 BAD_REQUEST")
+    void shouldRejectInvalidOverlapIntervals() throws Exception {
+        int before = auditJournal.size();
+        String reversed = """
+                {
+                    "startA": "2024-10-05T00:00:00Z",
+                    "endA": "2024-10-01T00:00:00Z",
+                    "startB": "2024-10-03T00:00:00Z",
+                    "endB": "2024-10-07T00:00:00Z"
+                }
+                """;
+        String zeroLength = """
+                {
+                    "startA": "2024-10-01T00:00:00Z",
+                    "endA": "2024-10-01T00:00:00Z",
+                    "startB": "2024-10-01T00:00:00Z",
+                    "endB": "2024-10-02T00:00:00Z"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/utils/datetime/overlap")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(reversed))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message",
+                        org.hamcrest.Matchers.containsString("endA must be strictly after startA")));
+
+        mockMvc.perform(post("/api/v1/utils/datetime/overlap")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(zeroLength))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message",
+                        org.hamcrest.Matchers.containsString("endA must be strictly after startA")));
+
+        // The PENDING entry was already begun before the call, so each 400 journals a FAILED entry.
+        assertThat(auditJournal.size()).isEqualTo(before + 2);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/datetime/overlap - is journalled as DATETIME_OVERLAP and replays identically")
+    void shouldJournalAndReplayDateTimeOverlap() throws Exception {
+        String body = """
+                {
+                    "startA": "2024-10-01T00:00:00Z",
+                    "endA": "2024-10-05T00:00:00Z",
+                    "startB": "2024-10-03T00:00:00Z",
+                    "endB": "2024-10-07T00:00:00Z"
+                }
+                """;
+
+        int before = auditJournal.size();
+
+        mockMvc.perform(post("/api/v1/utils/datetime/overlap")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.overlapStart").value("2024-10-03T00:00:00Z"));
+
+        assertThat(auditJournal.size()).isEqualTo(before + 1);
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("DATETIME_OVERLAP"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.overlapStart").value("2024-10-03T00:00:00Z"))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        JsonNode storedResult = entry.get("result");
+        AuditEntry journalEntry = auditJournal.find(id).orElseThrow();
+        assertThat(OperationType.DATETIME_OVERLAP.isDeterministic()).isTrue();
+        assertThat(journalEntry.state()).isEqualTo(JournalState.SUCCEEDED);
+
+        MvcResult replay = mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("DATETIME_OVERLAP"))
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"))
+                .andReturn();
+
+        JsonNode replayedResult = objectMapper.readTree(replay.getResponse().getContentAsString())
+                .get("data").get("result");
+        assertThat(replayedResult).isEqualTo(storedResult);
+
+        // Replay must not append a second journal entry.
+        assertThat(auditJournal.size()).isEqualTo(before + 1);
+        AuditEntry after = auditJournal.find(id).orElseThrow();
+        assertThat(after.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(after.result()).isEqualTo(journalEntry.result());
+    }
 }

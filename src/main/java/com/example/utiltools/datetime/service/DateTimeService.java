@@ -7,6 +7,8 @@ import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
+import com.example.utiltools.datetime.dto.DateTimeOverlapRequest;
+import com.example.utiltools.datetime.dto.DateTimeOverlapResponse;
 import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
 import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
 import com.example.utiltools.datetime.dto.DateTimeRangeRequest;
@@ -265,6 +267,36 @@ public class DateTimeService {
                 days, duration.toHoursPart(), duration.toMinutesPart(), duration.toSecondsPart());
 
         return new DateTimeDiffResponse(days, hours, minutes, seconds, millis, humanReadable);
+    }
+
+    public DateTimeOverlapResponse overlap(DateTimeOverlapRequest request) {
+        Instant startA = parseInstant(request.startA());
+        Instant endA = parseInstant(request.endA());
+        Instant startB = parseInstant(request.startB());
+        Instant endB = parseInstant(request.endB());
+
+        if (!endA.isAfter(startA)) {
+            throw new IllegalArgumentException("endA must be strictly after startA");
+        }
+        if (!endB.isAfter(startB)) {
+            throw new IllegalArgumentException("endB must be strictly after startB");
+        }
+
+        // Half-open intervals [start, end): the intersection is [max(starts), min(ends)) and is
+        // empty (including the adjacent case endA == startB) whenever it is not before its start.
+        Instant overlapStart = startA.isAfter(startB) ? startA : startB;
+        Instant overlapEnd = endA.isBefore(endB) ? endA : endB;
+
+        if (!overlapStart.isBefore(overlapEnd)) {
+            return new DateTimeOverlapResponse(false, null, null, 0L);
+        }
+
+        long overlapMillis = Duration.between(overlapStart, overlapEnd).toMillis();
+        return new DateTimeOverlapResponse(
+                true,
+                DateTimeFormatter.ISO_INSTANT.format(overlapStart),
+                DateTimeFormatter.ISO_INSTANT.format(overlapEnd),
+                overlapMillis);
     }
 
     public CurrentTimeResponse getCurrentTime(String timeZoneStr) {

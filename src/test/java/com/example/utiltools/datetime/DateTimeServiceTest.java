@@ -7,10 +7,14 @@ import com.example.utiltools.datetime.dto.DateTimeConvertRequest;
 import com.example.utiltools.datetime.dto.DateTimeConvertResponse;
 import com.example.utiltools.datetime.dto.DateTimeDiffRequest;
 import com.example.utiltools.datetime.dto.DateTimeDiffResponse;
+import com.example.utiltools.datetime.dto.DateTimeOverlapRequest;
+import com.example.utiltools.datetime.dto.DateTimeOverlapResponse;
 import com.example.utiltools.datetime.dto.DateTimeDurationRequest;
 import com.example.utiltools.datetime.dto.DateTimeDurationResponse;
 import com.example.utiltools.datetime.dto.DateTimeRangeRequest;
 import com.example.utiltools.datetime.dto.DateTimeRangeResponse;
+import com.example.utiltools.datetime.dto.DateTimeOverlapRequest;
+import com.example.utiltools.datetime.dto.DateTimeOverlapResponse;
 import com.example.utiltools.datetime.dto.DateTimeShiftRequest;
 import com.example.utiltools.datetime.dto.DateTimeShiftResponse;
 import com.example.utiltools.datetime.dto.DateTimeWeekResponse;
@@ -21,6 +25,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
@@ -1054,5 +1059,127 @@ class DateTimeServiceTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("unit must be one of DAYS, WEEKS, MONTHS, YEARS: " + "Z".repeat(64))
                 .hasMessageNotContaining("Z".repeat(65));
+    }
+
+    @Test
+    @DisplayName("Should compute the half-open intersection of partially overlapping intervals")
+    void shouldComputePartialOverlap() {
+        DateTimeOverlapResponse response = dateTimeService.overlap(
+                new DateTimeOverlapRequest("2024-10-01T00:00:00Z", "2024-10-05T00:00:00Z",
+                        "2024-10-03T00:00:00Z", "2024-10-07T00:00:00Z"));
+
+        assertThat(response.overlap()).isTrue();
+        assertThat(response.overlapStart()).isEqualTo("2024-10-03T00:00:00Z");
+        assertThat(response.overlapEnd()).isEqualTo("2024-10-05T00:00:00Z");
+        assertThat(response.overlapMillis()).isEqualTo(2L * 24 * 60 * 60 * 1000);
+    }
+
+    @Test
+    @DisplayName("Should return the contained interval as the intersection of containment cases")
+    void shouldComputeContainmentOverlap() {
+        DateTimeOverlapResponse response = dateTimeService.overlap(
+                new DateTimeOverlapRequest("2024-10-01T00:00:00Z", "2024-10-10T00:00:00Z",
+                        "2024-10-03T12:00:00Z", "2024-10-05T06:00:00Z"));
+
+        assertThat(response.overlap()).isTrue();
+        assertThat(response.overlapStart()).isEqualTo("2024-10-03T12:00:00Z");
+        assertThat(response.overlapEnd()).isEqualTo("2024-10-05T06:00:00Z");
+        assertThat(response.overlapMillis())
+                .isEqualTo(Duration.between(Instant.parse("2024-10-03T12:00:00Z"),
+                        Instant.parse("2024-10-05T06:00:00Z")).toMillis());
+    }
+
+    @Test
+    @DisplayName("Should return the full interval when both intervals are identical")
+    void shouldComputeIdenticalIntervalOverlap() {
+        DateTimeOverlapResponse response = dateTimeService.overlap(
+                new DateTimeOverlapRequest("2024-10-01T00:00:00Z", "2024-10-03T00:00:00Z",
+                        "2024-10-01T00:00:00Z", "2024-10-03T00:00:00Z"));
+
+        assertThat(response.overlap()).isTrue();
+        assertThat(response.overlapStart()).isEqualTo("2024-10-01T00:00:00Z");
+        assertThat(response.overlapEnd()).isEqualTo("2024-10-03T00:00:00Z");
+        assertThat(response.overlapMillis()).isEqualTo(2L * 24 * 60 * 60 * 1000);
+    }
+
+    @Test
+    @DisplayName("Should report disjoint intervals with null bounds and zero overlapMillis")
+    void shouldReportDisjointIntervals() {
+        DateTimeOverlapResponse response = dateTimeService.overlap(
+                new DateTimeOverlapRequest("2024-10-01T00:00:00Z", "2024-10-02T00:00:00Z",
+                        "2024-10-03T00:00:00Z", "2024-10-04T00:00:00Z"));
+
+        assertThat(response.overlap()).isFalse();
+        assertThat(response.overlapStart()).isNull();
+        assertThat(response.overlapEnd()).isNull();
+        assertThat(response.overlapMillis()).isZero();
+    }
+
+    @Test
+    @DisplayName("Should treat adjacent half-open boundaries (endA == startB) as disjoint")
+    void shouldReportAdjacentIntervalsAsDisjoint() {
+        DateTimeOverlapResponse response = dateTimeService.overlap(
+                new DateTimeOverlapRequest("2024-10-01T00:00:00Z", "2024-10-02T00:00:00Z",
+                        "2024-10-02T00:00:00Z", "2024-10-03T00:00:00Z"));
+
+        assertThat(response.overlap()).isFalse();
+        assertThat(response.overlapStart()).isNull();
+        assertThat(response.overlapEnd()).isNull();
+        assertThat(response.overlapMillis()).isZero();
+    }
+
+    @Test
+    @DisplayName("Should parse overlap bounds with the same auto-detect grammar as diff")
+    void shouldAutoDetectEpochSecondsAndMillisForOverlapBounds() {
+        DateTimeOverlapResponse response = dateTimeService.overlap(
+                new DateTimeOverlapRequest("1727740800", "1727913600",
+                        "1727827200000", "1727913600000"));
+
+        // 1727740800s = 2024-10-01T00:00:00Z, 1727913600s = 2024-10-03T00:00:00Z,
+        // 1727827200000ms = 2024-10-02T00:00:00Z, 1727913600000ms = 2024-10-03T00:00:00Z
+        assertThat(response.overlap()).isTrue();
+        assertThat(response.overlapStart()).isEqualTo("2024-10-02T00:00:00Z");
+        assertThat(response.overlapEnd()).isEqualTo("2024-10-03T00:00:00Z");
+        assertThat(response.overlapMillis()).isEqualTo(24L * 60 * 60 * 1000);
+    }
+
+    @Test
+    @DisplayName("Should reject a reversed first interval (endA before startA) with IllegalArgumentException")
+    void shouldRejectReversedFirstInterval() {
+        assertThatThrownBy(() -> dateTimeService.overlap(
+                new DateTimeOverlapRequest("2024-10-05T00:00:00Z", "2024-10-01T00:00:00Z",
+                        "2024-10-03T00:00:00Z", "2024-10-07T00:00:00Z")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("endA must be strictly after startA");
+    }
+
+    @Test
+    @DisplayName("Should reject a zero-length first interval (endA equal to startA) with IllegalArgumentException")
+    void shouldRejectZeroLengthFirstInterval() {
+        assertThatThrownBy(() -> dateTimeService.overlap(
+                new DateTimeOverlapRequest("2024-10-01T00:00:00Z", "2024-10-01T00:00:00Z",
+                        "2024-10-03T00:00:00Z", "2024-10-07T00:00:00Z")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("endA must be strictly after startA");
+    }
+
+    @Test
+    @DisplayName("Should reject a reversed second interval (endB before startB) with IllegalArgumentException")
+    void shouldRejectReversedSecondInterval() {
+        assertThatThrownBy(() -> dateTimeService.overlap(
+                new DateTimeOverlapRequest("2024-10-01T00:00:00Z", "2024-10-02T00:00:00Z",
+                        "2024-10-07T00:00:00Z", "2024-10-03T00:00:00Z")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("endB must be strictly after startB");
+    }
+
+    @Test
+    @DisplayName("Should reject a zero-length second interval (endB equal to startB) with IllegalArgumentException")
+    void shouldRejectZeroLengthSecondInterval() {
+        assertThatThrownBy(() -> dateTimeService.overlap(
+                new DateTimeOverlapRequest("2024-10-01T00:00:00Z", "2024-10-02T00:00:00Z",
+                        "2024-10-03T00:00:00Z", "2024-10-03T00:00:00Z")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("endB must be strictly after startB");
     }
 }
