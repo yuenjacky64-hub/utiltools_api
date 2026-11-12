@@ -17,11 +17,21 @@ import java.util.Set;
  *       witness; an in-flight dispatch still terminalizes {@code DELIVERED}/{@code FAILED})</li>
  *   <li>{@code FAILED -> QUEUED} (bounded retry: only while the attempt counter is below
  *       {@code maxAttempts}; increments the counter, so {@code QUEUED} is reachable this way only)</li>
+ *   <li>{@code DISPATCHING -> DEAD_LETTERED} (a retryable {@code CONTACT_DISPATCH_FAILED} or
+ *       {@code CONTACT_DELIVERY_LEASE_EXPIRED} failure that has reached {@code maxAttempts}:
+ *       the attempt-ceiling failure is quarantined instead of staying {@code FAILED} forever)</li>
+ *   <li>{@code DEAD_LETTERED -> QUEUED} (operator redrive, bounded by
+ *       {@code utiltools.contact.max-redrives}; extends {@code maxAttempts} to {@code attempt + 1},
+ *       so {@code QUEUED} is reachable this way only)</li>
  * </ul>
  *
- * <p>{@code DELIVERED} and {@code CANCELLED} are terminal: no edge leaves them. Any edge not
- * listed is illegal and must leave the submission, its attempt counter, and its idempotency
- * mapping untouched while surfacing a {@code CONTACT_TRANSITION_CONFLICT} error (409).</p>
+ * <p>{@code DELIVERED} and {@code CANCELLED} are terminal: no edge leaves them.
+ * {@code DEAD_LETTERED} has exactly one outgoing edge — the operator-only redrive — and is
+ * otherwise terminal: {@code cancel()} and {@code retry()} both refuse it with
+ * {@code CONTACT_TRANSITION_CONFLICT} (409), and the automatic retry scanner never scans it.
+ * Any edge not listed is illegal and must leave the submission, its attempt counter, and its
+ * idempotency mapping untouched while surfacing a {@code CONTACT_TRANSITION_CONFLICT} error
+ * (409).</p>
  */
 public enum ContactStatus {
 
@@ -29,13 +39,18 @@ public enum ContactStatus {
     DISPATCHING,
     DELIVERED,
     FAILED,
-    CANCELLED;
+    CANCELLED,
+    /** Quarantined: a retryable attempt-ceiling failure. Only an operator {@code /redrive}
+     *  leaves this state (bounded by {@code utiltools.contact.max-redrives}). */
+    DEAD_LETTERED;
 
     private static final Set<ContactStatus> TERMINAL =
             Set.of(DELIVERED, CANCELLED);
 
     /**
-     * @return true when no legal edge leaves this state
+     * @return true when no *automatic* edge leaves this state; the operator-only redrive edge
+     *         leaves {@code DEAD_LETTERED}, and a bounded operator retry re-enters
+     *         {@code QUEUED} from {@code FAILED}
      */
     public boolean isTerminal() {
         return TERMINAL.contains(this);
@@ -49,8 +64,9 @@ public enum ContactStatus {
     public boolean allows(ContactStatus from, ContactStatus to) {
         return switch (from) {
             case QUEUED -> to == DISPATCHING || to == CANCELLED;
-            case DISPATCHING -> to == DELIVERED || to == FAILED || to == CANCELLED;
+            case DISPATCHING -> to == DELIVERED || to == FAILED || to == DEAD_LETTERED || to == CANCELLED;
             case FAILED -> to == QUEUED; // bounded retry, enforced by the service's attempt counter
+            case DEAD_LETTERED -> to == QUEUED; // operator redrive, bounded by max-redrives
             case DELIVERED, CANCELLED -> false;
         };
     }

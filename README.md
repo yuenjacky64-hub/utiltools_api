@@ -183,9 +183,10 @@ utiltools_api/
 | `POST` | `/api/v1/utils/audit/verify` | Sweep-verify up to `limit` (default `20`, clamped to `max-entries`) SUCCEEDED entries in one pass and report per-entry `VERIFIED` / `MISMATCH` / `FAILED` / `SKIPPED` |
 | `GET` | `/api/v1/utils/audit/reaps` | List reaper tombstones (newest first) with optional `limit` (default `50`, clamped to `max-entries`) and `reason` filter; read-only |
 | `POST` | `/api/v1/utils/contact/submissions` | Admit a contact submission into the bounded dispatch pool; `202` with a snapshot whose `status` is `QUEUED`; `409` `CONTACT_IDEMPOTENCY_CONFLICT` on a reused-key payload mismatch, `429` `CONTACT_QUEUE_FULL` when the pool is saturated |
-| `GET` | `/api/v1/utils/contact/submissions/{id}` | Fetch one submission snapshot: `QUEUED` / `DISPATCHING` / `DELIVERED` / `FAILED` / `CANCELLED`; `404` `CONTACT_SUBMISSION_NOT_FOUND` |
+| `GET` | `/api/v1/utils/contact/submissions/{id}` | Fetch one submission snapshot: `QUEUED` / `DISPATCHING` / `DELIVERED` / `FAILED` / `DEAD_LETTERED` / `CANCELLED`; `404` `CONTACT_SUBMISSION_NOT_FOUND` |
 | `GET` | `/api/v1/utils/contact/submissions` | List submission snapshots newest first; optional `limit` (default `20`, clamped to `1..100`) |
-| `POST` | `/api/v1/utils/contact/submissions/{id}/retry` | Requeue a `FAILED` attempt as `attempt+1` (`200`); `409` `CONTACT_TRANSITION_CONFLICT` for any illegal transition |
+| `POST` | `/api/v1/utils/contact/submissions/{id}/retry` | Requeue a `FAILED` attempt as `attempt+1` (`200`); `409` `CONTACT_TRANSITION_CONFLICT` for any illegal transition, including a `DEAD_LETTERED` row (use `/redrive`) or an exhausted attempt budget |
+| `POST` | `/api/v1/utils/contact/submissions/{id}/redrive` | The only exit from `DEAD_LETTERED`: extends `maxAttempts` to `attempt+1`, requeues `attempt+1` as `DISPATCHING` with a fresh lease and a new `CONTACT_SUBMIT` journal entry (`200`); `404` `CONTACT_SUBMISSION_NOT_FOUND`; `409` `CONTACT_TRANSITION_CONFLICT` when the row is not `DEAD_LETTERED` or the `utiltools.contact.max-redrives` budget is spent; `429` `CONTACT_QUEUE_FULL` restores the exact prior `DEAD_LETTERED` snapshot |
 | `DELETE` | `/api/v1/utils/contact/submissions/{id}` | Withdraw a submission before the dispatcher starts: `200` with the `CANCELLED` snapshot; `404` `CONTACT_SUBMISSION_NOT_FOUND`; `409` `CONTACT_TRANSITION_CONFLICT` while dispatch is in flight or the row is terminal (`DELIVERED` / `FAILED`). A repeat cancel of an already-`CANCELLED` row is idempotent and re-answers `200` with its `CANCELLED` snapshot |
 
 ---
@@ -2671,8 +2672,16 @@ It is deliberately bounded (default `20`, ceiling `100`) and not paginated — f
 ### 6. Contact Submissions (async)
 
 Contact submissions are admitted into a bounded dispatch pool and delivered by an in-JVM executor pool.
-A submission's lifecycle is `QUEUED` → `DISPATCHING` → `DELIVERED` / `FAILED` (with bounded automatic
-retries up to `maxAttempts`), plus the terminal `CANCELLED` state:
+A submission's lifecycle is `QUEUED` → `DISPATCHING` → `DELIVERED` / `FAILED` / `DEAD_LETTERED` (with
+bounded automatic retries up to `maxAttempts`), plus the terminal `CANCELLED` state. `FAILED` is the
+retryable terminal: the automatic scanner and `POST .../retry` can still move it back to `QUEUED`.
+`DEAD_LETTERED` is the quarantine: a retryable failure (`CONTACT_DISPATCH_FAILED` or
+`CONTACT_DELIVERY_LEASE_EXPIRED`) that has already reached `maxAttempts` is committed as
+`DEAD_LETTERED` in the same registry-lock critical section that terminalizes the attempt, keeping the
+original bounded error and `completedAt`, clearing `nextRetryAt`, and closing the attempt's
+`CONTACT_SUBMIT` journal entry **exactly once** with the `CONTACT_DEAD_LETTERED` detail. A
+dead-lettered row is *permanently* failed: `retry()` and `DELETE` are both `409`
+`CONTACT_TRANSITION_CONFLICT`, and only an explicit operator redrive leaves the state.
 
 - `POST /api/v1/utils/contact/submissions` admits a submission with `202`; `409`
   `CONTACT_IDEMPOTENCY_CONFLICT` on a reused-key payload mismatch, `429` `CONTACT_QUEUE_FULL` when the
@@ -2682,15 +2691,36 @@ retries up to `maxAttempts`), plus the terminal `CANCELLED` state:
   `CONTACT_SUBMISSION_NOT_FOUND` for unknown ids.
 - `POST .../submissions/{id}/retry` requeues a `FAILED` attempt as `attempt+1`; `409`
   `CONTACT_TRANSITION_CONFLICT` for any illegal transition.
+- `POST .../submissions/{id}/redrive` is the only transition out of `DEAD_LETTERED` (`DEAD_LETTERED` →
+  `QUEUED`): it atomically extends `maxAttempts` to the prior `attempt + 1`, re-queues the row as
+  `attempt+1` / `DISPATCHING` with a fresh execution lease, and opens a **new** `CONTACT_SUBMIT` journal
+  entry, so the attempt that died is audited once and its redrive is audited once. Illegal from
+  `FAILED` / `QUEUED` / `DELIVERED` / `CANCELLED` (`409` `CONTACT_TRANSITION_CONFLICT`). Each submission
+  carries a redrive count bounded by `utiltools.contact.max-redrives` (default `3`, non-negative);
+  once the budget is spent, every further redrive is `409` `CONTACT_TRANSITION_CONFLICT`.
 - `DELETE .../submissions/{id}` withdraws a submission **before dispatch**: a successful (or repeated)
   cancel returns `200` with the `CANCELLED` snapshot — the attempt's error is
   `CONTACT_SUBMISSION_CANCELLED`, `nextRetryAt` is cleared, and the `CONTACT_SUBMIT` journal entry is
   closed **exactly once**. Cancellation and the worker's execution start race under the same registry
   lock; exactly one side wins, so a fenced worker never invokes the dispatcher after a withdrawal.
 - `409` `CONTACT_TRANSITION_CONFLICT` answers a cancel while the dispatcher is running or against a
-  terminal row (`DELIVERED`, `FAILED`); an in-flight attempt still terminalizes
+  terminal row (`DELIVERED`, `FAILED`, `DEAD_LETTERED`); an in-flight attempt still terminalizes
   `DELIVERED` or `FAILED` when the dispatcher returns. A repeat cancel of an already-`CANCELLED` row is
   idempotent and re-answers `200` with its snapshot. `CANCELLED` is terminal and can never retry.
+
+Both `POST .../retry` and `POST .../redrive` reserve a dispatch slot before touching the row. When the
+bounded pool rejects that reservation (`429` `CONTACT_QUEUE_FULL`), a row-preserving rollback restores
+the exact pre-admission snapshot — status, `attempt`, `maxAttempts`, `error`, `completedAt`,
+`startedAt`, the lease fields, `nextRetryAt` **and** the redrive count — releases only the admission
+reservation, and leaves the submission row plus its idempotency mapping in place. A rejected redrive
+therefore keeps the row `DEAD_LETTERED` byte-for-byte and opens no orphaned journal entry, so the
+operator can simply repeat the call once capacity frees.
+
+| Property | Default | Meaning |
+| :------- | :------ | :------ |
+| `utiltools.contact.retry-backoff-base-ms` / `-max-ms` | `1000` / `60000` | Capped exponential backoff for the automatic re-queue of a retryable `FAILED` attempt |
+| `utiltools.contact.retry-scan-interval-ms` | `1000` | Delay between automatic-retry scan passes; the scanner only ever scans `FAILED` rows, never `DEAD_LETTERED` |
+| `utiltools.contact.max-redrives` | `3` | Per-submission operator redrive budget from `DEAD_LETTERED`. `0` disables redrive entirely; negative values fail startup |
 
 ---
 
