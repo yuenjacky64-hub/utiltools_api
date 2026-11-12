@@ -12,7 +12,9 @@ import com.example.utiltools.text.dto.TextTruncateRequest;
 import com.example.utiltools.text.dto.TextTruncateResponse;
 import com.example.utiltools.text.dto.TextWordFrequencyRequest;
 import com.example.utiltools.text.dto.TextWordFrequencyResponse;
+import com.example.utiltools.text.exception.RegexTimeoutException;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Value;
 
 import java.text.Normalizer;
 import java.util.ArrayList;
@@ -27,16 +29,23 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
+import java.time.Clock;
+
 /**
  * Deterministic text transformation, find-and-replace and statistics.
  *
  * <p>Every operation is a pure function of the request body: only {@link Locale#ROOT} case
- * mapping is used and no clock, locale or random source is read, so a journalled result always
- * matches its replay. Word tokenization is the single {@link #tokenize(String)} method: a token is
- * a maximal run of code points for which {@link Character#isLetterOrDigit(int)} is true.</p>
+ * mapping is used and no locale or random source is read, so a journalled result always matches
+ * its replay. The injected {@link Clock} is used only to bound {@link #replace} regex evaluation
+ * time (one shared deadline per request); it never feeds any result value, so a completed,
+ * journalled result still replays exactly. Word tokenization is the single {@link #tokenize(String)}
+ * method: a token is a maximal run of code points for which {@link Character#isLetterOrDigit(int)}
+ * is true.</p>
  */
 @Service
 public class TextService {
+
+    private static final int DEFAULT_REGEX_TIMEOUT_MS = 200;
 
     private static final String ALLOWED_OPERATIONS = "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE";
 
@@ -62,6 +71,26 @@ public class TextService {
     private static final String SLUG = "SLUG";
     private static final String SENTENCE_CASE = "SENTENCE_CASE";
     private static final String REVERSE = "REVERSE";
+
+    /** Wall-clock budget (ms) shared by both regex passes of {@link #replace}. */
+    private final int regexTimeoutMs;
+
+    /** Bounds regex evaluation time only; never contributes to a result value. */
+    private final Clock clock;
+
+    /** Defaults to system UTC and the standard 200 ms budget, so direct construction keeps its existing behaviour. */
+    public TextService() {
+        this(DEFAULT_REGEX_TIMEOUT_MS, Clock.systemUTC());
+    }
+
+    public TextService(@Value("${utiltools.text.regex-timeout-ms:200}") int regexTimeoutMs, Clock clock) {
+        if (regexTimeoutMs < 1 || regexTimeoutMs > 60_000) {
+            throw new IllegalArgumentException(
+                    "utiltools.text.regex-timeout-ms must be in 1..60000, got " + regexTimeoutMs);
+        }
+        this.regexTimeoutMs = regexTimeoutMs;
+        this.clock = clock;
+    }
 
     public TextTransformResponse transform(TextTransformRequest request) {
         String text = request.text();
@@ -99,7 +128,11 @@ public class TextService {
             throw new IllegalArgumentException("Invalid regex pattern '" + request.pattern()
                     + "': " + e.getDescription());
         }
-        Matcher counter = compiled.matcher(text);
+        // One request-scoped deadline bounds the combined count-plus-replace regex work (REQ-02);
+        // the same guarded sequence is reused for the replacement pass below.
+        long deadlineMs = clock.millis() + regexTimeoutMs;
+        BudgetedCharSequence guarded = new BudgetedCharSequence(text, clock, deadlineMs, regexTimeoutMs);
+        Matcher counter = compiled.matcher(guarded);
         int matches = 0;
         while (counter.find()) {
             matches++;
@@ -113,7 +146,7 @@ public class TextService {
         // inflate the result past MAX_RESULT_CHARS before the check runs. The bound is therefore
         // enforced *instead of* materialising an oversized string.
         StringBuilder builder = new StringBuilder(Math.min(MAX_RESULT_CHARS, text.length() + 16));
-        Matcher matcher = compiled.matcher(text);
+        Matcher matcher = compiled.matcher(guarded);
         int appended = 0;
         int position = 0;
         while (appended < replacements && matcher.find()) {

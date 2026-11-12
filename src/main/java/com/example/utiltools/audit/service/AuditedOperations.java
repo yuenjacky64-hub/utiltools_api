@@ -71,6 +71,7 @@ import com.example.utiltools.text.dto.TextTruncateRequest;
 import com.example.utiltools.text.dto.TextTruncateResponse;
 import com.example.utiltools.text.dto.TextWordFrequencyRequest;
 import com.example.utiltools.text.dto.TextWordFrequencyResponse;
+import com.example.utiltools.text.exception.RegexTimeoutException;
 import com.example.utiltools.text.service.TextService;
 import org.springframework.stereotype.Service;
 
@@ -91,6 +92,8 @@ public class AuditedOperations {
 
     private static final String BAD_REQUEST = "BAD_REQUEST";
     private static final String INTERNAL_SERVER_ERROR = "INTERNAL_SERVER_ERROR";
+    /** Bounded-budget regex evaluation abort; the journal detail stays empty as on other failures. */
+    private static final String REGEX_TIMEOUT = "REGEX_TIMEOUT";
 
     private final DateTimeService dateTimeService;
     private final CryptoService cryptoService;
@@ -320,6 +323,9 @@ public class AuditedOperations {
             result = call.get();
         } catch (IllegalArgumentException e) {
             recordFailure(id, BAD_REQUEST);
+            throw e;
+        } catch (RegexTimeoutException e) {
+            recordFailure(id, REGEX_TIMEOUT);
             throw e;
         } catch (RuntimeException e) {
             recordFailure(id, INTERNAL_SERVER_ERROR);

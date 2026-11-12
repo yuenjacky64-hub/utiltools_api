@@ -1888,9 +1888,13 @@ append against the exact expanded length of that match's replacement (so `$n`/`$
 smuggle an oversized expansion past the check), and the trailing unmatched text is checked too. A request that
 would exceed the bound answers `400 BAD_REQUEST` with `replacement result exceeds 1000000 characters` instead of
 allocating, and only the matches actually replaced count — `all=false` is bounded by its single replacement, not
-by every match. There is no regex
-timeout in this service, so keep untrusted patterns simple — the route sits behind the standard
-`/api/v1/utils/**` rate limit.
+by every match. Regex evaluation is bounded by a request-scoped wall-clock budget, `utiltools.text.regex-timeout-ms`
+(default `200`, accepted range `1`..`60000`; out-of-range values fail application startup): one deadline is
+computed when the request starts and the **count pass and the replacement pass share it** — the combined regex
+work of a request never exceeds the budget, a timed-out call returns no partial replacement, and the single
+journalled `TEXT_REPLACE` entry fails as `REGEX_TIMEOUT`. A pattern that exhausts the budget answers `422` `REGEX_TIMEOUT` (`success: false`) with bounded details
+carrying the configured `timeoutMs` — the caller text is never echoed back. The budget bounds the regex engine cooperatively (a bounded `charAt` cadence against the deadline); the
+route still sits behind the standard `/api/v1/utils/**` rate limit, so keep untrusted patterns simple.
 
 #### HTML entities
 
