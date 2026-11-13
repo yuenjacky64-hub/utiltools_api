@@ -42,6 +42,7 @@ from ai_maintainer.concurrency import (
     write_heartbeat,
 )
 from ai_maintainer.config import MaintainerConfig
+from ai_maintainer.scheduler import CycleScheduler
 from ai_maintainer.memory.store import atomic_write_text
 from ai_maintainer.util.fs import (
     LOCK_PROBE_HELD,
@@ -131,6 +132,12 @@ __all__ = [
 ]
 
 EVENT_LOG_MAXLEN = 100
+# UTILTOOLS-130 REQ-02: how long the producer's "wait for the pool to go
+# idle" loop sleeps between reads of the scheduler's view. Small in absolute
+# terms, and it goes through the injected ``_sleep`` seam, so a fake clock
+# stays in charge of the pacing in tests.
+SCHEDULER_IDLE_POLL_INTERVAL_SEC = 0.02
+
 DEFAULT_CYCLE_INTERVAL_SEC = 1.0
 DEFAULT_STOP_REASON = "stop_requested"
 DEFAULT_CANCEL_REASON = "cancel_requested"
@@ -804,6 +811,10 @@ class MaintainerEngine:
         self._last_cycle_issues: list[str] = []
         self._scheduler_thread: threading.Thread | None = None
         self._scheduler_stop = threading.Event()
+        # UTILTOOLS-130 REQ-01/REQ-02: the bounded cycle pool that
+        # ``run_forever()`` builds for its own run (``None`` outside the loop,
+        # and for a direct ``run_cycle()`` caller).
+        self._scheduler: CycleScheduler | None = None
         # UTILTOOLS-73: graceful wind-down seams. ``_sleep`` is injected so the
         # bounded wait is testable with a fake clock; ``_cycle_done`` is the
         # checkpoint a wind-down waits on (set = no cycle in flight).
@@ -877,7 +888,15 @@ class MaintainerEngine:
             enforce_priority=lambda: bool(
                 self._config.priority_preemption_enabled
             ),
+            # UTILTOOLS-130 REQ-03: waiters age, so a queued cycle that has
+            # waited a full aging interval overtakes a newer, harder one.
+            aging_interval_sec=lambda: self._config.aging_threshold_seconds,
+            clock=self._clock,
         )
+        # UTILTOOLS-130 REQ-01/REQ-02: the bounded cycle pool. It is rebuilt by
+        # every ``_run_forever_locked()`` (in-memory, no crash survival) and is
+        # ``None`` for a caller that only drives ``run_cycle()`` directly.
+        self._scheduler: CycleScheduler | None = None
         self._watcher = watcher
         self._heartbeat_path: Path | None = (
             Path(heartbeat_path) if heartbeat_path is not None else None
@@ -1623,6 +1642,10 @@ class MaintainerEngine:
                     steps=0,
                 )
             cycle = self._allocate_cycle_id()
+            # UTILTOOLS-130: tell the scheduler which engine cycle the work it
+            # admitted is running, so preemption and the report name the same
+            # number. A no-op when ``run_cycle()`` was called directly.
+            self._note_scheduler_cycle(cycle)
             lease = self.acquire_lease(f"cycle-{cycle}")
             difficulty = self._admission_difficulty()
             token = self._gate.acquire(
@@ -2101,35 +2124,64 @@ class MaintainerEngine:
                 # Off the main thread, or a platform without signal support:
                 # the programmatic ``request_stop()`` path still works.
                 previous = None
+        # UTILTOOLS-130 REQ-02: cycles compete for slots in a bounded pool
+        # instead of running one after another in this thread. The pool is
+        # rebuilt for every ``run_forever()`` (no persistent scheduler state)
+        # and bounded by ``max_concurrent_cycles``, which is also the gate's
+        # limit - so the pool can never widen admission (INV-SCHED-1).
+        scheduler = self._build_scheduler()
+        self._scheduler = scheduler
         try:
             while True:
                 if self.should_stop():
                     break
-                with self._lock:
-                    if self._state is EngineState.STOPPED:
-                        self._state = EngineState.IDLE
-                    self._state = EngineState.RUNNING
-                    self._cycle_done.clear()
-                try:
-                    self.run_cycle()
-                finally:
-                    self._cycle_done.set()
+                # Fill every free slot: with ``max_concurrent_cycles`` at its
+                # default of 1 this submits exactly one body, which reproduces
+                # the historical sequential loop.
+                submitted = 0
+                while (
+                    submitted < scheduler.limit
+                    and not self.should_stop()
+                    and scheduler.state()["idle_workers"] > 0
+                ):
                     with self._lock:
-                        if self._state is EngineState.RUNNING:
+                        if self._state is EngineState.STOPPED:
                             self._state = EngineState.IDLE
+                        self._state = EngineState.RUNNING
+                    difficulty = self._admission_difficulty()
+                    # REQ-04: a saturated pool can hand its lowest-priority
+                    # slot to the cycle about to be admitted.
+                    self._maybe_preempt(scheduler, difficulty)
+                    work = scheduler.submit(
+                        None, difficulty, self._scheduled_cycle_body
+                    )
+                    if work is None:
+                        break
+                    submitted += 1
                 self._write_runtime_markers()
                 if self.should_stop():
                     break
                 # REQ-04: reclaim an expired lease left by a stalled cycle, so
                 # the next acquire is not parked behind a dead holder.
                 self._reap_stale_leases()
+                # Pace the producer on *completions*: the next batch is offered
+                # only once the pool is empty again, so a zero interval cannot
+                # outrun the bodies and ``_pause()`` still observes the idle
+                # state between batches.
+                self._await_pool_idle(scheduler)
                 with self._lock:
+                    if self._active_cycles == 0 and self._state is EngineState.RUNNING:
+                        self._state = EngineState.IDLE
                     if self._state is EngineState.IDLE:
                         self._state = EngineState.SLEEPING
                 if self.should_stop():
                     break
                 self._pause(interval)
         finally:
+            # REQ-05: stop accepting work and let every in-flight body reach
+            # its own break point before the wind-down stamps the heartbeat.
+            self._drain_scheduler(scheduler)
+            self._scheduler = None
             # REQ-03 / INV-SHUT-9: the handler only set the flag; the
             # attributable ``SIGNAL_*`` reason is published here, in normal
             # context, before the reason is logged and before the wind-down
@@ -2166,6 +2218,117 @@ class MaintainerEngine:
             finally:
                 if previous:
                     _restore_stop_handlers(previous)
+
+    # ------------------------------------------------- scheduler pool (REQ-01..05)
+
+    def _build_scheduler(self) -> CycleScheduler:
+        """Build this run's bounded pool (REQ-01/REQ-02).
+
+        One worker per admission slot, the engine's clock so the pool's wait
+        stamps match the engine's own, and ``should_stop`` wiring so a stop
+        published from a signal handler abandons every queued work.
+        """
+
+        return CycleScheduler(
+            self._gate,
+            int(self._config.max_concurrent_cycles),
+            drain_timeout_sec=float(self._config.scheduler_drain_timeout_sec),
+            clock=self._clock,
+            should_stop=self.should_stop,
+        )
+
+    def _scheduled_cycle_body(self) -> None:
+        """One engine cycle as the pool's worker runs it (REQ-02).
+
+        The worker already holds the gate slot and inherited it into this
+        thread, so ``run_cycle()``'s own acquire is a no-op and its release
+        leaves the slot with the pool (REQ-01). The latch/state bookkeeping the
+        sequential loop used to do inline happens here, in the worker thread,
+        so ``_cycle_done`` keeps meaning "no cycle is in flight" and the
+        wind-down still drains through :meth:`_await_cycle_break_point`.
+        """
+
+        try:
+            self.run_cycle()
+        finally:
+            with self._lock:
+                if self._active_cycles == 0:
+                    self._cycle_done.set()
+                    if self._state is EngineState.RUNNING:
+                        self._state = EngineState.IDLE
+
+    def _note_scheduler_cycle(self, cycle: int) -> None:
+        """Tell the pool which engine cycle the work it admitted is running."""
+
+        scheduler = self._scheduler
+        if scheduler is not None:
+            scheduler.note_cycle(int(cycle))
+
+    def _scheduler_preempted(self) -> bool:
+        """Has this thread's work been asked to yield its slot (REQ-04)?
+
+        ``False`` off-pool, which is what keeps a direct ``run_cycle()``
+        caller's behaviour unchanged.
+        """
+
+        scheduler = self._scheduler
+        if scheduler is None:
+            return False
+        return bool(scheduler.preemption_requested())
+
+    def _maybe_preempt(
+        self, scheduler: CycleScheduler, difficulty: Difficulty
+    ) -> int | None:
+        """Offer the incoming cycle's priority to a saturated pool (REQ-04)."""
+
+        try:
+            return scheduler.preempt(difficulty)
+        except Exception:  # pragma: no cover - preemption is advisory
+            LOG.warning("scheduler preemption probe failed", exc_info=True)
+            return None
+
+    def _await_pool_idle(self, scheduler: CycleScheduler) -> bool:
+        """Wait until the pool has no active and no queued work (REQ-02).
+
+        Returns ``True`` when a stop cut the wait short. Polls the pool's
+        read-only view through the engine's ``_sleep`` seam, so a fake clock in
+        tests stays in charge of the pacing and ``_pause`` is still the only
+        thing that advances it.
+        """
+
+        while True:
+            if self.should_stop():
+                return True
+            view = scheduler.state()
+            if not view["active"] and not view["queued"]:
+                return False
+            self._sleep(SCHEDULER_IDLE_POLL_INTERVAL_SEC)
+
+    def _drain_scheduler(self, scheduler: CycleScheduler) -> bool:
+        """Finalize in-progress cycles and retire the pool (REQ-05).
+
+        Sets the stop event of every in-flight work - the same break point a
+        stop-requested wind-down uses - drops anything still queued, and waits
+        for the workers, bounded by ``scheduler_drain_timeout_sec`` so a wedged
+        body cannot park the wind-down sequence.
+        """
+
+        drained = scheduler.drain(
+            timeout_sec=float(self._config.scheduler_drain_timeout_sec)
+        )
+        with self._lock:
+            self._events.append(
+                {
+                    "event": "SCHEDULER_DRAINED",
+                    "cycle": self._cycles,
+                    "clean": bool(drained),
+                    "timeout_sec": float(self._config.scheduler_drain_timeout_sec),
+                    "preemptions": int(scheduler.state()["preemptions"]),
+                }
+            )
+            if drained and self._active_cycles == 0:
+                self._cycle_done.set()
+        return bool(drained)
 
     def graceful_shutdown(self, *, exit_process: bool = False) -> ShutdownReport:
         """Operator-facing wind-down: drain, stamp, persist, tear down.
@@ -2732,12 +2895,34 @@ class MaintainerEngine:
             self._evaluate_stale(self._clock())
 
         interrupted = False
+        # UTILTOOLS-130 REQ-04: set when the scheduler asked this cycle to wind
+        # down so a higher-priority cycle could take its slot. It is a *third*
+        # interruption reason, distinct from the engine stop and the task
+        # cancel, and it is attributed as such in the cycle report.
+        preempted_cycle = False
         while steps < self._config.max_steps_per_cycle:
             # REQ-02: a stop or cancel issued while the previous step was in
             # flight is honoured here, before any new step starts. The flags are
             # read directly (they are what ``should_stop()`` reports) so the
             # per-step check stays free of subclass hooks: ``run_forever()``
             # stays the single poller of the public predicate.
+            #
+            # UTILTOOLS-130 REQ-04: the scheduler's preemption request is
+            # checked at the same break point - never mid-step - so a preempted
+            # cycle ends exactly where a stop would end it (INV-SCHED-2).
+            if self._scheduler_preempted():
+                preempted_cycle = True
+                interrupted = True
+                with self._lock:
+                    self._events.append(
+                        {
+                            "event": "CYCLE_PREEMPTED",
+                            "cycle": cycle,
+                            "steps": steps,
+                            "reason": "SCHEDULER_SLOT_PREEMPTION",
+                        }
+                    )
+                break
             if self._wind_down_requested():
                 # UTILTOOLS-80: only *this* first break truncates the review
                 # phase. With ``steps == 0`` the cycle never ran a step, which
@@ -2806,6 +2991,22 @@ class MaintainerEngine:
                 # stop landing between the pre-step bookkeeping and
                 # ``_monitor_step()`` cannot report SUCCESS with ``steps == 0``.
                 interrupted = steps == 0
+                break
+            if self._scheduler_preempted():
+                # UTILTOOLS-130 REQ-04: same break point, second half of the
+                # step. The task stays RUNNING (nothing cancelled it) and the
+                # cycle is reported as a scheduler preemption.
+                preempted_cycle = True
+                interrupted = True
+                with self._lock:
+                    self._events.append(
+                        {
+                            "event": "CYCLE_PREEMPTED",
+                            "cycle": cycle,
+                            "steps": steps,
+                            "reason": "SCHEDULER_SLOT_PREEMPTION",
+                        }
+                    )
                 break
             # Monitor step body runs outside the lock.
             error: BaseException | None = None
@@ -2907,7 +3108,11 @@ class MaintainerEngine:
             # UTILTOOLS-80 ``interrupted`` short-circuit keeps precedence.
             outcome=self._outcome_for(self.stop_reason, interrupted=interrupted),
             interrupted_by=(
-                ("STOP" if self._stop.is_set() else "CANCEL")
+                (
+                    "PREEMPT"
+                    if preempted_cycle
+                    else ("STOP" if self._stop.is_set() else "CANCEL")
+                )
                 if interrupted
                 else None
             ),
@@ -3024,7 +3229,14 @@ class MaintainerEngine:
         # INV-LEASE-2: ``lease_snapshot()`` takes ``_lease_lock``, so it is
         # built *after* ``self._lock`` is released - the lease lock is never
         # acquired while the engine lock is held.
-        view["leases"] = self.lease_snapshot()
+        # UTILTOOLS-130 REQ-02: the pool's own read-only view rides along, so
+        # a cycle report shows how many of the ``max_concurrent_cycles`` slots
+        # are in use, who is still waiting, and whether a preemption or a
+        # timed-out drain happened. Read after ``_lock`` is released - the
+        # scheduler has its own condition and the order is scheduler -> gate,
+        # never the engine lock.
+        scheduler = self._scheduler
+        view["scheduler"] = None if scheduler is None else scheduler.state()
         return view
 
     def fingerprint_state(self, now: float | None = None) -> dict[str, Any]:

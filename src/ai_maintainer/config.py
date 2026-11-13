@@ -51,6 +51,11 @@ DEFAULT_MEMORY_MAX_LEARNINGS = 500
 # restores the historical one-at-a-time admission.
 DEFAULT_MAX_CONCURRENT_CYCLES = 2
 
+# Bound on the scheduler pool drain during a wind-down (UTILTOOLS-130 REQ-05).
+# Same clock unit as ``max_shutdown_wait_sec``; a drain that exceeds it is
+# reported (``timed_out``) and the wind-down proceeds instead of blocking.
+DEFAULT_SCHEDULER_DRAIN_TIMEOUT_SEC = 30.0
+
 # Wall-clock budget for one OpenCode runner invocation (UTILTOOLS-90 REQ-01).
 # Ten minutes by default; ``validate()`` accepts the inclusive range
 # ``[60, 3600]`` seconds.
@@ -199,6 +204,7 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
             "stale_timeout_sec",
             "stale_recovery_grace_sec",
             "max_shutdown_wait_sec",
+            "scheduler_drain_timeout_sec",
         ):
             if isinstance(value, bool):
                 raise ValueError(f"{key} must be a number")
@@ -279,6 +285,9 @@ class MaintainerConfig:
     stale_recovery_grace_sec: float = DEFAULT_STALE_RECOVERY_GRACE_SEC
     max_shutdown_wait_sec: float = DEFAULT_MAX_SHUTDOWN_WAIT_SEC
     max_concurrent_cycles: int = DEFAULT_MAX_CONCURRENT_CYCLES
+    # UTILTOOLS-130 REQ-05: bounded wait for the scheduler pool to go idle on
+    # stop. Validation shares ``max_shutdown_wait_sec``'s rules.
+    scheduler_drain_timeout_sec: float = DEFAULT_SCHEDULER_DRAIN_TIMEOUT_SEC
     # Deliberate exception to the ``__post_init__`` convention: this knob is
     # ``validate()``-only so out-of-range values stay constructible and are
     # reportable through ``validate()`` instead of raising at build time.
@@ -378,6 +387,14 @@ class MaintainerConfig:
             or float(shutdown_wait) < 0.0
         ):
             raise ValueError("max_shutdown_wait_sec must be a finite float >= 0")
+        drain_timeout = self.scheduler_drain_timeout_sec
+        if (
+            isinstance(drain_timeout, bool)
+            or not isinstance(drain_timeout, (int, float))
+            or not math.isfinite(float(drain_timeout))
+            or float(drain_timeout) < 0.0
+        ):
+            raise ValueError("scheduler_drain_timeout_sec must be a finite float >= 0")
         for name in (
             "memory_max_runs",
             "memory_max_bug_fixes",
