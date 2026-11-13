@@ -381,14 +381,14 @@ class CryptoControllerTest {
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
                 .andExpect(jsonPath("$.message").value("Validation failed"))
                 .andExpect(jsonPath("$.details[0]")
-                        .value("Unsupported hash algorithm. Supported: SHA-256, SHA-384, SHA-512, MD5, SHA-1"));
+                        .value("Unsupported hash algorithm. Supported: SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1"));
     }
 
     @Test
     @DisplayName("POST /api/v1/utils/crypto/hash - should accept all supported algorithms case-insensitively")
     void shouldAcceptAllSupportedAlgorithmsCaseInsensitively() throws Exception {
-        for (String algorithm : List.of("SHA-256", "SHA-384", "SHA-512", "SHA-1", "MD5",
-                "sha-256", "sha-384", "Sha-512", "md5", "sha-1")) {
+        for (String algorithm : List.of("SHA-224", "SHA-256", "SHA-384", "SHA-512", "SHA-1", "MD5",
+                "sha-224", "sha-256", "sha-384", "Sha-512", "md5", "sha-1")) {
             mockMvc.perform(post("/api/v1/utils/crypto/hash")
                             .contentType(MediaType.APPLICATION_JSON)
                             .content("""
@@ -418,33 +418,36 @@ class CryptoControllerTest {
     }
 
     @Test
-    @DisplayName("POST /api/v1/utils/crypto/hash - should reject SHA-224 as unsupported")
-    void shouldRejectSha224AsUnsupported() throws Exception {
+    @DisplayName("POST /api/v1/utils/crypto/hash - should accept SHA-224 and return the 56-char digest")
+    void shouldAcceptSha224() throws Exception {
         mockMvc.perform(post("/api/v1/utils/crypto/hash")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"algorithm": "SHA-224", "content": "abc"}
                                 """))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.success").value(false))
-                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
-                .andExpect(jsonPath("$.details[0]").value(
-                        "Unsupported hash algorithm. Supported: SHA-256, SHA-384, SHA-512, MD5, SHA-1"));
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.algorithm").value("SHA-224"))
+                .andExpect(jsonPath("$.data.isHmac").value(false))
+                .andExpect(jsonPath("$.data.digest").value(
+                        "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7"));
     }
 
     @Test
-    @DisplayName("POST /api/v1/utils/crypto/hash - should reject algorithm with surrounding whitespace")
+    @DisplayName("POST /api/v1/utils/crypto/hash - should reject algorithm with surrounding whitespace or trailing characters")
     void shouldRejectAlgorithmWithSurroundingWhitespace() throws Exception {
-        mockMvc.perform(post("/api/v1/utils/crypto/hash")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("""
-                                {"algorithm": " SHA-256 ", "content": "test"}
-                                """))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.success").value(false))
-                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
-                .andExpect(jsonPath("$.details[0]")
-                        .value("Unsupported hash algorithm. Supported: SHA-256, SHA-384, SHA-512, MD5, SHA-1"));
+        for (String algorithm : List.of(" SHA-256 ", " SHA-224 ", "SHA-224X")) {
+            mockMvc.perform(post("/api/v1/utils/crypto/hash")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("""
+                                    {"algorithm": "%s", "content": "test"}
+                                    """.formatted(algorithm)))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.success").value(false))
+                    .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                    .andExpect(jsonPath("$.details[0]")
+                            .value("Unsupported hash algorithm. Supported: SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1"));
+        }
     }
 
     @Test
