@@ -132,7 +132,7 @@ def test_budget_enforced() -> None:
     assert engine._should_diagnose(1) is True
     assert engine._should_diagnose(1) is True
     assert engine._should_diagnose(1) is False
-    assert engine._diagnosis_attempts == 2
+    assert engine._diagnosis_attempts == {1: 2}
 
     engine2, _ = _build(_failing(), errors=_errors(("a", "b", "c")), max_diagnosis_budget=2)
     result2 = engine2.run_cycle()
@@ -179,7 +179,7 @@ def test_history_recorded() -> None:
 def test_exhaustion_audit_event() -> None:
     """DOD-04 / REQ-04: exhaustion is audited with limit, attempts and outcome."""
 
-    engine, _ = _build(_failing(), errors=_errors(("a", "b", "c")), max_diagnosis_budget=1)
+    engine, clock = _build(_failing(), errors=_errors(("a", "b", "c")), max_diagnosis_budget=1)
     result = engine.run_cycle()
 
     exhausted = [
@@ -196,10 +196,31 @@ def test_exhaustion_audit_event() -> None:
         "outcome": "EXHAUSTED",
     }
 
+    # REQ-04 "in the cycle report": the same refusal is part of the report the
+    # cycle returns, so ``CycleResult.to_dict()`` carries it too.
+    reported = [e for e in result.issues_detected if e.get("kind") == "EXHAUSTED"]
+    assert len(reported) == 1
+    assert reported[0]["cycle"] == 1
+    assert reported[0]["budget_state"] == {
+        "limit": 1,
+        "used": 1,
+        "remaining": 0,
+        "exhausted": True,
+    }
+    assert reported[0]["attempts_made"] == 1
+    assert reported[0]["outcome"] == "EXHAUSTED"
+    assert reported[0]["error_type"].endswith(".ErrorA")
+    assert reported[0]["timestamp"] == clock.now
+    assert "EXHAUSTED" in [e["kind"] for e in result.to_dict()["issues_detected"]]
+
     # Safe rollback: three tasks failed, yet the refusal after the first
     # window means no further diagnosis was attempted for this cycle.
     assert len([e for e in engine.events if e["event"] == "FAILED"]) == 3
     assert len([e for e in result.issues_detected if e.get("kind") == "ATTEMPT"]) == 1
+
+    # Only the first refusal of the cycle is audited, so a refused-adoption
+    # streak cannot evict earlier audit rows from the bounded event log.
+    assert len(exhausted) == 1
 
 
 def test_reset_on_success() -> None:
@@ -210,8 +231,9 @@ def test_reset_on_success() -> None:
 
     first = engine.run_cycle()
     assert first.outcome == "SUCCESS"
-    assert engine._diagnosis_attempts == 0
-    assert engine._diagnosis_history == []
+    # Only cycle 1's slice is dropped: nothing is left to leak into cycle 2.
+    assert engine._diagnosis_attempts == {}
+    assert engine._diagnosis_history == {}
     reset_entries = [
         entry for entry in first.issues_detected if entry.get("kind") == "BUDGET_RESET"
     ]
@@ -234,4 +256,91 @@ def test_reset_on_success() -> None:
         entry for entry in second.issues_detected if entry.get("kind") == "BUDGET_RESET"
     ]
     assert second_reset and second_reset[0]["attempts_before_reset"] == 1
-    assert engine._diagnosis_attempts == 0
+    assert engine._diagnosis_attempts == {}
+
+
+def test_non_success_cycle_does_not_leak() -> None:
+    """REQ-01/REQ-03: a non-SUCCESS cycle neither leaks nor pre-spends the budget.
+
+    Regression for the reviewer probe ``report_cycles [1, 2]``: cycle 1 used up
+    its budget without a SUCCESS reset, and its entries then showed up in
+    cycle 2's report while cycle 2's own budget looked partly spent.
+    """
+
+    engine, _ = _build(_failing(), max_diagnosis_budget=2)
+
+    for _ in range(3):
+        if engine._should_diagnose(1):
+            engine._record_diagnosis_attempt(cycle=1, task=_spec("a"))
+            engine._record_diagnosis_outcome("FAILED", cycle=1, error=ErrorA("a"))
+    first = engine._diagnosis_report(1)  # cycle 1 ends non-SUCCESS: no reset
+    assert [entry["kind"] for entry in first] == ["ATTEMPT", "ATTEMPT", "EXHAUSTED"]
+
+    # Cycle 2 starts from its own, fully available budget.
+    assert engine._should_diagnose(2) is True
+    engine._record_diagnosis_attempt(cycle=2, task=_spec("b"))
+    engine._record_diagnosis_outcome("FAILED", cycle=2, error=ErrorA("b"))
+    second = engine._diagnosis_report(2)
+    assert {entry["cycle"] for entry in second} == {2}
+    assert [entry["kind"] for entry in second] == ["ATTEMPT"]
+    assert second[0]["budget_state"] == {
+        "limit": 2,
+        "used": 1,
+        "remaining": 1,
+        "exhausted": False,
+    }
+    # Nothing accumulates between cycles.
+    assert engine._diagnosis_history == {}
+    assert engine._diagnosis_pending == {}
+    assert engine._diagnosis_attempts == {}
+    assert engine._diagnosis_exhausted == {}
+
+
+def test_history_bounded_by_budget() -> None:
+    """REQ-01/REQ-03: a failing streak cannot grow the history without bound."""
+
+    engine, _ = _build(_failing(), max_diagnosis_budget=2)
+
+    for _ in range(50):
+        engine._should_diagnose(7)
+        engine._record_diagnosis_attempt(cycle=7, task=_spec("a"))
+        engine._record_diagnosis_outcome("FAILED", cycle=7, error=ErrorA("a"))
+
+    # The gate allows exactly ``limit`` windows, and the deque is capped at the
+    # same size, so repeated attempts for one cycle stay bounded.
+    assert len(engine._diagnosis_history[7]) == 2
+    assert engine._diagnosis_history[7].maxlen == 2
+    assert engine._diagnosis_attempts == {7: 2}
+
+
+def test_open_window_closed_on_interrupt() -> None:
+    """REQ-03: a window still open when the cycle ends is stamped, not lost."""
+
+    engine, _ = _build(_failing(), max_diagnosis_budget=3)
+    assert engine._should_diagnose(4) is True
+    engine._record_diagnosis_attempt(cycle=4, task=_spec("a"))
+
+    issues = engine._diagnosis_report(4)
+
+    assert [entry["kind"] for entry in issues] == ["ATTEMPT"]
+    assert issues[0]["outcome"] == "INTERRUPTED"
+    assert issues[0]["error_type"] is None
+    # The slot is released, so nothing keeps the dead window alive.
+    assert 4 not in engine._diagnosis_pending
+    assert 4 not in engine._diagnosis_history
+
+
+def test_success_reset_leaves_other_cycles_alone() -> None:
+    """REQ-05: one cycle's SUCCESS reset must not delete a peer's report data."""
+
+    engine, _ = _build(_failing(), max_diagnosis_budget=3)
+    assert engine._should_diagnose(11) is True
+    engine._record_diagnosis_attempt(cycle=11, task=_spec("a"))
+
+    summary = engine._reset_diagnosis_budget(cycle=12)
+
+    assert summary["kind"] == "BUDGET_RESET"
+    assert summary["attempts_before_reset"] == 0
+    assert len(engine._diagnosis_history[11]) == 1
+    assert 11 in engine._diagnosis_pending
+    assert engine._diagnosis_attempts == {11: 1}
