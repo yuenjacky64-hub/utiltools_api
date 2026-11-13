@@ -25,7 +25,7 @@ import pytest
 
 from ai_maintainer.concurrency import CycleAdmissionGate
 from ai_maintainer.config import MaintainerConfig
-from ai_maintainer.engine import MaintainerEngine
+from ai_maintainer.engine import CooperativeCancel, CycleResult, MaintainerEngine
 from ai_maintainer.scheduler import (
     SCHEDULER_POLL_INTERVAL_SEC,
     CycleScheduler,
@@ -346,7 +346,11 @@ def test_graceful_drain_on_shutdown():
         scheduler.note_cycle(41)
         started.set()
         for _ in range(500):
-            if scheduler.preemption_requested():
+            # Review v4 MUST_FIX: a drain signals the *shutdown* channel only;
+            # a preemption request on the same work would make the engine report
+            # ``interrupted_by="PREEMPT"`` for an operator stop.
+            if scheduler.shutdown_requested():
+                assert scheduler.preemption_requested() is False
                 stopped.set()
                 return
             time.sleep(0.01)
@@ -399,7 +403,9 @@ def test_request_stop_signals_without_waiting():
     def body() -> None:
         scheduler.note_cycle(61)
         started.set()
-        while not scheduler.preemption_requested():
+        while not scheduler.shutdown_requested():
+            # Constant: ``request_stop`` is a shutdown, never a preemption.
+            assert scheduler.preemption_requested() is False
             time.sleep(0.01)
 
     try:
@@ -682,3 +688,109 @@ def test_engine_preempts_low_priority_cycle_for_higher_priority_slot(tmp_path):
     assert engine.durations[0] < 4.0, engine.durations
     events = [e for e in engine.events if e["event"] == "SCHEDULER_DRAINED"]
     assert events and events[-1]["preemptions"] >= 1, events
+
+
+class _DrainProbeEngine(MaintainerEngine):
+    """Engine whose first step blocks, so a stop truncates an in-flight cycle.
+
+    Pins the Review v4 MUST_FIX: an operator stop that lands while a cycle body
+    is running must reach the body through the *shutdown* channel and be
+    reported as ``interrupted_by="STOP"`` — never as a preemption.
+    """
+
+    def __init__(self, *args, hold_sec: float = 5.0, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.hold_sec = float(hold_sec)
+        self.step_entered = threading.Event()
+        self.stop_channel_seen = False
+        self.preempt_channel_seen = False
+        self.results: list[CycleResult] = []
+        self._probe_lock = threading.Lock()
+
+    def _monitor_step(self, task) -> None:
+        self.step_entered.set()
+        deadline = time.monotonic() + self.hold_sec
+        while time.monotonic() < deadline:
+            scheduler = self._scheduler
+            if scheduler is not None and scheduler.shutdown_requested():
+                with self._probe_lock:
+                    self.stop_channel_seen = True
+                # The cooperative stop path the engine classifies as INTERRUPTED.
+                raise CooperativeCancel("stop_requested")
+            if self._scheduler_preempted():
+                with self._probe_lock:
+                    self.preempt_channel_seen = True
+            time.sleep(0.01)
+        return None
+
+    def run_cycle(self) -> CycleResult:
+        result = super().run_cycle()
+        with self._probe_lock:
+            self.results.append(result)
+        return result
+
+
+def make_drain_engine(tmp_path, *, hold_sec: float = 5.0) -> _DrainProbeEngine:
+    config = MaintainerConfig(
+        max_steps_per_cycle=2,
+        max_concurrent_cycles=1,
+        cycle_pool_size=1,
+        scheduler_drain_timeout_sec=10.0,
+        max_shutdown_wait_sec=10.0,
+    )
+    curriculum = TaskCurriculum(
+        specs=[
+            TaskSpec(
+                name="task-drain",
+                difficulty=Difficulty.EASY,
+                steps_required=8,
+                progress=0,
+                last_proposed_cycle=0,
+                state=TaskState.RUNNING,
+            )
+        ],
+        config=config,
+        clock=time.monotonic,
+    )
+    return _DrainProbeEngine(
+        curriculum,
+        config=config,
+        hold_sec=hold_sec,
+        state_root=tmp_path / "state",
+        shutdown_audit_path=tmp_path / "data" / "maintainer_shutdown.log",
+    )
+
+
+def test_stop_while_a_cycle_is_in_flight_is_not_reported_as_a_preemption(tmp_path):
+    """DOD-01(d): a drain-truncated cycle is attributed to the stop channel."""
+
+    engine = make_drain_engine(tmp_path)
+    thread, holder = run_engine_in_thread(engine)
+    try:
+        assert engine.step_entered.wait(15.0), "the cycle body never ran a step"
+        in_flight = engine.snapshot()["scheduler"]
+        assert in_flight is not None
+        assert in_flight["active"] == 1, in_flight
+        engine.request_stop("test-drain-attribution")
+        thread.join(30.0)
+    finally:
+        if thread.is_alive():
+            engine.request_stop("test-drain-attribution")
+            thread.join(30.0)
+
+    assert not thread.is_alive(), "the engine did not finish its drain"
+    assert engine.stop_channel_seen is True
+
+    # MUST_FIX: the operator stop reaches the body through the shutdown channel
+    # only; the preemption channel stays clear, so nothing can be mislabelled.
+    assert engine.preempt_channel_seen is False
+    assert engine.results, "the truncated cycle never produced a report"
+    report = engine.results[-1]
+    assert report.interrupted_by == "STOP", report.to_dict()
+    assert report.to_dict()["interrupted_by"] == "STOP"
+
+    # The pool view while work was in flight carried no preemption record.
+    assert in_flight["preemptions"] == 0, in_flight
+    events = [e for e in engine.events if e["event"] == "SCHEDULER_DRAINED"]
+    assert events, engine.events
+    assert events[-1]["preemptions"] == 0, events[-1]

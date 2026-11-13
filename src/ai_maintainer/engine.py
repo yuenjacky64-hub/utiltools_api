@@ -149,6 +149,12 @@ SCHEDULER_IDLE_POLL_INTERVAL_SEC = 0.02
 # worker.
 SCHEDULER_OVERLAP_GRACE_SEC = 0.25
 
+# UTILTOOLS-130 Review v4: hard poll budget for the producer's bounded waits.
+# Both waits now take their deadline from the engine's ``_clock`` seam, so an
+# injected (frozen) clock would never expire them; the budget is the belt to
+# that suspenders - a frozen clock costs at most this many short parks.
+SCHEDULER_GRACE_MAX_POLLS = 64
+
 DEFAULT_CYCLE_INTERVAL_SEC = 1.0
 DEFAULT_STOP_REASON = "stop_requested"
 DEFAULT_CANCEL_REASON = "cancel_requested"
@@ -2298,7 +2304,24 @@ class MaintainerEngine:
             work = self._admit_cycle(scheduler, difficulty)
             if work is None:
                 return
+            if victim is not None:
+                # The work that took the preempted slot: link it to the
+                # preemption record so ``incoming_cycle`` is reported (rather
+                # than permanently ``None``) once the body allocates its id.
+                scheduler.attribute_preemption(work, victim)
             inflight.append(work)
+
+    def _grace_deadline(self, window_sec: float) -> float:
+        """Deadline for a bounded producer wait, on the engine's clock seam.
+
+        Review v4 SHOULD_FIX: these waits used ``time.monotonic()`` directly, so
+        a test with an injected clock burned *real* grace windows and the
+        preemption handling could not be observed under a fake clock. The
+        engine's default clock *is* ``time.monotonic``, so production behaviour
+        is unchanged.
+        """
+
+        return self._clock() + float(window_sec)
 
     def _await_free_slot(self, scheduler: CycleScheduler) -> bool:
         """Wait briefly for a preempted cycle to hand its slot back (REQ-04).
@@ -2309,13 +2332,15 @@ class MaintainerEngine:
         read. Returns ``True`` when a slot is free.
         """
 
-        deadline = time.monotonic() + SCHEDULER_OVERLAP_GRACE_SEC
+        deadline = self._grace_deadline(SCHEDULER_OVERLAP_GRACE_SEC)
+        polls = 0
         while not self.should_stop():
             if scheduler.state()["idle_workers"] > 0:
                 return True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = deadline - self._clock()
+            if remaining <= 0 or polls >= SCHEDULER_GRACE_MAX_POLLS:
                 return False
+            polls += 1
             self._stop.wait(min(remaining, SCHEDULER_IDLE_POLL_INTERVAL_SEC))
         return False
 
@@ -2348,7 +2373,8 @@ class MaintainerEngine:
 
         if not inflight:
             return False
-        deadline = time.monotonic() + SCHEDULER_OVERLAP_GRACE_SEC
+        deadline = self._grace_deadline(SCHEDULER_OVERLAP_GRACE_SEC)
+        polls = 0
         while True:
             with self._lock:
                 finished = inflight[-1].finished_at is not None
@@ -2356,9 +2382,10 @@ class MaintainerEngine:
                 return False
             if self.should_stop():
                 return False
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = deadline - self._clock()
+            if remaining <= 0 or polls >= SCHEDULER_GRACE_MAX_POLLS:
                 return True
+            polls += 1
             # REQ-05: park on the stop flag as well as on the work, so a stop
             # published from another thread is honoured inside the grace window.
             self._stop.wait(min(remaining, SCHEDULER_IDLE_POLL_INTERVAL_SEC))
@@ -3029,6 +3056,16 @@ class MaintainerEngine:
         # down so a higher-priority cycle could take its slot. It is a *third*
         # interruption reason, distinct from the engine stop and the task
         # cancel, and it is attributed as such in the cycle report.
+        #
+        # Review v4 MUST_FIX: the wind-down check runs *first* at every break
+        # point and a stop wins over a preemption. The shutdown drain signals
+        # in-flight work so the pool can go idle, and that signal used to be
+        # read by the preemption branch (first break point), so an operator stop
+        # during an in-flight cycle was reported ``interrupted_by="PREEMPT"``.
+        # The scheduler keeps the two channels apart
+        # (:meth:`CycleScheduler.shutdown_requested` vs
+        # :meth:`CycleScheduler.preemption_requested`) and the engine never
+        # preempts a stopped engine, so a stop is attributed as ``"STOP"``.
         preempted_cycle = False
         while steps < self._config.max_steps_per_cycle:
             # REQ-02: a stop or cancel issued while the previous step was in
@@ -3037,9 +3074,17 @@ class MaintainerEngine:
             # per-step check stays free of subclass hooks: ``run_forever()``
             # stays the single poller of the public predicate.
             #
+            # UTILTOOLS-80: only *this* first break truncates the review
+            # phase. With ``steps == 0`` the cycle never ran a step, which is
+            # the one INTERRUPTED case; a stop seen after a committed step
+            # leaves the review phase complete, i.e. SUCCESS.
+            if self._wind_down_requested():
+                interrupted = steps == 0
+                break
             # UTILTOOLS-130 REQ-04: the scheduler's preemption request is
             # checked at the same break point - never mid-step - so a preempted
-            # cycle ends exactly where a stop would end it (INV-SCHED-2).
+            # cycle ends exactly where a stop would end it (INV-SCHED-2). It is
+            # evaluated *after* the wind-down so the two reasons never compete.
             if self._scheduler_preempted():
                 preempted_cycle = True
                 interrupted = True
@@ -3052,13 +3097,6 @@ class MaintainerEngine:
                             "reason": "SCHEDULER_SLOT_PREEMPTION",
                         }
                     )
-                break
-            if self._wind_down_requested():
-                # UTILTOOLS-80: only *this* first break truncates the review
-                # phase. With ``steps == 0`` the cycle never ran a step, which
-                # is the one INTERRUPTED case; a stop seen after a committed
-                # step leaves the review phase complete, i.e. SUCCESS.
-                interrupted = steps == 0
                 break
             with self._lock:
                 now = self._clock()
@@ -3239,9 +3277,14 @@ class MaintainerEngine:
             outcome=self._outcome_for(self.stop_reason, interrupted=interrupted),
             interrupted_by=(
                 (
-                    "PREEMPT"
-                    if preempted_cycle
-                    else ("STOP" if self._stop.is_set() else "CANCEL")
+                    # Review v4 MUST_FIX: an operator stop outranks a
+                    # preemption. ``scheduler.drain`` signals in-flight work on
+                    # the shutdown channel, so a stop that lands on a cycle
+                    # which also saw a preemption request is a ``STOP`` - the
+                    # only reason the pool was asked to wind down.
+                    "STOP"
+                    if self._stop.is_set()
+                    else ("PREEMPT" if preempted_cycle else "CANCEL")
                 )
                 if interrupted
                 else None

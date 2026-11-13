@@ -16,12 +16,20 @@ that removes that coupling while keeping the bound the operator asked for:
   cycle that has waited long enough overtakes a newer, harder one.
 * **REQ-04 - preemption.** :meth:`CycleScheduler.preempt` picks the
   lowest-priority *running* work whose difficulty is strictly below the
-  incoming one and sets its per-work :class:`threading.Event`. The body polls
+  incoming one and sets its per-work *preemption* event. The body polls
   :meth:`CycleScheduler.preemption_requested` at its own step boundaries
   (INV-SCHED-2: never mid-step), returns, and its worker hands the slot over.
 * **REQ-05 - graceful drain.** :meth:`CycleScheduler.drain` stops accepting
-  work, signals every in-flight work, and waits a *bounded* time for the pool
-  to go idle (INV-SCHED-3); a timeout is reported, never raised.
+  work, signals every in-flight work on the *shutdown* channel
+  (:meth:`CycleScheduler.shutdown_requested`), and waits a *bounded* time for
+  the pool to go idle (INV-SCHED-3); a timeout is reported, never raised.
+
+The two channels stay distinct on purpose (Review v4 MUST_FIX): a shutdown
+drain and a scheduler preemption both ask a body to wind down, but they are
+different interruptions - one truncates the cycle for the operator, the other
+hands its slot to a higher-priority sibling - and the engine attributes them
+separately in the cycle report. Sharing one event made every drained cycle
+report ``interrupted_by="PREEMPT"``.
 
 Locking: the scheduler has one :class:`threading.Condition` of its own and the
 gate has another. The documented order is scheduler -> gate, and neither is
@@ -74,6 +82,13 @@ class CycleWork:
     through :meth:`CycleScheduler.note_cycle` (the engine calls it right after
     it allocates the id), because the id is allocated inside ``run_cycle()`` -
     the public signature of which this task must not change.
+
+    ``stop_event`` and ``preempt_event`` are the two interruption channels of
+    this work: ``stop_event`` is set by a shutdown (:meth:`CycleScheduler.drain`
+    or :meth:`CycleScheduler.request_stop`), ``preempt_event`` by
+    :meth:`CycleScheduler.preempt` when a higher-priority sibling needs the
+    slot. A body that sees ``stop_event`` is reporting an operator stop; a body
+    that sees only ``preempt_event`` is yielding its slot (REQ-04).
     """
 
     work_id: int
@@ -82,6 +97,7 @@ class CycleWork:
     enqueued_at: float
     cycle: int | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
+    preempt_event: threading.Event = field(default_factory=threading.Event)
     started_at: float | None = None
     admitted_at: float | None = None
     finished_at: float | None = None
@@ -168,6 +184,9 @@ class CycleScheduler:
         self._closed = False
         self._timed_out = False
         self._preemptions: list[dict[str, Any]] = []
+        # Preemption records whose incoming work had not reported its cycle id
+        # yet, keyed by ``work_id`` (see :meth:`attribute_preemption`).
+        self._pending_incoming: dict[int, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ public
 
@@ -243,13 +262,27 @@ class CycleScheduler:
 
         Returns the preempted cycle id (or the scheduler ``work_id`` when the
         cycle had not reported its id yet), or ``None`` when nothing was
-        preempted - the pool has a free slot, no work is *running* yet, or no
-        running work is strictly below ``incoming_priority``.
+        preempted - a slot is free, no work is *running* yet, or no running work
+        is strictly below ``incoming_priority``.
+
+        ``incoming_cycle`` is the id of the cycle the caller wants the slot for;
+        it is stamped into the preemption record. When the producer does not
+        know the id yet (the engine allocates it inside ``run_cycle()``) it can
+        link the work afterwards through :meth:`attribute_preemption`.
+
+        Review v4 NIT: the *capacity* test asks the gate for its live active
+        count instead of comparing the pool's own running count to the limit, so
+        ``cycle_pool_size < max_concurrent_cycles`` (e.g. ``1`` slot for a
+        3-worker pool) still preempts: the gate is saturated, which is what
+        "the pool has no free slot" actually means.
         """
 
         level = Difficulty.parse(incoming_priority)
+        # Read the gate's capacity *outside* the pool lock (the gate has its own
+        # lock; the pool never nests the two).
+        gate_active = self._gate_active()
         with self._condition:
-            if len(self._active) < self.limit or not self._active:
+            if not self._active or gate_active < self.limit:
                 # A free slot exists: nobody has to be interrupted.
                 return None
             candidates = [
@@ -274,16 +307,18 @@ class CycleScheduler:
                 ),
             )
             victim.preempted = True
-            victim.stop_event.set()
-            self._preemptions.append(
-                {
-                    "cycle": victim.cycle,
-                    "work_id": victim.work_id,
-                    "difficulty": Difficulty.parse(victim.difficulty).name,
-                    "incoming_cycle": incoming_cycle,
-                    "incoming_difficulty": level.name,
-                }
-            )
+            # Preemption channel, *not* the shutdown one: the engine attributes
+            # the interrupted cycle from which channel fired (Review v4).
+            victim.preempt_event.set()
+            record = {
+                "cycle": victim.cycle,
+                "work_id": victim.work_id,
+                "difficulty": Difficulty.parse(victim.difficulty).name,
+                "incoming_cycle": None if incoming_cycle is None else int(incoming_cycle),
+                "incoming_work_id": None,
+                "incoming_difficulty": level.name,
+            }
+            self._preemptions.append(record)
             self._condition.notify_all()
             LOG.info(
                 "scheduler preempting cycle=%s difficulty=%s for incoming cycle=%s difficulty=%s",
@@ -294,13 +329,56 @@ class CycleScheduler:
             )
             return victim.cycle if victim.cycle is not None else victim.work_id
 
+    def attribute_preemption(
+        self, incoming_work: CycleWork | None, victim: int | None = None
+    ) -> None:
+        """Link the work that took the preempted slot to its record (REQ-04).
+
+        The engine calls this right after admitting the incoming cycle: the
+        cycle id only exists once the body is running, so the record is stamped
+        here when it is already known and filled by :meth:`note_cycle`
+        otherwise. This is what keeps ``incoming_cycle`` from being permanently
+        ``None`` in the cycle report (Review v4 NIT).
+        """
+
+        if incoming_work is None:
+            return
+        with self._condition:
+            record = next(
+                (
+                    candidate
+                    for candidate in reversed(self._preemptions)
+                    if candidate.get("incoming_work_id") is None
+                    and candidate.get("incoming_cycle") is None
+                    and (victim is None or candidate.get("cycle") == victim
+                         or candidate.get("work_id") == victim)
+                ),
+                None,
+            )
+            if record is None:
+                return
+            record["incoming_work_id"] = incoming_work.work_id
+            if incoming_work.cycle is not None:
+                record["incoming_cycle"] = int(incoming_work.cycle)
+            else:
+                self._pending_incoming[incoming_work.work_id] = record
+            self._condition.notify_all()
+
     def note_cycle(self, cycle: int) -> None:
-        """Record the engine cycle id of the work this thread is running."""
+        """Record the engine cycle id of the work this thread is running.
+
+        Also completes a pending preemption record when this work is the one
+        that took the preempted slot.
+        """
 
         work = getattr(self._local, "work", None)
-        if work is None or work.cycle is not None:
+        if work is None:
             return
-        work.cycle = int(cycle)
+        record = self._pending_incoming.pop(work.work_id, None)
+        if record is not None and record.get("incoming_cycle") is None:
+            record["incoming_cycle"] = int(cycle)
+        if work.cycle is None:
+            work.cycle = int(cycle)
 
     def current_work(self) -> CycleWork | None:
         """The work the calling thread is running (``None`` off-pool)."""
@@ -308,11 +386,27 @@ class CycleScheduler:
         return getattr(self._local, "work", None)
 
     def preemption_requested(self) -> bool:
-        """Has *this thread's* work been asked to wind down (REQ-04)?
+        """Has *this thread's* work been asked to yield its slot (REQ-04)?
 
         The engine's step loop calls this at its break points. Off-pool (a
         direct ``run_cycle()`` caller) it is always ``False``, which is what
         keeps the historical single-cycle call shape unchanged.
+
+        Only the *preemption* channel is reported here; a shutdown signal is
+        :meth:`shutdown_requested` (Review v4 MUST_FIX - the two interruptions
+        are attributed separately in the cycle report).
+        """
+
+        work = getattr(self._local, "work", None)
+        return work is not None and work.preempt_event.is_set()
+
+    def shutdown_requested(self) -> bool:
+        """Has *this thread's* work been told to wind down by a drain (REQ-05)?
+
+        ``True`` once :meth:`drain` / :meth:`request_stop` signalled this work.
+        Off-pool it is always ``False``. Kept separate from
+        :meth:`preemption_requested` so the engine can tell an operator stop
+        (``interrupted_by="STOP"``) from a slot hand-over (``"PREEMPT"``).
         """
 
         work = getattr(self._local, "work", None)
@@ -321,8 +415,9 @@ class CycleScheduler:
     def drain(self, timeout_sec: float | None = None) -> bool:
         """Stop accepting work and wait for the pool to go idle (REQ-05).
 
-        Every queued work is abandoned and every running work is signalled;
-        the wait is bounded by ``timeout_sec`` (default
+        Every queued work is abandoned and every running work is signalled on
+        the *shutdown* channel (:meth:`shutdown_requested`), never on the
+        preemption one; the wait is bounded by ``timeout_sec`` (default
         ``drain_timeout_sec``) and by the wall clock, so a stuck body can never
         park the wind-down. Returns ``True`` when the pool drained cleanly and
         ``False`` on timeout, in which case the still-active cycle ids are
@@ -364,7 +459,11 @@ class CycleScheduler:
         return not self._timed_out
 
     def request_stop(self) -> None:
-        """Signal every in-flight work without waiting for the pool (REQ-05)."""
+        """Signal every in-flight work on the shutdown channel, without waiting.
+
+        Same channel as :meth:`drain`, so the engine attributes the truncated
+        cycle to the operator stop rather than to a preemption (REQ-05).
+        """
 
         with self._condition:
             self._closed = True
@@ -459,6 +558,21 @@ class CycleScheduler:
             return bool(self._should_stop())
         except Exception:  # pragma: no cover - defensive
             return True
+
+    def _gate_active(self) -> int:
+        """Live slot count held in the admission gate (the capacity authority).
+
+        Falls back to the pool's own running count for a gate without a
+        ``state()`` view, so the class stays usable with a minimal stand-in.
+        """
+
+        view = getattr(self._gate, "state", None)
+        if callable(view):
+            try:
+                return int(view().get("active", len(self._active)))
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return len(self._active)
 
     def _ensure_workers_locked(self) -> None:
         while len(self._workers) < self._max_workers:
