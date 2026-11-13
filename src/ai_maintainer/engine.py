@@ -163,6 +163,11 @@ LEASE_HISTORY_MAXLEN = 100  # memory-growth bound, INV-LEASE-6
 LEASE_STATUS_ACTIVE = "ACTIVE"
 LEASE_STATUS_EXPIRED = "EXPIRED"
 LEASE_STATUS_RECLAIMED = "RECLAIMED"
+
+# Diagnosis budget (REQ-01 .. REQ-05): per-cycle cap on diagnosis attempts plus
+# the audit vocabulary for the two budget transitions.
+DIAGNOSIS_BUDGET_EXHAUSTED_EVENT = "DIAGNOSIS_BUDGET_EXHAUSTED"
+DIAGNOSIS_BUDGET_RESET_EVENT = "DIAGNOSIS_BUDGET_RESET"
 LEASE_ACQUIRED = "LEASE_ACQUIRED"
 LEASE_RELEASED = "LEASE_RELEASED"
 LEASE_EXPIRED = "LEASE_EXPIRED"
@@ -384,6 +389,16 @@ class CycleResult:
     # (``cancel_task()``); ``None`` for ``SUCCESS``. Distinguishes a
     # shutdown-limited cycle from an operator cancellation.
     interrupted_by: str | None = None
+    # UTILTOOLS-131 REQ-03/REQ-04: the cycle's diagnosis metadata — one entry
+    # per diagnosis window opened by this cycle (``kind="ATTEMPT"``, ``outcome``
+    # ``ATTEMPTED``/``SUCCEEDED``/``FAILED``/``CANCELLED``/``INTERRUPTED``),
+    # followed by one ``kind="EXHAUSTED"`` entry when the per-cycle budget ran
+    # out (last, with the limit and ``attempts_made``), and — on a ``SUCCESS``
+    # cycle — one ``kind="BUDGET_RESET"`` entry documenting the reset (REQ-05).
+    # Entries carry ``timestamp``, ``error_type``, ``outcome`` and
+    # ``budget_state`` and are consumed when the report is built, so every
+    # entry belongs to this cycle only.
+    issues_detected: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -396,6 +411,7 @@ class CycleResult:
             "memory_cycle": self.memory_cycle,
             "outcome": self.outcome,
             "interrupted_by": self.interrupted_by,
+            "issues_detected": [dict(entry) for entry in self.issues_detected],
         }
 
 
@@ -796,6 +812,28 @@ class MaintainerEngine:
         self._cycles = 0
         self._buckets: dict[str, FingerprintBucket] = {}
         self._task_fingerprint: dict[str, str] = {}
+        # UTILTOOLS-131 REQ-01: per-cycle diagnosis budget. ``_should_diagnose``
+        # consumes one unit per diagnosis window. Every counter, history list
+        # and open window is keyed by cycle id, so a non-SUCCESS cycle can never
+        # leak attempts into (or pre-spend) the next cycle's budget and report
+        # (REQ-01/REQ-03), and one cycle's SUCCESS reset cannot delete another
+        # concurrent cycle's data. Each cycle's slice is consumed by
+        # ``_diagnosis_report()`` when its report is built, so nothing
+        # accumulates across cycles. Guarded by ``self._lock``.
+        self._diagnosis_budget: int = int(self._config.max_diagnosis_budget)
+        self._diagnosis_attempts: dict[int, int] = {}
+        # Bounded per cycle: ``maxlen`` is the budget, so a cycle's history can
+        # never exceed the number of windows the gate allows it.
+        self._diagnosis_history: dict[int, deque[dict[str, Any]]] = {}
+        # Entry of the currently open diagnosis window per cycle, awaiting its
+        # outcome (``SUCCEEDED`` / ``FAILED`` / ``CANCELLED`` / ``INTERRUPTED``).
+        self._diagnosis_pending: dict[int, dict[str, Any]] = {}
+        # One refusal record per cycle (REQ-04): the gate audits the first
+        # refusal only, so refused adoptions cannot flood the bounded event log.
+        self._diagnosis_exhausted: dict[int, dict[str, Any]] = {}
+        # Summary of the last budget reset, copied into the cycle report so a
+        # healthy cycle documents that the budget was restored (REQ-05).
+        self._last_diagnosis_reset: dict[str, Any] | None = None
         self._probe = probe
         self._signal_gate = signal_gate
         # UTILTOOLS-72 REQ-03: injected memory store (``None`` disables it) and
@@ -2767,8 +2805,15 @@ class MaintainerEngine:
                         continue
                     self._adopt(incoming, cycle=cycle)
                     # UTILTOOLS-111 REQ-01: a task adopted this cycle opens
-                    # the diagnosis window.
-                    self._transition_cycle_state(CycleState.DIAGNOSING, cycle=cycle)
+                    # the diagnosis window. UTILTOOLS-131 REQ-02: only while the
+                    # per-cycle diagnosis budget has room — once it is spent the
+                    # cycle rolls back to the plain RUNNING step (no further
+                    # diagnosis) and the exhaustion is audited.
+                    if self._should_diagnose(cycle):
+                        self._record_diagnosis_attempt(cycle=cycle, task=incoming)
+                        self._transition_cycle_state(
+                            CycleState.DIAGNOSING, cycle=cycle
+                        )
                 elif (
                     incoming is not None
                     and incoming is not mine
@@ -2782,8 +2827,13 @@ class MaintainerEngine:
                     preempted_name = previous.name
                     self._adopt(incoming, cycle=cycle)
                     # UTILTOOLS-111 REQ-01: a preempted adoption re-opens
-                    # the diagnosis window for the incoming task.
-                    self._transition_cycle_state(CycleState.DIAGNOSING, cycle=cycle)
+                    # the diagnosis window for the incoming task, subject to the
+                    # same UTILTOOLS-131 REQ-02 per-cycle budget gate.
+                    if self._should_diagnose(cycle):
+                        self._record_diagnosis_attempt(cycle=cycle, task=incoming)
+                        self._transition_cycle_state(
+                            CycleState.DIAGNOSING, cycle=cycle
+                        )
                 task = self._monitored_by_cycle.get(cycle)
                 if task is None:
                     break
@@ -2851,6 +2901,9 @@ class MaintainerEngine:
                             "reason": cooperative.reason,
                         }
                     )
+                    self._record_diagnosis_outcome(
+                        "CANCELLED", cycle=cycle, task=task
+                    )
                     interrupted = True
                     break
                 if error is not None:
@@ -2859,6 +2912,11 @@ class MaintainerEngine:
                     self._monitored_by_cycle.pop(cycle, None)
                     self._record_cycle_outcome(
                         "BLOCKED", task, cycle=cycle, error=error
+                    )
+                    # REQ-03: stamp the cycle's diagnosis entry with the failure
+                    # fingerprint so the report carries the error type.
+                    self._record_diagnosis_outcome(
+                        "FAILED", cycle=cycle, error=error
                     )
                     # UTILTOOLS-111 REQ-01: a step that raises enters the
                     # recovery window for the remaining steps.
@@ -2876,6 +2934,7 @@ class MaintainerEngine:
                     self._record_cycle_outcome("COMPLETED", task, cycle=cycle)
                 else:
                     self._record_cycle_outcome("PROGRESS", task, cycle=cycle)
+                self._record_diagnosis_outcome("SUCCEEDED", cycle=cycle, task=task)
                 # UTILTOOLS-111 REQ-01: a committed step clears the
                 # diagnosis/recovery window and closes the step.
                 self._transition_cycle_state(CycleState.RUNNING, cycle=cycle)
@@ -2893,8 +2952,26 @@ class MaintainerEngine:
         else:
             self._transition_cycle_state(CycleState.IDLE, cycle=cycle)
 
+        # REQ-04: one total classifier decides the outcome token; the
+        # UTILTOOLS-80 ``interrupted`` short-circuit keeps precedence.
+        outcome = self._outcome_for(self.stop_reason, interrupted=interrupted)
         with self._lock:
             memory_installed = self._memory is not None
+            # REQ-03/REQ-04: the cycle's *own* diagnosis metadata goes into the
+            # report — its attempts (with the still-open window closed as
+            # ``INTERRUPTED``) plus the ``EXHAUSTED`` record when the per-cycle
+            # budget ran out. The cycle's slice is consumed here, so a
+            # non-SUCCESS cycle cannot leak into the next report.
+            attempts_used = int(self._diagnosis_attempts.get(int(cycle), 0))
+            issues_detected = self._diagnosis_report(cycle)
+            if outcome == OUTCOME_SUCCESS:
+                # REQ-05: a healthy cycle restores the full diagnosis budget and
+                # documents the reset in its own cycle summary.
+                issues_detected.append(
+                    self._reset_diagnosis_budget(
+                        cycle=cycle, attempts_before=attempts_used
+                    )
+                )
         return CycleResult(
             cycle=cycle,
             monitored=monitored_name,
@@ -2903,15 +2980,225 @@ class MaintainerEngine:
             steps=steps,
             admitted=True,
             memory_cycle=cycle if memory_installed else None,
-            # REQ-04: one total classifier decides the outcome token; the
-            # UTILTOOLS-80 ``interrupted`` short-circuit keeps precedence.
-            outcome=self._outcome_for(self.stop_reason, interrupted=interrupted),
+            outcome=outcome,
             interrupted_by=(
                 ("STOP" if self._stop.is_set() else "CANCEL")
                 if interrupted
                 else None
             ),
+            issues_detected=issues_detected,
         )
+
+    def _diagnosis_budget_state(self, cycle: int | None = None) -> dict[str, Any]:
+        """Snapshot one cycle's diagnosis budget usage (REQ-01/REQ-04).
+
+        Called with ``_lock`` held. The snapshot is copied into every history
+        entry and into the exhaustion record, so the cycle report always states
+        the limit, how much that cycle used and whether the budget ran out.
+        ``cycle=None`` reports an unused slice (used ``0``).
+        """
+
+        used = 0 if cycle is None else int(self._diagnosis_attempts.get(int(cycle), 0))
+        return {
+            "limit": self._diagnosis_budget,
+            "used": used,
+            "remaining": max(self._diagnosis_budget - used, 0),
+            "exhausted": used >= self._diagnosis_budget,
+        }
+
+    def _should_diagnose(self, cycle: int) -> bool:
+        """Return True when one more diagnosis window fits the budget (REQ-02).
+
+        The budget is a hard per-cycle gate: every ``True`` consumes one unit of
+        ``cycle``'s allowance, and once that cycle's units are spent this returns
+        ``False`` for the rest of *that* cycle — the caller then skips the
+        ``DIAGNOSING`` transition entirely, which is the safe rollback (no
+        further diagnosis is attempted for that cycle). Other cycles keep their
+        own allowance.
+
+        The refusal is recorded once per cycle (REQ-04) in
+        ``_diagnosis_exhausted`` — mirrored into ``self._events`` — carrying the
+        limit, the number of attempts made and the ``EXHAUSTED`` outcome. It is
+        then copied into ``CycleResult.issues_detected`` by
+        ``_diagnosis_report()``. The first-refusal-only guard keeps repeated
+        refused adoptions from flooding the bounded event log.
+        """
+
+        cid = int(cycle)
+        with self._lock:
+            used = int(self._diagnosis_attempts.get(cid, 0))
+            if used < self._diagnosis_budget:
+                self._diagnosis_attempts[cid] = used + 1
+                return True
+            if cid in self._diagnosis_exhausted:
+                return False
+            record: dict[str, Any] = {
+                "kind": "EXHAUSTED",
+                "cycle": cid,
+                "timestamp": self._clock(),
+                "error_type": self._last_diagnosis_error_type(cid),
+                "attempts_made": used,
+                "outcome": "EXHAUSTED",
+                "budget_state": self._diagnosis_budget_state(cid),
+            }
+            self._diagnosis_exhausted[cid] = record
+            self._events.append(
+                {
+                    "event": DIAGNOSIS_BUDGET_EXHAUSTED_EVENT,
+                    "cycle": cid,
+                    "budget": self._diagnosis_budget,
+                    "attempts_made": used,
+                    "outcome": "EXHAUSTED",
+                }
+            )
+            return False
+
+    def _record_diagnosis_attempt(self, *, cycle: int, task: TaskSpec) -> None:
+        """Record one diagnosis attempt in the cycle's history (REQ-03).
+
+        Called with ``_lock`` held, right after ``_should_diagnose()`` granted
+        the window and before the ``DIAGNOSING`` transition. The entry is left
+        in ``_diagnosis_pending`` until the step stamps its outcome.
+        """
+
+        cid = int(cycle)
+        with self._lock:
+            entry: dict[str, Any] = {
+                "kind": "ATTEMPT",
+                "cycle": cid,
+                "task": str(task.name),
+                "timestamp": self._clock(),
+                "error_type": None,
+                "outcome": "ATTEMPTED",
+                "budget_state": self._diagnosis_budget_state(cid),
+            }
+            history = self._diagnosis_history.get(cid)
+            if history is None:
+                # Bounded by the budget: the gate allows at most ``limit``
+                # windows per cycle, so this slice can never grow past it.
+                history = deque(maxlen=max(self._diagnosis_budget, 1))
+                self._diagnosis_history[cid] = history
+            history.append(entry)
+            self._diagnosis_pending[cid] = entry
+
+    def _record_diagnosis_outcome(
+        self,
+        outcome: str,
+        *,
+        cycle: int,
+        task: TaskSpec | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Stamp the open diagnosis window of ``cycle`` with its outcome.
+
+        Called with ``_lock`` held. ``outcome`` is ``SUCCEEDED`` (committed
+        step), ``FAILED`` (step raised; ``error_type`` becomes the failure
+        fingerprint) or ``CANCELLED`` (cooperative cancel ended the cycle). A
+        cycle with no open window is left untouched.
+        """
+
+        cid = int(cycle)
+        with self._lock:
+            entry = self._diagnosis_pending.pop(cid, None)
+            if entry is None:
+                return
+            entry["outcome"] = outcome
+            entry["resolved_at"] = self._clock()
+            if error is not None:
+                entry["error_type"] = error_fingerprint(error)
+            if task is not None:
+                entry["task"] = str(task.name)
+            entry["budget_state"] = self._diagnosis_budget_state(cid)
+
+    def _last_diagnosis_error_type(self, cycle: int) -> str | None:
+        """Return the error type of ``cycle``'s most recent diagnosed failure.
+
+        Called with ``_lock`` held. Feeds the ``EXHAUSTED`` record so the cycle
+        report names the recurring failure that used up the budget (REQ-04).
+        """
+
+        history = self._diagnosis_history.get(int(cycle))
+        if not history:
+            return None
+        for entry in reversed(history):
+            if entry.get("error_type"):
+                return str(entry["error_type"])
+        return None
+
+    def _diagnosis_report(self, cycle: int) -> list[dict[str, Any]]:
+        """Build ``cycle``'s diagnosis section of the cycle report (REQ-03/REQ-04).
+
+        Called with ``_lock`` held while the ``CycleResult`` is assembled. The
+        cycle's history is snapshotted and then consumed, so nothing accumulates
+        across cycles and a non-SUCCESS cycle cannot leak entries into the next
+        report. A window still open when the cycle ends (wind-down, concurrent
+        retire, cancel) is closed as ``INTERRUPTED`` here, and the
+        ``EXHAUSTED`` record is appended last when the budget ran out.
+        """
+
+        cid = int(cycle)
+        with self._lock:
+            # Close the open window *before* snapshotting: it is the same dict
+            # object the history holds, so the ``INTERRUPTED`` stamp lands in
+            # the report entry instead of duplicating it.
+            pending = self._diagnosis_pending.pop(cid, None)
+            if pending is not None:
+                pending["outcome"] = "INTERRUPTED"
+                pending["resolved_at"] = self._clock()
+                pending["budget_state"] = self._diagnosis_budget_state(cid)
+            history = self._diagnosis_history.pop(cid, None)
+            issues = [] if history is None else [dict(entry) for entry in history]
+            exhausted = self._diagnosis_exhausted.pop(cid, None)
+            if exhausted is not None:
+                issues.append(dict(exhausted))
+            # The cycle's allowance is released with its report, so a non-SUCCESS
+            # cycle cannot pre-spend the next cycle's budget and no per-cycle
+            # counter survives the report.
+            self._diagnosis_attempts.pop(cid, None)
+            return issues
+
+    def _reset_diagnosis_budget(
+        self, cycle: int | None = None, *, attempts_before: int | None = None
+    ) -> dict[str, Any]:
+        """Restore the full per-cycle diagnosis budget (REQ-05).
+
+        Called when ``cycle`` ends with ``OUTCOME_SUCCESS``: the limit is
+        re-read from the config, so the next cycle starts from the configured
+        maximum. Only that cycle's slice is dropped — other cycles keep their
+        open window and report data. The reset is documented in the cycle
+        summary through the ``BUDGET_RESET`` entry which the caller appends to
+        ``CycleResult.issues_detected`` and which this method returns (the
+        ``events`` log stays untouched, so a healthy cycle's event stream is
+        unchanged).
+        """
+
+        cid = None if cycle is None else int(cycle)
+        with self._lock:
+            if cid is None:
+                if attempts_before is None:
+                    attempts_before = sum(self._diagnosis_attempts.values())
+                self._diagnosis_attempts.clear()
+                self._diagnosis_history.clear()
+                self._diagnosis_pending.clear()
+                self._diagnosis_exhausted.clear()
+            else:
+                counted = int(self._diagnosis_attempts.pop(cid, 0))
+                if attempts_before is None:
+                    attempts_before = counted
+                self._diagnosis_history.pop(cid, None)
+                self._diagnosis_pending.pop(cid, None)
+                self._diagnosis_exhausted.pop(cid, None)
+            self._diagnosis_budget = int(self._config.max_diagnosis_budget)
+            summary: dict[str, Any] = {
+                "kind": "BUDGET_RESET",
+                "cycle": cid,
+                "timestamp": self._clock(),
+                "outcome": OUTCOME_SUCCESS,
+                "attempts_before_reset": attempts_before,
+                "budget_state": self._diagnosis_budget_state(cid),
+            }
+            self._last_diagnosis_reset = summary
+            return dict(summary)
 
     def _finish_cycle(self, cycle: int) -> list[str]:
         """Validate and persist the memory records at the end of a cycle.
