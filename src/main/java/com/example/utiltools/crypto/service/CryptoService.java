@@ -647,12 +647,13 @@ public class CryptoService {
 
     private String normalizeAlgorithm(String raw) {
         return switch (raw) {
+            case "SHA224", "SHA-224" -> "SHA-224";
             case "SHA256", "SHA-256" -> "SHA-256";
             case "SHA384", "SHA-384" -> "SHA-384";
             case "SHA512", "SHA-512" -> "SHA-512";
             case "SHA1", "SHA-1" -> "SHA-1";
             case "MD5" -> "MD5";
-            default -> throw new IllegalArgumentException("Unsupported hash algorithm: " + raw + ". Supported: SHA-256, SHA-384, SHA-512, SHA-1, MD5.");
+            default -> throw new IllegalArgumentException("Unsupported hash algorithm: " + raw + ". Supported: SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1.");
         };
     }
 
