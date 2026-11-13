@@ -2655,6 +2655,7 @@ public class BatchHashJobService {
         String upper = algorithm.trim().toUpperCase(Locale.ROOT);
         return switch (upper) {
             case "SHA256", "SHA-256" -> "SHA-256";
+            case "SHA384", "SHA-384" -> "SHA-384";
             case "SHA512", "SHA-512" -> "SHA-512";
             case "SHA1", "SHA-1" -> "SHA-1";
             case "MD5" -> "MD5";
