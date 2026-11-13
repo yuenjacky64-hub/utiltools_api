@@ -65,6 +65,19 @@ DEFAULT_MAX_CONCURRENT_CYCLES = 2
 # concurrent ``PatchManager`` instances instead of resetting with a process.
 DEFAULT_MAX_COMMITS_PER_HOUR = 0
 
+# Bound on the scheduler pool drain during a wind-down (UTILTOOLS-130 REQ-05).
+# Same clock unit as ``max_shutdown_wait_sec``; a drain that exceeds it is
+# reported (``timed_out``) and the wind-down proceeds instead of blocking.
+DEFAULT_SCHEDULER_DRAIN_TIMEOUT_SEC = 30.0
+
+# How many cycle bodies ``MaintainerEngine.run_forever`` keeps in flight at
+# once (UTILTOOLS-130 REQ-02). ``1`` keeps the historical contract - the loop
+# offers the next cycle only once the previous one left its break point, so a
+# stop requested *by* a cycle still ends the run after that cycle. Raising it
+# lets a slow cycle overlap the next ones; the gate's ``max_concurrent_cycles``
+# still caps the number of simultaneously *running* bodies (INV-SCHED-1).
+DEFAULT_CYCLE_POOL_SIZE = 2
+
 # Wall-clock budget for one OpenCode runner invocation (UTILTOOLS-90 REQ-01).
 # Ten minutes by default; ``validate()`` accepts the inclusive range
 # ``[60, 3600]`` seconds.
@@ -198,6 +211,7 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
             "max_fingerprint_buckets",
             "max_concurrent_cycles",
             "max_commits_per_hour",
+            "cycle_pool_size",
             "opencode_timeout_sec",
             "max_report_files",
         ):
@@ -215,6 +229,7 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
             "stale_timeout_sec",
             "stale_recovery_grace_sec",
             "max_shutdown_wait_sec",
+            "scheduler_drain_timeout_sec",
         ):
             if isinstance(value, bool):
                 raise ValueError(f"{key} must be a number")
@@ -299,6 +314,12 @@ class MaintainerConfig:
     # counting), so ``validate()`` never reports this knob; only the *type* is
     # guarded (see ``__post_init__``).
     max_commits_per_hour: int = DEFAULT_MAX_COMMITS_PER_HOUR
+    # UTILTOOLS-130 REQ-05: bounded wait for the scheduler pool to go idle on
+    # stop. Validation shares ``max_shutdown_wait_sec``'s rules.
+    scheduler_drain_timeout_sec: float = DEFAULT_SCHEDULER_DRAIN_TIMEOUT_SEC
+    # UTILTOOLS-130 REQ-02: how many cycle bodies ``run_forever`` may keep in
+    # flight. Validation shares ``max_concurrent_cycles``'s rules.
+    cycle_pool_size: int = DEFAULT_CYCLE_POOL_SIZE
     # Deliberate exception to the ``__post_init__`` convention: this knob is
     # ``validate()``-only so out-of-range values stay constructible and are
     # reportable through ``validate()`` instead of raising at build time.
@@ -386,6 +407,9 @@ class MaintainerConfig:
         commit_budget = self.max_commits_per_hour
         if not isinstance(commit_budget, int) or isinstance(commit_budget, bool):
             raise ValueError("max_commits_per_hour must be an integer")
+        pool_size = self.cycle_pool_size
+        if not isinstance(pool_size, int) or isinstance(pool_size, bool) or pool_size < 1:
+            raise ValueError("cycle_pool_size must be >= 1")
         stale_timeout = self.stale_timeout_sec
         if (
             isinstance(stale_timeout, bool)
@@ -408,6 +432,14 @@ class MaintainerConfig:
             or float(shutdown_wait) < 0.0
         ):
             raise ValueError("max_shutdown_wait_sec must be a finite float >= 0")
+        drain_timeout = self.scheduler_drain_timeout_sec
+        if (
+            isinstance(drain_timeout, bool)
+            or not isinstance(drain_timeout, (int, float))
+            or not math.isfinite(float(drain_timeout))
+            or float(drain_timeout) < 0.0
+        ):
+            raise ValueError("scheduler_drain_timeout_sec must be a finite float >= 0")
         for name in (
             "memory_max_runs",
             "memory_max_bug_fixes",
