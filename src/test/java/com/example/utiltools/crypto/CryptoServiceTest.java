@@ -147,8 +147,7 @@ class CryptoServiceTest {
     void rejectUnsupportedAlgorithm() {
         assertThatThrownBy(() -> cryptoService.hash(new HashRequest("SHA-512X", "abc", null)))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Unsupported hash algorithm: SHA-512X")
-                .hasMessageContaining("SHA-384");
+                .hasMessage("Unsupported hash algorithm: SHA-512X. Supported: SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1.");
         assertThatThrownBy(() -> cryptoService.hash(new HashRequest("SHA3-256", "abc", null)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Unsupported hash algorithm");
