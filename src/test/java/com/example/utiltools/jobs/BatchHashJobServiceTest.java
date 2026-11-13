@@ -550,6 +550,38 @@ class BatchHashJobServiceTest {
     }
 
     @Test
+    @DisplayName("submit - SHA-384 job completes with digests in input order")
+    void sha384BatchAndIdempotencyAlias() {
+        service = new BatchHashJobService(new CryptoService(), 2, 10, 300, 3);
+
+        List<String> items = List.of("abc", "alpha", "beta");
+        BatchHashJobResponse submitted = service.submit(new BatchHashRequest("SHA-384", items, null, null));
+        BatchHashJobResponse completed = awaitStatus(submitted.jobId(), JobStatus.COMPLETED);
+
+        assertThat(completed.results()).hasSize(items.size());
+        CryptoService reference = new CryptoService();
+        for (int i = 0; i < items.size(); i++) {
+            HashResponse expected = reference.hash(new HashRequest("SHA-384", items.get(i), null));
+            assertThat(completed.results().get(i).digest()).isEqualTo(expected.digest());
+            assertThat(completed.results().get(i).algorithm()).isEqualTo("SHA-384");
+        }
+        assertThat(completed.results().get(0).digest())
+                .isEqualTo("cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed"
+                        + "8086072ba1e7cc2358baeca134c825a7");
+
+        // SHA-384 and the SHA384 alias share one idempotency fingerprint.
+        BatchHashJobResponse canonical =
+                service.submit(new BatchHashRequest("SHA-384", List.of("abc"), null, "sha384-key"));
+        BatchHashJobResponse aliased =
+                service.submit(new BatchHashRequest("SHA384", List.of("abc"), null, "sha384-key"));
+
+        assertThat(aliased.jobId()).isEqualTo(canonical.jobId());
+        awaitStatus(canonical.jobId(), JobStatus.COMPLETED);
+        assertThat(registryKeys("jobs")).contains(canonical.jobId());
+        assertThat(registryKeys("idempotencyIndex")).contains("sha384-key");
+    }
+
+    @Test
     @DisplayName("submit - reordered or boundary-shifted items conflict under the same key")
     void shouldRejectConflictWhenItemsAreReordered() {
         service = new BatchHashJobService(new CryptoService(), 2, 10, 300, 3);

@@ -8,6 +8,9 @@ import com.example.utiltools.crypto.dto.HashRequest;
 import com.example.utiltools.crypto.dto.HashResponse;
 import com.example.utiltools.crypto.dto.JwtDecodeRequest;
 import com.example.utiltools.crypto.dto.JwtDecodeResponse;
+import com.example.utiltools.crypto.dto.UrlParseRequest;
+import com.example.utiltools.crypto.dto.UrlParseResponse;
+import com.example.utiltools.crypto.dto.UrlQueryParameter;
 import com.example.utiltools.crypto.dto.UrlRequest;
 import com.example.utiltools.crypto.dto.UrlResponse;
 import com.example.utiltools.crypto.dto.UuidInspectResponse;
@@ -17,6 +20,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
@@ -69,6 +74,83 @@ class CryptoServiceTest {
         assertThat(response.digest()).isNotBlank();
         assertThat(response.isHmac()).isTrue();
         assertThat(response.algorithm()).isEqualTo("HmacSHA256");
+    }
+
+    @Test
+    @DisplayName("Should generate the NIST SHA-384 vector for 'abc'")
+    void hashSha384KnownVector() {
+        HashResponse response = cryptoService.hash(new HashRequest("SHA-384", "abc", null));
+
+        assertThat(response.algorithm()).isEqualTo("SHA-384");
+        assertThat(response.isHmac()).isFalse();
+        assertThat(response.digest())
+                .isEqualTo("cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed"
+                        + "8086072ba1e7cc2358baeca134c825a7");
+    }
+
+    @Test
+    @DisplayName("Should treat SHA384 and SHA-384 as the same algorithm and use HmacSHA384 for HMAC")
+    void sha384AliasAndHmac() throws Exception {
+        HashResponse canonical = cryptoService.hash(new HashRequest("SHA-384", "abc", null));
+        HashResponse aliased = cryptoService.hash(new HashRequest("SHA384", "abc", null));
+
+        assertThat(aliased.algorithm()).isEqualTo("SHA-384");
+        assertThat(aliased.isHmac()).isFalse();
+        assertThat(aliased.digest()).isEqualTo(canonical.digest());
+
+        HashResponse hmac = cryptoService.hash(new HashRequest("SHA384", "abc", "secret-key"));
+        assertThat(hmac.algorithm()).isEqualTo("HmacSHA384");
+        assertThat(hmac.isHmac()).isTrue();
+
+        Mac reference = Mac.getInstance("HmacSHA384");
+        reference.init(new SecretKeySpec("secret-key".getBytes(StandardCharsets.UTF_8), "HmacSHA384"));
+        String expected = java.util.HexFormat.of().formatHex(reference.doFinal("abc".getBytes(StandardCharsets.UTF_8)));
+        assertThat(hmac.digest()).isEqualTo(expected);
+    }
+
+    @Test
+    @DisplayName("Should generate the NIST SHA-224 vector for 'abc'")
+    void hashSha224KnownVector() {
+        HashResponse response = cryptoService.hash(new HashRequest("SHA-224", "abc", null));
+
+        assertThat(response.algorithm()).isEqualTo("SHA-224");
+        assertThat(response.isHmac()).isFalse();
+        assertThat(response.digest())
+                .isEqualTo("23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7");
+        assertThat(response.digest()).hasSize(56);
+    }
+
+    @Test
+    @DisplayName("Should treat SHA224 and SHA-224 as the same algorithm and use HmacSHA224 for HMAC")
+    void sha224AliasCanonicalises() throws Exception {
+        HashResponse canonical = cryptoService.hash(new HashRequest("SHA-224", "abc", null));
+        HashResponse aliased = cryptoService.hash(new HashRequest("SHA224", "abc", null));
+        HashResponse lowerCased = cryptoService.hash(new HashRequest("sha-224", "abc", null));
+
+        assertThat(aliased.algorithm()).isEqualTo("SHA-224");
+        assertThat(aliased.isHmac()).isFalse();
+        assertThat(aliased.digest()).isEqualTo(canonical.digest());
+        assertThat(lowerCased.digest()).isEqualTo(canonical.digest());
+
+        HashResponse hmac = cryptoService.hash(new HashRequest("SHA224", "abc", "secret-key"));
+        assertThat(hmac.algorithm()).isEqualTo("HmacSHA224");
+        assertThat(hmac.isHmac()).isTrue();
+
+        Mac reference = Mac.getInstance("HmacSHA224");
+        reference.init(new SecretKeySpec("secret-key".getBytes(StandardCharsets.UTF_8), "HmacSHA224"));
+        String expected = java.util.HexFormat.of().formatHex(reference.doFinal("abc".getBytes(StandardCharsets.UTF_8)));
+        assertThat(hmac.digest()).isEqualTo(expected);
+    }
+
+    @Test
+    @DisplayName("Should reject an unsupported hash algorithm")
+    void rejectUnsupportedAlgorithm() {
+        assertThatThrownBy(() -> cryptoService.hash(new HashRequest("SHA-512X", "abc", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Unsupported hash algorithm: SHA-512X. Supported: SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1.");
+        assertThatThrownBy(() -> cryptoService.hash(new HashRequest("SHA3-256", "abc", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unsupported hash algorithm");
     }
 
     @Test
@@ -161,6 +243,145 @@ class CryptoServiceTest {
         assertThatThrownBy(() -> cryptoService.url(new UrlRequest("ENCODE", "abc", "SEGMENT")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Invalid mode");
+    }
+
+    @Test
+    @DisplayName("Should decompose an absolute URL with userInfo, port, duplicate parameters and fragment")
+    void shouldParseUrlComponents() {
+        UrlParseResponse response = cryptoService.parseUrl(new UrlParseRequest(
+                "https://alice:s3cr3t@example.com:8443/a/b%20c?tag=one&tag=two&flag&empty=&q=a+b#frag"));
+
+        assertThat(response.scheme()).isEqualTo("https");
+        assertThat(response.userInfo()).isEqualTo("alice:s3cr3t");
+        assertThat(response.host()).isEqualTo("example.com");
+        assertThat(response.port()).isEqualTo(8443);
+        assertThat(response.path()).isEqualTo("/a/b%20c");
+        assertThat(response.query()).isEqualTo("tag=one&tag=two&flag&empty=&q=a+b");
+        assertThat(response.fragment()).isEqualTo("frag");
+        assertThat(response.parameters()).containsExactly(
+                new UrlQueryParameter("tag", "one"),
+                new UrlQueryParameter("tag", "two"),
+                new UrlQueryParameter("flag", ""),
+                new UrlQueryParameter("empty", ""),
+                new UrlQueryParameter("q", "a b"));
+    }
+
+    @Test
+    @DisplayName("Should return null for absent components and an empty parameter list")
+    void shouldParseAbsoluteUrlWithoutOptionalComponents() {
+        UrlParseResponse response = cryptoService.parseUrl(new UrlParseRequest("https://example.com"));
+
+        assertThat(response.scheme()).isEqualTo("https");
+        assertThat(response.userInfo()).isNull();
+        assertThat(response.host()).isEqualTo("example.com");
+        assertThat(response.port()).isNull();
+        assertThat(response.path()).isNull();
+        assertThat(response.query()).isNull();
+        assertThat(response.fragment()).isNull();
+        assertThat(response.parameters()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Should parse a relative hierarchical URL")
+    void shouldParseRelativeUrl() {
+        UrlParseResponse response = cryptoService.parseUrl(new UrlParseRequest("/api/v1/items?limit=10&limit=20"));
+
+        assertThat(response.scheme()).isNull();
+        assertThat(response.userInfo()).isNull();
+        assertThat(response.host()).isNull();
+        assertThat(response.port()).isNull();
+        assertThat(response.path()).isEqualTo("/api/v1/items");
+        assertThat(response.query()).isEqualTo("limit=10&limit=20");
+        assertThat(response.fragment()).isNull();
+        assertThat(response.parameters()).containsExactly(
+                new UrlQueryParameter("limit", "10"),
+                new UrlQueryParameter("limit", "20"));
+    }
+
+    @Test
+    @DisplayName("Should decode '+' as space and '%2B' as a literal plus")
+    void shouldDistinguishPlusFromEncodedPlus() {
+        UrlParseResponse response = cryptoService.parseUrl(new UrlParseRequest("/search?a=1+2&b=x%2By&c=%C3%A9"));
+
+        assertThat(response.parameters()).containsExactly(
+                new UrlQueryParameter("a", "1 2"),
+                new UrlQueryParameter("b", "x+y"),
+                new UrlQueryParameter("c", "\u00e9"));
+    }
+
+    @Test
+    @DisplayName("Should return an empty parameter list for empty and missing queries")
+    void shouldParseEmptyAndMissingQuery() {
+        UrlParseResponse withEmptyQuery = cryptoService.parseUrl(new UrlParseRequest("/path?"));
+        assertThat(withEmptyQuery.query()).isNull();
+        assertThat(withEmptyQuery.parameters()).isEmpty();
+
+        UrlParseResponse withSeparatorOnly = cryptoService.parseUrl(new UrlParseRequest("/path?&&"));
+        assertThat(withSeparatorOnly.parameters()).isEmpty();
+
+        UrlParseResponse withoutQuery = cryptoService.parseUrl(new UrlParseRequest("/path#frag"));
+        assertThat(withoutQuery.query()).isNull();
+        assertThat(withoutQuery.fragment()).isEqualTo("frag");
+        assertThat(withoutQuery.parameters()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Should reject malformed URLs, opaque URIs, illegal ports, bad escapes and invalid UTF-8")
+    void shouldRejectMalformedUrlParse() {
+        for (String malformed : List.of(
+                "https://example.com/a b",
+                "https://exa mple.com/",
+                "https://example.com:99999999/path",
+                "mailto:alice@example.com",
+                "urn:isbn:0451450523")) {
+            assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest(malformed)))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+
+        assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest("/path?a=%2")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Malformed URL");
+        assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest("/path?a=%ZZ")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Malformed URL");
+        assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest("/path/caf%C3")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid UTF-8 sequence");
+        assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest("/path?a=%FF")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Invalid UTF-8 sequence");
+        assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest("  ")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("url is required");
+    }
+
+    @Test
+    @DisplayName("Should accept 128 query parameters and reject 129 without truncating")
+    void shouldRejectUrlWithTooManyQueryParameters() {
+        UrlParseResponse response = cryptoService.parseUrl(new UrlParseRequest(urlWithParameters(128)));
+
+        assertThat(response.parameters()).hasSize(128);
+        assertThat(response.parameters().get(0)).isEqualTo(new UrlQueryParameter("p0", "0"));
+        assertThat(response.parameters().get(127)).isEqualTo(new UrlQueryParameter("p127", "127"));
+
+        // Empty pairs ("a=1&&b=2", a trailing "&") are not parameters and must not consume the budget.
+        assertThat(cryptoService.parseUrl(new UrlParseRequest(urlWithParameters(128) + "&&")).parameters())
+                .hasSize(128);
+
+        assertThatThrownBy(() -> cryptoService.parseUrl(new UrlParseRequest(urlWithParameters(129))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("more than 128 query parameters");
+    }
+
+    private static String urlWithParameters(int count) {
+        StringBuilder url = new StringBuilder("/path?");
+        for (int i = 0; i < count; i++) {
+            if (i > 0) {
+                url.append('&');
+            }
+            url.append('p').append(i).append('=').append(i);
+        }
+        return url.toString();
     }
 
     @Test

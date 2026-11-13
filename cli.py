@@ -7,6 +7,7 @@ Usage::
     python3 cli.py start [--foreground] [--timeout SEC]
     python3 cli.py run-once
     python3 cli.py stop [--timeout SEC]
+    python3 cli.py reports [--prune] [--keep N] [--dry-run]
 
 ``check`` is a stand-alone, read-only pre-flight: it validates the resolved
 configuration paths, verifies that ``pi``-hosted models are free tier, reports
@@ -63,6 +64,7 @@ from ai_maintainer.engine import (  # noqa: E402  (import after sys.path bootstr
 from ai_maintainer.shutdown import SHUTDOWN_POLL_INTERVAL_SEC  # noqa: E402
 from ai_maintainer.config import MAINTAINER_ROOT_ENV, MaintainerConfig  # noqa: E402
 from ai_maintainer.memory import MEMORY_DOC_NAME, MemoryStore  # noqa: E402
+from ai_maintainer.reporter import MaintenanceReporter  # noqa: E402
 from ai_maintainer.tasks.curriculum import TaskCurriculum  # noqa: E402
 from ai_maintainer.util.fs import (  # noqa: E402
     LOCK_PROBE_FREE,
@@ -796,6 +798,70 @@ def _run_memory(args: argparse.Namespace) -> int:
     )
 
 
+def _positive_int(raw: str) -> int:
+    """argparse type: a retention limit of at least one report."""
+
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"invalid positive integer: {raw!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"invalid positive integer: {raw!r}")
+    return value
+
+
+def _reports_dir(config: MaintainerConfig) -> Path:
+    """Configured ``reports_dir``, else ``<maintainer_root>/reports``."""
+
+    configured = None if config.reports_dir is None else str(config.reports_dir).strip()
+    if configured:
+        return Path(configured).expanduser()
+    root = config.maintainer_root
+    base = Path(root).expanduser() if root else _repo_root()
+    return base / "reports"
+
+
+def _run_reports(args: argparse.Namespace) -> int:
+    """Inspect or prune the per-cycle ``RUN-*.md`` reports.
+
+    Without ``--prune`` the command is read-only: it prints how many reports the
+    configured limit would retain. With ``--prune`` it deletes everything beyond
+    the newest ``--keep`` (default: ``max_report_files``) reports, or only lists
+    them with ``--dry-run``. Ledgers and lock files are never candidates.
+    """
+
+    try:
+        config = MaintainerConfig.load(
+            config_path=args.config, maintainer_root=args.maintainer_root
+        )
+    except FileNotFoundError:
+        print(f"error: config path does not exist: {args.config}", file=sys.stderr)
+        return 1
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    reporter = MaintenanceReporter(
+        _reports_dir(config), max_report_files=config.max_report_files
+    )
+    if not args.prune:
+        kept, _ = reporter.prune_cycle_reports(dry_run=True)
+        print(f"kept={kept} limit={reporter.max_report_files}")
+        return 0
+    try:
+        kept, removed = reporter.prune_cycle_reports(
+            keep=args.keep, dry_run=args.dry_run
+        )
+    except OSError as error:
+        print(f"error: report pruning failed: {error}", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print(f"kept={kept} would-remove={removed}")
+    else:
+        print(f"kept={kept} removed={removed}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level parser with the peer subcommands."""
 
@@ -1028,6 +1094,56 @@ def build_parser() -> argparse.ArgumentParser:
         dest="state_root",
         help="directory holding the memory document (default: resolved data dir)",
     )
+
+    reports_parser = subparsers.add_parser(
+        "reports",
+        help="inspect or prune the per-cycle RUN-*.md reports",
+        description=(
+            "Cycle-report retention. Without --prune the command is read-only "
+            "and prints how many reports the configured limit keeps. With "
+            "--prune it removes everything beyond the newest --keep reports "
+            "(default: max_report_files), or only lists them with --dry-run. "
+            "Only regular RUN-*.md files are ever removed; maintenance_report.txt, "
+            "FIX_HISTORY.md, SUGGESTED_FEATURES.md and lock files are untouched. "
+            "Exits 0 on success including a no-op, 1 on a config or IO failure."
+        ),
+    )
+    reports_parser.add_argument(
+        "--prune",
+        action="store_true",
+        default=False,
+        dest="prune",
+        help="apply retention instead of only inspecting the report count",
+    )
+    reports_parser.add_argument(
+        "--keep",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        dest="keep",
+        help="number of newest reports to keep (default: max_report_files)",
+    )
+    reports_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        dest="dry_run",
+        help="list the reports --prune would remove without deleting anything",
+    )
+    reports_parser.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        dest="config",
+        help="config.json to read (default: MAINTAINER_CONFIG, else the root)",
+    )
+    reports_parser.add_argument(
+        "--maintainer-root",
+        default=None,
+        metavar="PATH",
+        dest="maintainer_root",
+        help="maintainer root to read (default: MAINTAINER_ROOT, else repo root)",
+    )
     return parser
 
 
@@ -1079,6 +1195,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "memory":
         return _run_memory(args)
+
+    if args.command == "reports":
+        return _run_reports(args)
 
     parser.print_help(sys.stderr)  # pragma: no cover - unreachable with required=
     return 2

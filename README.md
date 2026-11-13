@@ -46,7 +46,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | Tool | Base Path | Core Capabilities |
 | :--- | :--- | :--- |
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, interval overlap detection, cron next-run planning, current global time |
-| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 / UUID v8 generation (`version=V4|V7|V8`) |
+| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 / UUID v8 generation (`version=V4|V7|V8`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit, and NDJSON / JSON Lines conversion (array <-> line-delimited records) |
 | **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`, `REVERSE`), Unicode normalization (`NFC`, `NFD`, `NFKC`, `NFKD`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
 
@@ -150,9 +150,10 @@ utiltools_api/
 | `GET` | `/api/v1/utils/datetime/current` | Fetch current time in UTC and target timezone |
 | `GET` | `/api/v1/utils/datetime/timezones` | List IANA timezones with current UTC offsets, optionally filtered by `prefix` |
 | `GET` | `/api/v1/utils/datetime/week-date` | Resolve an ISO week (`year`, `week`, optional `day` = MONDAY..SUNDAY case-insensitive or 1..7, default MONDAY) back to its calendar date via `WeekFields.ISO`; rejects weeks that do not exist in that ISO week-year (e.g. 2021-W53). Read-only: not journalled |
-| `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-256, SHA-512, MD5) or HMAC |
+| `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1) or HMAC |
 | `POST` | `/api/v1/utils/crypto/base64` | Encode or decode standard / URL-safe Base64 strings |
 | `POST` | `/api/v1/utils/crypto/url` | Percent-encode or decode a URL component, path segment list or form value (`COMPONENT`, `PATH`, `FORM`) |
+| `POST` | `/api/v1/utils/crypto/url/parse` | Decompose a URL into `scheme`, `userInfo`, `host`, `port`, `path`, raw `query`, `fragment` and an ordered, duplicate-preserving list of decoded query `parameters` (absent components are `null`) |
 | `POST` | `/api/v1/utils/crypto/jwt/decode` | Decode a compact JWT into `algorithm`, `type`, `header` and `payload` without verifying the signature (`verified` is always `false`) |
 | `GET` | `/api/v1/utils/crypto/uuid` | Generate random UUID v4 list (standard or compact 32-hex) |
 | `GET` | `/api/v1/utils/crypto/uuid/inspect` | Validate and inspect an existing UUID (`value` = canonical `8-4-4-4-12` or compact 32-hex, case-insensitive, trimmed) returning `canonical`, `compact`, `version`, `variant` (`RFC_4122` / `NCS` / `MICROSOFT` / `FUTURE`) and, for UUIDv7 only, `unixTimestampMillis` (48-bit millisecond prefix); read-only — no journal entry |
@@ -184,9 +185,10 @@ utiltools_api/
 | `POST` | `/api/v1/utils/audit/verify` | Sweep-verify up to `limit` (default `20`, clamped to `max-entries`) SUCCEEDED entries in one pass and report per-entry `VERIFIED` / `MISMATCH` / `FAILED` / `SKIPPED` |
 | `GET` | `/api/v1/utils/audit/reaps` | List reaper tombstones (newest first) with optional `limit` (default `50`, clamped to `max-entries`) and `reason` filter; read-only |
 | `POST` | `/api/v1/utils/contact/submissions` | Admit a contact submission into the bounded dispatch pool; `202` with a snapshot whose `status` is `QUEUED`; `409` `CONTACT_IDEMPOTENCY_CONFLICT` on a reused-key payload mismatch, `429` `CONTACT_QUEUE_FULL` when the pool is saturated |
-| `GET` | `/api/v1/utils/contact/submissions/{id}` | Fetch one submission snapshot: `QUEUED` / `DISPATCHING` / `DELIVERED` / `FAILED` / `CANCELLED`; `404` `CONTACT_SUBMISSION_NOT_FOUND` |
+| `GET` | `/api/v1/utils/contact/submissions/{id}` | Fetch one submission snapshot: `QUEUED` / `DISPATCHING` / `DELIVERED` / `FAILED` / `DEAD_LETTERED` / `CANCELLED`; `404` `CONTACT_SUBMISSION_NOT_FOUND` |
 | `GET` | `/api/v1/utils/contact/submissions` | List submission snapshots newest first; optional `limit` (default `20`, clamped to `1..100`) |
-| `POST` | `/api/v1/utils/contact/submissions/{id}/retry` | Requeue a `FAILED` attempt as `attempt+1` (`200`); `409` `CONTACT_TRANSITION_CONFLICT` for any illegal transition |
+| `POST` | `/api/v1/utils/contact/submissions/{id}/retry` | Requeue a `FAILED` attempt as `attempt+1` (`200`); `409` `CONTACT_TRANSITION_CONFLICT` for any illegal transition, including a `DEAD_LETTERED` row (use `/redrive`) or an exhausted attempt budget |
+| `POST` | `/api/v1/utils/contact/submissions/{id}/redrive` | The only exit from `DEAD_LETTERED`: extends `maxAttempts` to `attempt+1`, requeues `attempt+1` as `DISPATCHING` with a fresh lease and a new `CONTACT_SUBMIT` journal entry (`200`); `404` `CONTACT_SUBMISSION_NOT_FOUND`; `409` `CONTACT_TRANSITION_CONFLICT` when the row is not `DEAD_LETTERED` or the `utiltools.contact.max-redrives` budget is spent; `429` `CONTACT_QUEUE_FULL` restores the exact prior `DEAD_LETTERED` snapshot |
 | `DELETE` | `/api/v1/utils/contact/submissions/{id}` | Withdraw a submission before the dispatcher starts: `200` with the `CANCELLED` snapshot; `404` `CONTACT_SUBMISSION_NOT_FOUND`; `409` `CONTACT_TRANSITION_CONFLICT` while dispatch is in flight or the row is terminal (`DELIVERED` / `FAILED`). A repeat cancel of an already-`CANCELLED` row is idempotent and re-answers `200` with its `CANCELLED` snapshot |
 | `GET` | `/api/v1/utils/maintenance/scheduler` | Read-only scheduler status: configured `poolSize`, `threadNamePrefix`, `awaitTerminationSeconds`, plus live `activeThreadCount`, `completedTaskCount`, `queueDepth`; never schedules, cancels, or mutates a maintenance pass |
 
@@ -690,7 +692,7 @@ curl -X POST http://localhost:8080/api/v1/utils/datetime/cron/next \
 ### 2. Cryptography & Encoding Utility
 
 #### A. Standard Hash Digest (SHA-256)
-Supported algorithms: `SHA-256`, `SHA-512`, `MD5`, `SHA-1` (case-insensitive).
+Supported algorithms: `SHA-224`, `SHA-256`, `SHA-384`, `SHA-512`, `MD5`, `SHA-1` (case-insensitive).
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/utils/crypto/hash \
@@ -921,7 +923,74 @@ request, the entry is replayable: `POST /api/v1/utils/audit/entries/{id}/replay`
 answers `replay.state = VERIFIED` without rewriting the entry's original `state`, `result` or `completedAt`, and
 without appending a second journal entry.
 
-#### F. JWT Decode (decode-only)
+#### F. URL Decompose & Query Parse
+`POST /api/v1/utils/crypto/url/parse` is the decomposition counterpart of the percent-encode/decode endpoint: it
+splits a URL into its components and decodes its query string into an ordered parameter list.
+
+```json
+{
+  "url": "https://alice:s3cr3t@example.com:8443/a/b?tag=one&tag=two&empty=&q=a+b#frag"
+}
+```
+
+```json
+{
+  "success": true,
+  "message": "URL parse completed successfully",
+  "data": {
+    "scheme": "https",
+    "userInfo": "alice:s3cr3t",
+    "host": "example.com",
+    "port": 8443,
+    "path": "/a/b",
+    "query": "tag=one&tag=two&empty=&q=a+b",
+    "fragment": "frag",
+    "parameters": [
+      {"name": "tag", "value": "one"},
+      {"name": "tag", "value": "two"},
+      {"name": "empty", "value": ""},
+      {"name": "q", "value": "a b"}
+    ]
+  },
+  "timestamp": "2026-11-12T20:15:32.981204112Z"
+}
+```
+
+**Component rules:** absent components are `null` — `scheme`, `userInfo`, `port`, `query` and `fragment` are often
+`null`, and `path` is `null` when the URL has no path (`https://example.com`). Relative hierarchical URLs work and
+return `null` for `scheme`, `userInfo`, `host` and `port` (`/api/v1/items?page=2` → `path = "/api/v1/items"`).
+Every component is returned **raw**: `userInfo`, `path`, `query` and `fragment` are still percent-encoded exactly as
+they appeared in `url` (`/a%20b?q=a%2Bb` → `path = "/a%20b"`, `query = "q=a%2Bb"`). Only the `parameters` list is
+decoded, and re-encoding a decoded name or value before comparing it with `query` is the caller's job.
+
+**Parameter rules:** `parameters` preserves duplicate keys and encounter order, decoding as `FORM` does — `+`
+becomes a space and `%2B` becomes `+`, so `?q=a+b` yields `a b` while `?q=a%2Bb` yields `a+b`. A key without an
+`=` keeps an empty-string value (`?flag` → `{"name": "flag", "value": ""}`), `?q=` keeps `""`, and a URL with no
+query returns an empty list. Empty pairs (`?a=1&&b=2`, a trailing `&`) are separators, not parameters, and never
+consume the budget. At most 128 query parameters are accepted; a URL with a 129th is rejected rather than
+truncated, so the response and its journal entry are always the whole query string or nothing.
+
+**Rejections:** opaque URIs (`mailto:alice@example.com`, `urn:isbn:...`), malformed syntax, ports outside
+`0..65535`, truncated (`%2`) or non-hex (`%ZZ`) escapes and percent sequences that are not valid UTF-8 are all
+rejected with HTTP `400` and error `BAD_REQUEST` — never a partial result. A blank `url` or one longer than `8192`
+characters fails bean validation first with error `VALIDATION_ERROR`; more than 128 query parameters is a
+`BAD_REQUEST` too.
+
+**Security note:** `url` is **journalled verbatim** — the request, and therefore any credential in the `userInfo`
+component (`https://alice:s3cr3t@example.com/…`), is stored in the in-memory journal row for that call and is
+visible through the audit read endpoints (`GET /api/v1/utils/audit/entries`). The journal's redaction is
+key-name-based and cannot recognise a secret embedded in a URL string, so strip or replace `userInfo` before
+calling this endpoint if the credential must not be recorded.
+
+**Journal & replay:** each call is recorded as a `CRYPTO_URL_PARSE` entry that moves `PENDING` →
+`SUCCEEDED`/`FAILED`. Because the response is a pure function of `url`, the entry is replayable:
+`POST /api/v1/utils/audit/entries/{id}/replay` re-runs the same parse and answers `replay.state = VERIFIED` with an
+identical response, without rewriting the entry's original `state`, `result` or `completedAt` and without appending
+a second journal entry. Because the request is bounded (8192 characters, 128 parameters) the journalled response is
+bounded too: no new truncation path is involved, since over-cap input is rejected up front instead of being stored
+short.
+
+#### G. JWT Decode (decode-only)
 `POST /api/v1/utils/crypto/jwt/decode` turns a compact JWS/JWT into its header and claims, so you can inspect
 a token while debugging without pulling a JWT library into the client. It is **decode-only**: the signature is
 never verified, no key is ever supplied, and `verified` is always `false`. Never use the decoded claims for an
@@ -1521,10 +1590,10 @@ populated only when a cached result is served).
 
 ## 🧾 Operation Journal & Replay Verification
 
-All thirty-three journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+All thirty-four journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
 `datetime/shift`, `datetime/duration`, `datetime/business-days`, `datetime/range`, `datetime/overlap`,
 `datetime/cron-next`, `crypto/hash`,
-`crypto/base64`, `crypto/base32`, `crypto/url`, `crypto/jwt/decode`, `crypto/uuid`, `json/format`,
+`crypto/base64`, `crypto/base32`, `crypto/url`, `crypto/url/parse`, `crypto/jwt/decode`, `crypto/uuid`, `json/format`,
 `json/validate`, `json/query`, `json/flatten`, `json/unflatten`, `json/merge-patch`, `json/pointer`,
 `json/to-csv`, `json/from-csv`, `json/csv-to-json`, `json/to-ndjson`, `json/from-ndjson`, `json/diff`,
 `text/transform`, `text/stats`, `text/replace`, `text/html-entities`, `text/word-frequency` — are recorded in a **bounded
@@ -2673,8 +2742,16 @@ It is deliberately bounded (default `20`, ceiling `100`) and not paginated — f
 ### 6. Contact Submissions (async)
 
 Contact submissions are admitted into a bounded dispatch pool and delivered by an in-JVM executor pool.
-A submission's lifecycle is `QUEUED` → `DISPATCHING` → `DELIVERED` / `FAILED` (with bounded automatic
-retries up to `maxAttempts`), plus the terminal `CANCELLED` state:
+A submission's lifecycle is `QUEUED` → `DISPATCHING` → `DELIVERED` / `FAILED` / `DEAD_LETTERED` (with
+bounded automatic retries up to `maxAttempts`), plus the terminal `CANCELLED` state. `FAILED` is the
+retryable terminal: the automatic scanner and `POST .../retry` can still move it back to `QUEUED`.
+`DEAD_LETTERED` is the quarantine: a retryable failure (`CONTACT_DISPATCH_FAILED` or
+`CONTACT_DELIVERY_LEASE_EXPIRED`) that has already reached `maxAttempts` is committed as
+`DEAD_LETTERED` in the same registry-lock critical section that terminalizes the attempt, keeping the
+original bounded error and `completedAt`, clearing `nextRetryAt`, and closing the attempt's
+`CONTACT_SUBMIT` journal entry **exactly once** with the `CONTACT_DEAD_LETTERED` detail. A
+dead-lettered row is *permanently* failed: `retry()` and `DELETE` are both `409`
+`CONTACT_TRANSITION_CONFLICT`, and only an explicit operator redrive leaves the state.
 
 - `POST /api/v1/utils/contact/submissions` admits a submission with `202`; `409`
   `CONTACT_IDEMPOTENCY_CONFLICT` on a reused-key payload mismatch, `429` `CONTACT_QUEUE_FULL` when the
@@ -2684,15 +2761,36 @@ retries up to `maxAttempts`), plus the terminal `CANCELLED` state:
   `CONTACT_SUBMISSION_NOT_FOUND` for unknown ids.
 - `POST .../submissions/{id}/retry` requeues a `FAILED` attempt as `attempt+1`; `409`
   `CONTACT_TRANSITION_CONFLICT` for any illegal transition.
+- `POST .../submissions/{id}/redrive` is the only transition out of `DEAD_LETTERED` (`DEAD_LETTERED` →
+  `QUEUED`): it atomically extends `maxAttempts` to the prior `attempt + 1`, re-queues the row as
+  `attempt+1` / `DISPATCHING` with a fresh execution lease, and opens a **new** `CONTACT_SUBMIT` journal
+  entry, so the attempt that died is audited once and its redrive is audited once. Illegal from
+  `FAILED` / `QUEUED` / `DELIVERED` / `CANCELLED` (`409` `CONTACT_TRANSITION_CONFLICT`). Each submission
+  carries a redrive count bounded by `utiltools.contact.max-redrives` (default `3`, non-negative);
+  once the budget is spent, every further redrive is `409` `CONTACT_TRANSITION_CONFLICT`.
 - `DELETE .../submissions/{id}` withdraws a submission **before dispatch**: a successful (or repeated)
   cancel returns `200` with the `CANCELLED` snapshot — the attempt's error is
   `CONTACT_SUBMISSION_CANCELLED`, `nextRetryAt` is cleared, and the `CONTACT_SUBMIT` journal entry is
   closed **exactly once**. Cancellation and the worker's execution start race under the same registry
   lock; exactly one side wins, so a fenced worker never invokes the dispatcher after a withdrawal.
 - `409` `CONTACT_TRANSITION_CONFLICT` answers a cancel while the dispatcher is running or against a
-  terminal row (`DELIVERED`, `FAILED`); an in-flight attempt still terminalizes
+  terminal row (`DELIVERED`, `FAILED`, `DEAD_LETTERED`); an in-flight attempt still terminalizes
   `DELIVERED` or `FAILED` when the dispatcher returns. A repeat cancel of an already-`CANCELLED` row is
   idempotent and re-answers `200` with its snapshot. `CANCELLED` is terminal and can never retry.
+
+Both `POST .../retry` and `POST .../redrive` reserve a dispatch slot before touching the row. When the
+bounded pool rejects that reservation (`429` `CONTACT_QUEUE_FULL`), a row-preserving rollback restores
+the exact pre-admission snapshot — status, `attempt`, `maxAttempts`, `error`, `completedAt`,
+`startedAt`, the lease fields, `nextRetryAt` **and** the redrive count — releases only the admission
+reservation, and leaves the submission row plus its idempotency mapping in place. A rejected redrive
+therefore keeps the row `DEAD_LETTERED` byte-for-byte and opens no orphaned journal entry, so the
+operator can simply repeat the call once capacity frees.
+
+| Property | Default | Meaning |
+| :------- | :------ | :------ |
+| `utiltools.contact.retry-backoff-base-ms` / `-max-ms` | `1000` / `60000` | Capped exponential backoff for the automatic re-queue of a retryable `FAILED` attempt |
+| `utiltools.contact.retry-scan-interval-ms` | `1000` | Delay between automatic-retry scan passes; the scanner only ever scans `FAILED` rows, never `DEAD_LETTERED` |
+| `utiltools.contact.max-redrives` | `3` | Per-submission operator redrive budget from `DEAD_LETTERED`. `0` disables redrive entirely; negative values fail startup |
 
 ---
 
