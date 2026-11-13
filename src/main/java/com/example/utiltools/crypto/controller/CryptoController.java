@@ -41,7 +41,7 @@ public class CryptoController {
     }
 
     @PostMapping("/hash")
-    @Operation(summary = "Generate cryptographic hash digest", description = "Computes SHA-256, SHA-512, MD5, SHA-1 or HMAC digests")
+    @Operation(summary = "Generate cryptographic hash digest", description = "Computes SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1 or HMAC digests")
     public ApiResponse<HashResponse> hash(@Valid @RequestBody HashRequest request) {
         HashResponse result = auditedOperations.hash(request);
         return ApiResponse.success(result, "Hash generated successfully");

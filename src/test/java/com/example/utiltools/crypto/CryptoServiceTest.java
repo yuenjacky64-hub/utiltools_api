@@ -109,6 +109,40 @@ class CryptoServiceTest {
     }
 
     @Test
+    @DisplayName("Should generate the NIST SHA-224 vector for 'abc'")
+    void hashSha224KnownVector() {
+        HashResponse response = cryptoService.hash(new HashRequest("SHA-224", "abc", null));
+
+        assertThat(response.algorithm()).isEqualTo("SHA-224");
+        assertThat(response.isHmac()).isFalse();
+        assertThat(response.digest())
+                .isEqualTo("23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7");
+        assertThat(response.digest()).hasSize(56);
+    }
+
+    @Test
+    @DisplayName("Should treat SHA224 and SHA-224 as the same algorithm and use HmacSHA224 for HMAC")
+    void sha224AliasCanonicalises() throws Exception {
+        HashResponse canonical = cryptoService.hash(new HashRequest("SHA-224", "abc", null));
+        HashResponse aliased = cryptoService.hash(new HashRequest("SHA224", "abc", null));
+        HashResponse lowerCased = cryptoService.hash(new HashRequest("sha-224", "abc", null));
+
+        assertThat(aliased.algorithm()).isEqualTo("SHA-224");
+        assertThat(aliased.isHmac()).isFalse();
+        assertThat(aliased.digest()).isEqualTo(canonical.digest());
+        assertThat(lowerCased.digest()).isEqualTo(canonical.digest());
+
+        HashResponse hmac = cryptoService.hash(new HashRequest("SHA224", "abc", "secret-key"));
+        assertThat(hmac.algorithm()).isEqualTo("HmacSHA224");
+        assertThat(hmac.isHmac()).isTrue();
+
+        Mac reference = Mac.getInstance("HmacSHA224");
+        reference.init(new SecretKeySpec("secret-key".getBytes(StandardCharsets.UTF_8), "HmacSHA224"));
+        String expected = java.util.HexFormat.of().formatHex(reference.doFinal("abc".getBytes(StandardCharsets.UTF_8)));
+        assertThat(hmac.digest()).isEqualTo(expected);
+    }
+
+    @Test
     @DisplayName("Should reject an unsupported hash algorithm")
     void rejectUnsupportedAlgorithm() {
         assertThatThrownBy(() -> cryptoService.hash(new HashRequest("SHA-512X", "abc", null)))
