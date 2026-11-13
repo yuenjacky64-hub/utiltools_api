@@ -57,6 +57,11 @@ DEFAULT_MEMORY_MAX_LEARNINGS = 500
 # restores the historical one-at-a-time admission.
 DEFAULT_MAX_CONCURRENT_CYCLES = 2
 
+# How many diagnosis windows one cycle may open (UTILTOOLS-131 REQ-01). Each
+# entry into ``CycleState.DIAGNOSING`` consumes one unit; the counter is reset
+# whenever a cycle finishes with ``OUTCOME_SUCCESS`` (REQ-05).
+DEFAULT_MAX_DIAGNOSIS_BUDGET = 3
+
 # Bound on the scheduler pool drain during a wind-down (UTILTOOLS-130 REQ-05).
 # Same clock unit as ``max_shutdown_wait_sec``; a drain that exceeds it is
 # reported (``timed_out``) and the wind-down proceeds instead of blocking.
@@ -210,6 +215,7 @@ def _coerce_mapping(raw: Mapping[str, Any], source: str) -> dict[str, Any]:
             "fingerprint_quarantine_threshold",
             "max_fingerprint_buckets",
             "max_concurrent_cycles",
+            "max_diagnosis_budget",
             "cycle_pool_size",
             "max_commits_per_hour",
             "opencode_timeout_sec",
@@ -325,6 +331,11 @@ class MaintainerConfig:
     # reportable through ``validate()`` instead of raising at build time.
     opencode_timeout_sec: int = DEFAULT_OPENCODE_TIMEOUT_SEC
 
+    # Per-cycle diagnosis budget (UTILTOOLS-131 REQ-01): the maximum number of
+    # diagnosis windows a single cycle may open before the gate in
+    # ``MaintainerEngine._should_diagnose`` refuses further attempts.
+    max_diagnosis_budget: int = DEFAULT_MAX_DIAGNOSIS_BUDGET
+
     # Path knobs (see ``CONFIG_PATH_FIELDS``). Stored as trimmed ``str | None`` so
     # the single ``Path(...)``/``expanduser()`` conversion site lives in
     # :meth:`validate` and the frozen dataclass never needs ``object.__setattr__``.
@@ -362,6 +373,13 @@ class MaintainerConfig:
         steps = self.max_steps_per_cycle
         if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
             raise ValueError("max_steps_per_cycle must be >= 1")
+        diagnosis_budget = self.max_diagnosis_budget
+        if (
+            not isinstance(diagnosis_budget, int)
+            or isinstance(diagnosis_budget, bool)
+            or diagnosis_budget < 1
+        ):
+            raise ValueError("max_diagnosis_budget must be >= 1")
         for name in ("primary_cli", "secondary_cli"):
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
