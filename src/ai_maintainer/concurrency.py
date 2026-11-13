@@ -10,6 +10,12 @@ Two things live here and nothing else:
   the next freed slot over a queued ``EASY`` waiter, ties resolving to the
   lowest ticket (FIFO). The engine passes ``enforce_priority`` so the existing
   ``priority_preemption_enabled`` switch degrades the gate to strict FIFO.
+  UTILTOOLS-130 REQ-03 adds *aging*: a waiter's effective level grows by
+  ``floor(waited / aging_interval)``, so a cycle that has waited long enough
+  overtakes a newer, harder one and can never starve.
+  UTILTOOLS-130 REQ-01 adds slot *inheritance* (:meth:`CycleAdmissionGate.inherit`)
+  so the cycle scheduler can take a slot for a worker thread and hand it to the
+  body it runs without the slot being counted - or waited for - twice.
 * :class:`CycleSnapshot` - the per-cycle capture of the shared state a cycle
   could leak into a peer: the memory document's three collections, the
   watcher's active task IDs and the raw heartbeat bytes.
@@ -71,6 +77,9 @@ class CycleAdmissionGate:
     ``enforce_priority`` is a callable returning the live
     ``priority_preemption_enabled`` value, so flipping the config field to
     ``False`` turns the gate into a strict FIFO queue without rebuilding it.
+    ``aging_interval_sec`` is the REQ-03 aging interval (a float or a callable
+    returning the live value; ``0``/``None`` disables aging, which is the
+    pre-UTILTOOLS-130 behaviour) and ``clock`` is the source of the wait time.
     """
 
     def __init__(
@@ -79,6 +88,8 @@ class CycleAdmissionGate:
         *,
         sleep: Callable[[float], Any] | None = None,
         enforce_priority: Callable[[], bool] | None = None,
+        aging_interval_sec: float | Callable[[], float] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._limit = int(limit)
         self._sleep: Callable[[float], Any] = (
@@ -87,16 +98,38 @@ class CycleAdmissionGate:
         self._enforce_priority: Callable[[], bool] = (
             enforce_priority if enforce_priority is not None else (lambda: True)
         )
+        self._aging_interval_sec = aging_interval_sec
+        self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
         self._condition = threading.Condition()
         self._active: dict[int, int] = {}  # token -> cycle
-        self._waiters: list[tuple[int, Difficulty, int]] = []  # (ticket, diff, cycle)
+        # (ticket, difficulty, cycle, enqueued_at)
+        self._waiters: list[tuple[int, Difficulty, int, float]] = []
         self._next_ticket = 0
+        # Per-thread slot inherited from the scheduler (see ``inherit``).
+        self._local = threading.local()
 
     # ------------------------------------------------------------------ public
 
     @property
     def limit(self) -> int:
         return self._limit
+
+    def inherit(self, token: int | None) -> None:
+        """Hand ``token`` to the calling thread's next :meth:`acquire`.
+
+        Used by :class:`~ai_maintainer.scheduler.CycleScheduler`: a worker takes
+        the slot, then inherits it into the thread that runs the body, so
+        ``run_cycle()``'s own acquire returns the token instead of counting a
+        second slot and its release is a no-op (the pool releases it). Passing
+        ``None`` clears the inheritance.
+        """
+
+        self._local.token = token
+
+    def inherited_token(self) -> int | None:
+        """The token inherited by the calling thread, or ``None``."""
+
+        return getattr(self._local, "token", None)
 
     def acquire(
         self,
@@ -119,15 +152,21 @@ class CycleAdmissionGate:
         stop published by a previous cycle cannot turn a later, uncontended
         ``run_cycle()`` into a no-op (the pre-task single-cycle behaviour every
         existing caller relies on).
+
+        A thread that already inherited a token (UTILTOOLS-130 REQ-01) gets it
+        back unchanged: the scheduler holds the slot for the whole body.
         """
 
         level = Difficulty.parse(difficulty)
         if self._limit < 1:  # defensive: config validation already rejects this
             return None
+        inherited = self.inherited_token()
+        if inherited is not None:
+            return inherited
         with self._condition:
             ticket = self._next_ticket
             self._next_ticket += 1
-            self._waiters.append((ticket, level, int(cycle)))
+            self._waiters.append((ticket, level, int(cycle), self._clock()))
             try:
                 while True:
                     if len(self._active) < self._limit and self._is_head(ticket):
@@ -145,9 +184,16 @@ class CycleAdmissionGate:
                 self._condition.notify_all()
 
     def release(self, token: int | None) -> None:
-        """Free the slot held by ``token``; an unknown token is a no-op."""
+        """Free the slot held by ``token``; an unknown token is a no-op.
+
+        An *inherited* token is not released here: the pool that handed it down
+        still owns the slot and frees it after the body returned.
+        """
 
         if token is None:
+            return
+        inherited = self.inherited_token()
+        if inherited is not None and int(inherited) == int(token):
             return
         with self._condition:
             self._active.pop(int(token), None)
@@ -157,38 +203,78 @@ class CycleAdmissionGate:
         """Read-only admission view for ``MaintainerEngine.snapshot()``."""
 
         with self._condition:
+            now = self._clock()
             return {
                 "limit": self._limit,
                 "active": len(self._active),
+                "aging_interval_sec": self._aging_interval(),
                 "waiting": [
-                    {"cycle": cycle, "difficulty": level.name}
-                    for _ticket, level, cycle in sorted(self._waiters)
+                    {
+                        "cycle": cycle,
+                        "difficulty": level.name,
+                        "waited_sec": max(0.0, now - enqueued_at),
+                        "effective_level": self._effective_level(level, enqueued_at),
+                    }
+                    for _ticket, level, cycle, enqueued_at in sorted(self._waiters)
                 ],
             }
 
     # ----------------------------------------------------------------- private
+
+    def _aging_interval(self) -> float:
+        """Live aging interval in the clock's unit (``0.0`` disables aging)."""
+
+        raw = self._aging_interval_sec
+        value = raw() if callable(raw) else raw
+        if value is None:
+            return 0.0
+        try:
+            interval = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if interval != interval or interval <= 0.0:  # NaN / non-positive
+            return 0.0
+        return interval
+
+    def _effective_level(self, level: Difficulty, enqueued_at: float) -> int:
+        """``difficulty`` plus the REQ-03 aging boost, as a comparable int."""
+
+        base = int(level.value)
+        interval = self._aging_interval()
+        if interval <= 0.0:
+            return base
+        waited = max(0.0, self._clock() - enqueued_at)
+        return base + int(waited / interval)
 
     def _is_head(self, ticket: int) -> bool:
         """May ``ticket`` take a free slot right now?
 
         With priority enforcement on, a waiter yields to a strictly harder one;
         equal difficulty is broken by the lower ticket, i.e. FIFO, so two
-        same-difficulty waiters cannot race past each other.
+        same-difficulty waiters cannot race past each other. UTILTOOLS-130
+        REQ-03: the comparison uses the *aged* level, so waiting long enough
+        makes a waiter the head regardless of who arrived with which difficulty.
         """
 
         mine = next(
-            (level for candidate, level, _cycle in self._waiters if candidate == ticket),
+            (
+                (level, enqueued_at)
+                for candidate, level, _cycle, enqueued_at in self._waiters
+                if candidate == ticket
+            ),
             None,
         )
         if mine is None:
             return False
         if not bool(self._enforce_priority()):
             # Operator opt-out: strict FIFO, the lowest live ticket wins.
-            return min(candidate for candidate, _l, _c in self._waiters) == ticket
-        for candidate, level, _cycle in self._waiters:
+            return min(candidate for candidate, _l, _c, _e in self._waiters) == ticket
+        mine_rank = self._effective_level(*mine)
+        for candidate, level, _cycle, enqueued_at in self._waiters:
             if candidate == ticket:
                 continue
-            if level > mine or (level == mine and candidate < ticket):
+            rank = self._effective_level(level, enqueued_at)
+            if rank > mine_rank or (rank == mine_rank and candidate < ticket):
                 return False
         return True
 
