@@ -442,3 +442,112 @@ def test_stop_is_a_no_op_without_a_pid_file(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert "maintainer not running" in result.stdout
     assert list(state_root.iterdir()) == []
+
+
+# --- UTILTOOLS-125: cycle-report retention ---------------------------------
+
+
+def _write_cycle_reports(directory: Path, count: int) -> list[Path]:
+    """Write ``count`` ``RUN-*.md`` reports, oldest first by mtime."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for index in range(count):
+        path = directory / f"RUN-cycle-{index}.md"
+        path.write_text(f"# cycle {index}\n", encoding="utf-8")
+        stamp = 1_000_000.0 + index * 10.0
+        os.utime(path, (stamp, stamp))
+        paths.append(path)
+    return paths
+
+
+def _write_report_ledgers(directory: Path) -> dict[Path, str]:
+    directory.mkdir(parents=True, exist_ok=True)
+    contents: dict[Path, str] = {}
+    for name in ("maintenance_report.txt", "FIX_HISTORY.md", "SUGGESTED_FEATURES.md"):
+        path = directory / name
+        path.write_text(f"ledger:{name}\n", encoding="utf-8")
+        contents[path] = f"ledger:{name}\n"
+    return contents
+
+
+def test_reports_inspects_without_pruning(tmp_path: Path) -> None:
+    """REQ-04: a bare ``reports`` run is read-only and works without the ledger."""
+
+    maintainer_root = tmp_path / "maintainer"
+    reports = _write_cycle_reports(maintainer_root / "reports", 4)
+    env = _base_env(MAINTAINER_ROOT=maintainer_root, MAINTAINER_MAX_REPORT_FILES=3)
+
+    proc = _run_cli(["reports"], env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "kept=3" in proc.stdout
+    assert "limit=3" in proc.stdout
+    assert all(path.is_file() for path in reports)
+
+
+def test_reports_prune_dry_run_lists_candidates(tmp_path: Path) -> None:
+    """DOD-02 / REQ-04: ``--dry-run`` prints the counts and deletes nothing."""
+
+    maintainer_root = tmp_path / "maintainer"
+    reports = _write_cycle_reports(maintainer_root / "reports", 3)
+    ledgers = _write_report_ledgers(maintainer_root / "reports")
+    env = _base_env(MAINTAINER_ROOT=maintainer_root)
+
+    proc = _run_cli(["reports", "--prune", "--dry-run", "--keep", "2"], env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "kept=2" in proc.stdout
+    assert "would-remove=1" in proc.stdout
+    assert all(path.is_file() for path in reports)
+    for path, body in ledgers.items():
+        assert path.read_text(encoding="utf-8") == body
+
+
+def test_reports_prune_applies_retention(tmp_path: Path) -> None:
+    """DOD-02 / REQ-04: ``--keep N`` removes only the old reports and counts them."""
+
+    maintainer_root = tmp_path / "maintainer"
+    reports = _write_cycle_reports(maintainer_root / "reports", 5)
+    ledgers = _write_report_ledgers(maintainer_root / "reports")
+    env = _base_env(MAINTAINER_ROOT=maintainer_root)
+
+    proc = _run_cli(["reports", "--prune", "--keep", "2"], env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "kept=2" in proc.stdout
+    assert "removed=3" in proc.stdout
+    remaining = sorted(path.name for path in (maintainer_root / "reports").glob("RUN-*.md"))
+    assert remaining == sorted([reports[3].name, reports[4].name])
+    for path, body in ledgers.items():
+        assert path.read_text(encoding="utf-8") == body
+
+
+def test_reports_prune_uses_the_configured_limit(tmp_path: Path) -> None:
+    """REQ-01 / REQ-04: ``MAINTAINER_MAX_REPORT_FILES`` drives a bare ``--prune``."""
+
+    maintainer_root = tmp_path / "maintainer"
+    _write_cycle_reports(maintainer_root / "reports", 4)
+    env = _base_env(MAINTAINER_ROOT=maintainer_root, MAINTAINER_MAX_REPORT_FILES=1)
+
+    proc = _run_cli(["reports", "--prune"], env)
+
+    assert proc.returncode == 0, proc.stderr
+    assert "kept=1" in proc.stdout
+    assert "removed=3" in proc.stdout
+    assert len(list((maintainer_root / "reports").glob("RUN-*.md"))) == 1
+
+
+def test_reports_prune_rejects_a_nonpositive_env_limit(tmp_path: Path) -> None:
+    """DOD-03 / REQ-04: a zero limit exits 1 and deletes nothing."""
+
+    maintainer_root = tmp_path / "maintainer"
+    reports = _write_cycle_reports(maintainer_root / "reports", 3)
+    env = _base_env(MAINTAINER_ROOT=maintainer_root, MAINTAINER_MAX_REPORT_FILES=0)
+
+    proc = _run_cli(["reports", "--prune"], env)
+
+    assert proc.returncode == 1
+    assert "max_report_files must be a positive integer" in proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert all(path.is_file() for path in reports)

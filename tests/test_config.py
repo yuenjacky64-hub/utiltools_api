@@ -361,3 +361,63 @@ def test_email_flows_through_config_json_and_env_layers(
         email="override@example.com",
     )
     assert overridden.email == "override@example.com"
+
+
+# --- UTILTOOLS-125: cycle-report retention ---------------------------------
+
+
+def test_max_report_files_default_is_500() -> None:
+    """REQ-01: the dataclass field defaults to 500 reports."""
+
+    assert config_module.DEFAULT_MAX_REPORT_FILES == 500
+    config = MaintainerConfig()
+    assert config.max_report_files == 500
+    assert isinstance(config.max_report_files, int)
+
+
+def test_validate_flags_nonpositive_max_report_files(tmp_path: Path) -> None:
+    """DOD-03 / REQ-01: ``0`` and negatives are reported, not swallowed."""
+
+    kwargs = _valid_path_kwargs(tmp_path)
+    for value in (0, -5):
+        config = MaintainerConfig(**kwargs)
+        # ``validate()`` is the documented guard, so exercise it directly.
+        object.__setattr__(config, "max_report_files", value)
+        assert config.validate() == ["max_report_files must be a positive integer"]
+    config = MaintainerConfig(**kwargs)
+    object.__setattr__(config, "max_report_files", True)
+    assert config.validate() == ["max_report_files must be a positive integer"]
+
+    # The constructor refuses the same values up front (defence in depth).
+    for value in (0, -5, True):
+        with pytest.raises(ValueError, match="max_report_files"):
+            MaintainerConfig(**kwargs, max_report_files=value)
+
+
+def test_max_report_files_flows_through_config_json_and_env_layers(
+    tmp_path: Path, empty_must_config: None
+) -> None:
+    """DOD-03 / REQ-01: honoured from config.json, the env var and overrides."""
+
+    _write_config(tmp_path, {"max_report_files": 7})
+    from_json = MaintainerConfig.load(maintainer_root=tmp_path, env={})
+    assert from_json.max_report_files == 7
+    assert not any("max_report_files" in issue for issue in from_json.validate())
+
+    from_env = MaintainerConfig.load(
+        maintainer_root=tmp_path, env={"MAINTAINER_MAX_REPORT_FILES": "2"}
+    )
+    assert from_env.max_report_files == 2
+    assert isinstance(from_env.max_report_files, int)
+
+    overridden = MaintainerConfig.load(
+        maintainer_root=tmp_path,
+        env={"MAINTAINER_MAX_REPORT_FILES": "2"},
+        max_report_files=9,
+    )
+    assert overridden.max_report_files == 9
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        MaintainerConfig.load(
+            maintainer_root=tmp_path, env={"MAINTAINER_MAX_REPORT_FILES": "many"}
+        )

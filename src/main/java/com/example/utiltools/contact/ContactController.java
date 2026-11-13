@@ -23,7 +23,7 @@ import jakarta.validation.Valid;
 import java.util.List;
 
 /**
- * HTTP intake for the contact form's network seam (REQ-01): five thin routes over
+ * HTTP intake for the contact form's network seam (REQ-01): six thin routes over
  * {@link ContactSubmissionService}, each wrapped in the standard {@link ApiResponse} envelope with
  * the jobs-style {@code @Operation} + explicit error {@code @ApiResponses} metadata.
  *
@@ -110,6 +110,36 @@ public class ContactController {
     public ResponseEntity<ApiResponse<ContactSubmissionResponse>> retry(
             @PathVariable("id") String id) {
         return ResponseEntity.ok(ApiResponse.success(service.retry(id)));
+    }
+
+    @PostMapping("/{id}/redrive")
+    @Operation(
+            summary = "Redrive a DEAD_LETTERED submission as attempt+1",
+            description = "The only way out of the quarantine: legal only from DEAD_LETTERED and "
+                    + "only while the per-submission redrive budget "
+                    + "(utiltools.contact.max-redrives) is not spent. Atomically extends "
+                    + "maxAttempts to attempt+1, re-queues the row as attempt+1/DISPATCHING with a "
+                    + "fresh execution lease, and opens a new CONTACT_SUBMIT journal entry; a "
+                    + "rejected admission restores the exact prior DEAD_LETTERED snapshot.",
+            responses = {
+                    @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "200",
+                            description = "Redriven: the requeued DISPATCHING snapshot",
+                            content = @Content(schema = @Schema(implementation = ApiResponse.class))),
+                    @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "404",
+                            description = "CONTACT_SUBMISSION_NOT_FOUND",
+                            content = @Content(schema = @Schema(implementation = ApiResponse.class))),
+                    @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "409",
+                            description = "CONTACT_TRANSITION_CONFLICT: not DEAD_LETTERED, or the "
+                                    + "redrive budget is exhausted",
+                            content = @Content(schema = @Schema(implementation = ApiResponse.class))),
+                    @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "429",
+                            description = "CONTACT_QUEUE_FULL: redrive cannot reserve a dispatch "
+                                    + "slot; the DEAD_LETTERED row is unchanged",
+                            content = @Content(schema = @Schema(implementation = ApiResponse.class)))
+            })
+    public ResponseEntity<ApiResponse<ContactSubmissionResponse>> redrive(
+            @PathVariable("id") String id) {
+        return ResponseEntity.ok(ApiResponse.success(service.redrive(id)));
     }
 
     @DeleteMapping("/{id}")

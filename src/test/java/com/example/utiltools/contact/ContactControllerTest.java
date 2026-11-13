@@ -207,6 +207,59 @@ class ContactControllerTest {
     }
 
     @Test
+    @DisplayName("POST {id}/redrive returns 200 with the requeued attempt+1 snapshot (REQ-03/DOD-05)")
+    void shouldReturn200ForRedrive() throws Exception {
+        Instant now = Instant.now();
+        when(service.redrive("sub-1")).thenReturn(new ContactSubmissionResponse("sub-1",
+                ContactStatus.DISPATCHING, "Ada Lovelace", "ada@example.com",
+                "Saturday in June - is the venue step-free?", null, 2, 2,
+                new ContactAttempt(2, ContactStatus.DISPATCHING, now, null, null, "entry-2", now,
+                        now.plusSeconds(30), null)));
+
+        mockMvc.perform(post(BASE + "/{id}/redrive", "sub-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.id").value("sub-1"))
+                .andExpect(jsonPath("$.data.status").value("DISPATCHING"))
+                .andExpect(jsonPath("$.data.attempt").value(2))
+                .andExpect(jsonPath("$.data.maxAttempts").value(2));
+    }
+
+    @Test
+    @DisplayName("POST {id}/redrive answers 409 CONTACT_TRANSITION_CONFLICT when the row is not DEAD_LETTERED")
+    void shouldReturn409ForIllegalRedrive() throws Exception {
+        when(service.redrive("sub-1")).thenThrow(new ContactTransitionConflictException("sub-1",
+                ContactStatus.FAILED, 1, 3, "may only be redriven while DEAD_LETTERED"));
+
+        mockMvc.perform(post(BASE + "/{id}/redrive", "sub-1"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("CONTACT_TRANSITION_CONFLICT"))
+                .andExpect(jsonPath("$.details.submissionId").value("sub-1"))
+                .andExpect(jsonPath("$.details.status").value("FAILED"));
+    }
+
+    @Test
+    @DisplayName("POST {id}/redrive answers 404 for an unknown id and 429 when the pool is saturated")
+    void shouldReturn404And429ForRedriveEdgeCases() throws Exception {
+        when(service.redrive(anyString())).thenAnswer(invocation -> {
+            String id = invocation.getArgument(0);
+            if ("unknown".equals(id)) {
+                throw new ContactSubmissionNotFoundException(id);
+            }
+            throw new ContactQueueFullException();
+        });
+
+        mockMvc.perform(post(BASE + "/unknown/redrive"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error").value("CONTACT_SUBMISSION_NOT_FOUND"));
+
+        mockMvc.perform(post(BASE + "/{id}/redrive", "sub-1"))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.error").value("CONTACT_QUEUE_FULL"));
+    }
+
+    @Test
     @DisplayName("DELETE {id} returns 200 with the CANCELLED snapshot (or the idempotent repeat)")
     void shouldReturn200ForCancelSnapshot() throws Exception {
         when(service.cancel("sub-1")).thenReturn(
