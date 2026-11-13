@@ -42,6 +42,7 @@ from ai_maintainer.concurrency import (
     write_heartbeat,
 )
 from ai_maintainer.config import MaintainerConfig
+from ai_maintainer.scheduler import CycleScheduler, CycleWork
 from ai_maintainer.memory.store import atomic_write_text
 from ai_maintainer.util.fs import (
     LOCK_PROBE_HELD,
@@ -131,6 +132,29 @@ __all__ = [
 ]
 
 EVENT_LOG_MAXLEN = 100
+# UTILTOOLS-130 REQ-02: how long a producer park lasts between two reads of the
+# scheduler's view. Small in absolute terms on purpose. The waits themselves
+# live in ``scheduler.wait_idle()`` / ``_await_overlap_grace()`` and park on
+# real time, *not* on the engine's ``_sleep`` seam - so a fake clock observes
+# ``_pause()`` and nothing else.
+SCHEDULER_IDLE_POLL_INTERVAL_SEC = 0.02
+
+# UTILTOOLS-130 REQ-02: how long the producer waits on the cycle it already
+# handed to the pool before offering the next one to a sibling slot. A cycle
+# that returns inside this window keeps the loop serial - the historical
+# contract, in which a stop published by a cycle is observed before any other
+# body starts (``test_second_run_forever_leaves_no_markers``). A cycle that
+# overruns it is exactly the slow cycle this pool exists for: the loop stops
+# waiting for it and the next cycle runs concurrently in the pool's other
+# worker.
+SCHEDULER_OVERLAP_GRACE_SEC = 0.25
+
+# UTILTOOLS-130 Review v4: hard poll budget for the producer's bounded waits.
+# Both waits now take their deadline from the engine's ``_clock`` seam, so an
+# injected (frozen) clock would never expire them; the budget is the belt to
+# that suspenders - a frozen clock costs at most this many short parks.
+SCHEDULER_GRACE_MAX_POLLS = 64
+
 DEFAULT_CYCLE_INTERVAL_SEC = 1.0
 DEFAULT_STOP_REASON = "stop_requested"
 DEFAULT_CANCEL_REASON = "cancel_requested"
@@ -163,6 +187,11 @@ LEASE_HISTORY_MAXLEN = 100  # memory-growth bound, INV-LEASE-6
 LEASE_STATUS_ACTIVE = "ACTIVE"
 LEASE_STATUS_EXPIRED = "EXPIRED"
 LEASE_STATUS_RECLAIMED = "RECLAIMED"
+
+# Diagnosis budget (REQ-01 .. REQ-05): per-cycle cap on diagnosis attempts plus
+# the audit vocabulary for the two budget transitions.
+DIAGNOSIS_BUDGET_EXHAUSTED_EVENT = "DIAGNOSIS_BUDGET_EXHAUSTED"
+DIAGNOSIS_BUDGET_RESET_EVENT = "DIAGNOSIS_BUDGET_RESET"
 LEASE_ACQUIRED = "LEASE_ACQUIRED"
 LEASE_RELEASED = "LEASE_RELEASED"
 LEASE_EXPIRED = "LEASE_EXPIRED"
@@ -384,6 +413,16 @@ class CycleResult:
     # (``cancel_task()``); ``None`` for ``SUCCESS``. Distinguishes a
     # shutdown-limited cycle from an operator cancellation.
     interrupted_by: str | None = None
+    # UTILTOOLS-131 REQ-03/REQ-04: the cycle's diagnosis metadata — one entry
+    # per diagnosis window opened by this cycle (``kind="ATTEMPT"``, ``outcome``
+    # ``ATTEMPTED``/``SUCCEEDED``/``FAILED``/``CANCELLED``/``INTERRUPTED``),
+    # followed by one ``kind="EXHAUSTED"`` entry when the per-cycle budget ran
+    # out (last, with the limit and ``attempts_made``), and — on a ``SUCCESS``
+    # cycle — one ``kind="BUDGET_RESET"`` entry documenting the reset (REQ-05).
+    # Entries carry ``timestamp``, ``error_type``, ``outcome`` and
+    # ``budget_state`` and are consumed when the report is built, so every
+    # entry belongs to this cycle only.
+    issues_detected: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -396,6 +435,7 @@ class CycleResult:
             "memory_cycle": self.memory_cycle,
             "outcome": self.outcome,
             "interrupted_by": self.interrupted_by,
+            "issues_detected": [dict(entry) for entry in self.issues_detected],
         }
 
 
@@ -796,6 +836,28 @@ class MaintainerEngine:
         self._cycles = 0
         self._buckets: dict[str, FingerprintBucket] = {}
         self._task_fingerprint: dict[str, str] = {}
+        # UTILTOOLS-131 REQ-01: per-cycle diagnosis budget. ``_should_diagnose``
+        # consumes one unit per diagnosis window. Every counter, history list
+        # and open window is keyed by cycle id, so a non-SUCCESS cycle can never
+        # leak attempts into (or pre-spend) the next cycle's budget and report
+        # (REQ-01/REQ-03), and one cycle's SUCCESS reset cannot delete another
+        # concurrent cycle's data. Each cycle's slice is consumed by
+        # ``_diagnosis_report()`` when its report is built, so nothing
+        # accumulates across cycles. Guarded by ``self._lock``.
+        self._diagnosis_budget: int = int(self._config.max_diagnosis_budget)
+        self._diagnosis_attempts: dict[int, int] = {}
+        # Bounded per cycle: ``maxlen`` is the budget, so a cycle's history can
+        # never exceed the number of windows the gate allows it.
+        self._diagnosis_history: dict[int, deque[dict[str, Any]]] = {}
+        # Entry of the currently open diagnosis window per cycle, awaiting its
+        # outcome (``SUCCEEDED`` / ``FAILED`` / ``CANCELLED`` / ``INTERRUPTED``).
+        self._diagnosis_pending: dict[int, dict[str, Any]] = {}
+        # One refusal record per cycle (REQ-04): the gate audits the first
+        # refusal only, so refused adoptions cannot flood the bounded event log.
+        self._diagnosis_exhausted: dict[int, dict[str, Any]] = {}
+        # Summary of the last budget reset, copied into the cycle report so a
+        # healthy cycle documents that the budget was restored (REQ-05).
+        self._last_diagnosis_reset: dict[str, Any] | None = None
         self._probe = probe
         self._signal_gate = signal_gate
         # UTILTOOLS-72 REQ-03: injected memory store (``None`` disables it) and
@@ -804,6 +866,10 @@ class MaintainerEngine:
         self._last_cycle_issues: list[str] = []
         self._scheduler_thread: threading.Thread | None = None
         self._scheduler_stop = threading.Event()
+        # UTILTOOLS-130 REQ-01/REQ-02: the bounded cycle pool that
+        # ``run_forever()`` builds for its own run (``None`` outside the loop,
+        # and for a direct ``run_cycle()`` caller).
+        self._scheduler: CycleScheduler | None = None
         # UTILTOOLS-73: graceful wind-down seams. ``_sleep`` is injected so the
         # bounded wait is testable with a fake clock; ``_cycle_done`` is the
         # checkpoint a wind-down waits on (set = no cycle in flight).
@@ -877,7 +943,15 @@ class MaintainerEngine:
             enforce_priority=lambda: bool(
                 self._config.priority_preemption_enabled
             ),
+            # UTILTOOLS-130 REQ-03: waiters age, so a queued cycle that has
+            # waited a full aging interval overtakes a newer, harder one.
+            aging_interval_sec=lambda: self._config.aging_threshold_seconds,
+            clock=self._clock,
         )
+        # UTILTOOLS-130 REQ-01/REQ-02: the bounded cycle pool. It is rebuilt by
+        # every ``_run_forever_locked()`` (in-memory, no crash survival) and is
+        # ``None`` for a caller that only drives ``run_cycle()`` directly.
+        self._scheduler: CycleScheduler | None = None
         self._watcher = watcher
         self._heartbeat_path: Path | None = (
             Path(heartbeat_path) if heartbeat_path is not None else None
@@ -1623,6 +1697,10 @@ class MaintainerEngine:
                     steps=0,
                 )
             cycle = self._allocate_cycle_id()
+            # UTILTOOLS-130: tell the scheduler which engine cycle the work it
+            # admitted is running, so preemption and the report name the same
+            # number. A no-op when ``run_cycle()`` was called directly.
+            self._note_scheduler_cycle(cycle)
             lease = self.acquire_lease(f"cycle-{cycle}")
             difficulty = self._admission_difficulty()
             token = self._gate.acquire(
@@ -2101,35 +2179,57 @@ class MaintainerEngine:
                 # Off the main thread, or a platform without signal support:
                 # the programmatic ``request_stop()`` path still works.
                 previous = None
+        # UTILTOOLS-130 REQ-02: cycles compete for slots in a bounded pool
+        # instead of running one after another in this thread. The pool is
+        # rebuilt for every ``run_forever()`` (no persistent scheduler state)
+        # and bounded by ``cycle_pool_size`` and by the gate's
+        # ``max_concurrent_cycles``, whichever is smaller - so the pool can
+        # never widen admission (INV-SCHED-1). The default of two workers
+        # (``DEFAULT_CYCLE_POOL_SIZE``) is the Plan §7 behaviour: a second body
+        # is only offered once the first outlives
+        # ``SCHEDULER_OVERLAP_GRACE_SEC``, so a cycle that returns quickly - or
+        # that publishes a stop - still keeps the run serial.
+        scheduler = self._build_scheduler()
+        self._scheduler = scheduler
+        # UTILTOOLS-130 review v2 (instance-lock regression): a cycle body that
+        # raises must end the loop the way the sequential loop did, not be
+        # retried forever by the next iteration of a zero-interval loop.
+        self._pool_exc: BaseException | None = None
         try:
             while True:
                 if self.should_stop():
                     break
-                with self._lock:
-                    if self._state is EngineState.STOPPED:
-                        self._state = EngineState.IDLE
-                    self._state = EngineState.RUNNING
-                    self._cycle_done.clear()
-                try:
-                    self.run_cycle()
-                finally:
-                    self._cycle_done.set()
-                    with self._lock:
-                        if self._state is EngineState.RUNNING:
-                            self._state = EngineState.IDLE
+                # REQ-02/REQ-04: offer this iteration's cycles. ``inflight`` is
+                # the producer's view of the works it handed to the pool; it is
+                # rebuilt every iteration, after the pool drains.
+                inflight: list[CycleWork] = []
+                self._offer_cycles(scheduler, inflight)
                 self._write_runtime_markers()
                 if self.should_stop():
                     break
                 # REQ-04: reclaim an expired lease left by a stalled cycle, so
                 # the next acquire is not parked behind a dead holder.
                 self._reap_stale_leases()
+                # Pace the producer on *completions*: the next offers wait until
+                # the pool is empty again, so a zero interval cannot outrun the
+                # bodies and ``_pause()`` still observes the idle state between
+                # iterations.
+                self._await_pool_idle(scheduler)
+                if self._pool_exc is not None:
+                    break
                 with self._lock:
+                    if self._active_cycles == 0 and self._state is EngineState.RUNNING:
+                        self._state = EngineState.IDLE
                     if self._state is EngineState.IDLE:
                         self._state = EngineState.SLEEPING
                 if self.should_stop():
                     break
                 self._pause(interval)
         finally:
+            # REQ-05: stop accepting work and let every in-flight body reach
+            # its own break point before the wind-down stamps the heartbeat.
+            self._drain_scheduler(scheduler)
+            self._scheduler = None
             # REQ-03 / INV-SHUT-9: the handler only set the flag; the
             # attributable ``SIGNAL_*`` reason is published here, in normal
             # context, before the reason is logged and before the wind-down
@@ -2151,6 +2251,8 @@ class MaintainerEngine:
                 self._log_stop_reason()
                 try:
                     report = self.graceful_shutdown()
+                    if self._pool_exc is not None:
+                        raise self._pool_exc
                     return report
                 finally:
                     # REQ-03 / INV-COOP-4: the teardown runs *after* the
@@ -2166,6 +2268,262 @@ class MaintainerEngine:
             finally:
                 if previous:
                     _restore_stop_handlers(previous)
+
+    # ------------------------------------------------- scheduler pool (REQ-01..05)
+
+    def _build_scheduler(self) -> CycleScheduler:
+        """Build this run's bounded pool (REQ-01/REQ-02).
+
+        One worker per admission slot, the engine's clock so the pool's wait
+        stamps match the engine's own, and ``should_stop`` wiring so a stop
+        published from a signal handler abandons every queued work.
+        """
+
+        admission_limit = max(
+            1, int(getattr(self._gate, "limit", self._config.max_concurrent_cycles))
+        )
+        workers = min(admission_limit, max(1, int(self._config.cycle_pool_size)))
+        return CycleScheduler(
+            self._gate,
+            workers,
+            drain_timeout_sec=float(self._config.scheduler_drain_timeout_sec),
+            clock=self._clock,
+            should_stop=self.should_stop,
+        )
+
+    def _offer_cycles(
+        self, scheduler: CycleScheduler, inflight: list[CycleWork]
+    ) -> None:
+        """Offer this iteration's cycles to the pool (REQ-02 / REQ-04).
+
+        The first cycle of an iteration always goes out: with
+        ``cycle_pool_size == 1`` that is the whole iteration and the loop is
+        the historical sequential one. A *second* cycle is only offered once the
+        first is known to be slow (it is still running after
+        ``SCHEDULER_OVERLAP_GRACE_SEC``) and a slot is genuinely free, which is
+        what makes ``max_concurrent_cycles`` observable at engine level:
+
+        * overlap - two cycles are in the pool at the same time, in two worker
+          threads (DOD-01);
+        * preemption - the loop is *not* parked on the first cycle when it asks
+          for a second slot, so a saturated pool really does face an incoming
+          cycle and :meth:`_maybe_preempt` can hand over its lowest-priority
+          slot (REQ-04).
+
+        A cycle that returns inside the grace window keeps the loop serial, so
+        a stop published by it is observed before a sibling body starts
+        (``test_second_run_forever_leaves_no_markers``).
+        """
+
+        difficulty = self._admission_difficulty()
+        if self.should_stop():
+            return
+        first = self._admit_cycle(scheduler, difficulty)
+        if first is not None:
+            inflight.append(first)
+        while not self.should_stop():
+            if not self._await_overlap_grace(scheduler, inflight):
+                return
+            if self.should_stop():
+                return
+            # REQ-03: re-peek before every further offer. The cycle that is now
+            # running has already claimed its task, so this peek is the weight
+            # of the *next* work - which is exactly the weight a preemption
+            # (REQ-04) has to justify itself against.
+            difficulty = self._admission_difficulty()
+            # REQ-04: the pool is full and the producer still wants a slot, so
+            # it offers the lowest-priority running cycle's slot to the incoming
+            # one (no-op unless the incoming cycle outranks it).
+            victim = self._maybe_preempt(scheduler, difficulty)
+            if victim is not None and not self._await_free_slot(scheduler):
+                return
+            if scheduler.state()["idle_workers"] <= 0:
+                return
+            work = self._admit_cycle(scheduler, difficulty)
+            if work is None:
+                return
+            if victim is not None:
+                # The work that took the preempted slot: link it to the
+                # preemption record so ``incoming_cycle`` is reported (rather
+                # than permanently ``None``) once the body allocates its id.
+                scheduler.attribute_preemption(work, victim)
+            inflight.append(work)
+
+    def _grace_deadline(self, window_sec: float) -> float:
+        """Deadline for a bounded producer wait, on the engine's clock seam.
+
+        Review v4 SHOULD_FIX: these waits used ``time.monotonic()`` directly, so
+        a test with an injected clock burned *real* grace windows and the
+        preemption handling could not be observed under a fake clock. The
+        engine's default clock *is* ``time.monotonic``, so production behaviour
+        is unchanged.
+        """
+
+        return self._clock() + float(window_sec)
+
+    def _await_free_slot(self, scheduler: CycleScheduler) -> bool:
+        """Wait briefly for a preempted cycle to hand its slot back (REQ-04).
+
+        A preemption only *signals* the victim; the worker releases the gate
+        slot when its step loop reaches a break point. The producer therefore
+        waits one grace window for the slot instead of giving up on the first
+        read. Returns ``True`` when a slot is free.
+        """
+
+        deadline = self._grace_deadline(SCHEDULER_OVERLAP_GRACE_SEC)
+        polls = 0
+        while not self.should_stop():
+            if scheduler.state()["idle_workers"] > 0:
+                return True
+            remaining = deadline - self._clock()
+            if remaining <= 0 or polls >= SCHEDULER_GRACE_MAX_POLLS:
+                return False
+            polls += 1
+            self._stop.wait(min(remaining, SCHEDULER_IDLE_POLL_INTERVAL_SEC))
+        return False
+
+    def _admit_cycle(
+        self, scheduler: CycleScheduler, difficulty: Difficulty
+    ) -> CycleWork | None:
+        """Submit one cycle body to the pool, or ``None`` if the pool refused."""
+
+        with self._lock:
+            if self._state is EngineState.STOPPED:
+                self._state = EngineState.IDLE
+            self._state = EngineState.RUNNING
+        work = scheduler.submit(None, difficulty, self._scheduled_cycle_body)
+        if work is None:
+            with self._lock:
+                if self._active_cycles == 0 and self._state is EngineState.RUNNING:
+                    self._state = EngineState.IDLE
+        return work
+
+    def _await_overlap_grace(
+        self, scheduler: CycleScheduler, inflight: list[CycleWork]
+    ) -> bool:
+        """Wait for the newest in-flight cycle to finish, up to the grace.
+
+        Returns ``True`` when the cycle is still running (the caller may then
+        overlap), ``False`` when every submitted cycle returned inside the grace
+        window (the caller must drain before offering more) or when a stop was
+        requested.
+        """
+
+        if not inflight:
+            return False
+        deadline = self._grace_deadline(SCHEDULER_OVERLAP_GRACE_SEC)
+        polls = 0
+        while True:
+            with self._lock:
+                finished = inflight[-1].finished_at is not None
+            if finished:
+                return False
+            if self.should_stop():
+                return False
+            remaining = deadline - self._clock()
+            if remaining <= 0 or polls >= SCHEDULER_GRACE_MAX_POLLS:
+                return True
+            polls += 1
+            # REQ-05: park on the stop flag as well as on the work, so a stop
+            # published from another thread is honoured inside the grace window.
+            self._stop.wait(min(remaining, SCHEDULER_IDLE_POLL_INTERVAL_SEC))
+
+    def _scheduled_cycle_body(self) -> None:
+        """One engine cycle as the pool's worker runs it (REQ-02).
+
+        The worker already holds the gate slot and inherited it into this
+        thread, so ``run_cycle()``'s own acquire is a no-op and its release
+        leaves the slot with the pool (REQ-01). The latch/state bookkeeping the
+        sequential loop used to do inline happens here, in the worker thread,
+        so ``_cycle_done`` keeps meaning "no cycle is in flight" and the
+        wind-down still drains through :meth:`_await_cycle_break_point`.
+        """
+
+        try:
+            self.run_cycle()
+        except BaseException as exc:  # noqa: BLE001 - re-raised by the loop
+            self._pool_exc = exc
+            raise
+        finally:
+            with self._lock:
+                if self._active_cycles == 0:
+                    self._cycle_done.set()
+                    if self._state is EngineState.RUNNING:
+                        self._state = EngineState.IDLE
+
+    def _note_scheduler_cycle(self, cycle: int) -> None:
+        """Tell the pool which engine cycle the work it admitted is running."""
+
+        scheduler = self._scheduler
+        if scheduler is not None:
+            scheduler.note_cycle(int(cycle))
+
+    def _scheduler_preempted(self) -> bool:
+        """Has this thread's work been asked to yield its slot (REQ-04)?
+
+        ``False`` off-pool, which is what keeps a direct ``run_cycle()``
+        caller's behaviour unchanged.
+        """
+
+        scheduler = self._scheduler
+        if scheduler is None:
+            return False
+        return bool(scheduler.preemption_requested())
+
+    def _maybe_preempt(
+        self, scheduler: CycleScheduler, difficulty: Difficulty
+    ) -> int | None:
+        """Offer the incoming cycle's priority to a saturated pool (REQ-04)."""
+
+        try:
+            return scheduler.preempt(difficulty)
+        except Exception:  # pragma: no cover - preemption is advisory
+            LOG.warning("scheduler preemption probe failed", exc_info=True)
+            return None
+
+    def _await_pool_idle(self, scheduler: CycleScheduler) -> bool:
+        """Wait until the pool has no active and no queued work (REQ-02).
+
+        Returns ``True`` when a stop cut the wait short. The wait happens on
+        the pool's own condition (``scheduler.wait_idle``), *not* through the
+        engine's ``_sleep`` seam: pacing belongs to ``_pause`` alone, so a
+        fake-clock test counts only real pauses and a stop-triggering sleeper
+        cannot be tripped by scheduler polling.
+        """
+
+        while not self.should_stop():
+            if scheduler.wait_idle(
+                timeout_sec=SCHEDULER_IDLE_POLL_INTERVAL_SEC,
+                should_stop=self.should_stop,
+            ):
+                return False
+        return True
+
+    def _drain_scheduler(self, scheduler: CycleScheduler) -> bool:
+        """Finalize in-progress cycles and retire the pool (REQ-05).
+
+        Sets the stop event of every in-flight work - the same break point a
+        stop-requested wind-down uses - drops anything still queued, and waits
+        for the workers, bounded by ``scheduler_drain_timeout_sec`` so a wedged
+        body cannot park the wind-down sequence.
+        """
+
+        drained = scheduler.drain(
+            timeout_sec=float(self._config.scheduler_drain_timeout_sec)
+        )
+        with self._lock:
+            self._events.append(
+                {
+                    "event": "SCHEDULER_DRAINED",
+                    "cycle": self._cycles,
+                    "clean": bool(drained),
+                    "timeout_sec": float(self._config.scheduler_drain_timeout_sec),
+                    "preemptions": int(scheduler.state()["preemptions"]),
+                }
+            )
+            if drained and self._active_cycles == 0:
+                self._cycle_done.set()
+        return bool(drained)
 
     def graceful_shutdown(self, *, exit_process: bool = False) -> ShutdownReport:
         """Operator-facing wind-down: drain, stamp, persist, tear down.
@@ -2732,18 +3090,51 @@ class MaintainerEngine:
             self._evaluate_stale(self._clock())
 
         interrupted = False
+        # UTILTOOLS-130 REQ-04: set when the scheduler asked this cycle to wind
+        # down so a higher-priority cycle could take its slot. It is a *third*
+        # interruption reason, distinct from the engine stop and the task
+        # cancel, and it is attributed as such in the cycle report.
+        #
+        # Review v4 MUST_FIX: the wind-down check runs *first* at every break
+        # point and a stop wins over a preemption. The shutdown drain signals
+        # in-flight work so the pool can go idle, and that signal used to be
+        # read by the preemption branch (first break point), so an operator stop
+        # during an in-flight cycle was reported ``interrupted_by="PREEMPT"``.
+        # The scheduler keeps the two channels apart
+        # (:meth:`CycleScheduler.shutdown_requested` vs
+        # :meth:`CycleScheduler.preemption_requested`) and the engine never
+        # preempts a stopped engine, so a stop is attributed as ``"STOP"``.
+        preempted_cycle = False
         while steps < self._config.max_steps_per_cycle:
             # REQ-02: a stop or cancel issued while the previous step was in
             # flight is honoured here, before any new step starts. The flags are
             # read directly (they are what ``should_stop()`` reports) so the
             # per-step check stays free of subclass hooks: ``run_forever()``
             # stays the single poller of the public predicate.
+            #
+            # UTILTOOLS-80: only *this* first break truncates the review
+            # phase. With ``steps == 0`` the cycle never ran a step, which is
+            # the one INTERRUPTED case; a stop seen after a committed step
+            # leaves the review phase complete, i.e. SUCCESS.
             if self._wind_down_requested():
-                # UTILTOOLS-80: only *this* first break truncates the review
-                # phase. With ``steps == 0`` the cycle never ran a step, which
-                # is the one INTERRUPTED case; a stop seen after a committed
-                # step leaves the review phase complete, i.e. SUCCESS.
                 interrupted = steps == 0
+                break
+            # UTILTOOLS-130 REQ-04: the scheduler's preemption request is
+            # checked at the same break point - never mid-step - so a preempted
+            # cycle ends exactly where a stop would end it (INV-SCHED-2). It is
+            # evaluated *after* the wind-down so the two reasons never compete.
+            if self._scheduler_preempted():
+                preempted_cycle = True
+                interrupted = True
+                with self._lock:
+                    self._events.append(
+                        {
+                            "event": "CYCLE_PREEMPTED",
+                            "cycle": cycle,
+                            "steps": steps,
+                            "reason": "SCHEDULER_SLOT_PREEMPTION",
+                        }
+                    )
                 break
             with self._lock:
                 now = self._clock()
@@ -2767,8 +3158,15 @@ class MaintainerEngine:
                         continue
                     self._adopt(incoming, cycle=cycle)
                     # UTILTOOLS-111 REQ-01: a task adopted this cycle opens
-                    # the diagnosis window.
-                    self._transition_cycle_state(CycleState.DIAGNOSING, cycle=cycle)
+                    # the diagnosis window. UTILTOOLS-131 REQ-02: only while the
+                    # per-cycle diagnosis budget has room — once it is spent the
+                    # cycle rolls back to the plain RUNNING step (no further
+                    # diagnosis) and the exhaustion is audited.
+                    if self._should_diagnose(cycle):
+                        self._record_diagnosis_attempt(cycle=cycle, task=incoming)
+                        self._transition_cycle_state(
+                            CycleState.DIAGNOSING, cycle=cycle
+                        )
                 elif (
                     incoming is not None
                     and incoming is not mine
@@ -2782,8 +3180,13 @@ class MaintainerEngine:
                     preempted_name = previous.name
                     self._adopt(incoming, cycle=cycle)
                     # UTILTOOLS-111 REQ-01: a preempted adoption re-opens
-                    # the diagnosis window for the incoming task.
-                    self._transition_cycle_state(CycleState.DIAGNOSING, cycle=cycle)
+                    # the diagnosis window for the incoming task, subject to the
+                    # same UTILTOOLS-131 REQ-02 per-cycle budget gate.
+                    if self._should_diagnose(cycle):
+                        self._record_diagnosis_attempt(cycle=cycle, task=incoming)
+                        self._transition_cycle_state(
+                            CycleState.DIAGNOSING, cycle=cycle
+                        )
                 task = self._monitored_by_cycle.get(cycle)
                 if task is None:
                     break
@@ -2806,6 +3209,22 @@ class MaintainerEngine:
                 # stop landing between the pre-step bookkeeping and
                 # ``_monitor_step()`` cannot report SUCCESS with ``steps == 0``.
                 interrupted = steps == 0
+                break
+            if self._scheduler_preempted():
+                # UTILTOOLS-130 REQ-04: same break point, second half of the
+                # step. The task stays RUNNING (nothing cancelled it) and the
+                # cycle is reported as a scheduler preemption.
+                preempted_cycle = True
+                interrupted = True
+                with self._lock:
+                    self._events.append(
+                        {
+                            "event": "CYCLE_PREEMPTED",
+                            "cycle": cycle,
+                            "steps": steps,
+                            "reason": "SCHEDULER_SLOT_PREEMPTION",
+                        }
+                    )
                 break
             # Monitor step body runs outside the lock.
             error: BaseException | None = None
@@ -2851,6 +3270,9 @@ class MaintainerEngine:
                             "reason": cooperative.reason,
                         }
                     )
+                    self._record_diagnosis_outcome(
+                        "CANCELLED", cycle=cycle, task=task
+                    )
                     interrupted = True
                     break
                 if error is not None:
@@ -2859,6 +3281,11 @@ class MaintainerEngine:
                     self._monitored_by_cycle.pop(cycle, None)
                     self._record_cycle_outcome(
                         "BLOCKED", task, cycle=cycle, error=error
+                    )
+                    # REQ-03: stamp the cycle's diagnosis entry with the failure
+                    # fingerprint so the report carries the error type.
+                    self._record_diagnosis_outcome(
+                        "FAILED", cycle=cycle, error=error
                     )
                     # UTILTOOLS-111 REQ-01: a step that raises enters the
                     # recovery window for the remaining steps.
@@ -2876,6 +3303,7 @@ class MaintainerEngine:
                     self._record_cycle_outcome("COMPLETED", task, cycle=cycle)
                 else:
                     self._record_cycle_outcome("PROGRESS", task, cycle=cycle)
+                self._record_diagnosis_outcome("SUCCEEDED", cycle=cycle, task=task)
                 # UTILTOOLS-111 REQ-01: a committed step clears the
                 # diagnosis/recovery window and closes the step.
                 self._transition_cycle_state(CycleState.RUNNING, cycle=cycle)
@@ -2893,8 +3321,26 @@ class MaintainerEngine:
         else:
             self._transition_cycle_state(CycleState.IDLE, cycle=cycle)
 
+        # REQ-04: one total classifier decides the outcome token; the
+        # UTILTOOLS-80 ``interrupted`` short-circuit keeps precedence.
+        outcome = self._outcome_for(self.stop_reason, interrupted=interrupted)
         with self._lock:
             memory_installed = self._memory is not None
+            # REQ-03/REQ-04: the cycle's *own* diagnosis metadata goes into the
+            # report — its attempts (with the still-open window closed as
+            # ``INTERRUPTED``) plus the ``EXHAUSTED`` record when the per-cycle
+            # budget ran out. The cycle's slice is consumed here, so a
+            # non-SUCCESS cycle cannot leak into the next report.
+            attempts_used = int(self._diagnosis_attempts.get(int(cycle), 0))
+            issues_detected = self._diagnosis_report(cycle)
+            if outcome == OUTCOME_SUCCESS:
+                # REQ-05: a healthy cycle restores the full diagnosis budget and
+                # documents the reset in its own cycle summary.
+                issues_detected.append(
+                    self._reset_diagnosis_budget(
+                        cycle=cycle, attempts_before=attempts_used
+                    )
+                )
         return CycleResult(
             cycle=cycle,
             monitored=monitored_name,
@@ -2903,15 +3349,234 @@ class MaintainerEngine:
             steps=steps,
             admitted=True,
             memory_cycle=cycle if memory_installed else None,
-            # REQ-04: one total classifier decides the outcome token; the
-            # UTILTOOLS-80 ``interrupted`` short-circuit keeps precedence.
-            outcome=self._outcome_for(self.stop_reason, interrupted=interrupted),
+            outcome=outcome,
             interrupted_by=(
-                ("STOP" if self._stop.is_set() else "CANCEL")
+                (
+                    # Review v4 MUST_FIX: an operator stop outranks a
+                    # preemption. ``scheduler.drain`` signals in-flight work on
+                    # the shutdown channel, so a stop that lands on a cycle
+                    # which also saw a preemption request is a ``STOP`` - the
+                    # only reason the pool was asked to wind down.
+                    "STOP"
+                    if self._stop.is_set()
+                    else ("PREEMPT" if preempted_cycle else "CANCEL")
+                )
                 if interrupted
                 else None
             ),
+            issues_detected=issues_detected,
         )
+
+    def _diagnosis_budget_state(self, cycle: int | None = None) -> dict[str, Any]:
+        """Snapshot one cycle's diagnosis budget usage (REQ-01/REQ-04).
+
+        Called with ``_lock`` held. The snapshot is copied into every history
+        entry and into the exhaustion record, so the cycle report always states
+        the limit, how much that cycle used and whether the budget ran out.
+        ``cycle=None`` reports an unused slice (used ``0``).
+        """
+
+        used = 0 if cycle is None else int(self._diagnosis_attempts.get(int(cycle), 0))
+        return {
+            "limit": self._diagnosis_budget,
+            "used": used,
+            "remaining": max(self._diagnosis_budget - used, 0),
+            "exhausted": used >= self._diagnosis_budget,
+        }
+
+    def _should_diagnose(self, cycle: int) -> bool:
+        """Return True when one more diagnosis window fits the budget (REQ-02).
+
+        The budget is a hard per-cycle gate: every ``True`` consumes one unit of
+        ``cycle``'s allowance, and once that cycle's units are spent this returns
+        ``False`` for the rest of *that* cycle — the caller then skips the
+        ``DIAGNOSING`` transition entirely, which is the safe rollback (no
+        further diagnosis is attempted for that cycle). Other cycles keep their
+        own allowance.
+
+        The refusal is recorded once per cycle (REQ-04) in
+        ``_diagnosis_exhausted`` — mirrored into ``self._events`` — carrying the
+        limit, the number of attempts made and the ``EXHAUSTED`` outcome. It is
+        then copied into ``CycleResult.issues_detected`` by
+        ``_diagnosis_report()``. The first-refusal-only guard keeps repeated
+        refused adoptions from flooding the bounded event log.
+        """
+
+        cid = int(cycle)
+        with self._lock:
+            used = int(self._diagnosis_attempts.get(cid, 0))
+            if used < self._diagnosis_budget:
+                self._diagnosis_attempts[cid] = used + 1
+                return True
+            if cid in self._diagnosis_exhausted:
+                return False
+            record: dict[str, Any] = {
+                "kind": "EXHAUSTED",
+                "cycle": cid,
+                "timestamp": self._clock(),
+                "error_type": self._last_diagnosis_error_type(cid),
+                "attempts_made": used,
+                "outcome": "EXHAUSTED",
+                "budget_state": self._diagnosis_budget_state(cid),
+            }
+            self._diagnosis_exhausted[cid] = record
+            self._events.append(
+                {
+                    "event": DIAGNOSIS_BUDGET_EXHAUSTED_EVENT,
+                    "cycle": cid,
+                    "budget": self._diagnosis_budget,
+                    "attempts_made": used,
+                    "outcome": "EXHAUSTED",
+                }
+            )
+            return False
+
+    def _record_diagnosis_attempt(self, *, cycle: int, task: TaskSpec) -> None:
+        """Record one diagnosis attempt in the cycle's history (REQ-03).
+
+        Called with ``_lock`` held, right after ``_should_diagnose()`` granted
+        the window and before the ``DIAGNOSING`` transition. The entry is left
+        in ``_diagnosis_pending`` until the step stamps its outcome.
+        """
+
+        cid = int(cycle)
+        with self._lock:
+            entry: dict[str, Any] = {
+                "kind": "ATTEMPT",
+                "cycle": cid,
+                "task": str(task.name),
+                "timestamp": self._clock(),
+                "error_type": None,
+                "outcome": "ATTEMPTED",
+                "budget_state": self._diagnosis_budget_state(cid),
+            }
+            history = self._diagnosis_history.get(cid)
+            if history is None:
+                # Bounded by the budget: the gate allows at most ``limit``
+                # windows per cycle, so this slice can never grow past it.
+                history = deque(maxlen=max(self._diagnosis_budget, 1))
+                self._diagnosis_history[cid] = history
+            history.append(entry)
+            self._diagnosis_pending[cid] = entry
+
+    def _record_diagnosis_outcome(
+        self,
+        outcome: str,
+        *,
+        cycle: int,
+        task: TaskSpec | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        """Stamp the open diagnosis window of ``cycle`` with its outcome.
+
+        Called with ``_lock`` held. ``outcome`` is ``SUCCEEDED`` (committed
+        step), ``FAILED`` (step raised; ``error_type`` becomes the failure
+        fingerprint) or ``CANCELLED`` (cooperative cancel ended the cycle). A
+        cycle with no open window is left untouched.
+        """
+
+        cid = int(cycle)
+        with self._lock:
+            entry = self._diagnosis_pending.pop(cid, None)
+            if entry is None:
+                return
+            entry["outcome"] = outcome
+            entry["resolved_at"] = self._clock()
+            if error is not None:
+                entry["error_type"] = error_fingerprint(error)
+            if task is not None:
+                entry["task"] = str(task.name)
+            entry["budget_state"] = self._diagnosis_budget_state(cid)
+
+    def _last_diagnosis_error_type(self, cycle: int) -> str | None:
+        """Return the error type of ``cycle``'s most recent diagnosed failure.
+
+        Called with ``_lock`` held. Feeds the ``EXHAUSTED`` record so the cycle
+        report names the recurring failure that used up the budget (REQ-04).
+        """
+
+        history = self._diagnosis_history.get(int(cycle))
+        if not history:
+            return None
+        for entry in reversed(history):
+            if entry.get("error_type"):
+                return str(entry["error_type"])
+        return None
+
+    def _diagnosis_report(self, cycle: int) -> list[dict[str, Any]]:
+        """Build ``cycle``'s diagnosis section of the cycle report (REQ-03/REQ-04).
+
+        Called with ``_lock`` held while the ``CycleResult`` is assembled. The
+        cycle's history is snapshotted and then consumed, so nothing accumulates
+        across cycles and a non-SUCCESS cycle cannot leak entries into the next
+        report. A window still open when the cycle ends (wind-down, concurrent
+        retire, cancel) is closed as ``INTERRUPTED`` here, and the
+        ``EXHAUSTED`` record is appended last when the budget ran out.
+        """
+
+        cid = int(cycle)
+        with self._lock:
+            # Close the open window *before* snapshotting: it is the same dict
+            # object the history holds, so the ``INTERRUPTED`` stamp lands in
+            # the report entry instead of duplicating it.
+            pending = self._diagnosis_pending.pop(cid, None)
+            if pending is not None:
+                pending["outcome"] = "INTERRUPTED"
+                pending["resolved_at"] = self._clock()
+                pending["budget_state"] = self._diagnosis_budget_state(cid)
+            history = self._diagnosis_history.pop(cid, None)
+            issues = [] if history is None else [dict(entry) for entry in history]
+            exhausted = self._diagnosis_exhausted.pop(cid, None)
+            if exhausted is not None:
+                issues.append(dict(exhausted))
+            # The cycle's allowance is released with its report, so a non-SUCCESS
+            # cycle cannot pre-spend the next cycle's budget and no per-cycle
+            # counter survives the report.
+            self._diagnosis_attempts.pop(cid, None)
+            return issues
+
+    def _reset_diagnosis_budget(
+        self, cycle: int | None = None, *, attempts_before: int | None = None
+    ) -> dict[str, Any]:
+        """Restore the full per-cycle diagnosis budget (REQ-05).
+
+        Called when ``cycle`` ends with ``OUTCOME_SUCCESS``: the limit is
+        re-read from the config, so the next cycle starts from the configured
+        maximum. Only that cycle's slice is dropped — other cycles keep their
+        open window and report data. The reset is documented in the cycle
+        summary through the ``BUDGET_RESET`` entry which the caller appends to
+        ``CycleResult.issues_detected`` and which this method returns (the
+        ``events`` log stays untouched, so a healthy cycle's event stream is
+        unchanged).
+        """
+
+        cid = None if cycle is None else int(cycle)
+        with self._lock:
+            if cid is None:
+                if attempts_before is None:
+                    attempts_before = sum(self._diagnosis_attempts.values())
+                self._diagnosis_attempts.clear()
+                self._diagnosis_history.clear()
+                self._diagnosis_pending.clear()
+                self._diagnosis_exhausted.clear()
+            else:
+                counted = int(self._diagnosis_attempts.pop(cid, 0))
+                if attempts_before is None:
+                    attempts_before = counted
+                self._diagnosis_history.pop(cid, None)
+                self._diagnosis_pending.pop(cid, None)
+                self._diagnosis_exhausted.pop(cid, None)
+            self._diagnosis_budget = int(self._config.max_diagnosis_budget)
+            summary: dict[str, Any] = {
+                "kind": "BUDGET_RESET",
+                "cycle": cid,
+                "timestamp": self._clock(),
+                "outcome": OUTCOME_SUCCESS,
+                "attempts_before_reset": attempts_before,
+                "budget_state": self._diagnosis_budget_state(cid),
+            }
+            self._last_diagnosis_reset = summary
+            return dict(summary)
 
     def _finish_cycle(self, cycle: int) -> list[str]:
         """Validate and persist the memory records at the end of a cycle.
@@ -3025,6 +3690,14 @@ class MaintainerEngine:
         # built *after* ``self._lock`` is released - the lease lock is never
         # acquired while the engine lock is held.
         view["leases"] = self.lease_snapshot()
+        # UTILTOOLS-130 REQ-02: the pool's own read-only view rides along, so
+        # a cycle report shows how many of the ``max_concurrent_cycles`` slots
+        # are in use, who is still waiting, and whether a preemption or a
+        # timed-out drain happened. Read after ``_lock`` is released - the
+        # scheduler has its own condition and the order is scheduler -> gate,
+        # never the engine lock.
+        scheduler = self._scheduler
+        view["scheduler"] = None if scheduler is None else scheduler.state()
         return view
 
     def fingerprint_state(self, now: float | None = None) -> dict[str, Any]:
