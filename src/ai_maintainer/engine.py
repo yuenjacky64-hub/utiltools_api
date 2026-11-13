@@ -2127,8 +2127,12 @@ class MaintainerEngine:
         # UTILTOOLS-130 REQ-02: cycles compete for slots in a bounded pool
         # instead of running one after another in this thread. The pool is
         # rebuilt for every ``run_forever()`` (no persistent scheduler state)
-        # and bounded by ``max_concurrent_cycles``, which is also the gate's
-        # limit - so the pool can never widen admission (INV-SCHED-1).
+        # and bounded by ``cycle_pool_size`` and by the gate's
+        # ``max_concurrent_cycles``, whichever is smaller - so the pool can
+        # never widen admission (INV-SCHED-1). The default of one worker keeps
+        # the historical contract: a stop requested by a cycle still ends the
+        # run after *that* cycle (the producer offers the next body only once
+        # the pool is empty).
         scheduler = self._build_scheduler()
         self._scheduler = scheduler
         try:
@@ -2139,8 +2143,12 @@ class MaintainerEngine:
                 # default of 1 this submits exactly one body, which reproduces
                 # the historical sequential loop.
                 submitted = 0
+                # The batch width is the pool's worker count, *not* the gate's
+                # limit: the producer never offers more bodies than the pool can
+                # carry, so a stop published by the first body is observed
+                # before a sibling is spawned (``test_second_run_forever_...``).
                 while (
-                    submitted < scheduler.limit
+                    submitted < scheduler.max_workers
                     and not self.should_stop()
                     and scheduler.state()["idle_workers"] > 0
                 ):
@@ -2229,9 +2237,13 @@ class MaintainerEngine:
         published from a signal handler abandons every queued work.
         """
 
+        admission_limit = max(
+            1, int(getattr(self._gate, "limit", self._config.max_concurrent_cycles))
+        )
+        workers = min(admission_limit, max(1, int(self._config.cycle_pool_size)))
         return CycleScheduler(
             self._gate,
-            int(self._config.max_concurrent_cycles),
+            workers,
             drain_timeout_sec=float(self._config.scheduler_drain_timeout_sec),
             clock=self._clock,
             should_stop=self.should_stop,
@@ -2290,19 +2302,20 @@ class MaintainerEngine:
     def _await_pool_idle(self, scheduler: CycleScheduler) -> bool:
         """Wait until the pool has no active and no queued work (REQ-02).
 
-        Returns ``True`` when a stop cut the wait short. Polls the pool's
-        read-only view through the engine's ``_sleep`` seam, so a fake clock in
-        tests stays in charge of the pacing and ``_pause`` is still the only
-        thing that advances it.
+        Returns ``True`` when a stop cut the wait short. The wait happens on
+        the pool's own condition (``scheduler.wait_idle``), *not* through the
+        engine's ``_sleep`` seam: pacing belongs to ``_pause`` alone, so a
+        fake-clock test counts only real pauses and a stop-triggering sleeper
+        cannot be tripped by scheduler polling.
         """
 
-        while True:
-            if self.should_stop():
-                return True
-            view = scheduler.state()
-            if not view["active"] and not view["queued"]:
+        while not self.should_stop():
+            if scheduler.wait_idle(
+                timeout_sec=SCHEDULER_IDLE_POLL_INTERVAL_SEC,
+                should_stop=self.should_stop,
+            ):
                 return False
-            self._sleep(SCHEDULER_IDLE_POLL_INTERVAL_SEC)
+        return True
 
     def _drain_scheduler(self, scheduler: CycleScheduler) -> bool:
         """Finalize in-progress cycles and retire the pool (REQ-05).
@@ -3229,6 +3242,7 @@ class MaintainerEngine:
         # INV-LEASE-2: ``lease_snapshot()`` takes ``_lease_lock``, so it is
         # built *after* ``self._lock`` is released - the lease lock is never
         # acquired while the engine lock is held.
+        view["leases"] = self.lease_snapshot()
         # UTILTOOLS-130 REQ-02: the pool's own read-only view rides along, so
         # a cycle report shows how many of the ``max_concurrent_cycles`` slots
         # are in use, who is still waiting, and whether a preemption or a

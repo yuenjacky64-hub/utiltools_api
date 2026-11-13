@@ -370,6 +370,41 @@ class CycleScheduler:
                 work.stop_event.set()
             self._condition.notify_all()
 
+    def wait_idle(
+        self,
+        timeout_sec: float | None = None,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Block until nothing is queued and nothing is running (REQ-02).
+
+        The producer paces itself on *completions* through this call instead
+        of a sleep loop, so the engine's pacing seam stays reserved for
+        ``_pause()`` - a fake-clock test still counts only real pauses.
+        Returns ``True`` when the pool is idle and ``False`` on timeout or on
+        a stop request (whichever came first).
+        """
+
+        deadline = None if timeout_sec is None else time.monotonic() + max(
+            0.0, float(timeout_sec)
+        )
+        with self._condition:
+            while True:
+                if not self._queue and not self._active:
+                    return True
+                if self._stop_requested():
+                    return False
+                if should_stop is not None and should_stop():
+                    return False
+                if deadline is None:
+                    wait_for = self._poll_interval
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        return False
+                    wait_for = min(remaining, self._poll_interval)
+                self._condition.wait(wait_for)
+
     def state(self) -> dict[str, Any]:
         """Read-only scheduler view for :meth:`MaintainerEngine.snapshot`."""
 
