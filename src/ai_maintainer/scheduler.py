@@ -331,7 +331,9 @@ class CycleScheduler:
 
         timeout = self._drain_timeout_sec if timeout_sec is None else float(timeout_sec)
         timeout = max(0.0, timeout)
-        deadline = time.monotonic() + timeout
+        # Deadline on the injected clock seam (REQ-05): a fake clock can bound
+        # the drain wait just like it bounds the engine's own waits.
+        deadline = self._clock() + timeout
         with self._condition:
             self._closed = True
             abandoned = list(self._queue)
@@ -344,7 +346,7 @@ class CycleScheduler:
                 work.stop_event.set()
             self._condition.notify_all()
             while self._active:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - self._clock()
                 if remaining <= 0.0:
                     self._timed_out = True
                     stuck = sorted(
@@ -385,8 +387,10 @@ class CycleScheduler:
         a stop request (whichever came first).
         """
 
-        deadline = None if timeout_sec is None else time.monotonic() + max(
-            0.0, float(timeout_sec)
+        deadline = (
+            None
+            if timeout_sec is None
+            else self._clock() + max(0.0, float(timeout_sec))
         )
         with self._condition:
             while True:
@@ -399,7 +403,7 @@ class CycleScheduler:
                 if deadline is None:
                     wait_for = self._poll_interval
                 else:
-                    remaining = deadline - time.monotonic()
+                    remaining = deadline - self._clock()
                     if remaining <= 0.0:
                         return False
                     wait_for = min(remaining, self._poll_interval)

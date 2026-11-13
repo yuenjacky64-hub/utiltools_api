@@ -62,7 +62,7 @@ DEFAULT_SCHEDULER_DRAIN_TIMEOUT_SEC = 30.0
 # stop requested *by* a cycle still ends the run after that cycle. Raising it
 # lets a slow cycle overlap the next ones; the gate's ``max_concurrent_cycles``
 # still caps the number of simultaneously *running* bodies (INV-SCHED-1).
-DEFAULT_CYCLE_POOL_SIZE = 1
+DEFAULT_CYCLE_POOL_SIZE = 2
 
 # Wall-clock budget for one OpenCode runner invocation (UTILTOOLS-90 REQ-01).
 # Ten minutes by default; ``validate()`` accepts the inclusive range

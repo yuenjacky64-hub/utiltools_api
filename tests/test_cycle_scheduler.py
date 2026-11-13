@@ -24,12 +24,19 @@ import time
 import pytest
 
 from ai_maintainer.concurrency import CycleAdmissionGate
+from ai_maintainer.config import MaintainerConfig
+from ai_maintainer.engine import MaintainerEngine
 from ai_maintainer.scheduler import (
     SCHEDULER_POLL_INTERVAL_SEC,
     CycleScheduler,
     CycleWork,
 )
-from ai_maintainer.tasks.curriculum import Difficulty
+from ai_maintainer.tasks.curriculum import (
+    Difficulty,
+    TaskCurriculum,
+    TaskSpec,
+    TaskState,
+)
 
 
 # --------------------------------------------------------------------- helpers
@@ -473,3 +480,205 @@ def test_validates_worker_count():
         CycleScheduler(gate, 0)
     with pytest.raises(ValueError):
         CycleScheduler(gate, True)
+
+
+# ------------------------------------------------- engine-level integration
+#
+# Review v2 MUST_FIX: every test above drives ``CycleScheduler``/the gate
+# directly, so DOD-01 (concurrent cycles observable at engine level) and
+# DOD-03 (preemption lowers the wait of a high-priority cycle) were only
+# asserted against the component, never against ``MaintainerEngine``. These two
+# tests run ``MaintainerEngine.run_forever`` with ``cycle_pool_size`` set and
+# observe the pool through the engine's own snapshot.
+
+
+class _PoolProbeEngine(MaintainerEngine):
+    """Engine whose cycle body is a controlled, observable real-time block.
+
+    ``run_cycle`` is replaced so the test can watch the pool: the body records
+    the number of simultaneously running bodies, the worker threads it landed
+    on, and whether the scheduler asked it to yield its slot (REQ-04).
+    ``_admission_difficulty`` can be scripted, so an incoming cycle with a
+    chosen priority can be produced deterministically.
+    """
+
+    def __init__(
+        self,
+        *args,
+        hold_sec: float = 1.0,
+        difficulties: list[Difficulty] | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.hold_sec = float(hold_sec)
+        self.scripted = list(difficulties or [])
+        self._probe_lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+        self.entered: list[str] = []
+        self.durations: list[float] = []
+        self.preempt_seen = False
+        self._script_index = 0
+
+    def _admission_difficulty(self) -> Difficulty:
+        with self._probe_lock:
+            if self._script_index < len(self.scripted):
+                level = self.scripted[self._script_index]
+                self._script_index += 1
+                return level
+        return super()._admission_difficulty()
+
+    def run_cycle(self) -> None:  # type: ignore[override]
+        started = time.monotonic()
+        with self._probe_lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.entered.append(threading.current_thread().name)
+        preempted = False
+        try:
+            deadline = started + self.hold_sec
+            while time.monotonic() < deadline:
+                if self._scheduler_preempted():
+                    preempted = True
+                    break
+                if self.should_stop():
+                    break
+                time.sleep(0.01)
+        finally:
+            with self._probe_lock:
+                self.active -= 1
+                self.durations.append(time.monotonic() - started)
+                if preempted:
+                    self.preempt_seen = True
+        return None
+
+
+def make_pool_engine(
+    tmp_path,
+    *,
+    cycle_pool_size: int,
+    max_concurrent_cycles: int,
+    hold_sec: float,
+    difficulties: list[Difficulty] | None = None,
+) -> _PoolProbeEngine:
+    config = MaintainerConfig(
+        max_steps_per_cycle=1,
+        max_concurrent_cycles=max_concurrent_cycles,
+        cycle_pool_size=cycle_pool_size,
+        scheduler_drain_timeout_sec=5.0,
+        max_shutdown_wait_sec=5.0,
+    )
+    curriculum = TaskCurriculum(
+        specs=[
+            TaskSpec(
+                name="task-a",
+                difficulty=Difficulty.EASY,
+                steps_required=4,
+                progress=0,
+                last_proposed_cycle=0,
+                state=TaskState.RUNNING,
+            )
+        ],
+        config=config,
+        clock=time.monotonic,
+    )
+    return _PoolProbeEngine(
+        curriculum,
+        config=config,
+        hold_sec=hold_sec,
+        difficulties=difficulties,
+        state_root=tmp_path / "state",
+        shutdown_audit_path=tmp_path / "data" / "maintainer_shutdown.log",
+    )
+
+
+def run_engine_in_thread(engine, interval_sec: float = 0.0):
+    """Start ``run_forever`` on a background thread (no signal handlers)."""
+
+    holder: dict[str, object] = {}
+
+    def target() -> None:
+        holder["report"] = engine.run_forever(interval_sec, install_signals=False)
+
+    thread = threading.Thread(target=target, name="engine-run", daemon=True)
+    thread.start()
+    return thread, holder
+
+
+def test_engine_runs_cycles_concurrently_up_to_the_pool_limit(tmp_path):
+    """DOD-01: two cycles really are in flight at once under ``run_forever``.
+
+    ``cycle_pool_size=2`` / ``max_concurrent_cycles=2``: the engine overlaps a
+    second cycle in a second worker thread, the observed concurrency never
+    exceeds the configured bound, and the pool is visible in the engine's own
+    report.
+    """
+
+    engine = make_pool_engine(
+        tmp_path,
+        cycle_pool_size=2,
+        max_concurrent_cycles=2,
+        hold_sec=2.0,
+        difficulties=[Difficulty.EASY],
+    )
+    thread, holder = run_engine_in_thread(engine)
+    try:
+        assert wait_until(lambda: engine.max_active >= 2, timeout=10.0), (
+            engine.entered
+        )
+        view = engine.snapshot()
+        pool = view["scheduler"]
+        assert pool is not None, view
+        assert pool["limit"] == 2
+        assert pool["max_workers"] == 2
+        assert pool["active"] == 2, pool
+        assert engine.max_active == 2, engine.entered
+    finally:
+        engine.request_stop("test-overlap")
+        thread.join(15.0)
+    assert not thread.is_alive()
+    assert engine.max_active == 2, engine.entered
+    assert len(set(engine.entered)) == 2, engine.entered
+    events = [e for e in engine.events if e["event"] == "SCHEDULER_DRAINED"]
+    assert events, engine.events
+    assert events[-1]["clean"] is True, events[-1]
+
+
+def test_engine_preempts_low_priority_cycle_for_higher_priority_slot(tmp_path):
+    """DOD-03/REQ-04: the incoming harder cycle takes a running easier one's slot.
+
+    ``cycle_pool_size=1`` so the pool is genuinely saturated. The first cycle
+    is admitted as EASY and blocks far longer than the overlap grace; the
+    producer re-peeks, sees HARD, and preempts the running EASY body, which
+    yields its slot long before its natural end.
+    """
+
+    engine = make_pool_engine(
+        tmp_path,
+        cycle_pool_size=1,
+        max_concurrent_cycles=1,
+        hold_sec=5.0,
+        difficulties=[Difficulty.EASY, Difficulty.HARD],
+    )
+    thread, holder = run_engine_in_thread(engine)
+    try:
+        assert wait_until(
+            lambda: engine.preempt_seen and len(engine.entered) >= 2, timeout=15.0
+        ), (engine.entered, engine.durations, engine.preempt_seen)
+        pool = engine.snapshot()["scheduler"]
+        assert pool is not None
+        assert pool["limit"] == 1
+        assert pool["max_workers"] == 1
+        assert pool["preemptions"] >= 1, pool
+        assert pool["last_preemption"]["difficulty"] == "EASY", pool
+        assert pool["last_preemption"]["incoming_difficulty"] == "HARD", pool
+        assert engine.max_active == 1, engine.entered
+    finally:
+        engine.request_stop("test-preempt")
+        thread.join(15.0)
+    assert not thread.is_alive()
+    # The preempted body returned well inside its 5 s hold: the slot was handed
+    # over instead of being waited for.
+    assert engine.durations[0] < 4.0, engine.durations
+    events = [e for e in engine.events if e["event"] == "SCHEDULER_DRAINED"]
+    assert events and events[-1]["preemptions"] >= 1, events

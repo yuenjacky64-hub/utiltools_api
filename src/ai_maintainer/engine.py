@@ -42,7 +42,7 @@ from ai_maintainer.concurrency import (
     write_heartbeat,
 )
 from ai_maintainer.config import MaintainerConfig
-from ai_maintainer.scheduler import CycleScheduler
+from ai_maintainer.scheduler import CycleScheduler, CycleWork
 from ai_maintainer.memory.store import atomic_write_text
 from ai_maintainer.util.fs import (
     LOCK_PROBE_HELD,
@@ -132,11 +132,22 @@ __all__ = [
 ]
 
 EVENT_LOG_MAXLEN = 100
-# UTILTOOLS-130 REQ-02: how long the producer's "wait for the pool to go
-# idle" loop sleeps between reads of the scheduler's view. Small in absolute
-# terms, and it goes through the injected ``_sleep`` seam, so a fake clock
-# stays in charge of the pacing in tests.
+# UTILTOOLS-130 REQ-02: how long a producer park lasts between two reads of the
+# scheduler's view. Small in absolute terms on purpose. The waits themselves
+# live in ``scheduler.wait_idle()`` / ``_await_overlap_grace()`` and park on
+# real time, *not* on the engine's ``_sleep`` seam - so a fake clock observes
+# ``_pause()`` and nothing else.
 SCHEDULER_IDLE_POLL_INTERVAL_SEC = 0.02
+
+# UTILTOOLS-130 REQ-02: how long the producer waits on the cycle it already
+# handed to the pool before offering the next one to a sibling slot. A cycle
+# that returns inside this window keeps the loop serial - the historical
+# contract, in which a stop published by a cycle is observed before any other
+# body starts (``test_second_run_forever_leaves_no_markers``). A cycle that
+# overruns it is exactly the slow cycle this pool exists for: the loop stops
+# waiting for it and the next cycle runs concurrently in the pool's other
+# worker.
+SCHEDULER_OVERLAP_GRACE_SEC = 0.25
 
 DEFAULT_CYCLE_INTERVAL_SEC = 1.0
 DEFAULT_STOP_REASON = "stop_requested"
@@ -2129,54 +2140,39 @@ class MaintainerEngine:
         # rebuilt for every ``run_forever()`` (no persistent scheduler state)
         # and bounded by ``cycle_pool_size`` and by the gate's
         # ``max_concurrent_cycles``, whichever is smaller - so the pool can
-        # never widen admission (INV-SCHED-1). The default of one worker keeps
-        # the historical contract: a stop requested by a cycle still ends the
-        # run after *that* cycle (the producer offers the next body only once
-        # the pool is empty).
+        # never widen admission (INV-SCHED-1). The default of two workers
+        # (``DEFAULT_CYCLE_POOL_SIZE``) is the Plan §7 behaviour: a second body
+        # is only offered once the first outlives
+        # ``SCHEDULER_OVERLAP_GRACE_SEC``, so a cycle that returns quickly - or
+        # that publishes a stop - still keeps the run serial.
         scheduler = self._build_scheduler()
         self._scheduler = scheduler
+        # UTILTOOLS-130 review v2 (instance-lock regression): a cycle body that
+        # raises must end the loop the way the sequential loop did, not be
+        # retried forever by the next iteration of a zero-interval loop.
+        self._pool_exc: BaseException | None = None
         try:
             while True:
                 if self.should_stop():
                     break
-                # Fill every free slot: with ``max_concurrent_cycles`` at its
-                # default of 1 this submits exactly one body, which reproduces
-                # the historical sequential loop.
-                submitted = 0
-                # The batch width is the pool's worker count, *not* the gate's
-                # limit: the producer never offers more bodies than the pool can
-                # carry, so a stop published by the first body is observed
-                # before a sibling is spawned (``test_second_run_forever_...``).
-                while (
-                    submitted < scheduler.max_workers
-                    and not self.should_stop()
-                    and scheduler.state()["idle_workers"] > 0
-                ):
-                    with self._lock:
-                        if self._state is EngineState.STOPPED:
-                            self._state = EngineState.IDLE
-                        self._state = EngineState.RUNNING
-                    difficulty = self._admission_difficulty()
-                    # REQ-04: a saturated pool can hand its lowest-priority
-                    # slot to the cycle about to be admitted.
-                    self._maybe_preempt(scheduler, difficulty)
-                    work = scheduler.submit(
-                        None, difficulty, self._scheduled_cycle_body
-                    )
-                    if work is None:
-                        break
-                    submitted += 1
+                # REQ-02/REQ-04: offer this iteration's cycles. ``inflight`` is
+                # the producer's view of the works it handed to the pool; it is
+                # rebuilt every iteration, after the pool drains.
+                inflight: list[CycleWork] = []
+                self._offer_cycles(scheduler, inflight)
                 self._write_runtime_markers()
                 if self.should_stop():
                     break
                 # REQ-04: reclaim an expired lease left by a stalled cycle, so
                 # the next acquire is not parked behind a dead holder.
                 self._reap_stale_leases()
-                # Pace the producer on *completions*: the next batch is offered
-                # only once the pool is empty again, so a zero interval cannot
-                # outrun the bodies and ``_pause()`` still observes the idle
-                # state between batches.
+                # Pace the producer on *completions*: the next offers wait until
+                # the pool is empty again, so a zero interval cannot outrun the
+                # bodies and ``_pause()`` still observes the idle state between
+                # iterations.
                 self._await_pool_idle(scheduler)
+                if self._pool_exc is not None:
+                    break
                 with self._lock:
                     if self._active_cycles == 0 and self._state is EngineState.RUNNING:
                         self._state = EngineState.IDLE
@@ -2211,6 +2207,8 @@ class MaintainerEngine:
                 self._log_stop_reason()
                 try:
                     report = self.graceful_shutdown()
+                    if self._pool_exc is not None:
+                        raise self._pool_exc
                     return report
                 finally:
                     # REQ-03 / INV-COOP-4: the teardown runs *after* the
@@ -2249,6 +2247,122 @@ class MaintainerEngine:
             should_stop=self.should_stop,
         )
 
+    def _offer_cycles(
+        self, scheduler: CycleScheduler, inflight: list[CycleWork]
+    ) -> None:
+        """Offer this iteration's cycles to the pool (REQ-02 / REQ-04).
+
+        The first cycle of an iteration always goes out: with
+        ``cycle_pool_size == 1`` that is the whole iteration and the loop is
+        the historical sequential one. A *second* cycle is only offered once the
+        first is known to be slow (it is still running after
+        ``SCHEDULER_OVERLAP_GRACE_SEC``) and a slot is genuinely free, which is
+        what makes ``max_concurrent_cycles`` observable at engine level:
+
+        * overlap - two cycles are in the pool at the same time, in two worker
+          threads (DOD-01);
+        * preemption - the loop is *not* parked on the first cycle when it asks
+          for a second slot, so a saturated pool really does face an incoming
+          cycle and :meth:`_maybe_preempt` can hand over its lowest-priority
+          slot (REQ-04).
+
+        A cycle that returns inside the grace window keeps the loop serial, so
+        a stop published by it is observed before a sibling body starts
+        (``test_second_run_forever_leaves_no_markers``).
+        """
+
+        difficulty = self._admission_difficulty()
+        if self.should_stop():
+            return
+        first = self._admit_cycle(scheduler, difficulty)
+        if first is not None:
+            inflight.append(first)
+        while not self.should_stop():
+            if not self._await_overlap_grace(scheduler, inflight):
+                return
+            if self.should_stop():
+                return
+            # REQ-03: re-peek before every further offer. The cycle that is now
+            # running has already claimed its task, so this peek is the weight
+            # of the *next* work - which is exactly the weight a preemption
+            # (REQ-04) has to justify itself against.
+            difficulty = self._admission_difficulty()
+            # REQ-04: the pool is full and the producer still wants a slot, so
+            # it offers the lowest-priority running cycle's slot to the incoming
+            # one (no-op unless the incoming cycle outranks it).
+            victim = self._maybe_preempt(scheduler, difficulty)
+            if victim is not None and not self._await_free_slot(scheduler):
+                return
+            if scheduler.state()["idle_workers"] <= 0:
+                return
+            work = self._admit_cycle(scheduler, difficulty)
+            if work is None:
+                return
+            inflight.append(work)
+
+    def _await_free_slot(self, scheduler: CycleScheduler) -> bool:
+        """Wait briefly for a preempted cycle to hand its slot back (REQ-04).
+
+        A preemption only *signals* the victim; the worker releases the gate
+        slot when its step loop reaches a break point. The producer therefore
+        waits one grace window for the slot instead of giving up on the first
+        read. Returns ``True`` when a slot is free.
+        """
+
+        deadline = time.monotonic() + SCHEDULER_OVERLAP_GRACE_SEC
+        while not self.should_stop():
+            if scheduler.state()["idle_workers"] > 0:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self._stop.wait(min(remaining, SCHEDULER_IDLE_POLL_INTERVAL_SEC))
+        return False
+
+    def _admit_cycle(
+        self, scheduler: CycleScheduler, difficulty: Difficulty
+    ) -> CycleWork | None:
+        """Submit one cycle body to the pool, or ``None`` if the pool refused."""
+
+        with self._lock:
+            if self._state is EngineState.STOPPED:
+                self._state = EngineState.IDLE
+            self._state = EngineState.RUNNING
+        work = scheduler.submit(None, difficulty, self._scheduled_cycle_body)
+        if work is None:
+            with self._lock:
+                if self._active_cycles == 0 and self._state is EngineState.RUNNING:
+                    self._state = EngineState.IDLE
+        return work
+
+    def _await_overlap_grace(
+        self, scheduler: CycleScheduler, inflight: list[CycleWork]
+    ) -> bool:
+        """Wait for the newest in-flight cycle to finish, up to the grace.
+
+        Returns ``True`` when the cycle is still running (the caller may then
+        overlap), ``False`` when every submitted cycle returned inside the grace
+        window (the caller must drain before offering more) or when a stop was
+        requested.
+        """
+
+        if not inflight:
+            return False
+        deadline = time.monotonic() + SCHEDULER_OVERLAP_GRACE_SEC
+        while True:
+            with self._lock:
+                finished = inflight[-1].finished_at is not None
+            if finished:
+                return False
+            if self.should_stop():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            # REQ-05: park on the stop flag as well as on the work, so a stop
+            # published from another thread is honoured inside the grace window.
+            self._stop.wait(min(remaining, SCHEDULER_IDLE_POLL_INTERVAL_SEC))
+
     def _scheduled_cycle_body(self) -> None:
         """One engine cycle as the pool's worker runs it (REQ-02).
 
@@ -2262,6 +2376,9 @@ class MaintainerEngine:
 
         try:
             self.run_cycle()
+        except BaseException as exc:  # noqa: BLE001 - re-raised by the loop
+            self._pool_exc = exc
+            raise
         finally:
             with self._lock:
                 if self._active_cycles == 0:
