@@ -17,6 +17,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
@@ -69,6 +71,50 @@ class CryptoServiceTest {
         assertThat(response.digest()).isNotBlank();
         assertThat(response.isHmac()).isTrue();
         assertThat(response.algorithm()).isEqualTo("HmacSHA256");
+    }
+
+    @Test
+    @DisplayName("Should generate the NIST SHA-384 vector for 'abc'")
+    void hashSha384KnownVector() {
+        HashResponse response = cryptoService.hash(new HashRequest("SHA-384", "abc", null));
+
+        assertThat(response.algorithm()).isEqualTo("SHA-384");
+        assertThat(response.isHmac()).isFalse();
+        assertThat(response.digest())
+                .isEqualTo("cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed"
+                        + "8086072ba1e7cc2358baeca134c825a7");
+    }
+
+    @Test
+    @DisplayName("Should treat SHA384 and SHA-384 as the same algorithm and use HmacSHA384 for HMAC")
+    void sha384AliasAndHmac() throws Exception {
+        HashResponse canonical = cryptoService.hash(new HashRequest("SHA-384", "abc", null));
+        HashResponse aliased = cryptoService.hash(new HashRequest("SHA384", "abc", null));
+
+        assertThat(aliased.algorithm()).isEqualTo("SHA-384");
+        assertThat(aliased.isHmac()).isFalse();
+        assertThat(aliased.digest()).isEqualTo(canonical.digest());
+
+        HashResponse hmac = cryptoService.hash(new HashRequest("SHA384", "abc", "secret-key"));
+        assertThat(hmac.algorithm()).isEqualTo("HmacSHA384");
+        assertThat(hmac.isHmac()).isTrue();
+
+        Mac reference = Mac.getInstance("HmacSHA384");
+        reference.init(new SecretKeySpec("secret-key".getBytes(StandardCharsets.UTF_8), "HmacSHA384"));
+        String expected = java.util.HexFormat.of().formatHex(reference.doFinal("abc".getBytes(StandardCharsets.UTF_8)));
+        assertThat(hmac.digest()).isEqualTo(expected);
+    }
+
+    @Test
+    @DisplayName("Should reject an unsupported hash algorithm")
+    void rejectUnsupportedAlgorithm() {
+        assertThatThrownBy(() -> cryptoService.hash(new HashRequest("SHA-512X", "abc", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unsupported hash algorithm: SHA-512X")
+                .hasMessageContaining("SHA-384");
+        assertThatThrownBy(() -> cryptoService.hash(new HashRequest("SHA3-256", "abc", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unsupported hash algorithm");
     }
 
     @Test

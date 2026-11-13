@@ -46,7 +46,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | Tool | Base Path | Core Capabilities |
 | :--- | :--- | :--- |
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, interval overlap detection, cron next-run planning, current global time |
-| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 / UUID v8 generation (`version=V4|V7|V8`) |
+| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-256, SHA-384, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 / UUID v8 generation (`version=V4|V7|V8`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit, and NDJSON / JSON Lines conversion (array <-> line-delimited records) |
 | **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`, `REVERSE`), Unicode normalization (`NFC`, `NFD`, `NFKC`, `NFKD`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
 
@@ -150,7 +150,7 @@ utiltools_api/
 | `GET` | `/api/v1/utils/datetime/current` | Fetch current time in UTC and target timezone |
 | `GET` | `/api/v1/utils/datetime/timezones` | List IANA timezones with current UTC offsets, optionally filtered by `prefix` |
 | `GET` | `/api/v1/utils/datetime/week-date` | Resolve an ISO week (`year`, `week`, optional `day` = MONDAY..SUNDAY case-insensitive or 1..7, default MONDAY) back to its calendar date via `WeekFields.ISO`; rejects weeks that do not exist in that ISO week-year (e.g. 2021-W53). Read-only: not journalled |
-| `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-256, SHA-512, MD5) or HMAC |
+| `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-256, SHA-384, SHA-512, MD5) or HMAC |
 | `POST` | `/api/v1/utils/crypto/base64` | Encode or decode standard / URL-safe Base64 strings |
 | `POST` | `/api/v1/utils/crypto/url` | Percent-encode or decode a URL component, path segment list or form value (`COMPONENT`, `PATH`, `FORM`) |
 | `POST` | `/api/v1/utils/crypto/jwt/decode` | Decode a compact JWT into `algorithm`, `type`, `header` and `payload` without verifying the signature (`verified` is always `false`) |
@@ -690,7 +690,7 @@ curl -X POST http://localhost:8080/api/v1/utils/datetime/cron/next \
 ### 2. Cryptography & Encoding Utility
 
 #### A. Standard Hash Digest (SHA-256)
-Supported algorithms: `SHA-256`, `SHA-512`, `MD5`, `SHA-1` (case-insensitive).
+Supported algorithms: `SHA-256`, `SHA-384`, `SHA-512`, `MD5`, `SHA-1` (case-insensitive).
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/utils/crypto/hash \
