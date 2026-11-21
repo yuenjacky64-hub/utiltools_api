@@ -364,6 +364,52 @@ public class ContactSubmissionService {
     }
 
     /**
+     * Read-only aggregate of the dead-letter/redrive budgets (REQ-03), the contact-side sibling of
+     * the audit journal's quarantine status.
+     *
+     * <p>One {@code registryLock} section reads the whole registry, so the counts are one registry
+     * instant: {@code deadLetteredCount} counts the {@link ContactStatus#DEAD_LETTERED} rows,
+     * {@code redriveExhaustedCount} the subset whose redrive budget is spent
+     * ({@code redrives == maxRedrives} — {@code redrive} refuses at {@code redrives >= maxRedrives},
+     * so the equality is complete), {@code pendingCount} the {@code QUEUED} and {@code DISPATCHING}
+     * rows, and {@code pendingDispatchGate} the {@code workerCount + queueCapacity} admission gate
+     * they are bounded by.</p>
+     *
+     * <p>Pure read (INV-QS-C3): nothing is dispatched or enqueued, {@code pendingAttempts} is not
+     * touched, no row or lease field is written, the clock is not read for eviction and no
+     * {@code CONTACT_SUBMIT} journal entry is opened, so polling it cannot advance a submission.
+     * Counts only — no name, email, message or id appears in the response.</p>
+     *
+     * <p>{@code registryLock} alone is enough here (unlike the jobs projection, which also takes the
+     * per-row monitor): every writer of a submission row — admit, dispatch, complete, fail, redrive —
+     * mutates its row only inside {@code synchronized (registryLock)}, so a single lock section sees a
+     * consistent point-in-time view and no row monitor has to be acquired.</p>
+     *
+     * @return one point-in-time aggregate of the configured redrive budget and the current counts
+     */
+    public ContactQuarantineStatusResponse quarantineStatus() {
+        synchronized (registryLock) {
+            int deadLettered = 0;
+            int redriveExhausted = 0;
+            int pending = 0;
+            for (MutableSubmission submission : submissions.values()) {
+                if (submission.status == ContactStatus.DEAD_LETTERED) {
+                    deadLettered++;
+                    if (submission.redrives == maxRedrives) {
+                        redriveExhausted++;
+                    }
+                }
+                if (submission.status == ContactStatus.QUEUED
+                        || submission.status == ContactStatus.DISPATCHING) {
+                    pending++;
+                }
+            }
+            return new ContactQuarantineStatusResponse(maxRedrives, deadLettered, redriveExhausted,
+                    pending, workerCount + queueCapacity, submissions.size());
+        }
+    }
+
+    /**
      * Bounded retry of a failed submission (REQ-03 / REQ-07): legal only from {@code FAILED} with
      * room in the attempt budget; re-queues as attempt+1 and stamps the lease fields back to
      * {@code null} until the next admission. Anything else (or a retry with no room left) throws

@@ -164,4 +164,23 @@ public class ContactController {
             @PathVariable("id") String id) {
         return ResponseEntity.ok(ApiResponse.success(service.cancel(id)));
     }
+
+    @GetMapping("/quarantine-status")
+    @Operation(
+            summary = "Contact dead-letter quarantine status",
+            description = "Read-only operator aggregate of the contact dispatch workflow: the configured "
+                    + "utiltools.contact.max-redrives budget, the DEAD_LETTERED count, how many of those "
+                    + "rows have spent that redrive budget, how many rows are QUEUED or DISPATCHING, and "
+                    + "the pending dispatch gate (workers + queue capacity). An empty registry answers "
+                    + "200 with zero counts (never 404). Pure read: no row, pendingAttempts counter or "
+                    + "CONTACT_SUBMIT journal entry is created and nothing is dispatched; counts only, "
+                    + "no name, email or message is returned.",
+            responses = {
+                    @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "200",
+                            description = "Aggregate counts of the dead-letter quarantine",
+                            content = @Content(schema = @Schema(implementation = ApiResponse.class)))
+            })
+    public ResponseEntity<ApiResponse<ContactQuarantineStatusResponse>> quarantineStatus() {
+        return ResponseEntity.ok(ApiResponse.success(service.quarantineStatus()));
+    }
 }

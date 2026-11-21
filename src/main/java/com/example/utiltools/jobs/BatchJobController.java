@@ -105,6 +105,22 @@ public class BatchJobController {
         return ApiResponse.success(jobService.getJob(jobId), "Job status retrieved");
     }
 
+    @GetMapping("/quarantine-status")
+    @Operation(summary = "Batch-hash quarantine status",
+            description = "Read-only operator aggregate of the batch-hash background workflow: the configured "
+                    + "utiltools.jobs.max-auto-failovers budget, whether automatic lease-expiry failover is "
+                    + "enabled, how many non-terminal jobs have spent that budget, how many jobs are FAILED with "
+                    + "error EXECUTION_LEASE_EXPIRED, how many are QUEUED, and how many rows are retained. An "
+                    + "empty registry answers 200 with zero counts (never 404). Pure read: no job row, "
+                    + "checkpoint, deadline or lease is touched")
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(responseCode = "200",
+                    description = "Aggregate counts of the auto-failover quarantine; counts only, no job rows")
+    })
+    public ApiResponse<JobsQuarantineStatusResponse> quarantineStatus() {
+        return ApiResponse.success(jobService.quarantineStatus(), "Job quarantine status retrieved");
+    }
+
     @DeleteMapping("/{jobId}")
     @Operation(summary = "Cancel a batch hash job",
             description = "Cancellation is cooperative. A QUEUED job is withdrawn immediately (QUEUED -> CANCELLED); "

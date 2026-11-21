@@ -8,18 +8,24 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -113,6 +119,137 @@ class ContactSubmissionServiceTest {
                 throw new AssertionError(e);
             }
         }
+    }
+
+    /**
+     * DOD-06 / REQ-03 / REQ-05: the contact projection reports the configured budget, the
+     * DEAD_LETTERED population, the subset whose redrive budget is spent, the in-flight count and the
+     * dispatch gate for a hand-built registry - and mutates neither a row nor {@code pendingAttempts}.
+     */
+    @Test
+    @DisplayName("quarantineStatus - projects maxRedrives and the DEAD_LETTERED / redrive-exhausted / pending counts")
+    void quarantineStatusCountsDeadLetteredAndRedriveExhausted() throws Exception {
+        startServiceWithRedrives(3, 2);
+        putSubmissionRow("sub-exhausted", ContactStatus.DEAD_LETTERED, 2, 3);
+        putSubmissionRow("sub-quarantined", ContactStatus.DEAD_LETTERED, 1, 3);
+        putSubmissionRow("sub-queued", ContactStatus.QUEUED, 0, 1);
+        putSubmissionRow("sub-dispatching", ContactStatus.DISPATCHING, 0, 1);
+        putSubmissionRow("sub-delivered", ContactStatus.DELIVERED, 0, 1);
+
+        Map<String, String> before = submissionRowSnapshot();
+        ContactQuarantineStatusResponse projection = service.quarantineStatus();
+
+        assertThat(projection.maxRedrives()).isEqualTo(2);
+        assertThat(projection.deadLetteredCount()).isEqualTo(2);
+        assertThat(projection.redriveExhaustedCount()).isEqualTo(1);
+        assertThat(projection.pendingCount()).isEqualTo(2);
+        assertThat(projection.pendingDispatchGate()).isEqualTo(2);
+        assertThat(projection.retainedSubmissionCount()).isEqualTo(5);
+        // Pure read: the same projection again, and nothing in the registry or the gate moved.
+        assertThat(service.quarantineStatus()).isEqualTo(projection);
+        assertThat(submissionRowSnapshot()).isEqualTo(before);
+        Object pendingAttempts = readField(service, "pendingAttempts");
+        assertThat(pendingAttempts).isEqualTo(0);
+    }
+
+    /**
+     * DOD-06 / REQ-03: polling the projection opens no CONTACT_SUBMIT journal entry and leaves
+     * {@code pendingAttempts} where the workflow left it (INV-QS-C2), so a quiescent registry reports
+     * no pending row while {@code pendingDispatchGate} still reports the static
+     * {@code workerCount + queueCapacity} capacity.
+     */
+    @Test
+    @DisplayName("quarantineStatus - opens no CONTACT_SUBMIT journal entry and leaves pendingAttempts untouched")
+    void quarantineStatusIsAPureReadAndJournalsNothing() {
+        AuditJournalService journal = newJournal();
+        startServiceWithRedrives(3, 2);
+        service.setAuditJournal(journal);
+        ContactSubmissionResponse submitted = service.submit(request("quarantine-status-key", "hello there"));
+        pollUntil(submitted.id(), ContactStatus.DELIVERED);
+
+        int entriesBefore = journal.size();
+        Map<String, String> rowsBefore = submissionRowSnapshot();
+        ContactQuarantineStatusResponse first = service.quarantineStatus();
+        ContactQuarantineStatusResponse second = service.quarantineStatus();
+
+        assertThat(entriesBefore).isPositive();
+        assertThat(journal.size()).isEqualTo(entriesBefore);
+        assertThat(submissionRowSnapshot()).isEqualTo(rowsBefore);
+        assertThat(second).isEqualTo(first);
+        Object pendingAttempts = readField(service, "pendingAttempts");
+        assertThat(pendingAttempts).isEqualTo(0);
+        assertThat(first.pendingCount()).isZero();
+        assertThat(first.pendingDispatchGate()).isEqualTo(2);
+        assertThat(first.deadLetteredCount()).isZero();
+        assertThat(first.retainedSubmissionCount()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("quarantineStatus - blocks while registryLock is held and answers once it is released")
+    void quarantineStatusBlocksUntilRegistryLockIsReleased() throws Exception {
+        AuditJournalService journal = newJournal();
+        startServiceWithRedrives(3, 2);
+        service.setAuditJournal(journal);
+
+        Object registryLock = readField(service, "registryLock");
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            Future<ContactQuarantineStatusResponse> call;
+            synchronized (registryLock) {
+                call = caller.submit(service::quarantineStatus);
+                assertThatThrownBy(() -> call.get(250, TimeUnit.MILLISECONDS))
+                        .isInstanceOf(TimeoutException.class);
+                assertThat(call.isDone()).isFalse();
+            }
+            ContactQuarantineStatusResponse projection = call.get(10, TimeUnit.SECONDS);
+            assertThat(projection.maxRedrives()).isEqualTo(2);
+            assertThat(projection.retainedSubmissionCount()).isZero();
+            assertThat(journal.size()).isZero();
+        } finally {
+            caller.shutdownNow();
+        }
+    }
+
+    /**
+     * Hand-builds one registry row so a projection test does not have to drive the workflow: no lane
+     * task is enqueued and no journal entry is opened, so only the projection reads the row.
+     */
+    private void putSubmissionRow(String id, ContactStatus status, int redrives, int attempt)
+            throws Exception {
+        Class<?> rowType = Class.forName(ContactSubmissionService.class.getName() + "$MutableSubmission");
+        Constructor<?> constructor = rowType.getDeclaredConstructor(String.class, String.class,
+                String.class, String.class, String.class, String.class, Instant.class, long.class,
+                int.class);
+        constructor.setAccessible(true);
+        Object row = constructor.newInstance(id, "Ada Lovelace", "ada@example.com", "hello there",
+                null, "fp-" + id, clock.instant(), 0L, 3);
+        setField(row, "status", status);
+        setField(row, "redrives", redrives);
+        setField(row, "attempt", attempt);
+        if (status == ContactStatus.DEAD_LETTERED) {
+            setField(row, "error", ContactSubmissionService.CONTACT_DISPATCH_FAILED);
+        }
+        submissionRegistry().put(id, row);
+    }
+
+    /** The live {@code submissions} registry, seen as raw rows so a test can snapshot it. */
+    private Map<String, Object> submissionRegistry() {
+        return readField(service, "submissions");
+    }
+
+    /** Every row's observable state, so a purity assertion is a single map comparison. */
+    private Map<String, String> submissionRowSnapshot() {
+        Map<String, String> rows = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : submissionRegistry().entrySet()) {
+            Object row = entry.getValue();
+            rows.put(entry.getKey(), readField(row, "status") + "|" + readField(row, "redrives")
+                    + "|" + readField(row, "attempt") + "|" + readField(row, "error")
+                    + "|" + readField(row, "maxAttempts")
+                    + "|" + readField(row, "executionLeaseExpiresAt")
+                    + "|" + readField(row, "lastHeartbeatAt")
+                    + "|" + readField(row, "nextRetryAt"));
+        }
+        return rows;
     }
 
     @SuppressWarnings("unchecked")

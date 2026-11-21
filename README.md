@@ -2,7 +2,7 @@
 
 [![Java](https://img.shields.io/badge/Java-21%20LTS-orange.svg?logo=openjdk)](https://openjdk.org/projects/jdk/21/)
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4%20(3.4.2)-brightgreen.svg?logo=springboot)](https://spring.io/projects/spring-boot)
-[![Build & Tests](https://img.shields.io/badge/Tests-939%20Passed%20(100%25)-success.svg)](https://junit.org/junit5/)
+[![Build & Tests](https://img.shields.io/badge/Tests-990%20Passed%20(100%25)-success.svg)](https://junit.org/junit5/)
 [![OpenAPI](https://img.shields.io/badge/OpenAPI-3.0%20%2F%20Swagger%20UI-blue.svg?logo=swagger)](http://localhost:8080/swagger-ui/index.html)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
@@ -68,7 +68,7 @@ flowchart TD
 - **Framework**: **Spring Boot 4** (`spring-boot-starter-web`, `spring-boot-starter-validation`)
 - **JSON Processing**: Jackson (`ObjectMapper`) & Jayway `json-path`
 - **Documentation**: OpenAPI 3.0 & Swagger UI (`springdoc-openapi-starter-webmvc-ui`)
-- **Testing**: JUnit 5, MockMvc, AssertJ (100% test pass rate across 939 unit and integration tests)
+- **Testing**: JUnit 5, MockMvc, AssertJ (100% test pass rate across 990 unit and integration tests)
 
 ---
 
@@ -188,6 +188,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/jobs/{jobId}/retry` | Requeue a `FAILED` job (`202`); `409` `JOB_RETRY_CONFLICT` for any other status or once `attempt` reaches `maxAttempts` |
 | `POST` | `/api/v1/utils/jobs/{jobId}/heartbeat` | Renew a `RUNNING` job's execution lease (`200`); `404` `JOB_NOT_FOUND`, `409` `JOB_RETRY_CONFLICT` unless `RUNNING`, `400` `BAD_REQUEST` once the lease has expired |
 | `GET` | `/api/v1/utils/jobs` | List job snapshots newest first; optional `status` filter and `limit` (default `20`, clamped to `1..100`) |
+| `GET` | `/api/v1/utils/jobs/quarantine-status` | Read-only operator view of the batch-hash failover budget: the configured `utiltools.jobs.max-auto-failovers`, whether automatic lease-expiry failover is enabled, the count of non-terminal jobs whose budget is spent, and the `FAILED` (`EXECUTION_LEASE_EXPIRED`) / `QUEUED` / retained counts; never submits, retries, cancels, evicts or reaps |
 | `GET` | `/api/v1/utils/audit/entries` | List journal entries (newest first) with optional `limit` & `state` filters |
 | `GET` | `/api/v1/utils/audit/entries/{id}` | Fetch a single journal entry (redacted request/result) |
 | `POST` | `/api/v1/utils/audit/entries/{id}/replay` | Replay a deterministic SUCCEEDED entry and verify the outcome |
@@ -198,6 +199,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/contact/submissions` | Admit a contact submission into the bounded dispatch pool; `202` with a snapshot whose `status` is `QUEUED`; `409` `CONTACT_IDEMPOTENCY_CONFLICT` on a reused-key payload mismatch, `429` `CONTACT_QUEUE_FULL` when the pool is saturated |
 | `GET` | `/api/v1/utils/contact/submissions/{id}` | Fetch one submission snapshot: `QUEUED` / `DISPATCHING` / `DELIVERED` / `FAILED` / `DEAD_LETTERED` / `CANCELLED`; `404` `CONTACT_SUBMISSION_NOT_FOUND` |
 | `GET` | `/api/v1/utils/contact/submissions` | List submission snapshots newest first; optional `limit` (default `20`, clamped to `1..100`) |
+| `GET` | `/api/v1/utils/contact/submissions/quarantine-status` | Read-only operator view of the redrive quarantine: the configured `utiltools.contact.max-redrives`, the `DEAD_LETTERED` count, how many of those rows have spent their redrive budget, the pending `QUEUED`/`DISPATCHING` count, the pending dispatch gate and the retained count; never redrives, retries, cancels or opens a `CONTACT_SUBMIT` journal entry |
 | `POST` | `/api/v1/utils/contact/submissions/{id}/retry` | Requeue a `FAILED` attempt as `attempt+1` (`200`); `409` `CONTACT_TRANSITION_CONFLICT` for any illegal transition, including a `DEAD_LETTERED` row (use `/redrive`) or an exhausted attempt budget |
 | `POST` | `/api/v1/utils/contact/submissions/{id}/redrive` | The only exit from `DEAD_LETTERED`: extends `maxAttempts` to `attempt+1`, requeues `attempt+1` as `DISPATCHING` with a fresh lease and a new `CONTACT_SUBMIT` journal entry (`200`); `404` `CONTACT_SUBMISSION_NOT_FOUND`; `409` `CONTACT_TRANSITION_CONFLICT` when the row is not `DEAD_LETTERED` or the `utiltools.contact.max-redrives` budget is spent; `429` `CONTACT_QUEUE_FULL` restores the exact prior `DEAD_LETTERED` snapshot |
 | `DELETE` | `/api/v1/utils/contact/submissions/{id}` | Withdraw a submission before the dispatcher starts: `200` with the `CANCELLED` snapshot; `404` `CONTACT_SUBMISSION_NOT_FOUND`; `409` `CONTACT_TRANSITION_CONFLICT` while dispatch is in flight or the row is terminal (`DELIVERED` / `FAILED`). A repeat cancel of an already-`CANCELLED` row is idempotent and re-answers `200` with its `CANCELLED` snapshot |
