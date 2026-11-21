@@ -5,6 +5,7 @@ import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
 import com.example.utiltools.audit.model.OperationType;
 import com.example.utiltools.audit.model.ReapReason;
+import com.example.utiltools.audit.model.ReplayRecord;
 import com.example.utiltools.audit.model.ReplayState;
 import com.example.utiltools.audit.model.ReapRecord;
 import com.example.utiltools.audit.service.AuditJournalService;
@@ -40,6 +41,7 @@ import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -67,6 +69,8 @@ class AuditQuarantineStatusTest {
     private static final Instant START = Instant.parse("2026-01-01T00:00:00Z");
     private static final MutableAuditClock CLOCK = new MutableAuditClock(START);
     private static final long LEASE_SECONDS = 30L;
+    /** Wait past the first bounded-retry backoff seat so a rolled-back claim is due again. */
+    private static final long RETRY_BACKOFF_WAIT_SECONDS = 2L;
     private static final String PATH = "/api/v1/utils/audit/quarantine-status";
 
     @TestConfiguration
@@ -99,12 +103,22 @@ class AuditQuarantineStatusTest {
         return new HashResponse("SHA-256", "abc123", false);
     }
 
+    /** A SUCCEEDED entry whose stored result is the real hash, so its replay settles VERIFIED. */
+    private AuditEntry replayableEntry(String requestId) {
+        AuditEntry entry = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), requestId);
+        journal.succeed(entry.id(), new CryptoService().hash(hashRequest()));
+        return entry;
+    }
+
     /** Claims the entry's replay, advances the lease past expiry and runs one reap pass. */
     private void expireOneClaim(String id) {
         ReplayClaim claim = journal.claimReplay(id);
         assertThat(claim).isNotNull();
         CLOCK.advanceSeconds(LEASE_SECONDS + 1L);
         journal.reap();
+        // The rollback schedules a bounded retry: wait out the first backoff seat (1s base)
+        // before the next claim, otherwise the admission gate refuses it.
+        CLOCK.advanceSeconds(RETRY_BACKOFF_WAIT_SECONDS);
     }
 
     /** A SUCCEEDED entry whose replay state is {@code VERIFIED}. */
@@ -193,6 +207,93 @@ class AuditQuarantineStatusTest {
         mockMvc.perform(get(PATH))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.threshold").value(2));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/audit/entries/{id}/replay - 409 when quarantined, VERIFIED while in lease")
+    void replayReturns409WhenQuarantinedAndOutcomeWithinLease() throws Exception {
+        String replayPath = "/api/v1/utils/audit/entries/{id}/replay";
+
+        // An active entry with no live claim replays to VERIFIED straight away.
+        AuditEntry healthy = replayableEntry("req-replaypath1");
+        mockMvc.perform(post(replayPath, healthy.id()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"));
+
+        // A quarantined entry is permanently ineligible: 409 REPLAY_CONFLICT, no state rewrite.
+        AuditEntry doomed = journal.begin(OperationType.CRYPTO_HASH, hashRequest(), "req-replaypath2");
+        journal.succeed(doomed.id(), hashResponse());
+        expireOneClaim(doomed.id());
+        expireOneClaim(doomed.id());
+        AuditEntry quarantinedEntry = journal.find(doomed.id()).orElseThrow();
+        assertThat(quarantinedEntry.state()).isEqualTo(JournalState.FAILED);
+        assertThat(quarantinedEntry.errorCode()).isEqualTo(ReapReason.REPLAY_LEASE_QUARANTINED.name());
+
+        mockMvc.perform(post(replayPath, doomed.id()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("REPLAY_CONFLICT"));
+
+        // The refused replay mutated nothing: same state, error code, tombstone count.
+        assertThat(journal.find(doomed.id()).orElseThrow()).isEqualTo(quarantinedEntry);
+        assertThat(journal.reapLog(50)).hasSize(2);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/audit/entries/{id}/replay - retries are admitted only after the backoff seat")
+    void quarantinesAfterBoundedRetriesAndRefusesLaterReplays() throws Exception {
+        String replayPath = "/api/v1/utils/audit/entries/{id}/replay";
+        AuditEntry entry = replayableEntry("req-replaypath3");
+
+        // Claim 1 lapses: the rollback publishes a bounded-retry deadline one base seat ahead.
+        journal.claimReplay(entry.id());
+        CLOCK.advanceSeconds(LEASE_SECONDS + 1L);
+        assertThat(journal.reap()).isEqualTo(1);
+        ReplayRecord rolledBack = journal.find(entry.id()).orElseThrow().replay();
+        assertThat(rolledBack.nextRetryAt()).isNotNull();
+        assertThat(java.time.Duration.between(rolledBack.replayedAt(), rolledBack.nextRetryAt()))
+                .isEqualTo(java.time.Duration.ofMillis(1000L));
+        assertThat(journal.find(entry.id()).orElseThrow().state()).isEqualTo(JournalState.SUCCEEDED);
+
+        // During the backoff seat the endpoint refuses with 409 and touches nothing.
+        AuditEntry gated = journal.find(entry.id()).orElseThrow();
+        mockMvc.perform(post(replayPath, entry.id()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("REPLAY_CONFLICT"));
+        assertThat(journal.find(entry.id()).orElseThrow()).isEqualTo(gated);
+
+        // Once the seat passes the retry is admitted and the endpoint replays the entry.
+        CLOCK.advanceSeconds(1L);
+        mockMvc.perform(post(replayPath, entry.id()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"));
+
+        // The quarantine threshold (2) is reached on the next lapse: the entry fails for good,
+        // with exactly one REPLAY_LEASE_QUARANTINED tombstone and no further reap work.
+        journal.claimReplay(entry.id());
+        CLOCK.advanceSeconds(LEASE_SECONDS + 1L);
+        assertThat(journal.reap()).isEqualTo(1);
+        AuditEntry quarantined = journal.find(entry.id()).orElseThrow();
+        assertThat(quarantined.state()).isEqualTo(JournalState.FAILED);
+        assertThat(quarantined.errorCode()).isEqualTo(ReapReason.REPLAY_LEASE_QUARANTINED.name());
+        assertThat(quarantined.completedAt()).isNotNull();
+        assertThat(journal.reapLog(50)).hasSize(2);
+        assertThat(journal.reapLog(50).get(0).reason()).isEqualTo(ReapReason.REPLAY_LEASE_QUARANTINED);
+        assertThat(journal.reap()).isZero();
+
+        // DOD-07(f): every later replay is refused with 409 REPLAY_CONFLICT and mutates nothing.
+        mockMvc.perform(post(replayPath, entry.id()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("REPLAY_CONFLICT"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString(
+                        "REPLAY_LEASE_QUARANTINED")));
+        CLOCK.advanceSeconds(RETRY_BACKOFF_WAIT_SECONDS);
+        mockMvc.perform(post(replayPath, entry.id()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("REPLAY_CONFLICT"));
+        assertThat(journal.find(entry.id()).orElseThrow()).isEqualTo(quarantined);
+        assertThat(journal.reapLog(50)).hasSize(2);
     }
 
     private JsonNode data(MvcResult result) throws Exception {

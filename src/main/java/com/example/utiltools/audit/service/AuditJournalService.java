@@ -74,6 +74,19 @@ public class AuditJournalService {
     private static final String STALE_PENDING_DETAIL =
             "PENDING entry older than utiltools.audit.stale-pending-seconds";
 
+    /** Default first retry delay ({@code utiltools.audit.replay-retry-backoff-base-ms}); REQ-02. */
+    static final long DEFAULT_REPLAY_RETRY_BACKOFF_BASE_MS = 1000L;
+
+    /** Default retry delay cap ({@code utiltools.audit.replay-retry-backoff-max-ms}); REQ-02. */
+    static final long DEFAULT_REPLAY_RETRY_BACKOFF_MAX_MS = 60_000L;
+
+    /**
+     * Absolute ceiling for the effective retry cap (ten years): an absurd but syntactically valid
+     * {@code replay-retry-backoff-max-ms} is clamped here, so {@code now.plusMillis(delay)} can
+     * never overflow the {@link Instant} range inside the pure {@link #classify} pass.
+     */
+    static final long MAX_REPLAY_RETRY_BACKOFF_CEILING_MS = 10L * 365L * 24L * 60L * 60L * 1000L;
+
     /** Single source of truth for bounded detail length, shared with {@link ReapRecord}. */
     static final int MAX_DETAIL_LENGTH = ReapRecord.MAX_DETAIL_LENGTH;
 
@@ -84,6 +97,10 @@ public class AuditJournalService {
     private final long replayLeaseSeconds;
     /** Rollbacks of one entry's replay claim allowed before the entry is quarantined; REQ-05. */
     private final int replayLeaseQuarantineThreshold;
+    /** REQ-02: first bounded-retry delay in milliseconds; doubled per consumed attempt. */
+    private final long replayRetryBackoffBaseMs;
+    /** REQ-02: saturation point of the doubling retry delay, bounding the retry budget. */
+    private final long replayRetryBackoffMaxMs;
     private final Clock clock;
 
     /** Per-pass quarantine; a real guard with the documented defaults outside Spring (REQ-03). */
@@ -102,8 +119,13 @@ public class AuditJournalService {
     private final ArrayDeque<ReapRecord> reaped = new ArrayDeque<>();
 
     /**
-     * Production constructor: lease deadlines are measured with the application-wide
-     * {@link Clock} bean, so replay lease expiry is testable without sleeping.
+     * Production constructor and full construction seam (REQ-01/REQ-02): every value is a plain
+     * argument with the documented default, so journal-level tests can schedule bounded retries
+     * with explicit delays without touching wall-clock time. A base of zero means "retry
+     * immediately" (delay {@code 0}ms) and the cap is raised to the base and clamped to
+     * {@link #MAX_REPLAY_RETRY_BACKOFF_CEILING_MS}, so {@code delay <= maxBackoff} always holds and
+     * the deadline arithmetic can never overflow. Lease deadlines are measured with the
+     * application-wide {@link Clock} bean, so replay lease expiry is testable without sleeping.
      */
     @Autowired
     public AuditJournalService(ObjectMapper objectMapper,
@@ -113,6 +135,10 @@ public class AuditJournalService {
                                @Value("${utiltools.audit.replay-lease-seconds:30}") long replayLeaseSeconds,
                                @Value("${utiltools.audit.replay-lease-quarantine-threshold:3}")
                                int replayLeaseQuarantineThreshold,
+                               @Value("${utiltools.audit.replay-retry-backoff-base-ms:1000}")
+                               long replayRetryBackoffBaseMs,
+                               @Value("${utiltools.audit.replay-retry-backoff-max-ms:60000}")
+                               long replayRetryBackoffMaxMs,
                                Clock clock) {
         this.objectMapper = objectMapper;
         this.maxEntries = Math.max(1, maxEntries);
@@ -120,17 +146,33 @@ public class AuditJournalService {
         this.stalePendingSeconds = Math.max(1L, stalePendingSeconds);
         this.replayLeaseSeconds = Math.max(1L, replayLeaseSeconds);
         this.replayLeaseQuarantineThreshold = Math.max(1, replayLeaseQuarantineThreshold);
+        this.replayRetryBackoffBaseMs = Math.max(0L, replayRetryBackoffBaseMs);
+        this.replayRetryBackoffMaxMs = Math.min(MAX_REPLAY_RETRY_BACKOFF_CEILING_MS,
+                Math.max(this.replayRetryBackoffBaseMs, replayRetryBackoffMaxMs));
         this.clock = clock == null ? Clock.systemUTC() : clock;
     }
 
     /**
      * Convenience constructor defaulting the replay-lease quarantine threshold to
-     * {@code utiltools.audit.replay-lease-quarantine-threshold}'s default of 3.
+     * {@code utiltools.audit.replay-lease-quarantine-threshold}'s default of 3 and the
+     * bounded-retry backoff to {@code 1000ms} base / {@code 60000ms} cap.
      */
     public AuditJournalService(ObjectMapper objectMapper, int maxEntries, int maxReplayBytes,
                                long stalePendingSeconds, long replayLeaseSeconds, Clock clock) {
         this(objectMapper, maxEntries, maxReplayBytes, stalePendingSeconds, replayLeaseSeconds, 3,
-                clock);
+                DEFAULT_REPLAY_RETRY_BACKOFF_BASE_MS, DEFAULT_REPLAY_RETRY_BACKOFF_MAX_MS, clock);
+    }
+
+    /**
+     * Convenience constructor taking an explicit replay-lease quarantine threshold, keeping the
+     * bounded-retry backoff at its production defaults ({@code 1000ms} base / {@code 60000ms} cap).
+     */
+    public AuditJournalService(ObjectMapper objectMapper, int maxEntries, int maxReplayBytes,
+                               long stalePendingSeconds, long replayLeaseSeconds,
+                               int replayLeaseQuarantineThreshold, Clock clock) {
+        this(objectMapper, maxEntries, maxReplayBytes, stalePendingSeconds, replayLeaseSeconds,
+                replayLeaseQuarantineThreshold, DEFAULT_REPLAY_RETRY_BACKOFF_BASE_MS,
+                DEFAULT_REPLAY_RETRY_BACKOFF_MAX_MS, clock);
     }
 
     /** Defaults the replay lease to 30s and the clock to system UTC. */
@@ -419,29 +461,53 @@ public class AuditJournalService {
             int projected = record.replayLeaseExhaustionCount + 1;
             if (projected >= replayLeaseQuarantineThreshold) {
                 return new ReapDecision(ReapReason.REPLAY_LEASE_QUARANTINED, ReapAction.FAIL_ENTRY,
-                        ReapReason.REPLAY_LEASE_QUARANTINED.name(), quarantineDetail(projected));
+                        ReapReason.REPLAY_LEASE_QUARANTINED.name(), quarantineDetail(projected),
+                        null);
             }
+            // REQ-01/REQ-02: project the bounded-retry deadline purely so a preview reports the
+            // exact schedule the applying pass writes, without mutating the record.
+            Instant nextRetryAt = now.plusMillis(retryDelayMs(projected));
+            // REQ-05: the tombstone (and the rolled-back record detail) name the attempt and its
+            // own deadline, so two retries are distinguishable in the reap log, not just by time.
             return new ReapDecision(ReapReason.REPLAY_LEASE_EXPIRED, ReapAction.ROLLBACK_CLAIM,
-                    null, REPLAY_LEASE_EXPIRED_DETAIL);
+                    null, retryDetail(claim.leaseExpiresAt(), projected, nextRetryAt), nextRetryAt);
         }
 
         if (stateAtScan == JournalState.PENDING && manualIntent) {
             return new ReapDecision(ReapReason.MANUALLY_REAPED, ReapAction.FAIL_ENTRY,
-                    MANUALLY_REAPED, MANUALLY_REAPED_DETAIL);
+                    MANUALLY_REAPED, MANUALLY_REAPED_DETAIL, null);
         }
 
         if (stateAtScan == JournalState.PENDING && base.createdAt() != null
                 && base.createdAt().isBefore(staleCutoff)) {
             return new ReapDecision(ReapReason.STALE_PENDING, ReapAction.FAIL_ENTRY,
-                    STALE_PENDING_REAPED, STALE_PENDING_DETAIL);
+                    STALE_PENDING_REAPED, STALE_PENDING_DETAIL, null);
         }
 
         if (stateAtScan != JournalState.PENDING && record.requestOversize) {
             return new ReapDecision(ReapReason.OVERSIZE_PAYLOAD, ReapAction.RECLAIM_ENTRY,
-                    null, OVERSIZE_PAYLOAD_DETAIL);
+                    null, OVERSIZE_PAYLOAD_DETAIL, null);
         }
 
         return null;
+    }
+
+    /**
+     * Capped exponential backoff (REQ-02): {@code min(maxBackoff, base * 2^(attempt-1))}
+     * milliseconds, where {@code attempt} is the 1-based retry being scheduled. The shift is
+     * clamped and the product is overflow-guarded, so the returned delay is always positive and
+     * never exceeds the configured cap — the total retry budget stays bounded.
+     */
+    private long retryDelayMs(int attempt) {
+        if (replayRetryBackoffBaseMs <= 0L) {
+            return 0L;
+        }
+        int exponent = Math.min(Math.max(attempt - 1, 0), 62);
+        long factor = 1L << exponent;
+        if (replayRetryBackoffBaseMs > Long.MAX_VALUE / factor) {
+            return replayRetryBackoffMaxMs;
+        }
+        return Math.min(replayRetryBackoffMaxMs, replayRetryBackoffBaseMs * factor);
     }
 
     /**
@@ -455,11 +521,15 @@ public class AuditJournalService {
         AuditEntry base = record.base;
         switch (decision.action()) {
             case ROLLBACK_CLAIM -> {
-                ReplayRecord claim = record.replay;
+                int attempt = record.replayLeaseExhaustionCount + 1;
+                // REQ-01/REQ-02: the claim is rolled back with the attempt counter incremented
+                // and the backoff deadline published, so the retry is admitted only when due. The
+                // detail computed by classify() (attempt + deadline) is reused verbatim so the
+                // record and its tombstone stay byte-identical (REQ-05).
                 ReplayRecord rolledBack = new ReplayRecord(ReplayState.FAILED, now,
-                        boundedDetail(ReplayState.FAILED, REPLAY_LEASE_EXPIRED_DETAIL
-                                + " at " + (claim == null ? null : claim.leaseExpiresAt())), null);
-                record.replayLeaseExhaustionCount++;
+                        boundedDetail(ReplayState.FAILED, decision.detail()),
+                        null, decision.nextRetryAt());
+                record.replayLeaseExhaustionCount = attempt;
                 record.replayOwnerToken = null;
                 record.replay = rolledBack;
                 record.base = withReplay(base, rolledBack);
@@ -472,7 +542,7 @@ public class AuditJournalService {
                     // REQ-04: one final rollback of the lapsed claim, then the entry is failed
                     // for good — the flag makes every later pass skip it.
                     ReplayRecord quarantinedClaim = new ReplayRecord(ReplayState.FAILED, now,
-                            boundedDetail(ReplayState.FAILED, decision.detail()), null);
+                            boundedDetail(ReplayState.FAILED, decision.detail()), null, null);
                     record.replayLeaseExhaustionCount++;
                     record.replayLeaseQuarantined = true;
                     record.replayOwnerToken = null;
@@ -491,8 +561,12 @@ public class AuditJournalService {
     /** What to do to the entry behind one eligible reap reason. */
     private enum ReapAction { ROLLBACK_CLAIM, FAIL_ENTRY, RECLAIM_ENTRY }
 
-    /** One classified eligibility decision: the reason, the action it implies and its tombstone text. */
-    private record ReapDecision(ReapReason reason, ReapAction action, String errorCode, String detail) {}
+    /**
+     * One classified eligibility decision: the reason, the action it implies, its tombstone text
+     * and — for a {@code ROLLBACK_CLAIM} — the bounded-retry deadline to publish (REQ-02).
+     */
+    private record ReapDecision(ReapReason reason, ReapAction action, String errorCode, String detail,
+                                Instant nextRetryAt) {}
 
     /**
      * Newest-first snapshot of reaped-entry tombstones, clamped to {@code [1, maxEntries]} and,
@@ -635,9 +709,20 @@ public class AuditJournalService {
                         "entry already has an active replay claim (lease expires at "
                                 + current.leaseExpiresAt() + ")");
             }
+            // REQ-02: bounded-retry admission — a rolled-back claim is refused, without touching
+            // the record, until its backoff deadline; a quarantined entry has no schedule and so
+            // falls through to the state message below (REQ-03).
+            if (current != null && current.nextRetryAt() != null
+                    && current.nextRetryAt().isAfter(now)) {
+                throw new ReplayConflictException(id, "replay backoff in effect until "
+                        + current.nextRetryAt() + " (attempt " + record.replayLeaseExhaustionCount
+                        + " of " + replayLeaseQuarantineThreshold + ")");
+            }
             AuditEntry base = record.base;
             if (base.state() != JournalState.SUCCEEDED) {
                 throw new ReplayConflictException(id, "entry is " + base.state()
+                        + (record.replayLeaseQuarantined
+                        ? " (" + ReapReason.REPLAY_LEASE_QUARANTINED.name() + ")" : "")
                         + " and cannot be replayed");
             }
             if (base.operation() == null || !base.operation().isDeterministic()) {
@@ -650,7 +735,7 @@ public class AuditJournalService {
             }
             Instant leaseExpiresAt = now.plusSeconds(replayLeaseSeconds);
             ReplayRecord claimed = new ReplayRecord(ReplayState.IN_PROGRESS, now, "replay in progress",
-                    leaseExpiresAt);
+                    leaseExpiresAt, null);
             record.replayOwnerToken = UUID.randomUUID().toString();
             record.replay = claimed;
             record.base = withReplay(base, claimed);
@@ -692,7 +777,8 @@ public class AuditJournalService {
             if (current.leaseExpiresAt() != null && !current.leaseExpiresAt().isAfter(now)) {
                 return false;
             }
-            ReplayRecord completed = new ReplayRecord(state, now, boundedDetail(state, detail), null);
+            ReplayRecord completed = new ReplayRecord(state, now, boundedDetail(state, detail), null,
+                    null);
             record.replayOwnerToken = null;
             record.replay = completed;
             record.base = withReplay(record.base, completed);
@@ -742,7 +828,7 @@ public class AuditJournalService {
                 renewedUntil = current.leaseExpiresAt();
             }
             ReplayRecord renewed = new ReplayRecord(ReplayState.IN_PROGRESS, current.replayedAt(),
-                    "replay in progress", renewedUntil);
+                    "replay in progress", renewedUntil, null);
             record.replay = renewed;
             record.base = withReplay(record.base, renewed);
             return Optional.of(renewedUntil);
@@ -821,6 +907,17 @@ public class AuditJournalService {
     private static String quarantineDetail(int expirations) {
         return boundedDetail(ReplayState.FAILED,
                 ReapReason.REPLAY_LEASE_QUARANTINED_DETAIL.formatted(expirations));
+    }
+
+    /**
+     * REQ-05: replayable expiry detail naming the lapsed lease, the attempt being admitted and that
+     * attempt's own retry deadline, clamped to {@link #MAX_DETAIL_LENGTH} like every other detail.
+     */
+    private String retryDetail(Instant leaseExpiresAt, int attempt, Instant nextRetryAt) {
+        return boundedDetail(ReplayState.FAILED, REPLAY_LEASE_EXPIRED_DETAIL
+                + " at " + leaseExpiresAt
+                + "; retry " + attempt + " of " + replayLeaseQuarantineThreshold
+                + " at " + nextRetryAt);
     }
 
     private static AuditEntry withReplay(AuditEntry base, ReplayRecord replay) {
