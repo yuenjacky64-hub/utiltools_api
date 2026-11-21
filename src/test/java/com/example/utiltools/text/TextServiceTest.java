@@ -1166,8 +1166,8 @@ class TextServiceTest {
     }
 
     @Test
-    @DisplayName("diff - a supplementary code point counts as one position, not two (REQ-04, DOD-03)")
-    void shouldUseCodePointPositions() {
+    @DisplayName("diff - tokens carry line/token paths and code-point-accurate spans (REQ-04, DOD-04)")
+    void shouldDiffTokensWithCodePointAccuratePositions() {
         TextDiffResponse response = service.diff(new TextDiffRequest("\uD83D\uDC4D one", "\uD83D\uDC4D two"));
 
         // The emoji is not a LETTER token, so "one" is token 0 — but it starts at code point 2, not
@@ -1210,8 +1210,8 @@ class TextServiceTest {
     }
 
     @Test
-    @DisplayName("diff - blank sides and an over-long pattern are bean-validation failures (REQ-01, DOD-04)")
-    void shouldValidateDiffRequest() {
+    @DisplayName("diff - TextDiffRequest validation: blank sides, code-point bound, pattern and timeoutMs (REQ-01, DOD-09)")
+    void shouldValidateTextDiffRequest() {
         try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
             Validator validator = factory.getValidator();
 
@@ -1259,5 +1259,65 @@ class TextServiceTest {
         assertThat(first.changed()).containsOnlyKeys("line[0].token[2]");
         assertThat(first.changed().get("line[0].token[2]").oldToken()).isEqualTo("brown");
         assertThat(first.changed().get("line[0].token[2]").newToken()).isEqualTo("red");
+    }
+
+    @Test
+    @DisplayName("diff - case folding, regex tokenization and the regex timeout all apply to diff (REQ-04, DOD-07)")
+    void shouldApplyCaseAndTokenizerRulesToDiff() {
+        // caseSensitive absent/false folds with Locale.ROOT, so both sides are the same tokens.
+        assertThat(service.diff(new TextDiffRequest("Alpha Beta", "alpha beta")).identical()).isTrue();
+
+        // caseSensitive=true makes token matching exact.
+        TextDiffResponse exact = service.diff(new TextDiffRequest("Alpha Beta", "alpha beta", true));
+        assertThat(exact.identical()).isFalse();
+        assertThat(exact.changed()).containsOnlyKeys("line[0].token[0]", "line[0].token[1]");
+        assertThat(exact.summary()).isEqualTo("0 added, 0 removed, 2 changed");
+
+        // tokenizer=regex takes its tokens from the matches of the caller's pattern.
+        TextDiffResponse regex = service.diff(new TextDiffRequest("abcABCdef", "abcXYZdef", null,
+                TokenizerScheme.REGEX, "[A-Z]+", null));
+        assertThat(regex.changed()).containsOnlyKeys("line[0].token[0]");
+        TextDiffDetail changed = regex.changed().get("line[0].token[0]");
+        assertThat(changed.oldToken()).isEqualTo("ABC");
+        assertThat(changed.newToken()).isEqualTo("XYZ");
+        assertThat(changed.oldStartCodePoint()).isEqualTo(3);
+        assertThat(changed.oldEndCodePoint()).isEqualTo(6);
+        assertThat(changed.newStartCodePoint()).isEqualTo(3);
+        assertThat(changed.newEndCodePoint()).isEqualTo(6);
+
+        // The regex token path reuses the budgeted char sequence: an exhausted budget surfaces as
+        // RegexTimeoutException (HTTP 422 REGEX_TIMEOUT) naming the effective budget.
+        TextService stepping = new TextService(200, new SteppingClock(0L, 1L));
+        TextDiffRequest catastrophic = new TextDiffRequest("a".repeat(500) + "b", "plain", null,
+                TokenizerScheme.REGEX, "(a+)+$", null);
+        assertThatThrownBy(() -> stepping.diff(catastrophic))
+                .isInstanceOf(RegexTimeoutException.class)
+                .hasMessageContaining("timed out after 200 ms");
+    }
+
+    @Test
+    @DisplayName("diff - the cell and change budgets fail fast instead of an OOM or an unbounded result (REQ-04, DOD-10)")
+    void shouldRejectDiffExceedingCellAndChangeBudgets() {
+        // 1000 regex tokens per side with no common prefix or suffix: (1001 x 1001) cells is over the
+        // 1_000_000-token-pair budget and is refused before a single matrix row is allocated.
+        TextDiffRequest tooManyCells = new TextDiffRequest("ab".repeat(500), "cd".repeat(500), null,
+                TokenizerScheme.REGEX, "[a-z]", null);
+        assertThatThrownBy(() -> service.diff(tooManyCells))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("text diff exceeds the 1000000-token-pair budget");
+
+        // 2000 removals and one addition: the 1001st reported change trips the change budget.
+        TextDiffRequest tooManyChanges = new TextDiffRequest("ab".repeat(1000), "z", null,
+                TokenizerScheme.REGEX, "[a-z]", null);
+        assertThatThrownBy(() -> service.diff(tooManyChanges))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("diff must not contain more than 1000 changes");
+
+        // The guards are not new limits on in-bound input: 999 details, one below the cap, are served.
+        TextDiffResponse atBudget = service.diff(new TextDiffRequest("a".repeat(999), "z", null,
+                TokenizerScheme.REGEX, "[a-z]", null));
+        assertThat(atBudget.added().size() + atBudget.removed().size() + atBudget.changed().size())
+                .as("in-bound diffs just under MAX_TEXT_DIFF_CHANGES are still reported")
+                .isEqualTo(999);
     }
 }

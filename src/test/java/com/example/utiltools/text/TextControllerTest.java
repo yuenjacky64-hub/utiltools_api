@@ -1448,6 +1448,26 @@ class TextControllerTest {
                 .andExpect(jsonPath("$.data.changed['line[0].token[2]'].oldEndCodePoint").value(15))
                 .andExpect(jsonPath("$.data.changed['line[0].token[2]'].newStartCodePoint").value(10))
                 .andExpect(jsonPath("$.data.changed['line[0].token[2]'].newEndCodePoint").value(13));
+
+        // DOD-01 asks for differences on two *different* lines: with a case-sensitive whitespace
+        // tokenizer the two changed tokens keep the line index they were reported under.
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "one two three\\nfour five six",
+                                 "right": "one TWO three\\nfour FIVE six",
+                                 "tokenizer": "whitespace", "caseSensitive": true}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.summary").value("0 added, 0 removed, 2 changed"))
+                .andExpect(jsonPath("$.data.changed['line[0].token[1]'].oldToken").value("two"))
+                .andExpect(jsonPath("$.data.changed['line[0].token[1]'].newToken").value("TWO"))
+                .andExpect(jsonPath("$.data.changed['line[0].token[1]'].oldStartCodePoint").value(4))
+                .andExpect(jsonPath("$.data.changed['line[0].token[1]'].oldEndCodePoint").value(7))
+                .andExpect(jsonPath("$.data.changed['line[1].token[1]'].oldToken").value("five"))
+                .andExpect(jsonPath("$.data.changed['line[1].token[1]'].newToken").value("FIVE"))
+                .andExpect(jsonPath("$.data.changed['line[1].token[1]'].oldStartCodePoint").value(19))
+                .andExpect(jsonPath("$.data.changed['line[1].token[1]'].oldEndCodePoint").value(23));
     }
 
     @Test
@@ -1572,7 +1592,7 @@ class TextControllerTest {
 
     @Test
     @DisplayName("POST /api/v1/utils/text/diff - non-text payloads return 400 and blank sides are VALIDATION_ERROR (DOD-04)")
-    void shouldRejectNonTextDiffPayloads() throws Exception {
+    void shouldRejectInvalidDiffPayloads() throws Exception {
         int entriesBefore = journal.size();
 
         mockMvc.perform(post("/api/v1/utils/text/diff")
@@ -1603,6 +1623,71 @@ class TextControllerTest {
                 .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
 
         assertThat(journal.size()).isEqualTo(entriesBefore);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/diff - cell and change budget overruns answer 400 BAD_REQUEST and journal FAILED (DOD-10)")
+    void shouldAnswerDiffBudgetOverrunAs400AndJournalFailed() throws Exception {
+        String tooManyCells = objectMapper.writeValueAsString(java.util.Map.of(
+                "left", "ab".repeat(500), "right", "cd".repeat(500),
+                "tokenizer", "regex", "pattern", "[a-z]"));
+
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(tooManyCells))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value("text diff exceeds the 1000000-token-pair budget"));
+
+        mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_DIFF"))
+                .andExpect(jsonPath("$.data[0].state").value("FAILED"))
+                .andExpect(jsonPath("$.data[0].errorCode").value("BAD_REQUEST"));
+
+        String tooManyChanges = objectMapper.writeValueAsString(java.util.Map.of(
+                "left", "ab".repeat(1000), "right", "z",
+                "tokenizer", "regex", "pattern", "[a-z]"));
+
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(tooManyChanges))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value("diff must not contain more than 1000 changes"));
+
+        mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_DIFF"))
+                .andExpect(jsonPath("$.data[0].state").value("FAILED"))
+                .andExpect(jsonPath("$.data[0].errorCode").value("BAD_REQUEST"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/diff - the budgeted regex path answers 422 REGEX_TIMEOUT and journals FAILED (DOD-07)")
+    void shouldAnswerDiffRegexTimeoutAs422AndJournalFailed() throws Exception {
+        // `tokenizer=regex` reuses the budgeted-regex seam. The per-request timeoutMs override pins
+        // the budget to 1 ms so catastrophic backtracking aborts deterministically, whatever the
+        // configured default (utiltools.text.regex-timeout-ms) is.
+        String body = objectMapper.writeValueAsString(java.util.Map.of(
+                "left", "a".repeat(1999) + "!", "right", "b",
+                "tokenizer", "regex", "pattern", "(a+)+$", "timeoutMs", 1));
+
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("REGEX_TIMEOUT"))
+                .andExpect(jsonPath("$.details.timeoutMs").value(1));
+
+        mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_DIFF"))
+                .andExpect(jsonPath("$.data[0].state").value("FAILED"))
+                .andExpect(jsonPath("$.data[0].errorCode").value("REGEX_TIMEOUT"));
     }
 
     @Test
