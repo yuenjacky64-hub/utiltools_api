@@ -35,6 +35,61 @@ final class MaintenanceSchedulingPropertiesTest {
     }
 
     @Test
+    @DisplayName("documented pass-* defaults: 3 failures, 1 success, 60s cooldown, 10s probe lease")
+    void passDefaults() {
+        MaintenanceSchedulingProperties properties = MaintenanceSchedulingProperties.defaults();
+        assertThat(properties.passFailureThreshold()).isEqualTo(3);
+        assertThat(properties.passSuccessThreshold()).isEqualTo(1);
+        assertThat(properties.passCooldownMs()).isEqualTo(60_000L);
+        assertThat(properties.passProbeLeaseMs()).isEqualTo(10_000L);
+    }
+
+    @Test
+    @DisplayName("pass-failure-threshold below the bound fails startup")
+    void passFailureThresholdOutOfBoundsFailsStartup() {
+        assertThatThrownBy(() -> new MaintenanceSchedulingProperties(8, "maintenance-", 30, 0, 1,
+                60_000L, 10_000L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("utiltools.scheduling.pass-failure-threshold");
+        assertThatThrownBy(() -> new MaintenanceSchedulingProperties(8, "maintenance-", 30, 101, 1,
+                60_000L, 10_000L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("utiltools.scheduling.pass-failure-threshold");
+    }
+
+    @Test
+    @DisplayName("pass-success-threshold, pass-cooldown-ms and pass-probe-lease-ms bounds fail startup")
+    void passCooldownAndProbeLeaseBoundsFailStartup() {
+        assertThatThrownBy(() -> new MaintenanceSchedulingProperties(8, "maintenance-", 30, 3, 0,
+                60_000L, 10_000L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("utiltools.scheduling.pass-success-threshold");
+        assertThatThrownBy(() -> new MaintenanceSchedulingProperties(8, "maintenance-", 30, 3, 11,
+                60_000L, 10_000L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("utiltools.scheduling.pass-success-threshold");
+        assertThatThrownBy(() -> new MaintenanceSchedulingProperties(8, "maintenance-", 30, 3, 1,
+                -1L, 10_000L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("utiltools.scheduling.pass-cooldown-ms");
+        assertThatThrownBy(() -> new MaintenanceSchedulingProperties(8, "maintenance-", 30, 3, 1,
+                60_000L, 0L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("utiltools.scheduling.pass-probe-lease-ms");
+    }
+
+    @Test
+    @DisplayName("binding pass-failure-threshold=0 fails startup naming the property")
+    void bindPassFailureThresholdZeroFails() {
+        Map<String, Object> source =
+                Map.of("utiltools.scheduling.pass-failure-threshold", Collections.singletonList("0"));
+        assertThatThrownBy(() -> bind(source, -1, null, 0, "pass-failure-threshold"))
+                .isInstanceOf(BindException.class)
+                .rootCause()
+                .hasMessageContaining("utiltools.scheduling.pass-failure-threshold");
+    }
+
+    @Test
     @DisplayName("pool-size below the bound fails startup")
     void poolSizeBelowBoundFails() {
         assertThatThrownBy(() -> new MaintenanceSchedulingProperties(0, "maintenance-", 30))

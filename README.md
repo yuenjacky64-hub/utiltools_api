@@ -194,6 +194,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/contact/submissions/{id}/redrive` | The only exit from `DEAD_LETTERED`: extends `maxAttempts` to `attempt+1`, requeues `attempt+1` as `DISPATCHING` with a fresh lease and a new `CONTACT_SUBMIT` journal entry (`200`); `404` `CONTACT_SUBMISSION_NOT_FOUND`; `409` `CONTACT_TRANSITION_CONFLICT` when the row is not `DEAD_LETTERED` or the `utiltools.contact.max-redrives` budget is spent; `429` `CONTACT_QUEUE_FULL` restores the exact prior `DEAD_LETTERED` snapshot |
 | `DELETE` | `/api/v1/utils/contact/submissions/{id}` | Withdraw a submission before the dispatcher starts: `200` with the `CANCELLED` snapshot; `404` `CONTACT_SUBMISSION_NOT_FOUND`; `409` `CONTACT_TRANSITION_CONFLICT` while dispatch is in flight or the row is terminal (`DELIVERED` / `FAILED`). A repeat cancel of an already-`CANCELLED` row is idempotent and re-answers `200` with its `CANCELLED` snapshot |
 | `GET` | `/api/v1/utils/maintenance/scheduler` | Read-only scheduler status: configured `poolSize`, `threadNamePrefix`, `awaitTerminationSeconds`, plus live `activeThreadCount`, `completedTaskCount`, `queueDepth`; never schedules, cancels, or mutates a maintenance pass |
+| `GET` | `/api/v1/utils/maintenance/passes` | Read-only per-pass quarantine status: one row per maintenance pass with `state` (`CLOSED` / `OPEN` / `HALF_OPEN`), `consecutiveFailures`, `lastOutcome`, `lastFailureAt`, `lastSuccessAt`, `nextProbeAt`, `succeeded`, `failed`, `skipped`, plus `auditSize`, `auditCapacity` and a bounded (`<= 20`) `recentTransitions` list of `at`, `pass`, `from`, `to`, `trigger`; never schedules, cancels, resets or mutates a maintenance pass |
 
 ---
 
@@ -2961,10 +2962,33 @@ Independent passes share only the pool's capacity, never a per-task slot.
 | `utiltools.scheduling.pool-size` | `8` | Lanes in the shared pool; validated to `1..64` (one lane per maintenance pass by default) |
 | `utiltools.scheduling.thread-name-prefix` | `maintenance-` | Worker thread name prefix, appended with a 1-based counter; must be non-blank |
 | `utiltools.scheduling.await-termination-seconds` | `30` | Seconds to wait for in-flight passes at JVM exit; validated to `>= 0` |
+| `utiltools.scheduling.pass-failure-threshold` | `3` | Consecutive failed ticks that quarantine one pass (`CLOSED` -> `OPEN`); validated to `1..100` |
+| `utiltools.scheduling.pass-success-threshold` | `1` | Successful `HALF_OPEN` probes that close a quarantined pass; validated to `1..10` |
+| `utiltools.scheduling.pass-cooldown-ms` | `60000` | Quarantine cooldown before the first recovery probe is admitted, in milliseconds; validated to `>= 0` |
+| `utiltools.scheduling.pass-probe-lease-ms` | `10000` | Lease one admitted `HALF_OPEN` probe holds, so a hanging probe cannot wedge the pass forever; must be `> 0` |
 
 **Startup validation:** out-of-range or malformed values fail fast with a clear configuration
 error before the app starts — e.g. `pool-size=0` or `pool-size=65` (must be `1..64`), a blank
-`thread-name-prefix`, or a negative `await-termination-seconds` (must be `>= 0`).
+`thread-name-prefix`, a negative `await-termination-seconds` (must be `>= 0`), a
+`pass-failure-threshold` outside `1..100`, a `pass-success-threshold` outside `1..10`, a negative
+`pass-cooldown-ms`, or a `pass-probe-lease-ms` of `0` (must be `> 0`).
+
+### Per-pass quarantine
+
+Every pass is wrapped in its own `CLOSED` / `OPEN` / `HALF_OPEN` circuit
+(`scheduling.MaintenancePassGuard`, one `resilience.CircuitBreaker` named `maintenance-passes` with
+one fingerprint per `MaintenancePass`), so one failing pass can never starve the other seven:
+
+| Transition | Trigger |
+| :--- | :--- |
+| `CLOSED` -> `OPEN` | `pass-failure-threshold` (`3`) consecutive failed ticks; a `QUARANTINE` row is recorded in the guard's bounded audit trail |
+| `OPEN` -> `OPEN` | A scheduled tick during the cooldown; the tick counts as `skipped` and the pass body is **not** invoked |
+| `OPEN` -> `HALF_OPEN` | `pass-cooldown-ms` (`60000`) elapsed; exactly one probe is admitted and holds a `pass-probe-lease-ms` (`10000`) lease |
+| `HALF_OPEN` -> `OPEN` | The probe threw: the pass reopens with a fresh cooldown |
+| `HALF_OPEN` -> `CLOSED` | `pass-success-threshold` (`1`) successful probes: `consecutiveFailures` resets to `0` and `succeeded` increments |
+
+Pass failures go to the guard's own bounded audit trail only — never to the audit journal, so a
+failing reaper cannot recursively feed itself.
 
 **Graceful shutdown:** at JVM exit the pool waits up to
 `utiltools.scheduling.await-termination-seconds` for in-flight passes to finish before forcing
@@ -2993,6 +3017,57 @@ termination; maintenance threads are daemons, so a zero grace period never block
 | `activeThreadCount` | Threads currently executing a maintenance pass |
 | `completedTaskCount` | Total pass executions completed since startup |
 | `queueDepth` | Passes currently waiting for a free lane |
+
+### Pass status endpoint
+
+`GET /api/v1/utils/maintenance/passes` (read-only) reports one row per maintenance pass:
+
+```json
+{
+  "success": true,
+  "data": {
+    "passes": [
+      {
+        "pass": "RATE_LIMIT_EVICT_IDLE_BUCKETS",
+        "state": "OPEN",
+        "consecutiveFailures": 3,
+        "lastOutcome": "FAILED",
+        "lastFailureAt": "2026-01-01T00:00:00Z",
+        "lastSuccessAt": "2025-12-31T23:59:00Z",
+        "nextProbeAt": "2026-01-01T00:01:00Z",
+        "succeeded": 12,
+        "failed": 3,
+        "skipped": 1
+      }
+    ],
+    "auditSize": 1,
+    "auditCapacity": 128,
+    "recentTransitions": [
+      {
+        "at": "2026-01-01T00:00:00Z",
+        "pass": "RATE_LIMIT_EVICT_IDLE_BUCKETS",
+        "from": "CLOSED",
+        "to": "OPEN",
+        "trigger": "QUARANTINE"
+      }
+    ]
+  }
+}
+```
+
+| Field | Meaning |
+| :--- | :--- |
+| `passes[].state` | Per-pass circuit state: `CLOSED` (`1`), `OPEN` (`2`) or `HALF_OPEN` (`3`) |
+| `passes[].consecutiveFailures` | Failed ticks since the last success |
+| `passes[].lastOutcome` | Result of the last tick: `NONE` (never run) / `SUCCEEDED` / `FAILED` / `SKIPPED` (refused while `OPEN`) |
+| `passes[].lastFailureAt` / `lastSuccessAt` | Timestamps of the last failure / success (`null` until first observed) |
+| `passes[].nextProbeAt` | When the next `HALF_OPEN` probe may be admitted (only while `OPEN`) |
+| `passes[].succeeded` / `failed` / `skipped` | Lifetime tick counters for this pass |
+| `auditSize` / `auditCapacity` | Rows currently held in the guard's bounded audit trail, and its cap (`128`) |
+| `recentTransitions` | Bounded (`<= 20`) newest-first list of state transitions |
+
+The route is a pure projection of read-only guard accessors: polling it never advances a cooldown,
+claims a probe lease or moves a counter, and it cannot quarantine or reset a pass.
 
 The route is strictly read-only: it schedules, cancels, and mutates no maintenance pass.
 
