@@ -996,6 +996,68 @@ class TextControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - a body without ignoreWords keeps the pre-change result (DOD-01)")
+    void similarityWithoutIgnoreWordsIsBackwardCompatible() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "kitten", "right": "sitting"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.distance").value(3))
+                .andExpect(jsonPath("$.data.maxLength").value(7))
+                .andExpect(jsonPath("$.data.similarity").value(0.571429))
+                .andExpect(jsonPath("$.data.identical").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - ignoreWords are dropped from both inputs before the distance")
+    void similarityFiltersIgnoreWordsFromBothInputs() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "the cat sat", "right": "the car sat", "ignoreWords": ["the"]}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.distance").value(1))
+                .andExpect(jsonPath("$.data.maxLength").value(8))
+                .andExpect(jsonPath("$.data.similarity").value(0.875))
+                .andExpect(jsonPath("$.data.identical").value(false))
+                .andExpect(jsonPath("$.data.caseSensitive").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - over-cap or blank ignoreWords return 400 VALIDATION_ERROR")
+    void shouldRejectInvalidSimilarityIgnoreWords() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "abc", "right": "abd", "ignoreWords": ["   "]}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("ignoreWords entries must not be blank")));
+
+        StringBuilder tooMany = new StringBuilder("{\"left\": \"abc\", \"right\": \"abd\", \"ignoreWords\": [");
+        for (int index = 0; index < 1001; index++) {
+            if (index > 0) {
+                tooMany.append(',');
+            }
+            tooMany.append("\"w").append(index).append('"');
+        }
+        tooMany.append("]}");
+
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(tooMany.toString()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("ignoreWords must contain at most 1000 entries")));
+    }
+
+    @Test
     @DisplayName("a similarity call is journalled as TEXT_SIMILARITY and replays as VERIFIED without a new entry (DOD-05)")
     void similarityIsJournalledAndReplaysAsVerified() throws Exception {
         mockMvc.perform(post("/api/v1/utils/text/similarity")
