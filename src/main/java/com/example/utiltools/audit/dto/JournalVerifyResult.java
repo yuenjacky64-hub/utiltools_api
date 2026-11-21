@@ -8,8 +8,9 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  * One row of a journal verification sweep.
  *
  * <p>Exactly one of {@code outcome} ({@code VERIFIED} / {@code MISMATCH} / {@code FAILED}) and
- * {@code skipReason} ({@code LIVE_CLAIM}, {@code EVICTED}, {@code NOT_SUCCEEDED},
- * {@code NON_DETERMINISTIC}, {@code NOT_REPLAYABLE}, {@code CLAIM_LOST}, {@code CLAIM_CONFLICT})
+ * {@code skipReason} ({@code LIVE_CLAIM}, {@code EVICTED}, {@code BACKOFF_PENDING},
+ * {@code NOT_SUCCEEDED}, {@code NON_DETERMINISTIC}, {@code NOT_REPLAYABLE}, {@code CLAIM_LOST},
+ * {@code CLAIM_CONFLICT})
  * is non-null. {@code detail} is always present and never longer than
  * {@code AuditReplayService.MAX_DETAIL_LENGTH} characters, and it is derived only from the
  * mismatch pointer or an exception message — the stored request and result payloads, the owner

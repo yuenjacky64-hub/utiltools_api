@@ -1801,14 +1801,48 @@ produces a `REAPED` tombstone; and a renewal racing a reap resolves under the jo
 exactly one of *renewed claim* or *reaped claim* wins. Renewal stops being possible the moment the
 operation ends — a claim left `IN_PROGRESS` after that is still rolled back to `FAILED` exactly once
 with reason `REPLAY_LEASE_EXPIRED`. Renewal exposes nothing new: owner tokens remain private to the
-journal and only `leaseExpiresAt` (already part of the `replay` record) is returned by `list`,
-`find` and `replay`.
+journal and only `leaseExpiresAt` (already part of the `replay` record) plus `nextRetryAt` while a
+bounded retry is still pending are returned by `list`, `find` and `replay`.
 
 | Property | Default | Meaning |
 | :------- | :------ | :------ |
 | `utiltools.audit.replay-lease-seconds` | `30` | Lifetime of a replay claim before it may be taken over or reaped |
 | `utiltools.audit.replay-heartbeat-seconds` | half of the lease (`15`) | Cadence at which a running replay's owner renews its claim; minimum `1`, must be positive |
 | `utiltools.audit.replay-lease-quarantine-threshold` | `3` | How many times one entry's replay claim may expire and be rolled back before the reaper fails the entry for good with `REPLAY_LEASE_QUARANTINED`; clamped to `>= 1` |
+| `utiltools.audit.replay-retry-backoff-base-ms` | `1000` | First bounded-retry delay after a lapsed claim is rolled back; doubles per attempt; `0` means "retry immediately"; clamped to `>= 0` |
+| `utiltools.audit.replay-retry-backoff-max-ms` | `60000` | Cap on the bounded-retry delay, so the retry budget is bounded; raised to the base when configured lower |
+
+**A lapsed claim is retried with bounded backoff, then quarantined.** When the reaper finds an
+`IN_PROGRESS` claim whose `leaseExpiresAt` has passed it admits exactly **one** retry: the entry's
+`replayLeaseExhaustionCount` is incremented, the owner token is cleared, and the rollback publishes
+a wait deadline on the entry's `replay.nextRetryAt` field of
+`delay = min(replay-retry-backoff-max-ms, base * 2^(attempt - 1))` milliseconds. The entry itself
+stays `SUCCEEDED` with its `result` and `completedAt` untouched, so a replay before `nextRetryAt`
+answers `409 REPLAY_CONFLICT` ("replay backoff in effect until ...") **without mutating anything**,
+while a replay at or after it claims the entry through the ordinary path and clears the schedule.
+The delay therefore grows `base`, `2*base`, `4*base`, ... up to the cap, so a burst of expired
+claims cannot all retry at once and no entry can retry forever:
+
+```json
+"replay": {
+  "state": "FAILED",
+  "replayedAt": "2026-10-31T00:53:12.004Z",
+  "detail": "replay claim lease expired at 2026-10-31T00:52:42.004Z; retry 1 of 3 at 2026-10-31T00:53:13.004Z",
+  "nextRetryAt": "2026-10-31T00:53:13.004Z"
+}
+```
+
+The retry budget is the quarantine budget: the same counter that schedules the retry is the one
+counted against `replay-lease-quarantine-threshold`, so an entry gets at most `threshold - 1`
+automatic retries. On the attempt that reaches the threshold the reaper upgrades the rollback to
+`REPLAY_LEASE_QUARANTINED` — the entry becomes terminal `FAILED` with `errorCode =
+REPLAY_LEASE_QUARANTINED`, one `REAPED` tombstone is written with detail `replay lease expired 3
+times; entry quarantined`, the schedule is cleared and the flag makes every later pass skip it. From
+then on replay answers `409 REPLAY_CONFLICT` ("entry is FAILED (REPLAY_LEASE_QUARANTINED) and cannot
+be replayed"); only the reaper ever sets that state, and nothing redrives it. Every admission,
+backoff reschedule and quarantine rides the ordinary tombstone path, so the decision stays
+replayable and visible through `GET /api/v1/utils/audit/reaps?reason=REPLAY_LEASE_EXPIRED` /
+`?reason=REPLAY_LEASE_QUARANTINED` and verifiable through `POST /api/v1/utils/audit/verify`.
 
 **Failed replays are audited.** If `replayInvoke` throws (for example the stored payload is no
 longer accepted by the service), the replay is recorded as `FAILED` with a bounded
@@ -1873,9 +1907,9 @@ The sweep is **single-winner per entry**, exactly like a single replay: every ca
 through the same `claimReplay` lease. An entry whose claim is live is reported `SKIPPED` with
 `skipReason = "LIVE_CLAIM"` and its `replay.state` / `leaseExpiresAt` are **not** touched — the
 in-flight owner can still complete its own replay. Non-replayable (`NOT_REPLAYABLE`),
-non-deterministic (`NON_DETERMINISTIC`), no-longer-`SUCCEEDED` (`NOT_SUCCEEDED`) and evicted
-(`EVICTED`) entries are likewise `SKIPPED` with an explicit `skipReason` instead of failing the
-call.
+non-deterministic (`NON_DETERMINISTIC`), no-longer-`SUCCEEDED` (`NOT_SUCCEEDED`), evicted
+(`EVICTED`) and bounded-retry-pending (`BACKOFF_PENDING`, `replay.nextRetryAt` not yet reached)
+entries are likewise `SKIPPED` with an explicit `skipReason` instead of failing the call.
 
 **Failure isolation:** an invocation that throws is recorded as `FAILED` with a bounded `detail`
 (≤ 200 characters) and the sweep **continues** with the remaining candidates — one bad entry never

@@ -45,6 +45,8 @@ class AuditJournalReaperTest {
 
     private static final Instant START = Instant.parse("2026-01-01T00:00:00Z");
     private static final long LEASE_SECONDS = 30L;
+    /** Wait past the first bounded-retry backoff seat so a rolled-back claim is due again. */
+    private static final long RETRY_BACKOFF_WAIT_SECONDS = 2L;
     private static final long STALE_SECONDS = 300L;
     private static final int MAX_ENTRIES = 5;
     private static final int MAX_REPLAY_BYTES = 65536;
@@ -247,6 +249,7 @@ class AuditJournalReaperTest {
         clock.advanceSeconds(LEASE_SECONDS + 1);
 
         assertThat(journal.reap()).isEqualTo(1);
+        clock.advanceSeconds(RETRY_BACKOFF_WAIT_SECONDS);
 
         AuditEntry after = journal.find(succeeded.id()).orElseThrow();
         assertThat(after.state()).isEqualTo(JournalState.SUCCEEDED);
@@ -749,6 +752,7 @@ class AuditJournalReaperTest {
             clock.advanceSeconds(LEASE_SECONDS);
 
             assertThat(journal.reap()).isEqualTo(1);
+            clock.advanceSeconds(RETRY_BACKOFF_WAIT_SECONDS);
 
             AuditEntry rolledBack = journal.find(succeeded.id()).orElseThrow();
             assertThat(rolledBack.state()).isEqualTo(JournalState.SUCCEEDED);
