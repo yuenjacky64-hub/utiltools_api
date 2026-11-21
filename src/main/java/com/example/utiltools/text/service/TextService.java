@@ -494,10 +494,12 @@ public class TextService {
      * <p>The optional {@link TokenizerScheme tokenizer} then <em>selects</em> tokens from each
      * <em>folded</em> input (fold-then-tokenize: one {@code Locale#ROOT} fold, then one token scan), so
      * each scheme alone decides which code points survive and every non-matching code point is
-     * discarded. {@code letter} — the default when {@code tokenizer} is absent or {@code null} — keeps
-     * the folded input verbatim as a single token, so it reproduces the pre-tokenizer code-point
-     * behaviour exactly (punctuation, whitespace, symbols and supplementary code points all still
-     * count as one edit each). The other schemes do discard unmatched code points: {@code digit} keeps
+     * discarded. {@code letter} — the default when {@code tokenizer} is absent or {@code null} — is
+     * exactly {@link #tokenize(String)}: the maximal runs of
+     * {@link Character#isLetterOrDigit(int) letter-or-digit} code points, joined by one {@code U+0020},
+     * so punctuation, whitespace and symbols between runs are discarded instead of compared (and
+     * {@code "ab-cd"} and {@code "abcd"} join to different numbers of tokens). The other schemes also
+     * discard unmatched code points: {@code digit} keeps
      * digit runs, {@code alphanum} keeps alphanumeric runs and splits them where letters meet digits,
      * {@code whitespace} keeps non-whitespace runs and {@code regex} takes the non-empty matches of
      * {@code pattern}. Their surviving tokens are joined by a single {@code U+0020}, so a token-count
@@ -558,9 +560,10 @@ public class TextService {
      */
     private List<String> schemeTokens(String folded, TokenizerScheme scheme, Pattern custom, long deadlineMs) {
         if (scheme == TokenizerScheme.LETTER) {
-            // The default scheme is the pre-tokenizer behaviour verbatim: the folded input is one token,
-            // so no code point is dropped and no separator is inserted.
-            return List.of(folded);
+            // The default scheme is exactly {@link #tokenize(String)}: maximal letter/digit runs, which
+            // String.join below re-joins with one U+0020, so punctuation, whitespace and symbols between
+            // runs are dropped rather than counted.
+            return tokenize(folded);
         }
         if (scheme == TokenizerScheme.REGEX) {
             return regexTokens(new BudgetedCharSequence(folded, clock, deadlineMs, regexTimeoutMs), custom);
@@ -591,8 +594,8 @@ public class TextService {
     }
 
     /**
-     * Code points a predefined scheme keeps; {@code letter} (one verbatim token) and {@code regex} never
-     * reach this method.
+     * Code points a predefined scheme keeps; {@code letter} (the fixed {@link #tokenize(String)} runs) and
+     * {@code regex} never reach this method.
      */
     private static boolean isSchemeToken(TokenizerScheme scheme, int codePoint) {
         return switch (scheme) {

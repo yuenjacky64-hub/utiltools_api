@@ -19,8 +19,11 @@ import java.util.Locale;
 public enum TokenizerScheme {
 
     /**
-     * The folded input verbatim, i.e. one token — exactly today's code-point behaviour, so punctuation,
-     * whitespace, symbols and supplementary code points keep counting as single edits.
+     * The project's standard tokenizer: the maximal runs of
+     * {@link Character#isLetterOrDigit(int) letter-or-digit} code points, joined by one {@code U+0020}
+     * before the distance is measured — exactly {@code TextService.tokenize(String)}. Punctuation,
+     * whitespace and symbols between runs are discarded, so {@code "a.b"} and {@code "a b"} both
+     * tokenize to {@code "a b"}.
      */
     LETTER("letter"),
 

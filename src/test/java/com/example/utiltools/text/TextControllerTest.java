@@ -949,7 +949,8 @@ class TextControllerTest {
     @DisplayName("POST /api/v1/utils/text/similarity - supplementary code points count as a single edit")
     void shouldCountSupplementaryCodePointsAsOneEdit() throws Exception {
         String body = objectMapper.writeValueAsString(java.util.Map.of(
-                "left", "a\uD83D\uDE00b", "right", "a\uD83D\uDE01b"));
+                "left", "a\uD83D\uDE00b", "right", "a\uD83D\uDE01b",
+                "tokenizer", "whitespace"));
 
         mockMvc.perform(post("/api/v1/utils/text/similarity")
                         .contentType(MediaType.APPLICATION_JSON)

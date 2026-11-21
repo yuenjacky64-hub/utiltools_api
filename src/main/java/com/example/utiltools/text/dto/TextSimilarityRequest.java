@@ -18,13 +18,13 @@ import jakarta.validation.constraints.Pattern;
  *                      {@link java.util.Locale#ROOT} lowercasing before the distance is measured, so
  *                      {@code "Hello"} and {@code "hello"} compare identical
  * @param tokenizer     optional token scheme applied to both inputs before the code-point distance is
- *                      measured: {@code letter} (the default, the folded input verbatim, i.e. exactly
- *                      today's behaviour), {@code digit} (digit runs), {@code alphanum} (alphanumeric
- *                      runs split where letters meet digits), {@code whitespace} (non-whitespace runs) or
- *                      {@code regex}. Matching is case-insensitive on the wire; {@code null} means
- *                      {@code letter}. The four run-based schemes <em>select</em> tokens — everything
- *                      else is discarded — and their consecutive tokens are compared joined by one
- *                      space
+ *                      measured: {@code letter} (the default, the project's letter/digit run tokenizer,
+ *                      i.e. exactly {@code TextService.tokenize(String)}), {@code digit} (digit runs),
+ *                      {@code alphanum} (alphanumeric runs split where letters meet digits),
+ *                      {@code whitespace} (non-whitespace runs) or {@code regex}. Matching is
+ *                      case-insensitive on the wire; {@code null} means {@code letter}. Every scheme
+ *                      <em>selects</em> tokens — everything else is discarded — and the consecutive
+ *                      tokens are compared joined by one space
  * @param pattern       optional; the regular expression whose non-empty matches are the tokens when
  *                      {@code tokenizer} is {@code regex}. Required for that scheme (a missing or
  *                      blank value is rejected as {@code 400 BAD_REQUEST}), bounded to 1..512

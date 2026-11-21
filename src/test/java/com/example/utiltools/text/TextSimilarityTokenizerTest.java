@@ -69,7 +69,8 @@ class TextSimilarityTokenizerTest {
     @Test
     @DisplayName("similarity - every tokenizer scheme selects its own tokens (DOD-02)")
     void shouldApplyEachTokenizerScheme() {
-        // letter keeps the folded input verbatim, so each side stays one token.
+        // letter is exactly TextService.tokenize: "ab12" and "12ab" are one whole letter/digit run each,
+        // so the distance is the four code-point substitutions.
         TextSimilarityResponse letterMixed = similarity("ab12", "12ab", null, TokenizerScheme.LETTER, null);
         assertThat(letterMixed.distance()).isEqualTo(4);
         assertThat(letterMixed.maxLength()).isEqualTo(4);
@@ -83,7 +84,7 @@ class TextSimilarityTokenizerTest {
         assertThat(digitMixed.similarity()).isEqualTo(1.0);
         assertThat(digitMixed.identical()).isTrue();
 
-        // letter keeps "abc123" whole, so the stray space is one insertion.
+        // letter keeps "abc123" whole and joins "abc 123" as "abc 123", so the space is one insertion.
         TextSimilarityResponse letterSpaced = similarity("abc123", "abc 123", null, TokenizerScheme.LETTER, null);
         assertThat(letterSpaced.distance()).isEqualTo(1);
         assertThat(letterSpaced.maxLength()).isEqualTo(7);
@@ -102,11 +103,19 @@ class TextSimilarityTokenizerTest {
         assertThat(whitespaceSpaced.maxLength()).isEqualTo(3);
         assertThat(whitespaceSpaced.similarity()).isEqualTo(0.666667);
 
-        // letter never discards anything: a punctuation-vs-space edit stays one edit.
+        // letter drops the separator between runs, so "a.b" and "a b" both tokenize to "a b".
         TextSimilarityResponse letterPunctuation = similarity("a.b", "a b", null, TokenizerScheme.LETTER, null);
-        assertThat(letterPunctuation.distance()).isEqualTo(1);
+        assertThat(letterPunctuation.distance()).isZero();
         assertThat(letterPunctuation.maxLength()).isEqualTo(3);
-        assertThat(letterPunctuation.similarity()).isEqualTo(0.666667);
+        assertThat(letterPunctuation.similarity()).isEqualTo(1.0);
+        assertThat(letterPunctuation.identical()).isTrue();
+
+        // letter is TextService.tokenize written out: letter/digit runs joined by one U+0020, so symbols
+        // outside a run are not compared (whitespace, by contrast, keeps them inside its token).
+        TextSimilarityResponse letterSupplementary =
+                similarity("a\uD83D\uDE00b", "a\uD83D\uDE01b", null, TokenizerScheme.LETTER, null);
+        assertThat(letterSupplementary.distance()).isZero();
+        assertThat(letterSupplementary.maxLength()).isEqualTo(3);
 
         // regex selects the [a-z]+ runs and discards the digits on both sides.
         TextSimilarityResponse regexRuns =

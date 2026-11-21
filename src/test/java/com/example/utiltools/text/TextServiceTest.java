@@ -16,6 +16,7 @@ import com.example.utiltools.text.dto.TextTruncateRequest;
 import com.example.utiltools.text.dto.TextTruncateResponse;
 import com.example.utiltools.text.dto.TextWordFrequencyRequest;
 import com.example.utiltools.text.dto.TextWordFrequencyResponse;
+import com.example.utiltools.text.dto.TokenizerScheme;
 import com.example.utiltools.text.service.TextService;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validation;
@@ -824,9 +825,12 @@ class TextServiceTest {
     @Test
     @DisplayName("similarity - a supplementary code point counts as one edit, not two")
     void shouldCompareSupplementaryCodePoints() {
-        // U+1F600 is a surrogate pair: two chars but one code point.
+        // U+1F600 is a surrogate pair: two chars but one code point. The whitespace scheme is pinned so
+        // the symbol stays inside the compared token (the default letter scheme drops code points that
+        // are not letter-or-digit), keeping this a pure code-point-vs-char assertion.
         TextSimilarityResponse response =
-                service.similarity(new TextSimilarityRequest("a\uD83D\uDE00b", "a\uD83D\uDE01b", null, null, null));
+                service.similarity(new TextSimilarityRequest("a\uD83D\uDE00b", "a\uD83D\uDE01b", null,
+                        TokenizerScheme.WHITESPACE, null));
 
         assertThat(response.distance()).isEqualTo(1);
         assertThat(response.maxLength()).isEqualTo(3);
