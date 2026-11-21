@@ -2,7 +2,6 @@ package com.example.utiltools.text.dto;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 import java.util.List;
@@ -18,6 +17,12 @@ import java.util.List;
  * same asymmetry applies to {@code ignoreWords}: its entry caps are bean validation, so an over-cap
  * list answers {@code 400 VALIDATION_ERROR} and is <em>not</em> journalled.</p>
  *
+ * <p>The {@code pattern} bound follows that same service-side rule: {@code @Valid} says nothing about
+ * it, because {@code pattern} is only meaningful for the {@code regex} scheme. It is validated by
+ * {@code TextService} for that scheme alone, so a missing, blank, over-long or non-compiling pattern
+ * answers {@code 400 BAD_REQUEST} and is journalled as a {@code FAILED} {@code TEXT_SIMILARITY} entry
+ * instead of {@code 400 VALIDATION_ERROR}, while a pattern sent with any predefined scheme is ignored.</p>
+ *
  * @param left          the first text to compare; must be non-blank and at most 2000 code points
  * @param right         the second text to compare; must be non-blank and at most 2000 code points
  * @param caseSensitive optional; when {@code false} or absent, both inputs are folded with
@@ -32,9 +37,10 @@ import java.util.List;
  *                      <em>selects</em> tokens — everything else is discarded — and the consecutive
  *                      tokens are compared joined by one space
  * @param pattern       optional; the regular expression whose non-empty matches are the tokens when
- *                      {@code tokenizer} is {@code regex}. Required for that scheme (a missing or
- *                      blank value is rejected as {@code 400 BAD_REQUEST}), bounded to 1..512
- *                      characters, and ignored for every predefined scheme
+ *                      {@code tokenizer} is {@code regex}. Required for the {@code regex} scheme — a
+ *                      missing or blank value is rejected as {@code 400 BAD_REQUEST} by
+ *                      {@code TextService}, as is a value longer than 512 characters or one that does
+ *                      not compile; ignored for every predefined scheme
  * @param ignoreWords   optional words excluded from <em>both</em> inputs before the distance is
  *                      measured; at most 1000 non-blank entries of at most 100 characters each. Each
  *                      entry is matched against a whole token <em>after</em> the selected
@@ -55,7 +61,6 @@ public record TextSimilarityRequest(
 
         TokenizerScheme tokenizer,
 
-        @Pattern(regexp = "^[\\s\\S]{1,512}$", message = "pattern must be 1..512 characters")
         String pattern,
 
         @Valid

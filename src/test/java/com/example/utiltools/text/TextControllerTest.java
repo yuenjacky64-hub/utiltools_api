@@ -1191,6 +1191,45 @@ class TextControllerTest {
     }
 
     @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - a pattern is ignored, not rejected, for tokenizer=letter (DOD-02)")
+    void similarityAcceptsAnyPatternForNonRegexTokenizer() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "abc", "right": "abd", "tokenizer": "letter", "pattern": "anything"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.distance").value(1))
+                .andExpect(jsonPath("$.data.maxLength").value(3))
+                .andExpect(jsonPath("$.data.similarity").value(0.666667))
+                .andExpect(jsonPath("$.data.identical").value(false));
+
+        // The ignored pattern is still echoed into the journaled request, so nothing is silently dropped.
+        mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_SIMILARITY"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].request.tokenizer").value("letter"))
+                .andExpect(jsonPath("$.data[0].request.pattern").value("anything"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - tokenizer=regex with a valid pattern still answers 200 (DOD-03)")
+    void similarityWithRegexAndValidPattern() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "abc", "right": "abd", "tokenizer": "regex", "pattern": "[a-z]"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(1))
+                .andExpect(jsonPath("$.data.maxLength").value(5))
+                .andExpect(jsonPath("$.data.similarity").value(0.8))
+                .andExpect(jsonPath("$.data.identical").value(false));
+    }
+
+    @Test
     @DisplayName("a regex-tokenized similarity is journalled and replays as VERIFIED without a new entry (DOD-07)")
     void similarityWithCustomTokenizerJournalsAndReplaysAsVerified() throws Exception {
         mockMvc.perform(post("/api/v1/utils/text/similarity")
@@ -1265,6 +1304,43 @@ class TextControllerTest {
                 .andExpect(jsonPath("$.data[0].operation").value("TEXT_SIMILARITY"))
                 .andExpect(jsonPath("$.data[0].state").value("FAILED"))
                 .andExpect(jsonPath("$.data[0].errorCode").value("BAD_REQUEST"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - the retired 1..512 pattern bound is enforced by the service (DOD-05)")
+    void shouldRejectOverLongRegexPatternInService() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"regex\", "
+                                + "\"pattern\": \"" + "a".repeat(513) + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("pattern must be 1..512 characters")));
+
+        mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_SIMILARITY"))
+                .andExpect(jsonPath("$.data[0].state").value("FAILED"))
+                .andExpect(jsonPath("$.data[0].errorCode").value("BAD_REQUEST"));
+
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"regex\", "
+                                + "\"pattern\": \"" + "a".repeat(512) + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - an over-long pattern is ignored for tokenizer=letter (DOD-06)")
+    void similarityIgnoresOverLongPatternForNonRegexTokenizer() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"letter\", "
+                                + "\"pattern\": \"" + "a".repeat(513) + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(1))
+                .andExpect(jsonPath("$.data.maxLength").value(3));
     }
 
     @Test
