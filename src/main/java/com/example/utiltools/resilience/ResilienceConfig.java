@@ -12,6 +12,8 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.Scheduled;
 
 import java.time.Clock;
+import com.example.utiltools.scheduling.MaintenancePassGuard;
+import com.example.utiltools.scheduling.MaintenancePass;
 import java.time.Duration;
 
 /**
@@ -33,6 +35,16 @@ public class ResilienceConfig {
     // Same anti-circularity reason: the fallback cache bean is declared by this class.
     @Autowired
     private ObjectProvider<JsonQueryFallbackCache> fallbackCacheProvider;
+
+    /** Per-pass quarantine; a real guard with the documented defaults outside Spring (REQ-03). */
+    private MaintenancePassGuard guard = MaintenancePassGuard.defaults();
+
+    @Autowired(required = false)
+    void setMaintenancePassGuard(MaintenancePassGuard guard) {
+        if (guard != null) {
+            this.guard = guard;
+        }
+    }
 
     @Bean
     public CircuitBreaker jsonPathCircuitBreaker(
@@ -58,6 +70,10 @@ public class ResilienceConfig {
 
     @Scheduled(fixedDelayString = "${utiltools.resilience.probe-reaper-interval-ms:5000}")
     public void reapExpiredProbes() {
+        guard.run(MaintenancePass.RESILIENCE_REAP_EXPIRED_PROBES, this::reapExpiredProbeLeases);
+    }
+
+    private void reapExpiredProbeLeases() {
         CircuitBreaker breaker = breakerProvider.getIfAvailable();
         if (breaker != null && breaker.reapExpiredProbe()) {
             log.debug("released an expired HALF_OPEN probe lease on {}", breaker.name());
@@ -66,6 +82,10 @@ public class ResilienceConfig {
 
     @Scheduled(fixedDelayString = "${utiltools.resilience.fallback-cache-sweep-interval-ms:30000}")
     public void sweepExpiredFallbackEntries() {
+        guard.run(MaintenancePass.RESILIENCE_SWEEP_FALLBACK_ENTRIES, this::sweepExpiredFallbackCache);
+    }
+
+    private void sweepExpiredFallbackCache() {
         JsonQueryFallbackCache cache = fallbackCacheProvider.getIfAvailable();
         if (cache != null) {
             cache.sweepExpired();

@@ -14,6 +14,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
+import com.example.utiltools.scheduling.MaintenancePassGuard;
+import com.example.utiltools.scheduling.MaintenancePass;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -117,6 +119,16 @@ public class ContactSubmissionService {
     private volatile AuditJournalService journal;
     /** Flipped by {@link #shutdown()}: after it the retry scanner admits nothing more (REQ-05). */
     private volatile boolean shutdownRefused;
+
+    /** Per-pass quarantine; a real guard with the documented defaults outside Spring (REQ-03). */
+    private MaintenancePassGuard guard = MaintenancePassGuard.defaults();
+
+    @Autowired(required = false)
+    void setMaintenancePassGuard(MaintenancePassGuard guard) {
+        if (guard != null) {
+            this.guard = guard;
+        }
+    }
 
     /**
      * Registry: insertion-ordered (admission order), bounded by the retention/cap sweep. All
@@ -580,7 +592,7 @@ public class ContactSubmissionService {
      */
     @Scheduled(fixedDelayString = "${utiltools.contact.reaper-interval-ms:5000}")
     public void reapScheduled() {
-        reapStaleDispatching();
+        guard.run(MaintenancePass.CONTACT_REAP_SCHEDULED, this::reapStaleDispatching);
     }
 
     /**
@@ -681,6 +693,10 @@ public class ContactSubmissionService {
      */
     @Scheduled(fixedDelayString = "${utiltools.contact.retry-scan-interval-ms:1000}")
     void retryScheduled() {
+        guard.run(MaintenancePass.CONTACT_RETRY_SCHEDULED, this::retryDuePass);
+    }
+
+    private void retryDuePass() {
         // REQ-05: once the drain has started the scanner admits nothing further.
         if (shutdownRefused) {
             return;
