@@ -475,6 +475,44 @@ public class TextService {
     }
 
     /**
+     * Remove every alphanumeric run whose folded form is in {@code ignoredFolded}, in a single
+     * left-to-right pass over code points: {@code O(n)} time and space, no regular expression, so
+     * there is no backtracking surface. A dropped run is not replaced by a placeholder, so the
+     * surrounding punctuation and spacing survive (a dropped word can therefore leave a doubled
+     * space) and both compared sides are treated identically. The result is a pure function of the
+     * arguments — no clock, no default locale, no iteration order in the output path.
+     */
+    private static String stripIgnoredWords(String text, Set<String> ignoredFolded, boolean caseSensitive) {
+        StringBuilder result = new StringBuilder(text.length());
+        StringBuilder run = new StringBuilder();
+        for (int index = 0; index < text.length(); ) {
+            int codePoint = text.codePointAt(index);
+            if (Character.isLetterOrDigit(codePoint)) {
+                run.appendCodePoint(codePoint);
+            } else {
+                appendUnlessIgnored(result, run, ignoredFolded, caseSensitive);
+                result.appendCodePoint(codePoint);
+            }
+            index += Character.charCount(codePoint);
+        }
+        appendUnlessIgnored(result, run, ignoredFolded, caseSensitive);
+        return result.toString();
+    }
+
+    /** Append the buffered alphanumeric run unless it is an ignored word, then clear the buffer. */
+    private static void appendUnlessIgnored(StringBuilder result, StringBuilder run,
+                                            Set<String> ignoredFolded, boolean caseSensitive) {
+        if (run.length() == 0) {
+            return;
+        }
+        String word = run.toString();
+        run.setLength(0);
+        if (!ignoredFolded.contains(foldWord(word, caseSensitive))) {
+            result.append(word);
+        }
+    }
+
+    /**
      * Deterministic edit-distance comparison: {@code distance} is the code-point Levenshtein distance
      * between {@code left} and {@code right}, computed with a two-row dynamic programme
      * ({@code O(min(n, m))} memory, never an {@code n × m} table); {@code maxLength} is the longer of
@@ -491,11 +529,26 @@ public class TextService {
      * caller's input, not to the folded sequence, whose length may differ under case mapping; at most
      * {@code 2 × 2001} ints are ever allocated. The method reads no clock and no default locale, so the
      * output is a pure function of the request.</p>
+     *
+     * <p>Optional {@code ignoreWords} entries are removed from <em>both</em> inputs before the
+     * distance is measured, using the same folding as the inputs ({@link Locale#ROOT} lowercasing
+     * unless {@code caseSensitive} is {@code true}), so two documents that share only filler words
+     * are compared on their meaningful words. Each entry is matched against a whole alphanumeric run
+     * — the same token definition as {@link #tokenize(String)} — and an ignored run is dropped
+     * entirely while the surrounding punctuation and spacing are preserved. The bound check above
+     * still runs on the raw inputs, and filtering is skipped entirely when the request carries no
+     * ignore words, so the absent/none case is byte-for-byte the pre-change behaviour.</p>
      */
     public TextSimilarityResponse similarity(TextSimilarityRequest request) {
         boolean caseSensitive = Boolean.TRUE.equals(request.caseSensitive());
         String left = request.left();
         String right = request.right();
+        Set<String> ignored = new HashSet<>();
+        if (request.ignoreWords() != null) {
+            for (String word : request.ignoreWords()) {
+                ignored.add(foldWord(word, caseSensitive));
+            }
+        }
         // Bound check on the raw inputs, before folding and before any matrix row is allocated.
         if (left.codePointCount(0, left.length()) > MAX_SIMILARITY_CODE_POINTS) {
             throw new IllegalArgumentException("left must be at most 2000 code points");
@@ -503,11 +556,15 @@ public class TextService {
         if (right.codePointCount(0, right.length()) > MAX_SIMILARITY_CODE_POINTS) {
             throw new IllegalArgumentException("right must be at most 2000 code points");
         }
-        int[] comparison = foldWord(left, caseSensitive).codePoints().toArray();
-        int[] reference = foldWord(right, caseSensitive).codePoints().toArray();
+        // Filtering is a no-op when no ignore words were supplied: the compared strings stay as they are.
+        String comparedLeft = ignored.isEmpty() ? left : stripIgnoredWords(left, ignored, caseSensitive);
+        String comparedRight = ignored.isEmpty() ? right : stripIgnoredWords(right, ignored, caseSensitive);
+        int[] comparison = foldWord(comparedLeft, caseSensitive).codePoints().toArray();
+        int[] reference = foldWord(comparedRight, caseSensitive).codePoints().toArray();
         int distance = levenshteinDistance(comparison, reference);
         int maxLength = Math.max(comparison.length, reference.length);
-        // Both inputs empty is unreachable through the API (@NotBlank), but never divide by zero.
+        // Both inputs empty is unreachable through the API (@NotBlank) unless every word is ignored,
+        // but never divide by zero.
         double similarity = maxLength == 0
                 ? 1.0
                 : Math.min(1.0, Math.max(0.0,
