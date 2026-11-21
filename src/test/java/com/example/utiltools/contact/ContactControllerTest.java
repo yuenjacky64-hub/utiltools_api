@@ -16,6 +16,9 @@ import java.util.List;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -156,6 +159,34 @@ class ContactControllerTest {
                 .andExpect(jsonPath("$.success").value(true))
                 .andExpect(jsonPath("$.data[0].id").value("newer"))
                 .andExpect(jsonPath("$.data[1].id").value("older"));
+    }
+
+    /**
+     * DOD-02 / REQ-04 / REQ-05: the new operator route answers 200 with the aggregate projection
+     * under the standard envelope, and polling it dispatches no mutating service call at all - so
+     * the submission registry and the CONTACT_SUBMIT journal cannot be touched by the read.
+     */
+    @Test
+    @DisplayName("GET " + BASE + "/quarantine-status projects the redrive budget and mutates nothing")
+    void shouldReturn200ForQuarantineStatusWithoutMutating() throws Exception {
+        when(service.quarantineStatus())
+                .thenReturn(new ContactQuarantineStatusResponse(3, 2, 1, 4, 2, 5));
+
+        mockMvc.perform(get(BASE + "/quarantine-status"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.maxRedrives").value(3))
+                .andExpect(jsonPath("$.data.deadLetteredCount").value(2))
+                .andExpect(jsonPath("$.data.redriveExhaustedCount").value(1))
+                .andExpect(jsonPath("$.data.pendingCount").value(4))
+                .andExpect(jsonPath("$.data.pendingDispatchGate").value(2))
+                .andExpect(jsonPath("$.data.retainedSubmissionCount").value(5));
+
+        verify(service, times(1)).quarantineStatus();
+        verify(service, never()).submit(any(ContactSubmissionRequest.class));
+        verify(service, never()).retry(anyString());
+        verify(service, never()).redrive(anyString());
+        verify(service, never()).cancel(anyString());
     }
 
     @Test

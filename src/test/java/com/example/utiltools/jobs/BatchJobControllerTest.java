@@ -211,6 +211,68 @@ class BatchJobControllerTest {
                 .andExpect(jsonPath("$.error").value("JOB_NOT_FOUND"));
     }
 
+    /**
+     * DOD-01 / REQ-02 / REQ-05: the new operator route answers 200 with the aggregate projection and
+     * is a pure read - the registry is byte-identical before and after the call.
+     */
+    @Test
+    @DisplayName("GET /api/v1/utils/jobs/quarantine-status - should return 200 with the projection and mutate nothing")
+    void shouldReturn200WithJobsQuarantineStatus() throws Exception {
+        String jobId = com.jayway.jsonpath.JsonPath.read(mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"algorithm": "SHA-256", "items": ["alpha"]}
+                                """))
+                .andExpect(status().isAccepted())
+                .andReturn().getResponse().getContentAsString(), "$.data.jobId");
+        awaitStatus(jobService, jobId, JobStatus.COMPLETED);
+        assertThat(jobService.getJob(jobId).status()).isEqualTo(JobStatus.COMPLETED);
+
+        List<BatchHashJobResponse> registryBefore =
+                jobService.listJobs(null, BatchHashJobService.MAX_LIST_LIMIT);
+
+        mockMvc.perform(get("/api/v1/utils/jobs/quarantine-status"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.maxAutoFailovers").isNumber())
+                .andExpect(jsonPath("$.data.autoFailoverEnabled").isBoolean())
+                .andExpect(jsonPath("$.data.autoFailoverExhaustedCount").value(0))
+                .andExpect(jsonPath("$.data.failedLeaseExpiredCount").value(0))
+                .andExpect(jsonPath("$.data.queuedCount").isNumber())
+                .andExpect(jsonPath("$.data.retainedJobCount").value(registryBefore.size()));
+
+        assertThat(jobService.listJobs(null, BatchHashJobService.MAX_LIST_LIMIT))
+                .isEqualTo(registryBefore);
+    }
+
+    /**
+     * DOD-02 / REQ-02: the route projects the record's seven fields onto the documented JSON names and
+     * drives no mutation of the job machine - it never submits, retries, cancels, evicts or reaps.
+     */
+    @Test
+    @DisplayName("GET /api/v1/utils/jobs/quarantine-status - should project every field and touch no mutating path")
+    void shouldProjectJobsQuarantineStatusWithoutMutating() throws Exception {
+        doReturn(new JobsQuarantineStatusResponse(3, true, 2, 1, 4, 7))
+                .when(jobService).quarantineStatus();
+
+        mockMvc.perform(get("/api/v1/utils/jobs/quarantine-status"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.maxAutoFailovers").value(3))
+                .andExpect(jsonPath("$.data.autoFailoverEnabled").value(true))
+                .andExpect(jsonPath("$.data.autoFailoverExhaustedCount").value(2))
+                .andExpect(jsonPath("$.data.failedLeaseExpiredCount").value(1))
+                .andExpect(jsonPath("$.data.queuedCount").value(4))
+                .andExpect(jsonPath("$.data.retainedJobCount").value(7));
+
+        verify(jobService, times(1)).quarantineStatus();
+        verify(jobService, never()).submit(any(BatchHashRequest.class), anyString());
+        verify(jobService, never()).retry(anyString());
+        verify(jobService, never()).cancel(anyString());
+        verify(jobService, never()).evictExpiredJobs(any());
+        verify(jobService, never()).reapExpiredExecutions(any());
+    }
+
     @Test
     @DisplayName("POST /api/v1/utils/jobs/hash - should map a full queue to 429 QUEUE_FULL")
     void shouldReturn429WhenQueueFull() throws Exception {
