@@ -317,6 +317,22 @@ class AuditReplayRetryBackoffTest {
                 + "|replay claim lease expired at " + START.plusSeconds(LEASE_SECONDS)
                 + "; retry 1 of 3 at " + START.plusSeconds(LEASE_SECONDS + 1L + 1L)
                 + "|" + START.plusSeconds(LEASE_SECONDS + 1L));
+
+        // DOD-05 (verify leg): inside the same deterministic clock grammar, an admitted retry still
+        // replays VERIFIED through the verify path, proving the journalled decision is re-playable.
+        MutableAuditClock verifyClock = new MutableAuditClock(START);
+        AuditJournalService verifyJournal = newJournal(verifyClock, 3, 1000L, 60000L);
+        AuditReplayService verifyService = newReplayService(verifyJournal);
+        String verifyId = succeeded(verifyJournal, "retry-determ02");
+        verifyJournal.claimReplay(verifyId);
+        verifyClock.advanceSeconds(LEASE_SECONDS + 1L);
+        assertThat(verifyJournal.reap()).isEqualTo(1);
+        verifyClock.advanceSeconds(1L);
+        JournalVerifyResponse verified = verifyService.verify(1);
+        assertThat(verified.results()).hasSize(1);
+        assertThat(verified.results().get(0).outcome()).isEqualTo(ReplayState.VERIFIED);
+        assertThat(verified.results().get(0).skipReason()).isNull();
+        assertThat(verified.verified()).isEqualTo(1);
     }
 
     /** Two bounded retries then a quarantine, reduced to the deterministic tombstone trail. */
