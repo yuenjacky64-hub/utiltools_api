@@ -2800,6 +2800,27 @@ original bounded error and `completedAt`, clearing `nextRetryAt`, and closing th
 dead-lettered row is *permanently* failed: `retry()` and `DELETE` are both `409`
 `CONTACT_TRANSITION_CONFLICT`, and only an explicit operator redrive leaves the state.
 
+Lease expiry reclaims the **worker**, not just the registry row. `ContactDispatcher.dispatch` is
+allowed to block, and the attempt's execution lease (`utiltools.contact.execution-lease-seconds`)
+keeps running while it does. When the reaper terminalizes a `DISPATCHING` attempt as `FAILED`
+`CONTACT_DELIVERY_LEASE_EXPIRED`, it captures that generation's dispatch thread and interrupts it
+**exactly once**, in the same registry-lock critical section, so the bounded delivery lane is freed
+and the next submission is dispatched. The reaper never waits on the call — reclamation is
+**best-effort**:
+
+- An *interrupt-responsive* dispatcher observes `InterruptedException` (or the interrupt status
+  after returning) and is released as soon as its lease lapses. The service treats that as a
+  dispatch failure, fences the late completion out through the existing `attempt` / `DISPATCHING`
+  checks, and clears both the thread reference and the interrupt status in a `finally` before the
+  worker returns to the pool — so the next task on that executor thread starts clean. The reaped row
+  keeps its `FAILED` / `CONTACT_DELIVERY_LEASE_EXPIRED` (or `DEAD_LETTERED`) snapshot, its journal
+  entry closes exactly once, and `pendingAttempts` is released exactly once.
+- A dispatcher that *ignores interrupts* cannot be forcibly stopped in-process: the reaper still
+  returns promptly and the row is still terminal, but that lane stays occupied until the call
+  returns. The pool size (`utiltools.contact.worker-count`, default `2`) bounds how many lanes an
+  interrupt-hostile dispatcher can hold, so a dispatcher that ignores interrupts should be treated
+  as a defect in the dispatcher, not in the reaper.
+
 - `POST /api/v1/utils/contact/submissions` admits a submission with `202`; `409`
   `CONTACT_IDEMPOTENCY_CONFLICT` on a reused-key payload mismatch, `429` `CONTACT_QUEUE_FULL` when the
   pool is saturated.

@@ -183,10 +183,11 @@ class ContactSubmissionServiceTest {
         Instant reapedCompletedAt = reaped.currentAttempt().completedAt();
         assertThat(reapedCompletedAt).isEqualTo(clock.instant());
 
+        // Attempt 2 is admitted at reservation time and its own lane is held: DISPATCHING even
+        // though generation 1's late return is still fenced out, with the lease re-stamped.
+        dispatcher.holdGenerations.add(2);
         ContactSubmissionResponse retrying = service.retry(submitted.id());
         assertThat(retrying.attempt()).isEqualTo(2);
-        // attempt 2 is admitted at reservation time: DISPATCHING even though worker 1 still holds
-        // attempt 1, with the execution lease re-stamped.
         assertThat(retrying.status()).isEqualTo(ContactStatus.DISPATCHING);
         Instant startedAt2 = retrying.currentAttempt().startedAt();
 
@@ -961,6 +962,9 @@ class ContactSubmissionServiceTest {
         ContactSubmissionResponse dead = service.get(submitted.id());
         assertThat(dead.status()).isEqualTo(ContactStatus.DEAD_LETTERED);
 
+        // The redriven generation gets its own hold, so attempt 2 is observably DISPATCHING even
+        // though the reclaimed lane is free the moment the reaper interrupts generation 1.
+        dispatcher.holdGenerations.add(2);
         ContactSubmissionResponse requeued = service.redrive(submitted.id());
         assertThat(requeued.attempt()).isEqualTo(2);
         assertThat(requeued.status()).isEqualTo(ContactStatus.DISPATCHING);
@@ -982,13 +986,185 @@ class ContactSubmissionServiceTest {
         assertThat(journal.list(10, JournalState.PENDING)).isEmpty();
     }
 
+    /**
+     * REQ-01/REQ-02/REQ-03 (DOD-01): the lease reaper interrupts the blocked dispatch worker, so
+     * the bounded lane really frees up — a new submission is delivered on it without the test
+     * ever releasing the stalled call's latch.
+     */
+    @Test
+    @DisplayName("DOD-01: the reaper interrupts a blocked dispatch worker and a new submission is delivered on the reclaimed lane")
+    void reaperReclaimsBlockedDispatchWorker() {
+        startService(3); // workerCount = 1: a single hung dispatcher would pin every later row
+        dispatcher.holdGenerations.add(1);
+        ContactSubmissionResponse stalled = service.submit(request(null, "stalled on the only lane"));
+        pollUntil(stalled.id(), ContactStatus.DISPATCHING);
+        awaitCondition(() -> dispatcher.calls().size() >= 1);
+
+        clock.advance(LEASE_SECONDS + 1L);
+        assertThat(service.reapStaleDispatching()).isEqualTo(1);
+
+        ContactSubmissionResponse reaped = service.get(stalled.id());
+        assertThat(reaped.status()).isEqualTo(ContactStatus.FAILED);
+        assertThat(reaped.attempt()).isEqualTo(1);
+        assertThat(reaped.currentAttempt().error())
+                .isEqualTo(ContactSubmissionService.CONTACT_DELIVERY_LEASE_EXPIRED);
+        assertThat(reaped.currentAttempt().completedAt()).isEqualTo(clock.instant());
+
+        // The blocked call ended through InterruptedException: the worker was reclaimed.
+        awaitCondition(() -> dispatcher.interruptedGenerations.contains(1));
+
+        // No release(): the interrupted worker frees the lane on its own.
+        dispatcher.holdGenerations.remove(1);
+        ContactSubmissionResponse next = service.submit(request(null, "next on the freed lane"));
+        ContactSubmissionResponse delivered = pollUntil(next.id(), ContactStatus.DELIVERED);
+        assertThat(delivered.attempt()).isEqualTo(1);
+        assertThat(delivered.currentAttempt().error()).isNull();
+        assertThat(dispatcher.calls()).containsExactly(1, 1); // both ran on the single re-used thread
+        assertThat(dispatcher.release().getCount()).isEqualTo(1); // the old hold was never released
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(0);
+    }
+
+    /**
+     * REQ-03/REQ-04 (DOD-02): the reclaimed thread starts its next task with a clean interrupt
+     * flag, and generation 1's late return leaves the reaped snapshot byte-identical.
+     */
+    @Test
+    @DisplayName("DOD-02: the reclaimed worker starts its next attempt clean and the reaped snapshot survives the late return")
+    void reclaimedWorkerStartsNextAttemptClean() throws Exception {
+        startService(3);
+        dispatcher.holdGenerations.add(1);
+        ContactSubmissionResponse stalled = service.submit(request(null, "clean start"));
+        pollUntil(stalled.id(), ContactStatus.DISPATCHING);
+        awaitCondition(() -> dispatcher.calls().size() >= 1);
+
+        clock.advance(LEASE_SECONDS + 1L);
+        assertThat(service.reapStaleDispatching()).isEqualTo(1);
+        ContactSubmissionResponse reaped = service.get(stalled.id());
+        assertThat(reaped.status()).isEqualTo(ContactStatus.FAILED);
+        String reapedError = reaped.currentAttempt().error();
+        Instant reapedCompletedAt = reaped.currentAttempt().completedAt();
+
+        // Generation 1 returns through the interrupt; once the pool is idle again its late
+        // completion has been fenced out, so nothing about the reaped attempt moved.
+        awaitCondition(() -> dispatcher.interruptedGenerations.contains(1));
+        ThreadPoolExecutor pool = readField(service, "executor");
+        awaitCondition(() -> pool.getActiveCount() == 0 && pool.getQueue().isEmpty());
+
+        ContactSubmissionResponse afterLateReturn = service.get(stalled.id());
+        assertThat(afterLateReturn.status()).isEqualTo(ContactStatus.FAILED);
+        assertThat(afterLateReturn.attempt()).isEqualTo(1);
+        assertThat(afterLateReturn.currentAttempt().error()).isEqualTo(reapedError);
+        assertThat(afterLateReturn.currentAttempt().completedAt()).isEqualTo(reapedCompletedAt);
+        assertThat(afterLateReturn.currentAttempt().auditEntryId()).isNull();
+
+        // Attempt 2 runs on the very same pooled thread and starts with a clean interrupt flag.
+        ContactSubmissionResponse retrying = service.retry(stalled.id());
+        assertThat(retrying.attempt()).isEqualTo(2);
+        ContactSubmissionResponse delivered = pollUntil(stalled.id(), ContactStatus.DELIVERED);
+        assertThat(delivered.attempt()).isEqualTo(2);
+        assertThat(delivered.currentAttempt().error()).isNull();
+        assertThat(dispatcher.interruptedAtStart).containsEntry(2, false);
+        assertThat(dispatcher.interruptedAtStart.get(1)).isFalse();
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(0);
+    }
+
+    /**
+     * REQ-04 (DOD-03): the reaped attempt's journal entry closes exactly once with the lease code,
+     * the interrupted worker's late completion writes nothing, and a later retry still succeeds.
+     */
+    @Test
+    @DisplayName("DOD-03: the late completion after a reap is fenced out and the journal closes exactly once")
+    void lateCompletionAfterReapIsFencedAndJournalClosesOnce() throws Exception {
+        AuditJournalService journal = newJournal();
+        startService(3);
+        service.setAuditJournal(journal);
+        dispatcher.holdGenerations.add(1);
+        ContactSubmissionResponse stalled = service.submit(request(null, "fence my late completion"));
+        pollUntil(stalled.id(), ContactStatus.DISPATCHING);
+        awaitCondition(() -> dispatcher.calls().size() >= 1);
+        String entry1 = service.get(stalled.id()).currentAttempt().auditEntryId();
+        assertThat(entry1).isNotBlank();
+
+        clock.advance(LEASE_SECONDS + 1L);
+        assertThat(service.reapStaleDispatching()).isEqualTo(1);
+
+        awaitCondition(() -> dispatcher.interruptedGenerations.contains(1));
+        ThreadPoolExecutor pool = readField(service, "executor");
+        awaitCondition(() -> pool.getActiveCount() == 0 && pool.getQueue().isEmpty());
+
+        assertThat(journal.find(entry1).orElseThrow().state()).isEqualTo(JournalState.FAILED);
+        assertThat(journal.find(entry1).orElseThrow().errorCode())
+                .isEqualTo(ContactSubmissionService.CONTACT_DELIVERY_LEASE_EXPIRED);
+        assertThat(journal.list(10, JournalState.FAILED)).hasSize(1);
+        assertThat(journal.list(10, JournalState.PENDING)).isEmpty();
+        assertThat(journal.list(10, JournalState.SUCCEEDED)).isEmpty();
+        // The interrupted worker never completed a dispatch, yet the counter was released once.
+        assertThat(dispatcher.completedGenerations).doesNotContain(1);
+        assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(0);
+
+        // A later retry still succeeds and opens exactly one new entry.
+        dispatcher.holdGenerations.remove(1);
+        ContactSubmissionResponse retrying = service.retry(stalled.id());
+        assertThat(retrying.attempt()).isEqualTo(2);
+        ContactSubmissionResponse delivered = pollUntil(stalled.id(), ContactStatus.DELIVERED);
+        assertThat(delivered.attempt()).isEqualTo(2);
+        assertThat(delivered.currentAttempt().error()).isNull();
+        assertThat(journal.list(10, JournalState.SUCCEEDED)).hasSize(1);
+        assertThat(journal.list(10, JournalState.FAILED)).hasSize(1);
+        assertThat(journal.list(10, JournalState.PENDING)).isEmpty();
+    }
+
+    /**
+     * REQ-02 (DOD-04): reclamation is best-effort — an interrupt-hostile dispatcher cannot be
+     * stopped, but the reaper never waits on it and still terminalizes the row promptly.
+     */
+    @Test
+    @DisplayName("DOD-04: the reaper returns promptly even when the dispatcher ignores its interrupt")
+    void reaperDoesNotBlockOnUninterruptibleDispatcher() throws Exception {
+        startService(3);
+        dispatcher.holdGenerations.add(1);
+        dispatcher.interruptsToIgnore = 1;
+        try {
+            ContactSubmissionResponse stalled = service.submit(request(null, "hostile dispatcher"));
+            pollUntil(stalled.id(), ContactStatus.DISPATCHING);
+            awaitCondition(() -> dispatcher.calls().size() >= 1);
+
+            clock.advance(LEASE_SECONDS + 1L);
+            long startedNanos = System.nanoTime();
+            assertThat(service.reapStaleDispatching()).isEqualTo(1);
+            long elapsedMillis = (System.nanoTime() - startedNanos) / 1_000_000L;
+
+            assertThat(elapsedMillis).isLessThan(500L);
+            ContactSubmissionResponse reaped = service.get(stalled.id());
+            assertThat(reaped.status()).isEqualTo(ContactStatus.FAILED);
+            assertThat(reaped.currentAttempt().error())
+                    .isEqualTo(ContactSubmissionService.CONTACT_DELIVERY_LEASE_EXPIRED);
+            assertThat(reaped.currentAttempt().completedAt()).isEqualTo(clock.instant());
+            assertThat((Object) readField(service, "pendingAttempts")).isEqualTo(0);
+            // The single interrupt the reaper issued was delivered (and swallowed by the dispatcher).
+            awaitCondition(() -> dispatcher.interruptsSeen.contains(1));
+        } finally {
+            dispatcher.release().countDown(); // never leave the hostile hold running
+        }
+    }
+
     /** Per-generation dispatcher behaviour: hold, fail, or complete; counts every call. */
     private static final class ControllableDispatcher implements ContactDispatcher {
         final ConcurrentLinkedQueue<Integer> calls = new ConcurrentLinkedQueue<>();
         final Set<Integer> holdGenerations = ConcurrentHashMap.newKeySet();
         final Set<Integer> failGenerations = ConcurrentHashMap.newKeySet();
+        /** Generations whose held call ended by propagating an {@link InterruptedException}. */
+        final ConcurrentLinkedQueue<Integer> interruptedGenerations = new ConcurrentLinkedQueue<>();
+        /** Generations whose call returned normally, i.e. the late completion really ran. */
+        final ConcurrentLinkedQueue<Integer> completedGenerations = new ConcurrentLinkedQueue<>();
+        /** Generations that swallowed an interrupt (only the interrupt-hostile mode). */
+        final ConcurrentLinkedQueue<Integer> interruptsSeen = new ConcurrentLinkedQueue<>();
+        /** {@code Thread.currentThread().isInterrupted()} sampled as the first dispatch statement. */
+        final Map<Integer, Boolean> interruptedAtStart = new ConcurrentHashMap<>();
         private final CountDownLatch release;
         volatile boolean holdAll;
+        /** {@code > 0} makes the held call swallow that many interrupts before staying blocked. */
+        volatile int interruptsToIgnore;
 
         ControllableDispatcher(CountDownLatch release) {
             this.release = release;
@@ -1005,11 +1181,50 @@ class ContactSubmissionServiceTest {
         @Override
         public void dispatch(String submissionId, int generation) throws Exception {
             calls.add(generation);
+            interruptedAtStart.put(generation, Thread.currentThread().isInterrupted());
             if (holdAll || holdGenerations.contains(generation)) {
-                release.await(60, TimeUnit.SECONDS);
+                hold(generation);
             }
             if (failGenerations.contains(generation)) {
                 throw new IllegalStateException("dispatcher failure for generation " + generation);
+            }
+            completedGenerations.add(generation);
+        }
+
+        /**
+         * Holds the lane until {@link #release()} is counted down. Interrupt-responsive by
+         * default (the {@link InterruptedException} is recorded and rethrown, like a dispatcher
+         * that propagates it); interrupt-hostile when {@link #interruptsToIgnore} is positive —
+         * that many interrupts are swallowed, then the call stays blocked until the test releases
+         * it, bounded so the suite can never hang.
+         */
+        private void hold(int generation) throws InterruptedException {
+            int ignored = 0;
+            while (ignored < interruptsToIgnore) {
+                try {
+                    release.await(5, TimeUnit.SECONDS);
+                    return;
+                } catch (InterruptedException e) {
+                    ignored++;
+                    interruptsSeen.add(generation);
+                }
+            }
+            if (interruptsToIgnore > 0) {
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (release.getCount() > 0 && System.nanoTime() < deadline) {
+                    try {
+                        release.await(50, TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException swallowed) {
+                        interruptsSeen.add(generation); // hostile: the interrupt is discarded
+                    }
+                }
+                return;
+            }
+            try {
+                release.await(60, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                interruptedGenerations.add(generation);
+                throw e;
             }
         }
     }
