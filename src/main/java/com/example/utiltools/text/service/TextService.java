@@ -476,6 +476,40 @@ public class TextService {
     }
 
     /**
+     * Fold the caller's {@code ignoreWords} into the set the token filter compares against, using the
+     * same folding as the compared inputs ({@link Locale#ROOT} lowercasing unless
+     * {@code caseSensitive} is {@code true}). An absent list yields an empty set, and an empty set
+     * makes the filter a no-op, so a request without ignore words keeps the pre-change behaviour.
+     */
+    private static Set<String> ignoredTokens(List<String> ignoreWords, boolean caseSensitive) {
+        if (ignoreWords == null || ignoreWords.isEmpty()) {
+            return Set.of();
+        }
+        Set<String> ignored = new HashSet<>();
+        for (String word : ignoreWords) {
+            ignored.add(foldWord(word, caseSensitive));
+        }
+        return ignored;
+    }
+
+    /**
+     * Drop every token that is an ignored word from one already-selected token list, keeping the
+     * surviving tokens in their original order: {@code O(tokens)} and no regular expression, so there
+     * is no backtracking surface. The tokens are already folded exactly like the ignore set (and, for
+     * {@code regex}, are the pattern's matches), so the containment test is the whole matching rule;
+     * a dropped token is removed rather than replaced, so the joined sequence simply no longer
+     * contains it. Pure function of the arguments — no clock, no default locale, no iteration order in
+     * the output path.
+     */
+    private static List<String> withoutIgnoredTokens(List<String> tokens, Set<String> ignoredFolded) {
+        if (ignoredFolded.isEmpty()) {
+            return tokens;
+        }
+        tokens.removeIf(ignoredFolded::contains);
+        return tokens;
+    }
+
+    /**
      * Deterministic edit-distance comparison: {@code distance} is the code-point Levenshtein distance
      * between {@code left} and {@code right}, computed with a two-row dynamic programme
      * ({@code O(min(n, m))} memory, never an {@code n × m} table); {@code maxLength} is the longer of
@@ -513,12 +547,22 @@ public class TextService {
      * under the existing {@code utiltools.text.regex-timeout-ms} wall-clock budget and raises
      * {@link RegexTimeoutException} when exhausted. Every other scheme reads no clock, and no step
      * reads the default locale, so the output stays a pure function of the request.</p>
+     *
+     * <p>Optional {@code ignoreWords} entries are removed from <em>both</em> inputs after the
+     * tokenizer has selected the tokens and before the distance is measured, using the same folding
+     * as the inputs ({@link Locale#ROOT} lowercasing unless {@code caseSensitive} is {@code true}), so
+     * two documents that share only filler words are compared on their meaningful words. Each entry
+     * is matched against a whole token — never a substring of one — and an ignored token is dropped
+     * rather than replaced, so the surviving tokens are still joined by one {@code U+0020}. Filtering
+     * is skipped entirely when the request carries no ignore words, so the absent/none case is
+     * byte-for-byte the pre-change behaviour.</p>
      */
     public TextSimilarityResponse similarity(TextSimilarityRequest request) {
         boolean caseSensitive = Boolean.TRUE.equals(request.caseSensitive());
         TokenizerScheme scheme = request.tokenizer() == null ? TokenizerScheme.LETTER : request.tokenizer();
         String left = request.left();
         String right = request.right();
+        Set<String> ignored = ignoredTokens(request.ignoreWords(), caseSensitive);
         // Bound check on the raw inputs, before folding, tokenizing and before any matrix row is allocated.
         if (left.codePointCount(0, left.length()) > MAX_SIMILARITY_CODE_POINTS) {
             throw new IllegalArgumentException("left must be at most 2000 code points");
@@ -529,11 +573,12 @@ public class TextService {
         Pattern custom = scheme == TokenizerScheme.REGEX ? compileCustomPattern(request.pattern()) : null;
         // The wall-clock budget is request-scoped: set once, so both inputs share the same deadline.
         long deadlineMs = scheme == TokenizerScheme.REGEX ? clock.millis() + regexTimeoutMs : 0L;
-        int[] comparison = comparisonSequence(left, scheme, custom, caseSensitive, deadlineMs);
-        int[] reference = comparisonSequence(right, scheme, custom, caseSensitive, deadlineMs);
+        int[] comparison = comparisonSequence(left, scheme, custom, caseSensitive, deadlineMs, ignored);
+        int[] reference = comparisonSequence(right, scheme, custom, caseSensitive, deadlineMs, ignored);
         int distance = levenshteinDistance(comparison, reference);
         int maxLength = Math.max(comparison.length, reference.length);
-        // Both inputs empty is unreachable through the API (@NotBlank), but never divide by zero.
+        // Both inputs empty is unreachable through the API (@NotBlank) unless every word is ignored,
+        // but never divide by zero.
         double similarity = maxLength == 0
                 ? 1.0
                 : Math.min(1.0, Math.max(0.0,
@@ -542,15 +587,16 @@ public class TextService {
     }
 
     /**
-     * Fold, tokenize and join one similarity input into the code-point array the distance is measured
-     * over. Folding happens first so the token scan and the pattern matcher both see the same folded
-     * text; the join is by a single {@code U+0020}.
+     * Fold, tokenize, filter and join one similarity input into the code-point array the distance is
+     * measured over. Folding happens first so the token scan and the pattern matcher both see the same
+     * fold; ignored words are then removed from the selected tokens (a no-op when the request carries
+     * none) and the join is by a single {@code U+0020}.
      */
     private int[] comparisonSequence(String raw, TokenizerScheme scheme, Pattern custom,
-            boolean caseSensitive, long deadlineMs) {
+            boolean caseSensitive, long deadlineMs, Set<String> ignoredFolded) {
         String folded = foldWord(raw, caseSensitive);
         List<String> tokens = schemeTokens(folded, scheme, custom, deadlineMs);
-        return String.join(" ", tokens).codePoints().toArray();
+        return String.join(" ", withoutIgnoredTokens(tokens, ignoredFolded)).codePoints().toArray();
     }
 
     /**
