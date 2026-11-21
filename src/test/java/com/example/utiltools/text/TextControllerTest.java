@@ -1427,7 +1427,7 @@ class TextControllerTest {
 
     @Test
     @DisplayName("POST /api/v1/utils/text/diff - returns the changed token with both spans and a summary (DOD-01)")
-    void shouldDiffTwoTexts() throws Exception {
+    void shouldDiffTwoTextsReportingAddedRemovedAndChanged() throws Exception {
         mockMvc.perform(post("/api/v1/utils/text/diff")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
@@ -1488,7 +1488,7 @@ class TextControllerTest {
 
     @Test
     @DisplayName("POST /api/v1/utils/text/diff - identical inputs answer identical=true and identical=false for a folded pair (DOD-02)")
-    void shouldReportIdenticalTexts() throws Exception {
+    void shouldReportNoDifferencesForIdenticalTexts() throws Exception {
         mockMvc.perform(post("/api/v1/utils/text/diff")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
@@ -1536,7 +1536,7 @@ class TextControllerTest {
     }
 
     @Test
-    @DisplayName("POST /api/v1/utils/text/diff - a side over 2000 characters returns 400 VALIDATION_ERROR (DOD-03)")
+    @DisplayName("POST /api/v1/utils/text/diff - a side over 2000 code points returns 400 VALIDATION_ERROR (DOD-03)")
     void shouldRejectOverBoundDiffInput() throws Exception {
         int entriesBefore = journal.size();
         String body = objectMapper.writeValueAsString(java.util.Map.of(
@@ -1548,12 +1548,29 @@ class TextControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
-                .andExpect(jsonPath("$.details", hasItem("left must be at most 2000 characters")));
+                .andExpect(jsonPath("$.details", hasItem("left must be at most 2000 code points")));
 
         // A request refused by bean validation never reaches the service, so nothing is journalled.
         assertThat(journal.size()).isEqualTo(entriesBefore);
     }
 
+    @Test
+    @DisplayName("POST /api/v1/utils/text/diff - the bound counts code points, so 1200 astral characters are accepted (DOD-03)")
+    void shouldAcceptAstralTextInsideTheCodePointBound() throws Exception {
+        // 1200 supplementary code points are 2400 UTF-16 units: inside the documented budget.
+        String emoji = "\uD83D\uDC4D".repeat(1200);
+        String body = objectMapper.writeValueAsString(java.util.Map.of(
+                "left", emoji + " a", "right", emoji + " b", "tokenizer", "whitespace"));
+
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.identical").value(false));
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/text/diff - non-text payloads return 400 and blank sides are VALIDATION_ERROR (DOD-04)")
     void shouldRejectNonTextDiffPayloads() throws Exception {
         int entriesBefore = journal.size();
@@ -1567,6 +1584,7 @@ class TextControllerTest {
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
                 .andExpect(jsonPath("$.details", hasItem("right is required")));
 
+        // Strict string deserialization: a JSON number/boolean is refused, not coerced to "12"/"true".
         mockMvc.perform(post("/api/v1/utils/text/diff")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
@@ -1577,16 +1595,19 @@ class TextControllerTest {
                 .andExpect(jsonPath("$.message").value(containsString("Malformed JSON request body")));
 
         mockMvc.perform(post("/api/v1/utils/text/diff")
-                        .contentType(MediaType.TEXT_PLAIN)
-                        .content("not json"))
-                .andExpect(status().isBadRequest());
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": {"nested": 1}, "right": ["a"]}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
 
         assertThat(journal.size()).isEqualTo(entriesBefore);
     }
 
     @Test
     @DisplayName("a diff call is journalled as TEXT_DIFF and replays as VERIFIED without a new entry (DOD-05)")
-    void shouldJournalAndReplayTextDiff() throws Exception {
+    void shouldJournalDiffAsTextDiffAndReplayVerified() throws Exception {
         mockMvc.perform(post("/api/v1/utils/text/diff")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""

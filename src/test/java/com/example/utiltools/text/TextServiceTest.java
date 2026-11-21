@@ -1225,7 +1225,14 @@ class TextServiceTest {
 
             assertThat(validator.validate(new TextDiffRequest("a".repeat(2001), "abc")))
                     .extracting(ConstraintViolation::getMessage)
-                    .contains("left must be at most 2000 characters");
+                    .contains("left must be at most 2000 code points");
+
+            // The bound counts code points: 2000 supplementary characters are 4000 UTF-16 units.
+            assertThat(validator.validate(new TextDiffRequest("\uD83D\uDC4D".repeat(2000),
+                    "\uD83D\uDC4D".repeat(2000)))).isEmpty();
+            assertThat(validator.validate(new TextDiffRequest("abc", "\uD83D\uDC4D".repeat(2001))))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("right must be at most 2000 code points");
 
             assertThat(validator.validate(new TextDiffRequest("abc", "abd", null, null, "a".repeat(513), null)))
                     .extracting(ConstraintViolation::getMessage)

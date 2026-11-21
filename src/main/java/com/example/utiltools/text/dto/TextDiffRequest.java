@@ -1,9 +1,19 @@
 package com.example.utiltools.text.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JsonDeserializer;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
+
+import java.io.IOException;
 
 /**
  * Request body for {@code POST /api/v1/utils/text/diff}.
@@ -12,15 +22,23 @@ import jakarta.validation.constraints.Size;
  * it is the per-change companion of {@code POST /api/v1/utils/text/similarity}, which answers with a
  * single edit distance.</p>
  *
- * <p>{@code left} and {@code right} carry {@link NotBlank} and {@link Size} so a blank side answers
+ * <p>{@code left} and {@code right} carry {@link NotBlank} so a blank side answers
  * {@code 400 VALIDATION_ERROR} with the {@code "left is required"} / {@code "right is required"}
- * message and a side longer than 2000 characters answers {@code 400 VALIDATION_ERROR} with
- * {@code "left must be at most 2000 characters"} / {@code "right must be at most 2000 characters"}.
- * The annotation is {@link Size} rather than {@link Max} because Hibernate Validator's {@code @Max}
- * support for a {@link CharSequence} validates the string as a <em>number</em>, not as a length, so it
- * would reject {@code "abc"} outright. {@code @Size} bounds the UTF-16 length, and the authoritative
- * code-point bound stays in {@code TextService#diff}, which rejects a side over 2000 code points with
- * {@code 400 BAD_REQUEST} and journals the attempt as {@code FAILED}.</p>
+ * message, and a code-point bound so a side longer than 2000 <em>code points</em> answers
+ * {@code 400 VALIDATION_ERROR} with {@code "left must be at most 2000 code points"} /
+ * {@code "right must be at most 2000 code points"}. The bound is an {@link AssertTrue} over
+ * {@link String#codePointCount(int, int)} rather than {@link Size} or {@link Max}: Hibernate
+ * Validator's {@code @Max} support for a {@link CharSequence} validates the string as a
+ * <em>number</em> (it would reject {@code "abc"} outright), and {@code @Size} counts UTF-16 units,
+ * so a 1200-code-point astral string would be refused at 2400 units even though it is inside the
+ * documented code-point budget. The same bound is enforced authoritatively in
+ * {@code TextService#diff}, which rejects a side over 2000 code points with {@code 400 BAD_REQUEST}
+ * and journals the attempt as {@code FAILED} when bean validation is bypassed.</p>
+ *
+ * <p>Both sides are strictly textual on the wire: {@link StrictStringDeserializer} refuses a JSON
+ * number, boolean, object or array in {@code left}/{@code right} instead of letting Jackson coerce
+ * {@code 12} to {@code "12"}, so a non-text payload answers {@code 400 BAD_REQUEST} from the
+ * unreadable-body handler.</p>
  *
  * @param left          the original text; must be non-blank and at most 2000 code points
  * @param right         the revised text; must be non-blank and at most 2000 code points
@@ -46,11 +64,11 @@ import jakarta.validation.constraints.Size;
  */
 public record TextDiffRequest(
         @NotBlank(message = "left is required")
-        @Size(max = 2000, message = "left must be at most 2000 characters")
+        @JsonDeserialize(using = StrictStringDeserializer.class)
         String left,
 
         @NotBlank(message = "right is required")
-        @Size(max = 2000, message = "right must be at most 2000 characters")
+        @JsonDeserialize(using = StrictStringDeserializer.class)
         String right,
 
         Boolean caseSensitive,
@@ -73,5 +91,39 @@ public record TextDiffRequest(
     /** Three-argument form kept for callers that only pin the folding rule. */
     public TextDiffRequest(String left, String right, Boolean caseSensitive) {
         this(left, right, caseSensitive, null, null, null);
+    }
+
+    /** REQ-01: the documented bound is 2000 <em>code points</em>, not 2000 UTF-16 units. */
+    private static final int MAX_CODE_POINTS = 2000;
+
+    @AssertTrue(message = "left must be at most 2000 code points")
+    @JsonIgnore
+    @Schema(hidden = true)
+    public boolean isLeftWithinCodePointBound() {
+        return left == null || left.codePointCount(0, left.length()) <= MAX_CODE_POINTS;
+    }
+
+    @AssertTrue(message = "right must be at most 2000 code points")
+    @JsonIgnore
+    @Schema(hidden = true)
+    public boolean isRightWithinCodePointBound() {
+        return right == null || right.codePointCount(0, right.length()) <= MAX_CODE_POINTS;
+    }
+
+    /**
+     * Accepts only a JSON string. Jackson's default scalar coercion would otherwise turn
+     * {@code {"left": 12}} into {@code "12"} and serve a diff for a payload the contract calls
+     * invalid; {@link com.fasterxml.jackson.databind.DeserializationContext#handleUnexpectedToken}
+     * surfaces it as the {@code 400 BAD_REQUEST} unreadable-body response.
+     */
+    public static final class StrictStringDeserializer extends JsonDeserializer<String> {
+
+        @Override
+        public String deserialize(JsonParser parser, DeserializationContext context) throws IOException {
+            if (!parser.hasToken(JsonToken.VALUE_STRING)) {
+                return (String) context.handleUnexpectedToken(String.class, parser);
+            }
+            return parser.getText();
+        }
     }
 }
