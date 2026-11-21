@@ -875,4 +875,140 @@ class TextControllerTest {
         assertThat(after.result()).isEqualTo(before.result());
         assertThat(journal.size()).isEqualTo(entriesBefore);
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - kitten/sitting returns 200 with distance 3 and similarity 0.571429 (DOD-01)")
+    void shouldComputeSimilarity() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "kitten", "right": "sitting"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Text similarity computed successfully"))
+                .andExpect(jsonPath("$.data.distance").value(3))
+                .andExpect(jsonPath("$.data.maxLength").value(7))
+                .andExpect(jsonPath("$.data.similarity").value(0.571429))
+                .andExpect(jsonPath("$.data.identical").value(false))
+                .andExpect(jsonPath("$.data.caseSensitive").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - default folding makes Hello/hello identical, caseSensitive=true does not (DOD-02)")
+    void shouldHonourCaseSensitivity() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "Hello", "right": "hello"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(0))
+                .andExpect(jsonPath("$.data.similarity").value(1.0))
+                .andExpect(jsonPath("$.data.identical").value(true))
+                .andExpect(jsonPath("$.data.caseSensitive").value(false));
+
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "Hello", "right": "hello", "caseSensitive": true}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(1))
+                .andExpect(jsonPath("$.data.maxLength").value(5))
+                .andExpect(jsonPath("$.data.similarity").value(0.8))
+                .andExpect(jsonPath("$.data.identical").value(false))
+                .andExpect(jsonPath("$.data.caseSensitive").value(true));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - supplementary code points count as a single edit")
+    void shouldCountSupplementaryCodePointsAsOneEdit() throws Exception {
+        String body = objectMapper.writeValueAsString(java.util.Map.of(
+                "left", "a\uD83D\uDE00b", "right", "a\uD83D\uDE01b"));
+
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(1))
+                .andExpect(jsonPath("$.data.maxLength").value(3))
+                .andExpect(jsonPath("$.data.similarity").value(0.666667))
+                .andExpect(jsonPath("$.data.identical").value(false));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - an input over 2000 code points returns 400 BAD_REQUEST journalled FAILED (DOD-03)")
+    void shouldRejectOverBoundSimilarityInput() throws Exception {
+        String body = objectMapper.writeValueAsString(java.util.Map.of(
+                "left", "a".repeat(2001), "right", "abc"));
+
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("left must be at most 2000 code points")));
+
+        mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_SIMILARITY"))
+                .andExpect(jsonPath("$.data[0].state").value("FAILED"))
+                .andExpect(jsonPath("$.data[0].errorCode").value("BAD_REQUEST"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - blank inputs return 400 VALIDATION_ERROR and are not journalled")
+    void shouldRejectBlankSimilarityInput() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "abc"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("right is required")));
+    }
+
+    @Test
+    @DisplayName("a similarity call is journalled as TEXT_SIMILARITY and replays as VERIFIED without a new entry (DOD-05)")
+    void similarityIsJournalledAndReplaysAsVerified() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "kitten", "right": "sitting"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(3));
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_SIMILARITY"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.distance").value(3))
+                .andExpect(jsonPath("$.data[0].result.similarity").value(0.571429))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        AuditEntry before = journal.find(id).orElseThrow();
+        int entriesBefore = journal.size();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("TEXT_SIMILARITY"))
+                .andExpect(jsonPath("$.data.result.distance").value(3))
+                .andExpect(jsonPath("$.data.result.maxLength").value(7))
+                .andExpect(jsonPath("$.data.result.similarity").value(0.571429))
+                .andExpect(jsonPath("$.data.result.identical").value(false))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"));
+
+        AuditEntry after = journal.find(id).orElseThrow();
+        assertThat(after.operation()).isEqualTo(OperationType.TEXT_SIMILARITY);
+        assertThat(after.completedAt()).isEqualTo(before.completedAt());
+        assertThat(after.result()).isEqualTo(before.result());
+        assertThat(journal.size()).isEqualTo(entriesBefore);
+    }
 }

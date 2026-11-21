@@ -48,7 +48,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, interval overlap detection, cron next-run planning, current global time |
 | **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 / UUID v8 generation (`version=V4|V7|V8`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit, and NDJSON / JSON Lines conversion (array <-> line-delimited records) |
-| **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`, `REVERSE`), Unicode normalization (`NFC`, `NFD`, `NFKC`, `NFKD`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
+| **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`, `REVERSE`), Unicode normalization (`NFC`, `NFD`, `NFKC`, `NFKD`), code-point accurate text statistics (characters, words, lines, sentences), bounded literal/regex find-and-replace, HTML entity encode/decode, deterministic word-frequency counting, and bounded Levenshtein similarity comparison (edit distance, normalized `similarity`, identical-input detection) |
 
 ---
 
@@ -173,6 +173,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/text/replace` | Replace every (or, with `all=false`, the first) occurrence of a literal or regex `pattern`, reporting `replacements`, `changed` and code-point `length` |
 | `POST` | `/api/v1/utils/text/html-entities` | `ENCODE` a string for safe HTML embedding (`&`, `<`, `>`, `"`, `'`) or `DECODE` the five named entities plus decimal/hex numeric references, reporting `changed` and code-point `length` |
 | `POST` | `/api/v1/utils/text/word-frequency` | Count `totalWords`, `distinctWords` and a bounded `topWords` list (`limit` defaults to `10`, `caseSensitive` defaults to `false`, optional `ignoreWords`) in deterministic count-desc/word-asc order, journalled as `TEXT_WORD_FREQUENCY` |
+| `POST` | `/api/v1/utils/text/similarity` | Compare two texts (`left`, `right`) with a code-point-aware Levenshtein distance (two-row DP), reporting `distance`, `maxLength`, `similarity` (`1 - distance/maxLength` rounded to 6 decimals), `identical` and the effective `caseSensitive` flag (defaults to `false`, folded with `Locale.ROOT`, so `Hello`/`hello` is identical); either input over 2000 code points is rejected with `400 BAD_REQUEST` before any matrix allocation, and the call is journalled as `TEXT_SIMILARITY` |
 | `POST` | `/api/v1/utils/jobs/hash` | Submit a bounded async batch-hash job; `202` with a job id, idempotent via `idempotencyKey` |
 | `GET` | `/api/v1/utils/jobs/{jobId}` | Poll job status: `QUEUED` / `RUNNING` / `CANCELLING` / `COMPLETED` / `FAILED` / `CANCELLED` |
 | `DELETE` | `/api/v1/utils/jobs/{jobId}` | Cancel a job: `QUEUED` → `CANCELLED` immediately, `RUNNING` → `CANCELLING` (`200`, idempotent, the worker stops at its next checkpoint); `409` `JOB_CANCELLATION_CONFLICT` for `COMPLETED`/`FAILED` |
@@ -1590,13 +1591,13 @@ populated only when a cached result is served).
 
 ## 🧾 Operation Journal & Replay Verification
 
-All thirty-four journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+All thirty-five journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
 `datetime/shift`, `datetime/duration`, `datetime/business-days`, `datetime/range`, `datetime/overlap`,
 `datetime/cron-next`, `crypto/hash`,
 `crypto/base64`, `crypto/base32`, `crypto/url`, `crypto/url/parse`, `crypto/jwt/decode`, `crypto/uuid`, `json/format`,
 `json/validate`, `json/query`, `json/flatten`, `json/unflatten`, `json/merge-patch`, `json/pointer`,
 `json/to-csv`, `json/from-csv`, `json/csv-to-json`, `json/to-ndjson`, `json/from-ndjson`, `json/diff`,
-`text/transform`, `text/stats`, `text/replace`, `text/html-entities`, `text/word-frequency` — are recorded in a **bounded
+`text/transform`, `text/stats`, `text/replace`, `text/html-entities`, `text/word-frequency`, `text/similarity` — are recorded in a **bounded
 in-memory journal** so a failed
 hash, JSON query, datetime conversion or text operation leaves a trace of what actually executed, and a retry
 can be verified against the original outcome without ever mutating the original entry.

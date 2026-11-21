@@ -1,6 +1,8 @@
 package com.example.utiltools.text.service;
 
 import com.example.utiltools.text.dto.TextReplaceRequest;
+import com.example.utiltools.text.dto.TextSimilarityRequest;
+import com.example.utiltools.text.dto.TextSimilarityResponse;
 import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextHtmlEntitiesRequest;
 import com.example.utiltools.text.dto.TextHtmlEntitiesResponse;
@@ -56,6 +58,9 @@ public class TextService {
     private static final Pattern SENTENCE_SEPARATORS = Pattern.compile("[.!?]+");
 
     private static final int MAX_RESULT_CHARS = 1_000_000;
+
+    /** Hard bound on each {@link #similarity(TextSimilarityRequest)} input, in code points. */
+    public static final int MAX_SIMILARITY_CODE_POINTS = 2000;
 
     private static final String ALLOWED_ACTIONS = "ENCODE, DECODE";
 
@@ -467,6 +472,75 @@ public class TextService {
     /** Fold a token or ignore word with {@link Locale#ROOT} lowercasing unless counting is case-sensitive. */
     private static String foldWord(String word, boolean caseSensitive) {
         return caseSensitive ? word : word.toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * Deterministic edit-distance comparison: {@code distance} is the code-point Levenshtein distance
+     * between {@code left} and {@code right}, computed with a two-row dynamic programme
+     * ({@code O(min(n, m))} memory, never an {@code n × m} table); {@code maxLength} is the longer of
+     * the two compared code-point lengths and {@code similarity} is
+     * {@code 1 - distance / maxLength} rounded to six decimals, so a journalled result always replays
+     * exactly.
+     *
+     * <p>When {@code caseSensitive} is {@code false} or absent, both inputs are folded with
+     * {@link Locale#ROOT} lowercasing before the comparison, so {@code "Hello"} and {@code "hello"}
+     * have distance {@code 0} and are reported identical. Each raw input is bounded at
+     * {@value #MAX_SIMILARITY_CODE_POINTS} code points and a longer one is rejected with
+     * {@link IllegalArgumentException} <em>before</em> any allocation, so the API answers
+     * {@code 400 BAD_REQUEST} and the attempt is journalled as {@code FAILED}. The bound applies to the
+     * caller's input, not to the folded sequence, whose length may differ under case mapping; at most
+     * {@code 2 × 2001} ints are ever allocated. The method reads no clock and no default locale, so the
+     * output is a pure function of the request.</p>
+     */
+    public TextSimilarityResponse similarity(TextSimilarityRequest request) {
+        boolean caseSensitive = Boolean.TRUE.equals(request.caseSensitive());
+        String left = request.left();
+        String right = request.right();
+        // Bound check on the raw inputs, before folding and before any matrix row is allocated.
+        if (left.codePointCount(0, left.length()) > MAX_SIMILARITY_CODE_POINTS) {
+            throw new IllegalArgumentException("left must be at most 2000 code points");
+        }
+        if (right.codePointCount(0, right.length()) > MAX_SIMILARITY_CODE_POINTS) {
+            throw new IllegalArgumentException("right must be at most 2000 code points");
+        }
+        int[] comparison = foldWord(left, caseSensitive).codePoints().toArray();
+        int[] reference = foldWord(right, caseSensitive).codePoints().toArray();
+        int distance = levenshteinDistance(comparison, reference);
+        int maxLength = Math.max(comparison.length, reference.length);
+        // Both inputs empty is unreachable through the API (@NotBlank), but never divide by zero.
+        double similarity = maxLength == 0
+                ? 1.0
+                : Math.min(1.0, Math.max(0.0,
+                        Math.round((1.0 - (double) distance / maxLength) * 1_000_000.0) / 1_000_000.0));
+        return new TextSimilarityResponse(distance, maxLength, similarity, distance == 0, caseSensitive);
+    }
+
+    /**
+     * Two-row Levenshtein distance over code-point arrays: the shorter array is the column axis, so
+     * the largest allocation is {@code 2 × (min(n, m) + 1)} ints. Comparing {@code int} code points
+     * rather than {@code char} units is what makes a supplementary pair count as one edit.
+     */
+    private static int levenshteinDistance(int[] left, int[] right) {
+        int[] shortSide = left.length <= right.length ? left : right;
+        int[] longSide = left.length <= right.length ? right : left;
+        int[] previous = new int[shortSide.length + 1];
+        int[] current = new int[shortSide.length + 1];
+        for (int column = 0; column <= shortSide.length; column++) {
+            previous[column] = column;
+        }
+        for (int row = 1; row <= longSide.length; row++) {
+            current[0] = row;
+            int codePoint = longSide[row - 1];
+            for (int column = 1; column <= shortSide.length; column++) {
+                int substitution = previous[column - 1] + (shortSide[column - 1] == codePoint ? 0 : 1);
+                current[column] = Math.min(substitution,
+                        Math.min(previous[column] + 1, current[column - 1] + 1));
+            }
+            int[] swap = previous;
+            previous = current;
+            current = swap;
+        }
+        return previous[shortSide.length];
     }
 
     public TextTruncateResponse truncate(TextTruncateRequest request) {
