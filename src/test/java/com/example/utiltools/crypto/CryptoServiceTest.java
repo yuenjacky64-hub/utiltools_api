@@ -938,6 +938,28 @@ class CryptoServiceTest {
                 .hasMessageContaining("action must not be blank");
     }
 
+    @Test
+    @DisplayName("base58 - should enforce the 8192-character cap in the service guard")
+    void base58ShouldEnforceContentCapInServiceGuard() {
+        String atCap = "a".repeat(8192);
+        // ENCODE grows 8192 bytes to ~11190 Base58 chars, so only the encode side can sit at the cap.
+        String atCapEncoded = cryptoService.base58(new Base58Request("ENCODE", atCap)).result();
+        assertThat(atCapEncoded).isNotEmpty();
+        // 5000 bytes encode to ~6830 Base58 chars, comfortably inside the decode-side cap.
+        String decodableAtCap = "a".repeat(5000);
+        assertThat(cryptoService.base58(new Base58Request("DECODE",
+                cryptoService.base58(new Base58Request("ENCODE", decodableAtCap)).result())).result())
+                .isEqualTo(decodableAtCap);
+
+        String overCap = "a".repeat(8193);
+        assertThatThrownBy(() -> cryptoService.base58(new Base58Request("ENCODE", overCap)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("at most 8192 characters");
+        assertThatThrownBy(() -> cryptoService.base58(new Base58Request("DECODE", "1".repeat(8193))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("at most 8192 characters");
+    }
+
     // --- JWT decode (decode-only) -------------------------------------------------------------
 
     private static final String JWT_HEADER_SEGMENT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";

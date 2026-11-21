@@ -786,6 +786,12 @@ per leading `0x00` byte, and decoding restores those leading zero bytes. Any cha
 (`0`, `O`, `I`, `l`, `+`, `/`, ...) or bytes that are not well-formed UTF-8 are rejected with
 `400 BAD_REQUEST`.
 
+`content` is capped at 8192 characters — enforced by bean validation (`VALIDATION_ERROR`) and re-checked by
+the service guard (`BAD_REQUEST`) so a direct, non-HTTP caller cannot bypass it. Two documented limits: an
+unpaired UTF-16 surrogate is substituted with `?` by the UTF-8 conversion rather than rejected (the
+round-trip guarantee covers valid UTF-8 text), and content made *only* of NUL characters round-trips as `"1"`
+in the service but is rejected over HTTP because `@NotBlank` is trim-based.
+
 ```bash
 # Encode
 curl -X POST http://localhost:8080/api/v1/utils/crypto/base58 \

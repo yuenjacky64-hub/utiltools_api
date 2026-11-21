@@ -69,6 +69,9 @@ public class CryptoService {
     private static final char[] BASE58_ALPHABET =
             "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".toCharArray(); // 58 chars, no 0 O I l
     private static final int BASE58_RADIX = 58;
+    // Mirrors @Size(max = 8192) on Base58Request.content: the O(n^2) BigInteger digit fold must stay
+    // bounded for direct (non-HTTP) callers that never run bean validation.
+    private static final int BASE58_MAX_CONTENT_LENGTH = 8192;
     private static final int[] BASE58_INDEX = new int[128];
 
     static {
@@ -292,12 +295,28 @@ public class CryptoService {
         };
     }
 
+    /**
+     * Bitcoin-alphabet Base58 codec. Input is capped at {@value #BASE58_MAX_CONTENT_LENGTH} characters by
+     * this guard as well as by {@code @Size(max = 8192)} on the DTO, so a direct caller cannot push
+     * unbounded content into the O(n^2) {@code BigInteger} fold.
+     *
+     * <p>Documented limits, inherited from the base64/base32 posture: the invariant
+     * {@code decode(encode(x)) == x} holds for valid UTF-8 text. Content whose UTF-16 form carries an
+     * unpaired surrogate is not rejected — {@link String#getBytes(java.nio.charset.Charset)} substitutes
+     * {@code '?'} (0x3F), so such input round-trips lossily. Content made only of NUL characters is
+     * accepted here and round-trips as {@code "1"}, but is unreachable over HTTP because
+     * {@code @NotBlank} is trim-based and rejects it as a validation error.
+     */
     public Base58Response base58(Base58Request request) {
         if (request == null || request.action() == null || request.action().isBlank()) {
             throw new IllegalArgumentException("action must not be blank");
         }
         if (request.content() == null || request.content().isBlank()) {
             throw new IllegalArgumentException("content must not be blank");
+        }
+        if (request.content().length() > BASE58_MAX_CONTENT_LENGTH) {
+            throw new IllegalArgumentException(
+                    "content must be at most " + BASE58_MAX_CONTENT_LENGTH + " characters");
         }
         return switch (request.action().trim().toUpperCase(Locale.ROOT)) {
             case "ENCODE" -> new Base58Response("ENCODE",
