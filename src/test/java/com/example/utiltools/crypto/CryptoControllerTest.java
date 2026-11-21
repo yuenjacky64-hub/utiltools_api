@@ -965,6 +965,107 @@ class CryptoControllerTest {
         JsonNode replayed = objectMapper.readTree(replayBody).path("data");
         assertThat(replayed.path("result").path("result").asText()).isEqualTo("MZXW6YTBOI======");
     }
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/base58 - should encode and decode the known vector")
+    void base58ShouldEncodeAndDecodeKnownVector() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/base58")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "content": "Hello World!"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.action").value("ENCODE"))
+                .andExpect(jsonPath("$.data.result").value("2NEpo7TZRRrLZSi2U"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/base58")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "decode", "content": "2NEpo7TZRRrLZSi2U"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.action").value("DECODE"))
+                .andExpect(jsonPath("$.data.result").value("Hello World!"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/base58 - should reject invalid alphabet with 400")
+    void base58ShouldRejectInvalidAlphabetWith400() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/base58")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "DECODE", "content": "0OIl"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/base58")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "DECODE", "content": "5Q"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/base58 - should reject blank, oversized and bad action")
+    void base58ShouldRejectBlankOversizedAndBadAction() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/base58")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "content": "   "}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+
+        String oversized = "a".repeat(8193);
+        mockMvc.perform(post("/api/v1/utils/crypto/base58")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"action\": \"ENCODE\", \"content\": \"" + oversized + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+
+        mockMvc.perform(post("/api/v1/utils/crypto/base58")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ROT13", "content": "foobar"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/crypto/base58 - should journal and replay a CRYPTO_BASE58 entry")
+    void base58ShouldJournalAndReplayVerified() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/crypto/base58")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"action": "ENCODE", "content": "Hello World!"}
+                                """))
+                .andExpect(status().isOk());
+
+        List<AuditEntry> entries = journal.list(200, null).stream()
+                .filter(e -> e.operation() == OperationType.CRYPTO_BASE58)
+                .toList();
+        assertThat(entries).isNotEmpty();
+        AuditEntry entry = entries.get(0);
+        assertThat(entry.state()).isEqualTo(JournalState.SUCCEEDED);
+        assertThat(entry.replayable()).isTrue();
+        assertThat(entry.result().path("result").asText()).isEqualTo("2NEpo7TZRRrLZSi2U");
+
+        String replayBody = mockMvc.perform(post("/api/v1/utils/audit/entries/" + entry.id() + "/replay"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.replay.state").value(ReplayState.VERIFIED.name()))
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+
+        JsonNode replayed = objectMapper.readTree(replayBody).path("data");
+        assertThat(replayed.path("result").path("result").asText()).isEqualTo("2NEpo7TZRRrLZSi2U");
+    }
+
     // --- POST /api/v1/utils/crypto/jwt/decode -------------------------------------------------
 
     private static final String JWT_KNOWN_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"

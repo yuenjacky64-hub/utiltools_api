@@ -2,6 +2,8 @@ package com.example.utiltools.crypto.service;
 
 import com.example.utiltools.crypto.dto.Base32Request;
 import com.example.utiltools.crypto.dto.Base32Response;
+import com.example.utiltools.crypto.dto.Base58Request;
+import com.example.utiltools.crypto.dto.Base58Response;
 import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
@@ -24,6 +26,7 @@ import org.springframework.stereotype.Service;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.ByteArrayOutputStream;
+import java.math.BigInteger;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
@@ -60,6 +63,21 @@ public class CryptoService {
         for (int i = 0; i < BASE32_ALPHABET.length; i++) {
             BASE32_DECODE_TABLE[BASE32_ALPHABET[i]] = i;
             BASE32_DECODE_TABLE[Character.toLowerCase(BASE32_ALPHABET[i])] = i;
+        }
+    }
+
+    private static final char[] BASE58_ALPHABET =
+            "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".toCharArray(); // 58 chars, no 0 O I l
+    private static final int BASE58_RADIX = 58;
+    // Mirrors @Size(max = 8192) on Base58Request.content: the O(n^2) BigInteger digit fold must stay
+    // bounded for direct (non-HTTP) callers that never run bean validation.
+    private static final int BASE58_MAX_CONTENT_LENGTH = 8192;
+    private static final int[] BASE58_INDEX = new int[128];
+
+    static {
+        Arrays.fill(BASE58_INDEX, -1);
+        for (int i = 0; i < BASE58_RADIX; i++) {
+            BASE58_INDEX[BASE58_ALPHABET[i]] = i;
         }
     }
 
@@ -275,6 +293,103 @@ public class CryptoService {
             case 0, 2, 4, 5, 7 -> true;
             default -> false;
         };
+    }
+
+    /**
+     * Bitcoin-alphabet Base58 codec. Input is capped at {@value #BASE58_MAX_CONTENT_LENGTH} characters by
+     * this guard as well as by {@code @Size(max = 8192)} on the DTO, so a direct caller cannot push
+     * unbounded content into the O(n^2) {@code BigInteger} fold.
+     *
+     * <p>Documented limits, inherited from the base64/base32 posture: the invariant
+     * {@code decode(encode(x)) == x} holds for valid UTF-8 text. Content whose UTF-16 form carries an
+     * unpaired surrogate is not rejected — {@link String#getBytes(java.nio.charset.Charset)} substitutes
+     * {@code '?'} (0x3F), so such input round-trips lossily. Content made only of NUL characters is
+     * accepted here and round-trips as {@code "1"}, but is unreachable over HTTP because
+     * {@code @NotBlank} is trim-based and rejects it as a validation error.
+     */
+    public Base58Response base58(Base58Request request) {
+        if (request == null || request.action() == null || request.action().isBlank()) {
+            throw new IllegalArgumentException("action must not be blank");
+        }
+        if (request.content() == null || request.content().isBlank()) {
+            throw new IllegalArgumentException("content must not be blank");
+        }
+        if (request.content().length() > BASE58_MAX_CONTENT_LENGTH) {
+            throw new IllegalArgumentException(
+                    "content must be at most " + BASE58_MAX_CONTENT_LENGTH + " characters");
+        }
+        return switch (request.action().trim().toUpperCase(Locale.ROOT)) {
+            case "ENCODE" -> new Base58Response("ENCODE",
+                    encodeBase58(request.content().getBytes(StandardCharsets.UTF_8)));
+            case "DECODE" -> new Base58Response("DECODE", decodeBase58(request.content()));
+            default -> throw new IllegalArgumentException(
+                    "action must be ENCODE or DECODE, got: " + request.action());
+        };
+    }
+
+    /**
+     * Bitcoin-alphabet Base58: one leading {@code '1'} per leading {@code 0x00} byte, then the
+     * big-endian base-58 digits of the remaining magnitude. {@code BigInteger} discards leading
+     * zeros, so they are re-emitted explicitly.
+     */
+    private static String encodeBase58(byte[] bytes) {
+        int zeros = 0;
+        while (zeros < bytes.length && bytes[zeros] == 0) {
+            zeros++;
+        }
+        StringBuilder encoded = new StringBuilder();
+        if (zeros < bytes.length) {
+            BigInteger value = new BigInteger(1, Arrays.copyOfRange(bytes, zeros, bytes.length));
+            while (value.signum() > 0) {
+                BigInteger[] quotientAndRemainder = value.divideAndRemainder(BigInteger.valueOf(BASE58_RADIX));
+                encoded.append(BASE58_ALPHABET[quotientAndRemainder[1].intValue()]);
+                value = quotientAndRemainder[0];
+            }
+        }
+        for (int i = 0; i < zeros; i++) {
+            encoded.append(BASE58_ALPHABET[0]);
+        }
+        return encoded.reverse().toString();
+    }
+
+    /**
+     * Strict decoder: the alphabet is gated character by character (no trimming, no case folding —
+     * the alphabet is case-sensitive), leading {@code '1'}s become leading zero bytes, and the
+     * decoded bytes must be well-formed UTF-8.
+     */
+    private static String decodeBase58(String content) {
+        for (int i = 0; i < content.length(); i++) {
+            char ch = content.charAt(i);
+            if (ch >= 128 || BASE58_INDEX[ch] < 0) {
+                throw new IllegalArgumentException(
+                        "content contains a character outside the Bitcoin Base58 alphabet: " + ch);
+            }
+        }
+        int zeros = 0;
+        while (zeros < content.length() && content.charAt(zeros) == BASE58_ALPHABET[0]) {
+            zeros++;
+        }
+        BigInteger value = BigInteger.ZERO;
+        for (int i = zeros; i < content.length(); i++) {
+            value = value.multiply(BigInteger.valueOf(BASE58_RADIX))
+                    .add(BigInteger.valueOf(BASE58_INDEX[content.charAt(i)]));
+        }
+        byte[] magnitude = value.signum() == 0 ? new byte[0] : value.toByteArray();
+        if (magnitude.length > 1 && magnitude[0] == 0) {
+            magnitude = Arrays.copyOfRange(magnitude, 1, magnitude.length);
+        }
+        byte[] decoded = new byte[zeros + magnitude.length];
+        System.arraycopy(magnitude, 0, decoded, zeros, magnitude.length);
+
+        CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT);
+        try {
+            return decoder.decode(ByteBuffer.wrap(decoded)).toString();
+        } catch (CharacterCodingException e) {
+            throw new IllegalArgumentException(
+                    "content decodes to bytes that are not valid UTF-8: " + e.getMessage(), e);
+        }
     }
 
     public UrlResponse url(UrlRequest request) {
