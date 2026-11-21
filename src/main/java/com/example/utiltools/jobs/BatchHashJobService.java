@@ -1153,6 +1153,50 @@ public class BatchHashJobService {
     }
 
     /**
+     * Read-only aggregate of the auto-failover/quarantine budgets (REQ-01), the jobs-side sibling of
+     * the audit journal's quarantine status.
+     *
+     * <p>Exactly one {@code registryLock} section (INV-QS-J1) walks the live registry and classifies
+     * every row: {@code autoFailoverExhaustedCount} counts the rows that already spent the whole
+     * {@code utiltools.jobs.max-auto-failovers} budget and are still non-terminal ({@code COMPLETED}
+     * and {@code CANCELLED} are the terminal states; {@code FAILED} stays non-terminal until its
+     * attempt budget is spent), {@code failedLeaseExpiredCount} counts the {@code FAILED} rows whose
+     * error is {@link #EXECUTION_LEASE_EXPIRED}, and {@code queuedCount} counts the {@code QUEUED}
+     * rows. The row monitor is taken inside {@code registryLock}, the only order this class allows.</p>
+     *
+     * <p>Pure read (INV-QS-J4): no row is added, removed or re-put, no field is assigned, no clock is
+     * read, no dispatcher is called and no journal entry is opened, so polling it cannot renew a
+     * lease, fail an attempt or consume the failover budget. Counts only — no job id, item or error
+     * text is carried by the response.</p>
+     *
+     * @return one point-in-time aggregate of the configured budget and the current counts
+     */
+    public JobsQuarantineStatusResponse quarantineStatus() {
+        synchronized (registryLock) {
+            int autoFailoverExhausted = 0;
+            int failedLeaseExpired = 0;
+            int queued = 0;
+            for (MutableJob job : jobs.values()) {
+                synchronized (job) { // registryLock -> job monitor is the only legal order
+                    boolean terminal = job.status == JobStatus.COMPLETED
+                            || job.status == JobStatus.CANCELLED;
+                    if (maxAutoFailovers > 0 && job.autoFailovers == maxAutoFailovers && !terminal) {
+                        autoFailoverExhausted++;
+                    }
+                    if (job.status == JobStatus.FAILED && EXECUTION_LEASE_EXPIRED.equals(job.error)) {
+                        failedLeaseExpired++;
+                    }
+                    if (job.status == JobStatus.QUEUED) {
+                        queued++;
+                    }
+                }
+            }
+            return new JobsQuarantineStatusResponse(maxAutoFailovers, maxAutoFailovers > 0,
+                    autoFailoverExhausted, failedLeaseExpired, queued, jobs.size());
+        }
+    }
+
+    /**
      * Requeues a FAILED job for one more execution attempt.
      *
      * <p>Validation and the {@code FAILED -> QUEUED} transition happen in a single monitor section,

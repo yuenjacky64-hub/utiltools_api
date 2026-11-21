@@ -16,6 +16,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.RecordComponent;
 import java.time.Clock;
@@ -24,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -37,6 +39,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -2412,6 +2415,134 @@ class BatchHashJobServiceTest {
      * Reflection keeps the production class free of test-only accessors while still letting the
      * saturation test prove that a rejected submission leaves no job or idempotency residue.
      */
+    /**
+     * DOD-05 / REQ-01 / REQ-05: the jobs projection reports the configured budget, the
+     * auto-failover-exhausted count, the {@code FAILED} rows still in lease-expiry failure and the
+     * {@code QUEUED} count for a hand-built registry, and leaves every row byte-identical (status,
+     * autoFailovers, error and lease fields) - it is a pure read under {@code registryLock}.
+     */
+    @Test
+    @DisplayName("quarantineStatus - projects the budget and the exhausted/FAILED/QUEUED counts without touching any row")
+    void quarantineStatusCountsExhaustedFailedAndQueuedJobs() throws Exception {
+        MutableJobClock clock = new MutableJobClock(LEASE_START);
+        service = new BatchHashJobService(new CountingCryptoService(null, null, null), 1, 10, 300, 3,
+                LEASE_SECONDS, 5000, 1, 2, 0L, 2, clock);
+
+        putJobRow("job-exhausted", JobStatus.FAILED, 2, "ITEM_HASH_FAILED", null, null);
+        putJobRow("job-lease-expired", JobStatus.FAILED, 1, BatchHashJobService.EXECUTION_LEASE_EXPIRED,
+                LEASE_START.plusSeconds(LEASE_SECONDS), LEASE_START);
+        putJobRow("job-queued-one", JobStatus.QUEUED, 0, null, null, null);
+        putJobRow("job-queued-two", JobStatus.QUEUED, 0, null, null, null);
+        putJobRow("job-completed", JobStatus.COMPLETED, 2, null, null, null);
+
+        Map<String, String> before = jobRowSnapshot();
+        JobsQuarantineStatusResponse projection = service.quarantineStatus();
+        Map<String, String> after = jobRowSnapshot();
+
+        assertThat(projection.maxAutoFailovers()).isEqualTo(2);
+        assertThat(projection.autoFailoverEnabled()).isTrue();
+        assertThat(projection.autoFailoverExhaustedCount()).isEqualTo(1);
+        assertThat(projection.failedLeaseExpiredCount()).isEqualTo(1);
+        assertThat(projection.queuedCount()).isEqualTo(2);
+        assertThat(projection.retainedJobCount()).isEqualTo(5);
+        // Pure read: the second call answers the same projection and no row moved.
+        assertThat(service.quarantineStatus()).isEqualTo(projection);
+        assertThat(jobRowSnapshot()).isEqualTo(before);
+        assertThat(after).isEqualTo(before);
+    }
+
+    /**
+     * DOD-07 / REQ-01: the projection is computed under {@code registryLock} - a concurrent caller
+     * blocks until the lock is released, which is what makes the two counts one coherent snapshot.
+     */
+    @Test
+    @DisplayName("quarantineStatus - blocks while registryLock is held and answers once it is released")
+    void quarantineStatusBlocksUntilRegistryLockIsReleased() throws Exception {
+        service = new BatchHashJobService(new CountingCryptoService(null, null, null), 1, 10, 300, 3);
+        putJobRow("job-queued", JobStatus.QUEUED, 0, null, null, null);
+
+        Object registryLock = readField(service, "registryLock");
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            Future<JobsQuarantineStatusResponse> call;
+            synchronized (registryLock) {
+                call = caller.submit(service::quarantineStatus);
+                assertThatThrownBy(() -> call.get(250, TimeUnit.MILLISECONDS))
+                        .isInstanceOf(TimeoutException.class);
+                assertThat(call.isDone()).isFalse();
+            }
+            JobsQuarantineStatusResponse projection = call.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertThat(projection.queuedCount()).isEqualTo(1);
+            assertThat(projection.retainedJobCount()).isEqualTo(1);
+        } finally {
+            caller.shutdownNow();
+        }
+    }
+
+    /**
+     * Hand-builds one registry row so a projection test does not have to drive the workflow. The row
+     * is never dispatched: no lane entry is created, so only the projection reads it.
+     */
+    private void putJobRow(String jobId, JobStatus status, int autoFailovers, String error,
+            Instant executionLeaseExpiresAt, Instant lastHeartbeatAt) throws Exception {
+        Class<?> rowType = Class.forName(BatchHashJobService.class.getName() + "$MutableJob");
+        Constructor<?> constructor = rowType.getDeclaredConstructor(String.class, String.class,
+                String.class, List.class, String.class, String.class, Instant.class, String.class,
+                int.class, long.class);
+        constructor.setAccessible(true);
+        Object row = constructor.newInstance(jobId, null, "SHA-256", List.of("item-" + jobId), null,
+                null, LEASE_START, "hand-built-client", 3, 0L);
+        setField(row, "status", status);
+        setField(row, "autoFailovers", autoFailovers);
+        setField(row, "error", error);
+        setField(row, "executionLeaseExpiresAt", executionLeaseExpiresAt);
+        setField(row, "lastHeartbeatAt", lastHeartbeatAt);
+        jobRows().put(jobId, row);
+    }
+
+    /** The live {@code jobs} registry, seen as raw rows so a test can snapshot it. */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> jobRows() {
+        try {
+            Field field = BatchHashJobService.class.getDeclaredField("jobs");
+            field.setAccessible(true);
+            return (Map<String, Object>) field.get(service);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Cannot read BatchHashJobService.jobs", e);
+        }
+    }
+
+    /** Every row's observable state, so a purity assertion is a single map comparison. */
+    private Map<String, String> jobRowSnapshot() {
+        Map<String, String> rows = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : jobRows().entrySet()) {
+            Object row = entry.getValue();
+            rows.put(entry.getKey(), readField(row, "status") + "|" + readField(row, "autoFailovers")
+                    + "|" + readField(row, "error") + "|" + readField(row, "attempt")
+                    + "|" + readField(row, "executionLeaseExpiresAt")
+                    + "|" + readField(row, "lastHeartbeatAt") + "|" + readField(row, "deadlineAt")
+                    + "|" + readField(row, "completedAt") + "|" + readField(row, "checkpoint"));
+        }
+        return rows;
+    }
+
+    private static void setField(Object target, String name, Object value) throws Exception {
+        Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        field.set(target, value);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T readField(Object target, String name) {
+        try {
+            Field field = target.getClass().getDeclaredField(name);
+            field.setAccessible(true);
+            return (T) field.get(target);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Cannot read " + name, e);
+        }
+    }
+
     private Set<String> registryKeys(String fieldName) {
         try {
             Field field = BatchHashJobService.class.getDeclaredField(fieldName);
