@@ -949,7 +949,8 @@ class TextControllerTest {
     @DisplayName("POST /api/v1/utils/text/similarity - supplementary code points count as a single edit")
     void shouldCountSupplementaryCodePointsAsOneEdit() throws Exception {
         String body = objectMapper.writeValueAsString(java.util.Map.of(
-                "left", "a\uD83D\uDE00b", "right", "a\uD83D\uDE01b"));
+                "left", "a\uD83D\uDE00b", "right", "a\uD83D\uDE01b",
+                "tokenizer", "whitespace"));
 
         mockMvc.perform(post("/api/v1/utils/text/similarity")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -1034,5 +1035,158 @@ class TextControllerTest {
         assertThat(after.completedAt()).isEqualTo(before.completedAt());
         assertThat(after.result()).isEqualTo(before.result());
         assertThat(journal.size()).isEqualTo(entriesBefore);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - tokenizer=digit compares digit runs, the default does not (DOD-03)")
+    void shouldApplyDigitTokenizerOverHttp() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "ab12", "right": "12ab"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(4))
+                .andExpect(jsonPath("$.data.maxLength").value(4))
+                .andExpect(jsonPath("$.data.similarity").value(0.0))
+                .andExpect(jsonPath("$.data.identical").value(false));
+
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "ab12", "right": "12ab", "tokenizer": "digit"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(0))
+                .andExpect(jsonPath("$.data.maxLength").value(2))
+                .andExpect(jsonPath("$.data.similarity").value(1.0))
+                .andExpect(jsonPath("$.data.identical").value(true));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - tokenizer=regex with a pattern tokenizes by its matches (DOD-04)")
+    void shouldApplyCustomRegexTokenizerOverHttp() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "abc123def", "right": "abc456def", "tokenizer": "regex", "pattern": "[a-z]+"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(0))
+                .andExpect(jsonPath("$.data.maxLength").value(7))
+                .andExpect(jsonPath("$.data.similarity").value(1.0))
+                .andExpect(jsonPath("$.data.identical").value(true));
+
+        mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_SIMILARITY"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].request.tokenizer").value("regex"))
+                .andExpect(jsonPath("$.data[0].request.pattern").value("[a-z]+"));
+    }
+
+    @Test
+    @DisplayName("a regex-tokenized similarity is journalled and replays as VERIFIED without a new entry (DOD-07)")
+    void similarityWithCustomTokenizerJournalsAndReplaysAsVerified() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "abc123def", "right": "abc456def", "tokenizer": "regex", "pattern": "[a-z]+"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(0));
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_SIMILARITY"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.distance").value(0))
+                .andExpect(jsonPath("$.data[0].result.maxLength").value(7))
+                .andExpect(jsonPath("$.data[0].request.tokenizer").value("regex"))
+                .andExpect(jsonPath("$.data[0].request.pattern").value("[a-z]+"))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        AuditEntry before = journal.find(id).orElseThrow();
+        int entriesBefore = journal.size();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("TEXT_SIMILARITY"))
+                .andExpect(jsonPath("$.data.result.distance").value(0))
+                .andExpect(jsonPath("$.data.result.maxLength").value(7))
+                .andExpect(jsonPath("$.data.result.similarity").value(1.0))
+                .andExpect(jsonPath("$.data.result.identical").value(true))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"));
+
+        AuditEntry after = journal.find(id).orElseThrow();
+        assertThat(after.operation()).isEqualTo(OperationType.TEXT_SIMILARITY);
+        assertThat(after.result()).isEqualTo(before.result());
+        assertThat(after.request()).isEqualTo(before.request());
+        assertThat(journal.size()).isEqualTo(entriesBefore);
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - regex without a pattern or with an invalid one is journalled FAILED (DOD-11)")
+    void shouldRejectMissingOrInvalidTokenizerPattern() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "abc", "right": "abd", "tokenizer": "regex"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("pattern is required when tokenizer is 'regex'")));
+
+        mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_SIMILARITY"))
+                .andExpect(jsonPath("$.data[0].state").value("FAILED"))
+                .andExpect(jsonPath("$.data[0].errorCode").value("BAD_REQUEST"));
+
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "abc", "right": "abd", "tokenizer": "regex", "pattern": "("}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("Invalid regex pattern")));
+
+        mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_SIMILARITY"))
+                .andExpect(jsonPath("$.data[0].state").value("FAILED"))
+                .andExpect(jsonPath("$.data[0].errorCode").value("BAD_REQUEST"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - an unknown tokenizer name is a binding failure, DIGIT is accepted (DOD-12)")
+    void shouldRejectUnknownTokenizerName() throws Exception {
+        int entriesBefore = journal.size();
+
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "ab12", "right": "12ab", "tokenizer": "unknown"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("Malformed JSON request body")));
+
+        assertThat(journal.size()).isEqualTo(entriesBefore);
+
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "ab12", "right": "12ab", "tokenizer": "DIGIT"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(0))
+                .andExpect(jsonPath("$.data.maxLength").value(2))
+                .andExpect(jsonPath("$.data.similarity").value(1.0))
+                .andExpect(jsonPath("$.data.identical").value(true));
     }
 }

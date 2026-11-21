@@ -1,6 +1,7 @@
 package com.example.utiltools.text.dto;
 
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 
 /**
  * Request body for {@code POST /api/v1/utils/text/similarity}.
@@ -16,6 +17,18 @@ import jakarta.validation.constraints.NotBlank;
  * @param caseSensitive optional; when {@code false} or absent, both inputs are folded with
  *                      {@link java.util.Locale#ROOT} lowercasing before the distance is measured, so
  *                      {@code "Hello"} and {@code "hello"} compare identical
+ * @param tokenizer     optional token scheme applied to both inputs before the code-point distance is
+ *                      measured: {@code letter} (the default, the project's letter/digit run tokenizer,
+ *                      i.e. exactly {@code TextService.tokenize(String)}), {@code digit} (digit runs),
+ *                      {@code alphanum} (alphanumeric runs split where letters meet digits),
+ *                      {@code whitespace} (non-whitespace runs) or {@code regex}. Matching is
+ *                      case-insensitive on the wire; {@code null} means {@code letter}. Every scheme
+ *                      <em>selects</em> tokens — everything else is discarded — and the consecutive
+ *                      tokens are compared joined by one space
+ * @param pattern       optional; the regular expression whose non-empty matches are the tokens when
+ *                      {@code tokenizer} is {@code regex}. Required for that scheme (a missing or
+ *                      blank value is rejected as {@code 400 BAD_REQUEST}), bounded to 1..512
+ *                      characters, and ignored for every predefined scheme
  */
 public record TextSimilarityRequest(
         @NotBlank(message = "left is required")
@@ -24,5 +37,10 @@ public record TextSimilarityRequest(
         @NotBlank(message = "right is required")
         String right,
 
-        Boolean caseSensitive
+        Boolean caseSensitive,
+
+        TokenizerScheme tokenizer,
+
+        @Pattern(regexp = "^[\\s\\S]{1,512}$", message = "pattern must be 1..512 characters")
+        String pattern
 ) {}
