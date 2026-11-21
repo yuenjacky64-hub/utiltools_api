@@ -1143,6 +1143,43 @@ class TextControllerTest {
     }
 
     @Test
+    @DisplayName("a similarity request carrying timeoutMs is journalled and replays as VERIFIED (DOD-06)")
+    void similarityWithTimeoutReplaysAsVerified() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "abc123def", "right": "abc456def", "tokenizer": "regex",
+                                 "pattern": "[a-z]+", "timeoutMs": 50}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(0));
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_SIMILARITY"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].request.timeoutMs").value(50))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        AuditEntry before = journal.find(id).orElseThrow();
+        int entriesBefore = journal.size();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("TEXT_SIMILARITY"))
+                .andExpect(jsonPath("$.data.request.timeoutMs").value(50))
+                .andExpect(jsonPath("$.data.result.distance").value(0))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"));
+
+        AuditEntry after = journal.find(id).orElseThrow();
+        assertThat(after.result()).isEqualTo(before.result());
+        assertThat(journal.size()).isEqualTo(entriesBefore);
+    }
+
+    @Test
     @DisplayName("POST /api/v1/utils/text/similarity - tokenizer=digit compares digit runs, the default does not (DOD-03)")
     void shouldApplyDigitTokenizerOverHttp() throws Exception {
         mockMvc.perform(post("/api/v1/utils/text/similarity")
@@ -1307,22 +1344,24 @@ class TextControllerTest {
     }
 
     @Test
-    @DisplayName("POST /api/v1/utils/text/similarity - the retired 1..512 pattern bound is enforced by the service (DOD-05)")
-    void shouldRejectOverLongRegexPatternInService() throws Exception {
+    @DisplayName("POST /api/v1/utils/text/similarity - an over-long pattern is a bean-validation failure for every "
+            + "scheme and is not journalled (REQ-01 / DOD-03)")
+    void shouldRejectOverLongPatternAtTheValidationBoundary() throws Exception {
+        int entriesBefore = journal.size();
+
         mockMvc.perform(post("/api/v1/utils/text/similarity")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"regex\", "
                                 + "\"pattern\": \"" + "a".repeat(513) + "\"}"))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
-                .andExpect(jsonPath("$.message").value(containsString("pattern must be 1..512 characters")));
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.message").value("Validation failed"))
+                .andExpect(jsonPath("$.details", hasItem("pattern must be at most 512 characters")));
 
-        mockMvc.perform(get("/api/v1/utils/audit/entries"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.data[0].operation").value("TEXT_SIMILARITY"))
-                .andExpect(jsonPath("$.data[0].state").value("FAILED"))
-                .andExpect(jsonPath("$.data[0].errorCode").value("BAD_REQUEST"));
+        // @Valid runs before the controller body, so the rejection leaves no journal entry behind.
+        assertThat(journal.size()).isEqualTo(entriesBefore);
 
+        // 512 characters stays inside the @Size boundary, so the regex request still succeeds.
         mockMvc.perform(post("/api/v1/utils/text/similarity")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"regex\", "
@@ -1332,12 +1371,27 @@ class TextControllerTest {
     }
 
     @Test
-    @DisplayName("POST /api/v1/utils/text/similarity - an over-long pattern is ignored for tokenizer=letter (DOD-06)")
-    void similarityIgnoresOverLongPatternForNonRegexTokenizer() throws Exception {
+    @DisplayName("POST /api/v1/utils/text/similarity - the @Size bound is scheme-independent, a shorter pattern with "
+            + "tokenizer=letter is still ignored (REQ-01 / DOD-03)")
+    void similarityValidatesPatternSizeForNonRegexTokenizerToo() throws Exception {
+        int entriesBefore = journal.size();
+
         mockMvc.perform(post("/api/v1/utils/text/similarity")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"letter\", "
                                 + "\"pattern\": \"" + "a".repeat(513) + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.message").value("Validation failed"))
+                .andExpect(jsonPath("$.details", hasItem("pattern must be at most 512 characters")));
+
+        assertThat(journal.size()).isEqualTo(entriesBefore);
+
+        // Within the bound, a pattern sent with a predefined scheme is ignored exactly as before.
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"letter\", "
+                                + "\"pattern\": \"a+\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.distance").value(1))
                 .andExpect(jsonPath("$.data.maxLength").value(3));
