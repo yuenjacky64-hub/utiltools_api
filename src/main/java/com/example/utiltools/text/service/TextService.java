@@ -546,8 +546,11 @@ public class TextService {
      * code points, every code point its own token): tokenization cannot grow the compared sequences.
      * A {@code regex} request without a {@code pattern} or with an invalid one is rejected with
      * {@link IllegalArgumentException} ({@code 400 BAD_REQUEST}); every {@code pattern} evaluation runs
-     * under the existing {@code utiltools.text.regex-timeout-ms} wall-clock budget and raises
-     * {@link RegexTimeoutException} when exhausted. Every other scheme reads no clock, and no step
+     * under one request-scoped wall-clock budget — the configured {@code utiltools.text.regex-timeout-ms}
+     * ceiling, tightened to {@code request.timeoutMs()} when that optional value is positive (a request
+     * can only shorten the budget, never raise it) — and raises {@link RegexTimeoutException} reporting
+     * the <em>effective</em> budget, not the configured one, when exhausted. Every other scheme reads no
+     * clock, and no step
      * reads the default locale, so the output stays a pure function of the request.</p>
      *
      * <p>Optional {@code ignoreWords} entries are removed from <em>both</em> inputs after the
@@ -573,10 +576,13 @@ public class TextService {
             throw new IllegalArgumentException("right must be at most 2000 code points");
         }
         Pattern custom = scheme == TokenizerScheme.REGEX ? compileCustomPattern(request.pattern()) : null;
-        // The wall-clock budget is request-scoped: set once, so both inputs share the same deadline.
-        long deadlineMs = scheme == TokenizerScheme.REGEX ? clock.millis() + regexTimeoutMs : 0L;
-        int[] comparison = comparisonSequence(left, scheme, custom, caseSensitive, deadlineMs, ignored);
-        int[] reference = comparisonSequence(right, scheme, custom, caseSensitive, deadlineMs, ignored);
+        // Effective budget: a request may tighten the configured ceiling, never raise it. Computed once
+        // so both inputs share one deadline and one reported budget.
+        int requestedTimeoutMs = request.timeoutMs() == null ? 0 : request.timeoutMs();
+        int budgetMs = requestedTimeoutMs > 0 ? Math.min(requestedTimeoutMs, regexTimeoutMs) : regexTimeoutMs;
+        long deadlineMs = scheme == TokenizerScheme.REGEX ? clock.millis() + budgetMs : 0L;
+        int[] comparison = comparisonSequence(left, scheme, custom, caseSensitive, deadlineMs, budgetMs, ignored);
+        int[] reference = comparisonSequence(right, scheme, custom, caseSensitive, deadlineMs, budgetMs, ignored);
         int distance = levenshteinDistance(comparison, reference);
         int maxLength = Math.max(comparison.length, reference.length);
         // Both inputs empty is unreachable through the API (@NotBlank) unless every word is ignored,
@@ -595,9 +601,9 @@ public class TextService {
      * none) and the join is by a single {@code U+0020}.
      */
     private int[] comparisonSequence(String raw, TokenizerScheme scheme, Pattern custom,
-            boolean caseSensitive, long deadlineMs, Set<String> ignoredFolded) {
+            boolean caseSensitive, long deadlineMs, int budgetMs, Set<String> ignoredFolded) {
         String folded = foldWord(raw, caseSensitive);
-        List<String> tokens = schemeTokens(folded, scheme, custom, deadlineMs);
+        List<String> tokens = schemeTokens(folded, scheme, custom, deadlineMs, budgetMs);
         return String.join(" ", withoutIgnoredTokens(tokens, ignoredFolded)).codePoints().toArray();
     }
 
@@ -606,7 +612,8 @@ public class TextService {
      * a {@code null} element; a {@code regex} pattern is evaluated under a
      * {@link BudgetedCharSequence} so a catastrophic match cannot stall the request.
      */
-    private List<String> schemeTokens(String folded, TokenizerScheme scheme, Pattern custom, long deadlineMs) {
+    private List<String> schemeTokens(String folded, TokenizerScheme scheme, Pattern custom, long deadlineMs,
+            int budgetMs) {
         if (scheme == TokenizerScheme.LETTER) {
             // The default scheme is exactly {@link #tokenize(String)}: maximal letter/digit runs, which
             // String.join below re-joins with one U+0020, so punctuation, whitespace and symbols between
@@ -614,7 +621,7 @@ public class TextService {
             return tokenize(folded);
         }
         if (scheme == TokenizerScheme.REGEX) {
-            return regexTokens(new BudgetedCharSequence(folded, clock, deadlineMs, regexTimeoutMs), custom);
+            return regexTokens(new BudgetedCharSequence(folded, clock, deadlineMs, budgetMs), custom);
         }
         List<String> tokens = new ArrayList<>();
         StringBuilder current = new StringBuilder();
