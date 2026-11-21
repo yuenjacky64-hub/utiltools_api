@@ -1,5 +1,6 @@
 package com.example.utiltools.audit;
 
+import com.example.utiltools.audit.dto.JournalVerifyResponse;
 import com.example.utiltools.audit.model.AuditEntry;
 import com.example.utiltools.audit.model.JournalState;
 import com.example.utiltools.audit.model.OperationType;
@@ -8,9 +9,14 @@ import com.example.utiltools.audit.model.ReapRecord;
 import com.example.utiltools.audit.model.ReplayRecord;
 import com.example.utiltools.audit.model.ReplayState;
 import com.example.utiltools.audit.service.AuditJournalService;
+import com.example.utiltools.audit.service.AuditReplayService;
+import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.ReplayConflictException;
 import com.example.utiltools.crypto.dto.HashRequest;
-import com.example.utiltools.crypto.dto.HashResponse;
+import com.example.utiltools.crypto.service.CryptoService;
+import com.example.utiltools.datetime.service.DateTimeService;
+import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.text.service.TextService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -38,22 +44,37 @@ class AuditReplayRetryBackoffTest {
     private static final int MAX_REPLAY_BYTES = 65536;
     private static final long STALE_PENDING_SECONDS = 300L;
 
+    private static final CryptoService CRYPTO = new CryptoService();
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
     private static HashRequest request() {
         return new HashRequest("SHA-256", "Hello World", null);
     }
 
     private static String succeeded(AuditJournalService journal, String requestId) {
         AuditEntry entry = journal.begin(OperationType.CRYPTO_HASH, request(), requestId);
-        journal.succeed(entry.id(), new HashResponse("SHA-256", "abc123", false));
+        journal.succeed(entry.id(), CRYPTO.hash(request()));
         return entry.id();
+    }
+
+    private AuditJournalService newJournal(MutableAuditClock clock, int threshold, long baseMs,
+                                           long maxMs) {
+        return new AuditJournalService(objectMapper, MAX_ENTRIES, MAX_REPLAY_BYTES,
+                STALE_PENDING_SECONDS, LEASE_SECONDS, threshold, baseMs, maxMs, clock);
+    }
+
+    private AuditReplayService newReplayService(AuditJournalService journal) {
+        AuditedOperations operations = new AuditedOperations(new DateTimeService(),
+                new CryptoService(), new JsonService(objectMapper), new TextService(), journal);
+        return new AuditReplayService(journal, operations, objectMapper);
     }
 
     @Test
     @DisplayName("lapsed replay claim is rolled back with a fresh attempt and a published retry deadline")
-    void admittedRetryIncrementsAttemptAndStampsNextRetryAt() {
+    void retryAdmissionIncrementsAttemptAndStampsNextRetryAt() {
         MutableAuditClock clock = new MutableAuditClock(START);
-        AuditJournalService journal = new AuditJournalService(new ObjectMapper(), MAX_ENTRIES,
-                MAX_REPLAY_BYTES, STALE_PENDING_SECONDS, LEASE_SECONDS, 3, 1000L, 60000L, clock);
+        AuditJournalService journal = newJournal(clock, 3, 1000L, 60000L);
         String id = succeeded(journal, "retry-admit01");
         AuditEntry before = journal.find(id).orElseThrow();
         String firstOwner = journal.claimReplay(id).ownerToken();
@@ -78,6 +99,8 @@ class AuditReplayRetryBackoffTest {
         assertThat(journal.reapLog(MAX_ENTRIES)).hasSize(1);
         assertThat(journal.reapLog(MAX_ENTRIES).get(0).reason())
                 .isEqualTo(ReapReason.REPLAY_LEASE_EXPIRED);
+        // REQ-05: the tombstone carries the very same per-attempt detail as the rolled-back record.
+        assertThat(journal.reapLog(MAX_ENTRIES).get(0).detail()).isEqualTo(rolledBack.detail());
 
         // The admission gate refuses the claim until the backoff seat has passed.
         assertThatThrownBy(() -> journal.claimReplay(id))
@@ -97,13 +120,12 @@ class AuditReplayRetryBackoffTest {
     }
 
     @Test
-    @DisplayName("retry backoff doubles per attempt and saturates at the configured cap")
-    void backoffDoublesAndSaturatesAtCap() {
+    @DisplayName("retry backoff doubles per attempt, saturates at the cap and is immediately due at base 0")
+    void backoffDoublesUntilCappedAndGatesAdmission() {
         MutableAuditClock clock = new MutableAuditClock(START);
         // Threshold 5 leaves room for four rollbacks; base 1000ms, cap 3000ms so attempt 3 and 4
         // would be 4000ms/8000ms uncapped and must clamp to 3000ms.
-        AuditJournalService journal = new AuditJournalService(new ObjectMapper(), MAX_ENTRIES,
-                MAX_REPLAY_BYTES, STALE_PENDING_SECONDS, LEASE_SECONDS, 5, 1000L, 3000L, clock);
+        AuditJournalService journal = newJournal(clock, 5, 1000L, 3000L);
         String id = succeeded(journal, "retry-backoff1");
 
         long[] expectedDelaysMs = {1000L, 2000L, 3000L, 3000L};
@@ -123,14 +145,40 @@ class AuditReplayRetryBackoffTest {
             clock.advanceSeconds(expectedDelaysMs[attempt - 1] / 1000L);
             assertThat(journal.find(id).orElseThrow().state()).isEqualTo(JournalState.SUCCEEDED);
         }
+
+        // REQ-02 / DOD-02 (base = 0 clause): a zero base makes the retry immediately due, so the
+        // very next claim is admitted with no clock advance at all.
+        MutableAuditClock zeroClock = new MutableAuditClock(START);
+        AuditJournalService zeroBase = newJournal(zeroClock, 3, 0L, 60000L);
+        String zeroId = succeeded(zeroBase, "retry-basezero1");
+        zeroBase.claimReplay(zeroId);
+        zeroClock.advanceSeconds(LEASE_SECONDS + 1L);
+        assertThat(zeroBase.reap()).isEqualTo(1);
+
+        ReplayRecord zeroRolledBack = zeroBase.find(zeroId).orElseThrow().replay();
+        assertThat(zeroRolledBack.nextRetryAt()).isEqualTo(zeroRolledBack.replayedAt());
+        assertThat(zeroBase.claimReplay(zeroId).leaseExpiresAt())
+                .isEqualTo(Instant.now(zeroClock).plusSeconds(LEASE_SECONDS));
+
+        // REQ-02 hardening: an absurd cap is clamped to the documented ceiling rather than
+        // overflowing now.plusMillis(), and the pass still journals exactly one rollback.
+        MutableAuditClock ceilingClock = new MutableAuditClock(START);
+        AuditJournalService hostile = newJournal(ceilingClock, 3, Long.MAX_VALUE, Long.MAX_VALUE);
+        String hostileId = succeeded(hostile, "retry-ceiling1");
+        hostile.claimReplay(hostileId);
+        ceilingClock.advanceSeconds(LEASE_SECONDS + 1L);
+        assertThat(hostile.reap()).isEqualTo(1);
+        ReplayRecord hostileRolledBack = hostile.find(hostileId).orElseThrow().replay();
+        assertThat(hostileRolledBack.nextRetryAt())
+                .isEqualTo(Instant.now(ceilingClock).plus(Duration.ofDays(3650L)))
+                .isAfter(Instant.now(ceilingClock).plus(Duration.ofDays(3649L)));
     }
 
     @Test
     @DisplayName("reaching the quarantine threshold quarantines the entry with a tombstone")
-    void entryIsQuarantinedOnceThresholdIsReached() {
+    void quarantinesAfterThresholdRetries() {
         MutableAuditClock clock = new MutableAuditClock(START);
-        AuditJournalService journal = new AuditJournalService(new ObjectMapper(), MAX_ENTRIES,
-                MAX_REPLAY_BYTES, STALE_PENDING_SECONDS, LEASE_SECONDS, 3, 1000L, 60000L, clock);
+        AuditJournalService journal = newJournal(clock, 3, 1000L, 60000L);
         String id = succeeded(journal, "retry-quarant1");
         AuditEntry before = journal.find(id).orElseThrow();
 
@@ -179,10 +227,9 @@ class AuditReplayRetryBackoffTest {
 
     @Test
     @DisplayName("only the claim owner may renew or complete; a stale token never mutates the entry")
-    void staleOwnerTokenIsFencedOutOfRenewalAndCompletion() {
+    void fencesRenewalAndCompletionToTheClaimOwner() {
         MutableAuditClock clock = new MutableAuditClock(START);
-        AuditJournalService journal = new AuditJournalService(new ObjectMapper(), MAX_ENTRIES,
-                MAX_REPLAY_BYTES, STALE_PENDING_SECONDS, LEASE_SECONDS, 2, 1000L, 60000L, clock);
+        AuditJournalService journal = newJournal(clock, 2, 1000L, 60000L);
         String id = succeeded(journal, "retry-fence01");
         String owner = journal.claimReplay(id).ownerToken();
 
@@ -216,8 +263,42 @@ class AuditReplayRetryBackoffTest {
     }
 
     @Test
+    @DisplayName("a retry-pending entry is skipped by the sweep as BACKOFF_PENDING, then verifies once due")
+    void verifySweepReportsBackoffPendingSkipReason() {
+        MutableAuditClock clock = new MutableAuditClock(START);
+        AuditJournalService journal = newJournal(clock, 3, 1000L, 60000L);
+        AuditReplayService replayService = newReplayService(journal);
+        String id = succeeded(journal, "retry-verify01");
+        journal.claimReplay(id);
+        clock.advanceSeconds(LEASE_SECONDS + 1L);
+        assertThat(journal.reap()).isEqualTo(1);
+
+        // REQ-02/REQ-05: while the backoff deadline is pending the sweep never executes the entry
+        // and reports the structural skip reason instead of a parsed conflict message.
+        JournalVerifyResponse pending = replayService.verify(10);
+        assertThat(pending.scanned()).isEqualTo(1);
+        assertThat(pending.results()).hasSize(1);
+        assertThat(pending.results().get(0).entryId()).isEqualTo(id);
+        assertThat(pending.results().get(0).outcome()).isNull();
+        assertThat(pending.results().get(0).skipReason()).isEqualTo("BACKOFF_PENDING");
+        assertThat(pending.results().get(0).detail()).contains("replay backoff in effect");
+        assertThat(pending.skipped()).isEqualTo(1);
+        assertThat(journal.find(id).orElseThrow().replay().state()).isEqualTo(ReplayState.FAILED);
+
+        // Once the deadline passes the retried entry is admitted again and verifies normally.
+        clock.advanceSeconds(1L);
+        JournalVerifyResponse due = replayService.verify(10);
+        assertThat(due.results()).hasSize(1);
+        assertThat(due.results().get(0).outcome()).isEqualTo(ReplayState.VERIFIED);
+        assertThat(due.results().get(0).skipReason()).isNull();
+        assertThat(due.verified()).isEqualTo(1);
+    }
+
+    @Test
     @DisplayName("identical clock sequences journal identical retry schedules and quarantine decisions")
-    void replayingTheSameSequenceJournalsTheSameDecisions() {
+    void journalsDeterministicRetryAndQuarantineSequence() {
+        // One retry cycle: lease + 1s past expiry, then the mandated 60s backoff wait.
+        long cycle = LEASE_SECONDS + 1L + 60L;
         List<String> first = runDeterministicSequence();
         List<String> second = runDeterministicSequence();
         assertThat(second).isEqualTo(first);
@@ -225,9 +306,17 @@ class AuditReplayRetryBackoffTest {
         // reapLog is newest-first: the quarantine decision precedes its two expiry tombstones.
         assertThat(first.get(0)).isEqualTo(ReapReason.REPLAY_LEASE_QUARANTINED.name()
                 + "|replay lease expired 3 times; entry quarantined|"
-                + START.plusSeconds(2L * (LEASE_SECONDS + 1L + 60L) + LEASE_SECONDS + 1L));
-        assertThat(first.get(1)).startsWith(ReapReason.REPLAY_LEASE_EXPIRED.name());
-        assertThat(first.get(2)).startsWith(ReapReason.REPLAY_LEASE_EXPIRED.name());
+                + START.plusSeconds(2L * cycle + LEASE_SECONDS + 1L));
+        // REQ-05/F-01: each expiry tombstone names its own attempt and that attempt's deadline, so
+        // the two retries are byte-distinguishable and the schedule is re-playable verbatim.
+        assertThat(first.get(1)).isEqualTo(ReapReason.REPLAY_LEASE_EXPIRED.name()
+                + "|replay claim lease expired at " + START.plusSeconds(cycle + LEASE_SECONDS)
+                + "; retry 2 of 3 at " + START.plusSeconds(cycle + LEASE_SECONDS + 1L + 2L)
+                + "|" + START.plusSeconds(cycle + LEASE_SECONDS + 1L));
+        assertThat(first.get(2)).isEqualTo(ReapReason.REPLAY_LEASE_EXPIRED.name()
+                + "|replay claim lease expired at " + START.plusSeconds(LEASE_SECONDS)
+                + "; retry 1 of 3 at " + START.plusSeconds(LEASE_SECONDS + 1L + 1L)
+                + "|" + START.plusSeconds(LEASE_SECONDS + 1L));
     }
 
     /** Two bounded retries then a quarantine, reduced to the deterministic tombstone trail. */

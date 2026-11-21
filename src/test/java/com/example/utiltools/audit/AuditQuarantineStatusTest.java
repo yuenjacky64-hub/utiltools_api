@@ -211,7 +211,7 @@ class AuditQuarantineStatusTest {
 
     @Test
     @DisplayName("POST /api/v1/utils/audit/entries/{id}/replay - 409 when quarantined, VERIFIED while in lease")
-    void replayRefusedWhenQuarantinedAndVerifiedWhileActive() throws Exception {
+    void replayReturns409WhenQuarantinedAndOutcomeWithinLease() throws Exception {
         String replayPath = "/api/v1/utils/audit/entries/{id}/replay";
 
         // An active entry with no live claim replays to VERIFIED straight away.
@@ -242,7 +242,7 @@ class AuditQuarantineStatusTest {
 
     @Test
     @DisplayName("POST /api/v1/utils/audit/entries/{id}/replay - retries are admitted only after the backoff seat")
-    void retriesAreAdmittedAfterEachBackoffSeat() throws Exception {
+    void quarantinesAfterBoundedRetriesAndRefusesLaterReplays() throws Exception {
         String replayPath = "/api/v1/utils/audit/entries/{id}/replay";
         AuditEntry entry = replayableEntry("req-replaypath3");
 
@@ -269,12 +269,31 @@ class AuditQuarantineStatusTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"));
 
-        // The quarantine threshold (2) is reached on the next lapse: the entry fails for good.
+        // The quarantine threshold (2) is reached on the next lapse: the entry fails for good,
+        // with exactly one REPLAY_LEASE_QUARANTINED tombstone and no further reap work.
         journal.claimReplay(entry.id());
         CLOCK.advanceSeconds(LEASE_SECONDS + 1L);
         assertThat(journal.reap()).isEqualTo(1);
-        assertThat(journal.find(entry.id()).orElseThrow().errorCode())
-                .isEqualTo(ReapReason.REPLAY_LEASE_QUARANTINED.name());
+        AuditEntry quarantined = journal.find(entry.id()).orElseThrow();
+        assertThat(quarantined.state()).isEqualTo(JournalState.FAILED);
+        assertThat(quarantined.errorCode()).isEqualTo(ReapReason.REPLAY_LEASE_QUARANTINED.name());
+        assertThat(quarantined.completedAt()).isNotNull();
+        assertThat(journal.reapLog(50)).hasSize(2);
+        assertThat(journal.reapLog(50).get(0).reason()).isEqualTo(ReapReason.REPLAY_LEASE_QUARANTINED);
+        assertThat(journal.reap()).isZero();
+
+        // DOD-07(f): every later replay is refused with 409 REPLAY_CONFLICT and mutates nothing.
+        mockMvc.perform(post(replayPath, entry.id()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("REPLAY_CONFLICT"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString(
+                        "REPLAY_LEASE_QUARANTINED")));
+        CLOCK.advanceSeconds(RETRY_BACKOFF_WAIT_SECONDS);
+        mockMvc.perform(post(replayPath, entry.id()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error").value("REPLAY_CONFLICT"));
+        assertThat(journal.find(entry.id()).orElseThrow()).isEqualTo(quarantined);
+        assertThat(journal.reapLog(50)).hasSize(2);
     }
 
     private JsonNode data(MvcResult result) throws Exception {

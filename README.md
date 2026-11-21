@@ -1801,8 +1801,8 @@ produces a `REAPED` tombstone; and a renewal racing a reap resolves under the jo
 exactly one of *renewed claim* or *reaped claim* wins. Renewal stops being possible the moment the
 operation ends — a claim left `IN_PROGRESS` after that is still rolled back to `FAILED` exactly once
 with reason `REPLAY_LEASE_EXPIRED`. Renewal exposes nothing new: owner tokens remain private to the
-journal and only `leaseExpiresAt` (already part of the `replay` record) is returned by `list`,
-`find` and `replay`.
+journal and only `leaseExpiresAt` (already part of the `replay` record) plus `nextRetryAt` while a
+bounded retry is still pending are returned by `list`, `find` and `replay`.
 
 | Property | Default | Meaning |
 | :------- | :------ | :------ |

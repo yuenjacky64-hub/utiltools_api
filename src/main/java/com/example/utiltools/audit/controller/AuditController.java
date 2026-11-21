@@ -72,8 +72,8 @@ public class AuditController {
             stamped on replay.nextRetryAt after a REPLAY_LEASE_EXPIRED rollback) is still in effect, or
             when the entry is not replayable — including a permanently quarantined entry
             (REPLAY_LEASE_QUARANTINED); a crashed replayer's IN_PROGRESS claim is
-            taken over once utiltools.audit.replay-lease-seconds elapses. Only leaseExpiresAt is
-            exposed on the replay record.""")
+            taken over once utiltools.audit.replay-lease-seconds elapses. Only leaseExpiresAt and,
+            while a bounded retry is pending, nextRetryAt are exposed on the replay record.""")
     public ApiResponse<AuditEntry> replay(@PathVariable String id) {
         return ApiResponse.success(replayService.replay(id), "Replay verification completed");
     }
