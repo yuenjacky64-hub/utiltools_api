@@ -46,7 +46,7 @@ It packs the **3 most useful daily developer utility tools** into clean, predict
 | Tool | Base Path | Core Capabilities |
 | :--- | :--- | :--- |
 | **🕒 DateTime & Timezone** | `/api/v1/utils/datetime` | Epoch seconds/millis ⇄ ISO-8601 conversion, IANA timezone shifts, DST-aware duration shift, duration shift with month-end clamping, duration diff calculation, interval overlap detection, cron next-run planning, current global time |
-| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 / UUID v8 generation (`version=V4|V7|V8`) |
+| **🔐 Crypto & Encoding** | `/api/v1/utils/crypto` | SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1 digests, HMAC keyed signatures, Base64 & URL-safe Base64 encode/decode, RFC 4648 Base32 and Bitcoin-alphabet Base58 encode/decode, deterministic URL percent-encode/decode (`COMPONENT`, `PATH`, `FORM` modes), decode-only compact JWT inspection, UUID v4 batch generation and time-ordered RFC 9562 UUID v7 / UUID v8 generation (`version=V4|V7|V8`) |
 | **📄 JSON Data Processor** | `/api/v1/utils/json` | JSON formatting/pretty-printing, minification, syntax validation with line/column error diagnostics, JSONPath query evaluation, atomic RFC 6902-style patch with rollback audit, and NDJSON / JSON Lines conversion (array <-> line-delimited records) |
 | **🔤 Text Transformation** | `/api/v1/utils/text` | Deterministic case/format conversion (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`, `REVERSE`), Unicode normalization (`NFC`, `NFD`, `NFKC`, `NFKD`), code-point accurate text statistics (characters, words, lines, sentences) and bounded literal/regex find-and-replace |
 
@@ -152,6 +152,8 @@ utiltools_api/
 | `GET` | `/api/v1/utils/datetime/week-date` | Resolve an ISO week (`year`, `week`, optional `day` = MONDAY..SUNDAY case-insensitive or 1..7, default MONDAY) back to its calendar date via `WeekFields.ISO`; rejects weeks that do not exist in that ISO week-year (e.g. 2021-W53). Read-only: not journalled |
 | `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1) or HMAC |
 | `POST` | `/api/v1/utils/crypto/base64` | Encode or decode standard / URL-safe Base64 strings |
+| `POST` | `/api/v1/utils/crypto/base32` | Encode or decode RFC 4648 Base32 strings |
+| `POST` | `/api/v1/utils/crypto/base58` | Encode or decode Bitcoin-alphabet Base58 strings (leading-zero preserving) |
 | `POST` | `/api/v1/utils/crypto/url` | Percent-encode or decode a URL component, path segment list or form value (`COMPONENT`, `PATH`, `FORM`) |
 | `POST` | `/api/v1/utils/crypto/url/parse` | Decompose a URL into `scheme`, `userInfo`, `host`, `port`, `path`, raw `query`, `fragment` and an ordered, duplicate-preserving list of decoded query `parameters` (absent components are `null`) |
 | `POST` | `/api/v1/utils/crypto/jwt/decode` | Decode a compact JWT into `algorithm`, `type`, `header` and `payload` without verifying the signature (`verified` is always `false`) |
@@ -777,7 +779,45 @@ curl -X POST http://localhost:8080/api/v1/utils/crypto/base64 \
 }
 ```
 
-#### D. UUID Generator
+#### D. Base58 Encode / Decode
+`POST /api/v1/utils/crypto/base58` is the Bitcoin/IPFS/Solana alphabet
+(`123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz`) over UTF-8 bytes: encoding emits one leading `1`
+per leading `0x00` byte, and decoding restores those leading zero bytes. Any character outside the alphabet
+(`0`, `O`, `I`, `l`, `+`, `/`, ...) or bytes that are not well-formed UTF-8 are rejected with
+`400 BAD_REQUEST`.
+
+```bash
+# Encode
+curl -X POST http://localhost:8080/api/v1/utils/crypto/base58 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "ENCODE",
+    "content": "Hello World!"
+  }'
+
+# Decode
+curl -X POST http://localhost:8080/api/v1/utils/crypto/base58 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "DECODE",
+    "content": "2NEpo7TZRRrLZSi2U"
+  }'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Base58 operation completed successfully",
+  "data": {
+    "action": "ENCODE",
+    "result": "2NEpo7TZRRrLZSi2U"
+  },
+  "timestamp": "2026-10-30T16:50:38.923723150Z"
+}
+```
+
+#### E. UUID Generator
 Query parameters:
 - `count` (optional, default `1`, max `100`)
 - `compact` (optional, default `false`; when `true`, removes hyphens into 32-hex chars)
@@ -856,7 +896,7 @@ per-process monotonic counter:
 }
 ```
 
-#### E. URL Percent-Encode / Decode
+#### F. URL Percent-Encode / Decode
 `POST /api/v1/utils/crypto/url` is the deterministic, journalled counterpart of `base64` for URL text:
 same `ApiResponse` envelope, same validation, same replay guarantees, no client-side library needed.
 
@@ -923,7 +963,7 @@ request, the entry is replayable: `POST /api/v1/utils/audit/entries/{id}/replay`
 answers `replay.state = VERIFIED` without rewriting the entry's original `state`, `result` or `completedAt`, and
 without appending a second journal entry.
 
-#### F. URL Decompose & Query Parse
+#### G. URL Decompose & Query Parse
 `POST /api/v1/utils/crypto/url/parse` is the decomposition counterpart of the percent-encode/decode endpoint: it
 splits a URL into its components and decodes its query string into an ordered parameter list.
 
@@ -990,7 +1030,7 @@ a second journal entry. Because the request is bounded (8192 characters, 128 par
 bounded too: no new truncation path is involved, since over-cap input is rejected up front instead of being stored
 short.
 
-#### G. JWT Decode (decode-only)
+#### H. JWT Decode (decode-only)
 `POST /api/v1/utils/crypto/jwt/decode` turns a compact JWS/JWT into its header and claims, so you can inspect
 a token while debugging without pulling a JWT library into the client. It is **decode-only**: the signature is
 never verified, no key is ever supplied, and `verified` is always `false`. Never use the decoded claims for an
@@ -1590,10 +1630,10 @@ populated only when a cached result is served).
 
 ## 🧾 Operation Journal & Replay Verification
 
-All thirty-four journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
+All thirty-five journalled utility operations — `datetime/convert`, `datetime/diff`, `datetime/current`,
 `datetime/shift`, `datetime/duration`, `datetime/business-days`, `datetime/range`, `datetime/overlap`,
 `datetime/cron-next`, `crypto/hash`,
-`crypto/base64`, `crypto/base32`, `crypto/url`, `crypto/url/parse`, `crypto/jwt/decode`, `crypto/uuid`, `json/format`,
+`crypto/base64`, `crypto/base32`, `crypto/base58`, `crypto/url`, `crypto/url/parse`, `crypto/jwt/decode`, `crypto/uuid`, `json/format`,
 `json/validate`, `json/query`, `json/flatten`, `json/unflatten`, `json/merge-patch`, `json/pointer`,
 `json/to-csv`, `json/from-csv`, `json/csv-to-json`, `json/to-ndjson`, `json/from-ndjson`, `json/diff`,
 `text/transform`, `text/stats`, `text/replace`, `text/html-entities`, `text/word-frequency` — are recorded in a **bounded
@@ -2950,7 +2990,7 @@ When client input fails validation or business rules, `@RestControllerAdvice` fo
 | HTTP Status | Error Code | Trigger Condition |
 | :--- | :--- | :--- |
 | `400 BAD_REQUEST` | `VALIDATION_ERROR` | Missing required fields (`@NotBlank`, `@NotNull`, etc.) |
-| `400 BAD_REQUEST` | `BAD_REQUEST` | Invalid timezone ID, unsupported hash algorithm, corrupt Base64, malformed or non-UTF-8 percent escape on `crypto/url`, malformed compact JWT (segment count, base64url, UTF-8, JSON shape, `alg`/`typ`) on `crypto/jwt/decode` |
+| `400 BAD_REQUEST` | `BAD_REQUEST` | Invalid timezone ID, unsupported hash algorithm, corrupt Base64, Base32/Base58 text outside its alphabet or decoding to non-UTF-8 bytes, malformed or non-UTF-8 percent escape on `crypto/url`, malformed compact JWT (segment count, base64url, UTF-8, JSON shape, `alg`/`typ`) on `crypto/jwt/decode` |
 | `400 BAD_REQUEST` | `BAD_REQUEST` | Malformed HTTP request body |
 | `404 NOT_FOUND` | `JOB_NOT_FOUND` | Unknown or evicted batch job id |
 | `404 NOT_FOUND` | `NOT_FOUND` | Unknown audit journal entry id |
@@ -3026,7 +3066,7 @@ The project is built with Test-Driven Development (TDD) using JUnit 5, MockMvc, 
 
 - **`DateTimeServiceTest`**: Epoch parsing, timezone shifts, duration math, DST-aware shift arithmetic (month-end clamping, spring-forward, fall-back), boundary checks.
 - **`DateTimeControllerTest`**: Full HTTP endpoint testing with MockMvc, including shift validation and error envelopes.
-- **`CryptoServiceTest`**: Standard hashing vectors, HMAC calculations, Base64 encode/decode, URL percent-encoding across `COMPONENT`/`PATH`/`FORM` (round-trip, mode-specific `+`, malformed escape and undecodable UTF-8 rejection), UUID v4 generation, UUIDv7 fixed-clock vector, UUIDv8 fixed-clock vector and counter-modulo-65536 masking, `version=V4|V7|V8` parsing, clock-regression monotonicity, and an 8-thread x 10000 duplicate-free concurrency invariant.
+- **`CryptoServiceTest`**: Standard hashing vectors, HMAC calculations, Base64 encode/decode, Base58 known vector (`"Hello World!"` ⇄ `2NEpo7TZRRrLZSi2U`), leading-zero/NUL preservation, Unicode round-trip, invalid-alphabet and non-UTF-8 rejection, URL percent-encoding across `COMPONENT`/`PATH`/`FORM` (round-trip, mode-specific `+`, malformed escape and undecodable UTF-8 rejection), UUID v4 generation, UUIDv7 fixed-clock vector, UUIDv8 fixed-clock vector and counter-modulo-65536 masking, `version=V4|V7|V8` parsing, clock-regression monotonicity, and an 8-thread x 10000 duplicate-free concurrency invariant.
 - **`CryptoControllerTest`**: HTTP validation and crypto response envelope testing, including `crypto/url` encode/decode, decode-only `crypto/jwt/decode` (`algorithm`, `payload`, `signatureBytes`, `verified=false`, no raw token or signature echoed), 400 `BAD_REQUEST` vs `VALIDATION_ERROR`, and `CRYPTO_URL` / `CRYPTO_JWT_DECODE` journal/replay (`VERIFIED`), including `version=V4|V7|V8` selection, compact UUIDv7 and UUIDv8, `CRYPTO_UUID` journal/replay for V8, and the 400 unified envelope for an unknown `version`.
 - **`JsonServiceTest`**: Formatting, minification, Jackson parsing error positions, JSONPath queries, six-op patch success, rollback to byte-identical original, missing paths, malformed pointers, `-` append, dry runs, input-not-mutated.
 - **`JsonControllerTest`**: JSON endpoints MockMvc test suite, including the 200 patch envelope, the 422 `PATCH_ROLLBACK` audit payload, empty-`operations` validation rejection, and the stale-fallback envelopes: an opt-in request served from the cache with `staleFallback`/`cachedAt`/`cacheAgeMillis` on an `OPEN` breaker, plus the unchanged `503` `CIRCUIT_OPEN` envelope for a miss, a different `jsonPath` and a non-opt-in caller.

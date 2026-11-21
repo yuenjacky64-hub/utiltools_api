@@ -4,6 +4,8 @@ import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.ApiResponse;
 import com.example.utiltools.crypto.dto.Base32Request;
 import com.example.utiltools.crypto.dto.Base32Response;
+import com.example.utiltools.crypto.dto.Base58Request;
+import com.example.utiltools.crypto.dto.Base58Response;
 import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
@@ -29,7 +31,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/api/v1/utils/crypto")
-@Tag(name = "Crypto & Encoding Utility", description = "Endpoints for cryptographic hashing, HMAC signatures, Base32 encoding/decoding, Base64 encoding/decoding, URL percent-encoding/decoding, decode-only JWT inspection, and UUID generation")
+@Tag(name = "Crypto & Encoding Utility", description = "Endpoints for cryptographic hashing, HMAC signatures, Base58 encoding/decoding, Base32 encoding/decoding, Base64 encoding/decoding, URL percent-encoding/decoding, decode-only JWT inspection, and UUID generation")
 public class CryptoController {
 
     private final AuditedOperations auditedOperations;
@@ -59,6 +61,16 @@ public class CryptoController {
     public ApiResponse<Base32Response> base32(@Valid @RequestBody Base32Request request) {
         Base32Response result = auditedOperations.base32(request);
         return ApiResponse.success(result, "Base32 operation completed successfully");
+    }
+
+    @PostMapping("/base58")
+    @Operation(summary = "Encode or decode Base58 strings",
+            description = "Deterministic Bitcoin-alphabet Base58 over UTF-8 bytes; encoding emits one leading '1' "
+                    + "per leading NUL byte, decoding preserves leading-zero bytes and rejects any character outside "
+                    + "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz or invalid UTF-8 with 400 BAD_REQUEST")
+    public ApiResponse<Base58Response> base58(@Valid @RequestBody Base58Request request) {
+        Base58Response result = auditedOperations.base58(request);
+        return ApiResponse.success(result, "Base58 operation completed successfully");
     }
 
     @PostMapping("/url")
