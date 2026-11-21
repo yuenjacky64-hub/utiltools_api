@@ -6,6 +6,8 @@ import com.example.utiltools.text.dto.TextNormalizeRequest;
 import com.example.utiltools.text.dto.TextNormalizeResponse;
 import com.example.utiltools.text.dto.TextReplaceRequest;
 import com.example.utiltools.text.dto.TextReplaceResponse;
+import com.example.utiltools.text.dto.TextSimilarityRequest;
+import com.example.utiltools.text.dto.TextSimilarityResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
@@ -772,6 +774,101 @@ class TextServiceTest {
             // a boundary-valid request passes
             assertThat(validator.validate(new TextWordFrequencyRequest(
                     "abc", 100, true, List.of("x".repeat(100))))).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("similarity - kitten/sitting has code-point distance 3 and similarity 0.571429")
+    void shouldMeasureDistanceInCodePoints() {
+        TextSimilarityResponse response =
+                service.similarity(new TextSimilarityRequest("kitten", "sitting", null));
+
+        assertThat(response.distance()).isEqualTo(3);
+        assertThat(response.maxLength()).isEqualTo(7);
+        assertThat(response.similarity()).isEqualTo(0.571429);
+        assertThat(response.identical()).isFalse();
+        assertThat(response.caseSensitive()).isFalse();
+    }
+
+    @Test
+    @DisplayName("similarity - identical inputs have distance 0, similarity 1.0 and are identical")
+    void shouldReportIdenticalInputsAsZeroDistance() {
+        TextSimilarityResponse response =
+                service.similarity(new TextSimilarityRequest("abc", "abc", null));
+
+        assertThat(response.distance()).isZero();
+        assertThat(response.maxLength()).isEqualTo(3);
+        assertThat(response.similarity()).isEqualTo(1.0);
+        assertThat(response.identical()).isTrue();
+    }
+
+    @Test
+    @DisplayName("similarity - the default folds case with Locale.ROOT, caseSensitive=true does not")
+    void shouldFoldCaseUnlessCaseSensitive() {
+        TextSimilarityResponse folded =
+                service.similarity(new TextSimilarityRequest("Hello", "hello", null));
+        assertThat(folded.distance()).isZero();
+        assertThat(folded.similarity()).isEqualTo(1.0);
+        assertThat(folded.identical()).isTrue();
+        assertThat(folded.caseSensitive()).isFalse();
+
+        TextSimilarityResponse sensitive =
+                service.similarity(new TextSimilarityRequest("Hello", "hello", true));
+        assertThat(sensitive.distance()).isEqualTo(1);
+        assertThat(sensitive.maxLength()).isEqualTo(5);
+        assertThat(sensitive.similarity()).isEqualTo(0.8);
+        assertThat(sensitive.identical()).isFalse();
+        assertThat(sensitive.caseSensitive()).isTrue();
+    }
+
+    @Test
+    @DisplayName("similarity - a supplementary code point counts as one edit, not two")
+    void shouldCompareSupplementaryCodePoints() {
+        // U+1F600 is a surrogate pair: two chars but one code point.
+        TextSimilarityResponse response =
+                service.similarity(new TextSimilarityRequest("a\uD83D\uDE00b", "a\uD83D\uDE01b", null));
+
+        assertThat(response.distance()).isEqualTo(1);
+        assertThat(response.maxLength()).isEqualTo(3);
+        assertThat(response.similarity()).isEqualTo(0.666667);
+    }
+
+    @Test
+    @DisplayName("similarity - inputs at the 2000-code-point bound are accepted, one longer is rejected")
+    void shouldRejectInputsOverTheCodePointBound() {
+        String atBound = "a".repeat(TextService.MAX_SIMILARITY_CODE_POINTS);
+        TextSimilarityResponse response =
+                service.similarity(new TextSimilarityRequest(atBound, atBound, null));
+        assertThat(response.distance()).isZero();
+        assertThat(response.maxLength()).isEqualTo(2000);
+        assertThat(response.identical()).isTrue();
+
+        // 2001 supplementary code points are 4002 chars: the bound counts code points.
+        String overBound = "\uD83D\uDE00".repeat(TextService.MAX_SIMILARITY_CODE_POINTS + 1);
+        assertThatThrownBy(() -> service.similarity(new TextSimilarityRequest(overBound, "abc", null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("left must be at most 2000 code points");
+
+        assertThatThrownBy(() -> service.similarity(new TextSimilarityRequest("abc", overBound, null)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("right must be at most 2000 code points");
+    }
+
+    @Test
+    @DisplayName("similarity - the request validates both inputs and tolerates an absent caseSensitive")
+    void shouldValidateSimilarityRequest() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+
+            assertThat(validator.validate(new TextSimilarityRequest(" ", "abc", null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("left is required");
+
+            assertThat(validator.validate(new TextSimilarityRequest("abc", "   ", null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("right is required");
+
+            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null))).isEmpty();
         }
     }
 }

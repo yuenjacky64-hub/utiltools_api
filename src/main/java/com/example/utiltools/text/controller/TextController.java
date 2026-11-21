@@ -8,6 +8,8 @@ import com.example.utiltools.text.dto.TextReplaceRequest;
 import com.example.utiltools.text.dto.TextReplaceResponse;
 import com.example.utiltools.text.dto.TextNormalizeRequest;
 import com.example.utiltools.text.dto.TextNormalizeResponse;
+import com.example.utiltools.text.dto.TextSimilarityRequest;
+import com.example.utiltools.text.dto.TextSimilarityResponse;
 import com.example.utiltools.text.dto.TextStatsRequest;
 import com.example.utiltools.text.dto.TextStatsResponse;
 import com.example.utiltools.text.dto.TextTransformRequest;
@@ -108,5 +110,16 @@ public class TextController {
                     + "TEXT_WORD_FREQUENCY and can be replayed.")
     public ApiResponse<TextWordFrequencyResponse> wordFrequency(@Valid @RequestBody TextWordFrequencyRequest request) {
         return ApiResponse.success(auditedOperations.wordFrequency(request), "Word frequency computed successfully");
+    }
+
+    @PostMapping("/similarity")
+    @Operation(summary = "Compare two texts by edit distance",
+            description = "Computes the code-point Levenshtein distance between left and right with a two-row dynamic "
+                    + "programme, plus maxLength and similarity = 1 - distance/maxLength rounded to 6 decimals. "
+                    + "caseSensitive defaults to false, in which case both inputs are folded with Locale.ROOT first. "
+                    + "Each input is bounded at 2000 code points; a longer one returns 400 BAD_REQUEST. "
+                    + "Every call is journalled as TEXT_SIMILARITY and can be replayed.")
+    public ApiResponse<TextSimilarityResponse> similarity(@Valid @RequestBody TextSimilarityRequest request) {
+        return ApiResponse.success(auditedOperations.similarity(request), "Text similarity computed successfully");
     }
 }
