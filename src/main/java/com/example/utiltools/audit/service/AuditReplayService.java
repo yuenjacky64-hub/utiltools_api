@@ -260,8 +260,8 @@ public class AuditReplayService {
 
     /**
      * Classifies a rejected claim without parsing the conflict message, in the documented
-     * precedence order: evicted, live claim, not SUCCEEDED, non-deterministic, not replayable,
-     * anything else.
+     * precedence order: evicted, live claim, bounded-retry backoff pending, not SUCCEEDED,
+     * non-deterministic, not replayable, anything else.
      */
     private EntryAttempt skipped(String id, ReplayConflictException conflict) {
         String detail = boundedDetail(conflict.getMessage());
@@ -276,6 +276,12 @@ public class AuditReplayService {
         if (replay != null && replay.state() == ReplayState.IN_PROGRESS) {
             // A live lease is left exactly as it is: the sweep never touches another caller's claim.
             skipReason = "LIVE_CLAIM";
+        } else if (replay != null && replay.nextRetryAt() != null
+                && entry.state() == JournalState.SUCCEEDED) {
+            // A rolled-back claim waits for its bounded retry: the schedule is read structurally
+            // from the record (a retry-pending entry is still SUCCEEDED and carries the deadline),
+            // never parsed out of the conflict message, so the reason is stable.
+            skipReason = "BACKOFF_PENDING";
         } else if (entry.state() != JournalState.SUCCEEDED) {
             skipReason = "NOT_SUCCEEDED";
         } else if (operation == null || !operation.isDeterministic()) {
