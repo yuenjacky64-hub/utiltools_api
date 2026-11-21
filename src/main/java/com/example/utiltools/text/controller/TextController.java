@@ -2,6 +2,8 @@ package com.example.utiltools.text.controller;
 
 import com.example.utiltools.audit.service.AuditedOperations;
 import com.example.utiltools.common.ApiResponse;
+import com.example.utiltools.text.dto.TextDiffRequest;
+import com.example.utiltools.text.dto.TextDiffResponse;
 import com.example.utiltools.text.dto.TextHtmlEntitiesRequest;
 import com.example.utiltools.text.dto.TextHtmlEntitiesResponse;
 import com.example.utiltools.text.dto.TextReplaceRequest;
@@ -125,5 +127,21 @@ public class TextController {
                     + "Every call is journalled as TEXT_SIMILARITY and can be replayed.")
     public ApiResponse<TextSimilarityResponse> similarity(@Valid @RequestBody TextSimilarityRequest request) {
         return ApiResponse.success(auditedOperations.similarity(request), "Text similarity computed successfully");
+    }
+
+    @PostMapping("/diff")
+    @Operation(summary = "Report the token-level text-diff of two texts",
+            description = "Compares left and right token by token and reports the added, removed and changed tokens, the "
+                    + "structural path of every change (line[L].token[T]) and its half-open code-point span. Tokens are "
+                    + "selected with tokenizer (letter, the default, or digit, alphanum, whitespace, regex); caseSensitive "
+                    + "defaults to false, in which case every token is folded with Locale.ROOT before it is compared, so "
+                    + "positions always index the caller's own text. Each input is bounded at 2000 code points and the "
+                    + "token-pair matrix at 1000000 cells; a longer side returns 400 BAD_REQUEST, and so does a diff that "
+                    + "would report more than 1000 changes. pattern is optional, at most 512 characters (a longer one "
+                    + "returns 400 VALIDATION_ERROR) and only used by tokenizer=regex. The optional timeoutMs tightens the "
+                    + "regex wall-clock budget (0 or absent means the configured budget); an exhausted budget returns 422 "
+                    + "REGEX_TIMEOUT. Every call is journalled as TEXT_DIFF and can be replayed.")
+    public ApiResponse<TextDiffResponse> diff(@Valid @RequestBody TextDiffRequest request) {
+        return ApiResponse.success(auditedOperations.textDiff(request), "Text diff computed successfully");
     }
 }

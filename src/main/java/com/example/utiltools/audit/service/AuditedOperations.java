@@ -65,6 +65,8 @@ import com.example.utiltools.json.dto.JsonToNdjsonResponse;
 import com.example.utiltools.json.dto.JsonValidateRequest;
 import com.example.utiltools.json.dto.JsonValidateResponse;
 import com.example.utiltools.json.service.JsonService;
+import com.example.utiltools.text.dto.TextDiffRequest;
+import com.example.utiltools.text.dto.TextDiffResponse;
 import com.example.utiltools.text.dto.TextHtmlEntitiesRequest;
 import com.example.utiltools.text.dto.TextHtmlEntitiesResponse;
 import com.example.utiltools.text.dto.TextNormalizeRequest;
@@ -288,6 +290,10 @@ public class AuditedOperations {
         return record(OperationType.TEXT_SIMILARITY, request, () -> textService.similarity(request));
     }
 
+    public TextDiffResponse textDiff(TextDiffRequest request) {
+        return record(OperationType.TEXT_DIFF, request, () -> textService.diff(request));
+    }
+
     public TextTruncateResponse truncate(TextTruncateRequest request) {
         return record(OperationType.TEXT_TRUNCATE, request, () -> textService.truncate(request));
     }
@@ -338,6 +344,7 @@ public class AuditedOperations {
             case TEXT_TRUNCATE -> textService.truncate((TextTruncateRequest) request);
             case TEXT_WORD_FREQUENCY -> textService.wordFrequency((TextWordFrequencyRequest) request);
             case TEXT_SIMILARITY -> textService.similarity((TextSimilarityRequest) request);
+            case TEXT_DIFF -> textService.diff((TextDiffRequest) request);
             // Asynchronous batch hashing is audit-only: a BATCH_HASH entry can never be replayed,
             // because there is no servlet-bound payload to re-run and the operation is
             // non-deterministic. Defence in depth: claimReplay refuses the same entries.
