@@ -68,7 +68,10 @@ public class AuditController {
             lease still completes VERIFIED or MISMATCH and produces no REPLAY_LEASE_EXPIRED tombstone;
             renewal stops in a finally block and a stale, terminal or expired claim is never extended.
             Answers 409 REPLAY_CONFLICT when another replay holds a live claim, when the caller's claim
-            was lost, or when the entry is not replayable; a crashed replayer's IN_PROGRESS claim is
+            was lost, while the entry's bounded-retry backoff (utiltools.audit.replay-retry-backoff-base-ms,
+            stamped on replay.nextRetryAt after a REPLAY_LEASE_EXPIRED rollback) is still in effect, or
+            when the entry is not replayable — including a permanently quarantined entry
+            (REPLAY_LEASE_QUARANTINED); a crashed replayer's IN_PROGRESS claim is
             taken over once utiltools.audit.replay-lease-seconds elapses. Only leaseExpiresAt is
             exposed on the replay record.""")
     public ApiResponse<AuditEntry> replay(@PathVariable String id) {
