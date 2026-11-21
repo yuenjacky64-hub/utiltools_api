@@ -14,6 +14,7 @@ import com.example.utiltools.text.dto.TextTransformRequest;
 import com.example.utiltools.text.dto.TextTransformResponse;
 import com.example.utiltools.text.dto.TextTruncateRequest;
 import com.example.utiltools.text.dto.TextTruncateResponse;
+import com.example.utiltools.text.dto.TokenizerScheme;
 import com.example.utiltools.text.dto.TextWordFrequencyRequest;
 import com.example.utiltools.text.dto.TextWordFrequencyResponse;
 import com.example.utiltools.text.exception.RegexTimeoutException;
@@ -475,41 +476,37 @@ public class TextService {
     }
 
     /**
-     * Remove every alphanumeric run whose folded form is in {@code ignoredFolded}, in a single
-     * left-to-right pass over code points: {@code O(n)} time and space, no regular expression, so
-     * there is no backtracking surface. A dropped run is not replaced by a placeholder, so the
-     * surrounding punctuation and spacing survive (a dropped word can therefore leave a doubled
-     * space) and both compared sides are treated identically. The result is a pure function of the
-     * arguments — no clock, no default locale, no iteration order in the output path.
+     * Fold the caller's {@code ignoreWords} into the set the token filter compares against, using the
+     * same folding as the compared inputs ({@link Locale#ROOT} lowercasing unless
+     * {@code caseSensitive} is {@code true}). An absent list yields an empty set, and an empty set
+     * makes the filter a no-op, so a request without ignore words keeps the pre-change behaviour.
      */
-    private static String stripIgnoredWords(String text, Set<String> ignoredFolded, boolean caseSensitive) {
-        StringBuilder result = new StringBuilder(text.length());
-        StringBuilder run = new StringBuilder();
-        for (int index = 0; index < text.length(); ) {
-            int codePoint = text.codePointAt(index);
-            if (Character.isLetterOrDigit(codePoint)) {
-                run.appendCodePoint(codePoint);
-            } else {
-                appendUnlessIgnored(result, run, ignoredFolded, caseSensitive);
-                result.appendCodePoint(codePoint);
-            }
-            index += Character.charCount(codePoint);
+    private static Set<String> ignoredTokens(List<String> ignoreWords, boolean caseSensitive) {
+        if (ignoreWords == null || ignoreWords.isEmpty()) {
+            return Set.of();
         }
-        appendUnlessIgnored(result, run, ignoredFolded, caseSensitive);
-        return result.toString();
+        Set<String> ignored = new HashSet<>();
+        for (String word : ignoreWords) {
+            ignored.add(foldWord(word, caseSensitive));
+        }
+        return ignored;
     }
 
-    /** Append the buffered alphanumeric run unless it is an ignored word, then clear the buffer. */
-    private static void appendUnlessIgnored(StringBuilder result, StringBuilder run,
-                                            Set<String> ignoredFolded, boolean caseSensitive) {
-        if (run.length() == 0) {
-            return;
+    /**
+     * Drop every token that is an ignored word from one already-selected token list, keeping the
+     * surviving tokens in their original order: {@code O(tokens)} and no regular expression, so there
+     * is no backtracking surface. The tokens are already folded exactly like the ignore set (and, for
+     * {@code regex}, are the pattern's matches), so the containment test is the whole matching rule;
+     * a dropped token is removed rather than replaced, so the joined sequence simply no longer
+     * contains it. Pure function of the arguments — no clock, no default locale, no iteration order in
+     * the output path.
+     */
+    private static List<String> withoutIgnoredTokens(List<String> tokens, Set<String> ignoredFolded) {
+        if (ignoredFolded.isEmpty()) {
+            return tokens;
         }
-        String word = run.toString();
-        run.setLength(0);
-        if (!ignoredFolded.contains(foldWord(word, caseSensitive))) {
-            result.append(word);
-        }
+        tokens.removeIf(ignoredFolded::contains);
+        return tokens;
     }
 
     /**
@@ -521,46 +518,63 @@ public class TextService {
      * exactly.
      *
      * <p>When {@code caseSensitive} is {@code false} or absent, both inputs are folded with
-     * {@link Locale#ROOT} lowercasing before the comparison, so {@code "Hello"} and {@code "hello"}
-     * have distance {@code 0} and are reported identical. Each raw input is bounded at
+     * {@link Locale#ROOT} lowercasing <em>first</em>, so {@code "Hello"} and {@code "hello"} have
+     * distance {@code 0} and are reported identical. Each raw input is bounded at
      * {@value #MAX_SIMILARITY_CODE_POINTS} code points and a longer one is rejected with
-     * {@link IllegalArgumentException} <em>before</em> any allocation, so the API answers
-     * {@code 400 BAD_REQUEST} and the attempt is journalled as {@code FAILED}. The bound applies to the
-     * caller's input, not to the folded sequence, whose length may differ under case mapping; at most
-     * {@code 2 × 2001} ints are ever allocated. The method reads no clock and no default locale, so the
-     * output is a pure function of the request.</p>
+     * {@link IllegalArgumentException} <em>before</em> tokenization or any allocation, so the API
+     * answers {@code 400 BAD_REQUEST} and the attempt is journalled as {@code FAILED}. The bound
+     * applies to the caller's input, not to the tokenized sequence.</p>
      *
-     * <p>Optional {@code ignoreWords} entries are removed from <em>both</em> inputs before the
-     * distance is measured, using the same folding as the inputs ({@link Locale#ROOT} lowercasing
-     * unless {@code caseSensitive} is {@code true}), so two documents that share only filler words
-     * are compared on their meaningful words. Each entry is matched against a whole alphanumeric run
-     * — the same token definition as {@link #tokenize(String)} — and an ignored run is dropped
-     * entirely while the surrounding punctuation and spacing are preserved. The bound check above
-     * still runs on the raw inputs, and filtering is skipped entirely when the request carries no
-     * ignore words, so the absent/none case is byte-for-byte the pre-change behaviour.</p>
+     * <p>The optional {@link TokenizerScheme tokenizer} then <em>selects</em> tokens from each
+     * <em>folded</em> input (fold-then-tokenize: one {@code Locale#ROOT} fold, then one token scan), so
+     * each scheme alone decides which code points survive and every non-matching code point is
+     * discarded. {@code letter} — the default when {@code tokenizer} is absent or {@code null} — is
+     * exactly {@link #tokenize(String)}: the maximal runs of
+     * {@link Character#isLetterOrDigit(int) letter-or-digit} code points, joined by one {@code U+0020},
+     * so punctuation, whitespace and symbols between runs are discarded instead of compared (and
+     * {@code "ab-cd"} and {@code "abcd"} join to different numbers of tokens). The other schemes also
+     * discard unmatched code points: {@code digit} keeps
+     * digit runs, {@code alphanum} keeps alphanumeric runs and splits them where letters meet digits,
+     * {@code whitespace} keeps non-whitespace runs and {@code regex} takes the non-empty matches of
+     * {@code pattern}. Their surviving tokens are joined by a single {@code U+0020}, so a token-count
+     * difference costs one extra edit; the joined strings are the code-point arrays fed to
+     * {@link #levenshteinDistance}, no separator is ever configurable and an empty match contributes
+     * nothing. Because the distance is then measured
+     * over the joined tokens, the worst-case memory stays {@code 2 × 4001} ints (two texts of 2000
+     * code points, every code point its own token): tokenization cannot grow the compared sequences.
+     * A {@code regex} request without a {@code pattern} or with an invalid one is rejected with
+     * {@link IllegalArgumentException} ({@code 400 BAD_REQUEST}); every {@code pattern} evaluation runs
+     * under the existing {@code utiltools.text.regex-timeout-ms} wall-clock budget and raises
+     * {@link RegexTimeoutException} when exhausted. Every other scheme reads no clock, and no step
+     * reads the default locale, so the output stays a pure function of the request.</p>
+     *
+     * <p>Optional {@code ignoreWords} entries are removed from <em>both</em> inputs after the
+     * tokenizer has selected the tokens and before the distance is measured, using the same folding
+     * as the inputs ({@link Locale#ROOT} lowercasing unless {@code caseSensitive} is {@code true}), so
+     * two documents that share only filler words are compared on their meaningful words. Each entry
+     * is matched against a whole token — never a substring of one — and an ignored token is dropped
+     * rather than replaced, so the surviving tokens are still joined by one {@code U+0020}. Filtering
+     * is skipped entirely when the request carries no ignore words, so the absent/none case is
+     * byte-for-byte the pre-change behaviour.</p>
      */
     public TextSimilarityResponse similarity(TextSimilarityRequest request) {
         boolean caseSensitive = Boolean.TRUE.equals(request.caseSensitive());
+        TokenizerScheme scheme = request.tokenizer() == null ? TokenizerScheme.LETTER : request.tokenizer();
         String left = request.left();
         String right = request.right();
-        Set<String> ignored = new HashSet<>();
-        if (request.ignoreWords() != null) {
-            for (String word : request.ignoreWords()) {
-                ignored.add(foldWord(word, caseSensitive));
-            }
-        }
-        // Bound check on the raw inputs, before folding and before any matrix row is allocated.
+        Set<String> ignored = ignoredTokens(request.ignoreWords(), caseSensitive);
+        // Bound check on the raw inputs, before folding, tokenizing and before any matrix row is allocated.
         if (left.codePointCount(0, left.length()) > MAX_SIMILARITY_CODE_POINTS) {
             throw new IllegalArgumentException("left must be at most 2000 code points");
         }
         if (right.codePointCount(0, right.length()) > MAX_SIMILARITY_CODE_POINTS) {
             throw new IllegalArgumentException("right must be at most 2000 code points");
         }
-        // Filtering is a no-op when no ignore words were supplied: the compared strings stay as they are.
-        String comparedLeft = ignored.isEmpty() ? left : stripIgnoredWords(left, ignored, caseSensitive);
-        String comparedRight = ignored.isEmpty() ? right : stripIgnoredWords(right, ignored, caseSensitive);
-        int[] comparison = foldWord(comparedLeft, caseSensitive).codePoints().toArray();
-        int[] reference = foldWord(comparedRight, caseSensitive).codePoints().toArray();
+        Pattern custom = scheme == TokenizerScheme.REGEX ? compileCustomPattern(request.pattern()) : null;
+        // The wall-clock budget is request-scoped: set once, so both inputs share the same deadline.
+        long deadlineMs = scheme == TokenizerScheme.REGEX ? clock.millis() + regexTimeoutMs : 0L;
+        int[] comparison = comparisonSequence(left, scheme, custom, caseSensitive, deadlineMs, ignored);
+        int[] reference = comparisonSequence(right, scheme, custom, caseSensitive, deadlineMs, ignored);
         int distance = levenshteinDistance(comparison, reference);
         int maxLength = Math.max(comparison.length, reference.length);
         // Both inputs empty is unreachable through the API (@NotBlank) unless every word is ignored,
@@ -570,6 +584,109 @@ public class TextService {
                 : Math.min(1.0, Math.max(0.0,
                         Math.round((1.0 - (double) distance / maxLength) * 1_000_000.0) / 1_000_000.0));
         return new TextSimilarityResponse(distance, maxLength, similarity, distance == 0, caseSensitive);
+    }
+
+    /**
+     * Fold, tokenize, filter and join one similarity input into the code-point array the distance is
+     * measured over. Folding happens first so the token scan and the pattern matcher both see the same
+     * fold; ignored words are then removed from the selected tokens (a no-op when the request carries
+     * none) and the join is by a single {@code U+0020}.
+     */
+    private int[] comparisonSequence(String raw, TokenizerScheme scheme, Pattern custom,
+            boolean caseSensitive, long deadlineMs, Set<String> ignoredFolded) {
+        String folded = foldWord(raw, caseSensitive);
+        List<String> tokens = schemeTokens(folded, scheme, custom, deadlineMs);
+        return String.join(" ", withoutIgnoredTokens(tokens, ignoredFolded)).codePoints().toArray();
+    }
+
+    /**
+     * Select the tokens one scheme keeps from already-folded text. Never returns {@code null} and never
+     * a {@code null} element; a {@code regex} pattern is evaluated under a
+     * {@link BudgetedCharSequence} so a catastrophic match cannot stall the request.
+     */
+    private List<String> schemeTokens(String folded, TokenizerScheme scheme, Pattern custom, long deadlineMs) {
+        if (scheme == TokenizerScheme.LETTER) {
+            // The default scheme is exactly {@link #tokenize(String)}: maximal letter/digit runs, which
+            // String.join below re-joins with one U+0020, so punctuation, whitespace and symbols between
+            // runs are dropped rather than counted.
+            return tokenize(folded);
+        }
+        if (scheme == TokenizerScheme.REGEX) {
+            return regexTokens(new BudgetedCharSequence(folded, clock, deadlineMs, regexTimeoutMs), custom);
+        }
+        List<String> tokens = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        int currentKind = 0;
+        for (int index = 0; index < folded.length(); ) {
+            int codePoint = folded.codePointAt(index);
+            if (isSchemeToken(scheme, codePoint)) {
+                int kind = tokenKind(scheme, codePoint);
+                if (current.length() > 0 && kind != currentKind) {
+                    tokens.add(current.toString());
+                    current.setLength(0);
+                }
+                currentKind = kind;
+                current.appendCodePoint(codePoint);
+            } else if (current.length() > 0) {
+                tokens.add(current.toString());
+                current.setLength(0);
+            }
+            index += Character.charCount(codePoint);
+        }
+        if (current.length() > 0) {
+            tokens.add(current.toString());
+        }
+        return tokens;
+    }
+
+    /**
+     * Code points a predefined scheme keeps; {@code letter} (the fixed {@link #tokenize(String)} runs) and
+     * {@code regex} never reach this method.
+     */
+    private static boolean isSchemeToken(TokenizerScheme scheme, int codePoint) {
+        return switch (scheme) {
+            case ALPHANUM -> Character.isLetterOrDigit(codePoint);
+            case DIGIT -> Character.isDigit(codePoint);
+            case WHITESPACE -> !Character.isWhitespace(codePoint);
+            case LETTER, REGEX -> false;
+        };
+    }
+
+    /**
+     * Run kind used to split {@code alphanum} runs: {@code 1} for a letter, {@code 2} for a digit and
+     * {@code 0} for every scheme that does not split, so the split test never fires for them.
+     */
+    private static int tokenKind(TokenizerScheme scheme, int codePoint) {
+        if (scheme != TokenizerScheme.ALPHANUM) {
+            return 0;
+        }
+        return Character.isDigit(codePoint) ? 2 : 1;
+    }
+
+    /** The non-empty matches of {@code pattern}, in order; unmatched text is discarded. */
+    private static List<String> regexTokens(CharSequence subject, Pattern pattern) {
+        List<String> tokens = new ArrayList<>();
+        Matcher matcher = pattern.matcher(subject);
+        while (matcher.find()) {
+            String match = matcher.group();
+            if (!match.isEmpty()) {
+                tokens.add(match);
+            }
+        }
+        return tokens;
+    }
+
+    /** A {@code regex} request needs a compilable pattern; anything else is a caller error. */
+    private static Pattern compileCustomPattern(String pattern) {
+        if (pattern == null || pattern.isBlank()) {
+            throw new IllegalArgumentException("pattern is required when tokenizer is 'regex'");
+        }
+        try {
+            return Pattern.compile(pattern);
+        } catch (PatternSyntaxException e) {
+            throw new IllegalArgumentException(
+                    "Invalid regex pattern '" + pattern + "': " + e.getDescription());
+        }
     }
 
     /**

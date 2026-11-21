@@ -16,6 +16,7 @@ import com.example.utiltools.text.dto.TextTruncateRequest;
 import com.example.utiltools.text.dto.TextTruncateResponse;
 import com.example.utiltools.text.dto.TextWordFrequencyRequest;
 import com.example.utiltools.text.dto.TextWordFrequencyResponse;
+import com.example.utiltools.text.dto.TokenizerScheme;
 import com.example.utiltools.text.service.TextService;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validation;
@@ -781,7 +782,7 @@ class TextServiceTest {
     @DisplayName("similarity - kitten/sitting has code-point distance 3 and similarity 0.571429")
     void shouldMeasureDistanceInCodePoints() {
         TextSimilarityResponse response =
-                service.similarity(new TextSimilarityRequest("kitten", "sitting", null));
+                service.similarity(new TextSimilarityRequest("kitten", "sitting", null, null, null));
 
         assertThat(response.distance()).isEqualTo(3);
         assertThat(response.maxLength()).isEqualTo(7);
@@ -794,7 +795,7 @@ class TextServiceTest {
     @DisplayName("similarity - identical inputs have distance 0, similarity 1.0 and are identical")
     void shouldReportIdenticalInputsAsZeroDistance() {
         TextSimilarityResponse response =
-                service.similarity(new TextSimilarityRequest("abc", "abc", null));
+                service.similarity(new TextSimilarityRequest("abc", "abc", null, null, null));
 
         assertThat(response.distance()).isZero();
         assertThat(response.maxLength()).isEqualTo(3);
@@ -806,14 +807,14 @@ class TextServiceTest {
     @DisplayName("similarity - the default folds case with Locale.ROOT, caseSensitive=true does not")
     void shouldFoldCaseUnlessCaseSensitive() {
         TextSimilarityResponse folded =
-                service.similarity(new TextSimilarityRequest("Hello", "hello", null));
+                service.similarity(new TextSimilarityRequest("Hello", "hello", null, null, null));
         assertThat(folded.distance()).isZero();
         assertThat(folded.similarity()).isEqualTo(1.0);
         assertThat(folded.identical()).isTrue();
         assertThat(folded.caseSensitive()).isFalse();
 
         TextSimilarityResponse sensitive =
-                service.similarity(new TextSimilarityRequest("Hello", "hello", true));
+                service.similarity(new TextSimilarityRequest("Hello", "hello", true, null, null));
         assertThat(sensitive.distance()).isEqualTo(1);
         assertThat(sensitive.maxLength()).isEqualTo(5);
         assertThat(sensitive.similarity()).isEqualTo(0.8);
@@ -824,9 +825,12 @@ class TextServiceTest {
     @Test
     @DisplayName("similarity - a supplementary code point counts as one edit, not two")
     void shouldCompareSupplementaryCodePoints() {
-        // U+1F600 is a surrogate pair: two chars but one code point.
+        // U+1F600 is a surrogate pair: two chars but one code point. The whitespace scheme is pinned so
+        // the symbol stays inside the compared token (the default letter scheme drops code points that
+        // are not letter-or-digit), keeping this a pure code-point-vs-char assertion.
         TextSimilarityResponse response =
-                service.similarity(new TextSimilarityRequest("a\uD83D\uDE00b", "a\uD83D\uDE01b", null));
+                service.similarity(new TextSimilarityRequest("a\uD83D\uDE00b", "a\uD83D\uDE01b", null,
+                        TokenizerScheme.WHITESPACE, null));
 
         assertThat(response.distance()).isEqualTo(1);
         assertThat(response.maxLength()).isEqualTo(3);
@@ -838,18 +842,18 @@ class TextServiceTest {
     void shouldRejectInputsOverTheCodePointBound() {
         String atBound = "a".repeat(TextService.MAX_SIMILARITY_CODE_POINTS);
         TextSimilarityResponse response =
-                service.similarity(new TextSimilarityRequest(atBound, atBound, null));
+                service.similarity(new TextSimilarityRequest(atBound, atBound, null, null, null));
         assertThat(response.distance()).isZero();
         assertThat(response.maxLength()).isEqualTo(2000);
         assertThat(response.identical()).isTrue();
 
         // 2001 supplementary code points are 4002 chars: the bound counts code points.
         String overBound = "\uD83D\uDE00".repeat(TextService.MAX_SIMILARITY_CODE_POINTS + 1);
-        assertThatThrownBy(() -> service.similarity(new TextSimilarityRequest(overBound, "abc", null)))
+        assertThatThrownBy(() -> service.similarity(new TextSimilarityRequest(overBound, "abc", null, null, null)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("left must be at most 2000 code points");
 
-        assertThatThrownBy(() -> service.similarity(new TextSimilarityRequest("abc", overBound, null)))
+        assertThatThrownBy(() -> service.similarity(new TextSimilarityRequest("abc", overBound, null, null, null)))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("right must be at most 2000 code points");
     }
@@ -860,88 +864,89 @@ class TextServiceTest {
         try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
             Validator validator = factory.getValidator();
 
-            assertThat(validator.validate(new TextSimilarityRequest(" ", "abc", null)))
+            assertThat(validator.validate(new TextSimilarityRequest(" ", "abc", null, null, null)))
                     .extracting(ConstraintViolation::getMessage)
                     .contains("left is required");
 
-            assertThat(validator.validate(new TextSimilarityRequest("abc", "   ", null)))
+            assertThat(validator.validate(new TextSimilarityRequest("abc", "   ", null, null, null)))
                     .extracting(ConstraintViolation::getMessage)
                     .contains("right is required");
 
-            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null))).isEmpty();
+            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null, null, null))).isEmpty();
         }
     }
 
     @Test
     @DisplayName("similarity - ignore words are removed from both inputs before the distance is measured")
     void similarityRemovesIgnoreWordsFromBothTexts() {
-        TextSimilarityResponse filtered = service.similarity(
-                new TextSimilarityRequest("the cat sat", "the car sat", null, List.of("the")));
+        TextSimilarityResponse filtered = service.similarity(new TextSimilarityRequest(
+                "the cat sat", "the car sat", null, null, null, List.of("the")));
         TextSimilarityResponse baseline = service.similarity(
-                new TextSimilarityRequest(" cat sat", " car sat", null));
+                new TextSimilarityRequest("cat sat", "car sat", null));
 
-        // The dropped word leaves the surrounding spacing in place, so "the cat sat" compares as " cat sat".
+        // The dropped token is not replaced, so the default letter scheme joins "cat sat" and "car sat".
         assertThat(filtered.distance()).isEqualTo(1);
         assertThat(filtered.distance()).isEqualTo(baseline.distance());
-        assertThat(filtered.maxLength()).isEqualTo(8);
-        assertThat(filtered.similarity()).isEqualTo(0.875);
+        assertThat(filtered.maxLength()).isEqualTo(7);
+        assertThat(filtered.similarity()).isEqualTo(0.857143);
         assertThat(filtered.identical()).isFalse();
 
-        // Each entry matches a whole alphanumeric run, never a substring of one.
-        TextSimilarityResponse runBoundary = service.similarity(
-                new TextSimilarityRequest("cat", "at", null, List.of("at")));
-        assertThat(runBoundary.distance()).isEqualTo(3);
-        assertThat(runBoundary.maxLength()).isEqualTo(3);
-        assertThat(runBoundary.similarity()).isZero();
+        // Each entry matches a whole token, never a substring of one: "at" does not shorten "cat".
+        TextSimilarityResponse tokenBoundary = service.similarity(new TextSimilarityRequest(
+                "cat", "at", null, null, null, List.of("at")));
+        assertThat(tokenBoundary.distance()).isEqualTo(3);
+        assertThat(tokenBoundary.maxLength()).isEqualTo(3);
+        assertThat(tokenBoundary.similarity()).isZero();
     }
 
     @Test
     @DisplayName("similarity - ignore words fold with Locale.ROOT when caseSensitive is absent or false")
     void similarityIgnoreWordsFoldCaseByDefault() {
-        TextSimilarityResponse absentFlag = service.similarity(
-                new TextSimilarityRequest("the cat", "the car", null, List.of("THE")));
+        TextSimilarityResponse absentFlag = service.similarity(new TextSimilarityRequest(
+                "the cat", "the car", null, null, null, List.of("THE")));
         assertThat(absentFlag.distance()).isEqualTo(1);
-        assertThat(absentFlag.maxLength()).isEqualTo(4);
-        assertThat(absentFlag.similarity()).isEqualTo(0.75);
+        assertThat(absentFlag.maxLength()).isEqualTo(3);
+        assertThat(absentFlag.similarity()).isEqualTo(0.666667);
         assertThat(absentFlag.caseSensitive()).isFalse();
 
-        TextSimilarityResponse falseFlag = service.similarity(
-                new TextSimilarityRequest("FOO cat", "foo car", false, List.of("foo")));
+        TextSimilarityResponse falseFlag = service.similarity(new TextSimilarityRequest(
+                "FOO cat", "foo car", false, null, null, List.of("foo")));
         assertThat(falseFlag.distance()).isEqualTo(1);
-        assertThat(falseFlag.maxLength()).isEqualTo(4);
-        assertThat(falseFlag.similarity()).isEqualTo(0.75);
+        assertThat(falseFlag.maxLength()).isEqualTo(3);
+        assertThat(falseFlag.similarity()).isEqualTo(0.666667);
     }
 
     @Test
     @DisplayName("similarity - caseSensitive=true makes ignore word matching an exact comparison")
     void similarityIgnoreWordsAreExactWhenCaseSensitive() {
-        TextSimilarityResponse notMatched = service.similarity(
-                new TextSimilarityRequest("the cat", "the car", true, List.of("THE")));
+        TextSimilarityResponse notMatched = service.similarity(new TextSimilarityRequest(
+                "the cat", "the car", true, null, null, List.of("THE")));
         assertThat(notMatched.distance()).isEqualTo(1);
         assertThat(notMatched.maxLength()).isEqualTo(7);
         assertThat(notMatched.similarity()).isEqualTo(0.857143);
         assertThat(notMatched.caseSensitive()).isTrue();
 
-        TextSimilarityResponse matched = service.similarity(
-                new TextSimilarityRequest("THE cat", "THE car", true, List.of("THE")));
+        TextSimilarityResponse matched = service.similarity(new TextSimilarityRequest(
+                "THE cat", "THE car", true, null, null, List.of("THE")));
         assertThat(matched.distance()).isEqualTo(1);
-        assertThat(matched.maxLength()).isEqualTo(4);
-        assertThat(matched.similarity()).isEqualTo(0.75);
+        assertThat(matched.maxLength()).isEqualTo(3);
+        assertThat(matched.similarity()).isEqualTo(0.666667);
     }
 
     @Test
     @DisplayName("similarity - distance, maxLength and similarity describe the filtered texts")
     void similarityReportsFilteredLengthAndScore() {
         TextSimilarityResponse response = service.similarity(new TextSimilarityRequest(
-                "the cat sat on the mat", "the car sat on the log", null, List.of("the", "on")));
+                "the cat sat on the mat", "the car sat on the log", null, null, null,
+                List.of("the", "on")));
         assertThat(response.distance()).isEqualTo(4);
-        assertThat(response.maxLength()).isEqualTo(14);
-        assertThat(response.similarity()).isEqualTo(0.714286);
+        assertThat(response.maxLength()).isEqualTo(11);
+        assertThat(response.similarity()).isEqualTo(0.636364);
         assertThat(response.identical()).isFalse();
 
         // Every word ignored: both sides compare empty, so the maxLength == 0 guard reports 1.0.
-        TextSimilarityResponse everythingIgnored = service.similarity(
-                new TextSimilarityRequest("the", "of", null, List.of("the", "of")));
+        TextSimilarityResponse everythingIgnored = service.similarity(new TextSimilarityRequest(
+                "the", "of", null, null, null, List.of("the", "of")));
         assertThat(everythingIgnored.distance()).isZero();
         assertThat(everythingIgnored.maxLength()).isZero();
         assertThat(everythingIgnored.similarity()).isEqualTo(1.0);
@@ -954,9 +959,9 @@ class TextServiceTest {
         TextSimilarityResponse implicit = service.similarity(
                 new TextSimilarityRequest("kitten", "sitting", null));
         TextSimilarityResponse nullList = service.similarity(
-                new TextSimilarityRequest("kitten", "sitting", null, null));
+                new TextSimilarityRequest("kitten", "sitting", null, null, null, null));
         TextSimilarityResponse emptyList = service.similarity(
-                new TextSimilarityRequest("kitten", "sitting", null, List.of()));
+                new TextSimilarityRequest("kitten", "sitting", null, null, null, List.of()));
 
         assertThat(implicit.distance()).isEqualTo(3);
         assertThat(implicit.maxLength()).isEqualTo(7);
@@ -971,12 +976,12 @@ class TextServiceTest {
         try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
             Validator validator = factory.getValidator();
 
-            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null, List.of("   "))))
+            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null, null, null, List.of("   "))))
                     .extracting(ConstraintViolation::getMessage)
                     .contains("ignoreWords entries must not be blank");
 
             assertThat(validator.validate(
-                    new TextSimilarityRequest("abc", "abd", null, List.of("x".repeat(101)))))
+                    new TextSimilarityRequest("abc", "abd", null, null, null, List.of("x".repeat(101)))))
                     .extracting(ConstraintViolation::getMessage)
                     .contains("each ignoreWords entry must be at most 100 characters");
 
@@ -984,11 +989,11 @@ class TextServiceTest {
             for (int index = 0; index < 1001; index++) {
                 tooMany.add("w" + index);
             }
-            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null, tooMany)))
+            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null, null, null, tooMany)))
                     .extracting(ConstraintViolation::getMessage)
                     .contains("ignoreWords must contain at most 1000 entries");
 
-            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null, List.of("the"))))
+            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null, null, null, List.of("the"))))
                     .isEmpty();
         }
     }
