@@ -2,7 +2,7 @@
 
 [![Java](https://img.shields.io/badge/Java-21%20LTS-orange.svg?logo=openjdk)](https://openjdk.org/projects/jdk/21/)
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4%20(3.4.2)-brightgreen.svg?logo=springboot)](https://spring.io/projects/spring-boot)
-[![Build & Tests](https://img.shields.io/badge/Tests-41%20Passed%20(100%25)-success.svg)](https://junit.org/junit5/)
+[![Build & Tests](https://img.shields.io/badge/Tests-939%20Passed%20(100%25)-success.svg)](https://junit.org/junit5/)
 [![OpenAPI](https://img.shields.io/badge/OpenAPI-3.0%20%2F%20Swagger%20UI-blue.svg?logo=swagger)](http://localhost:8080/swagger-ui/index.html)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
@@ -68,7 +68,7 @@ flowchart TD
 - **Framework**: **Spring Boot 4** (`spring-boot-starter-web`, `spring-boot-starter-validation`)
 - **JSON Processing**: Jackson (`ObjectMapper`) & Jayway `json-path`
 - **Documentation**: OpenAPI 3.0 & Swagger UI (`springdoc-openapi-starter-webmvc-ui`)
-- **Testing**: JUnit 5, MockMvc, AssertJ (100% test pass rate across 48 unit and integration tests)
+- **Testing**: JUnit 5, MockMvc, AssertJ (100% test pass rate across 939 unit and integration tests)
 
 ---
 
@@ -149,6 +149,7 @@ utiltools_api/
 | `POST` | `/api/v1/utils/datetime/cron/next` | Expand a cron expression (5-field, 6-field with seconds, or a Spring `@` macro such as `@daily`) into exactly `count` (1–100, default 5) occurrences strictly after `from` in the requested IANA `timeZone` (default UTC); each run carries its UTC ISO instant, ISO-offset local date-time and `epochMillis`, ordered and DST-aware |
 | `GET` | `/api/v1/utils/datetime/current` | Fetch current time in UTC and target timezone |
 | `GET` | `/api/v1/utils/datetime/timezones` | List IANA timezones with current UTC offsets, optionally filtered by `prefix` |
+| `GET` | `/api/v1/utils/datetime/week` | Resolve a yyyy-MM-dd date to ISO week-year, week, day of week, day of year and weekend flag (2024-12-30 is 2025-W01); read-only, not journalled |
 | `GET` | `/api/v1/utils/datetime/week-date` | Resolve an ISO week (`year`, `week`, optional `day` = MONDAY..SUNDAY case-insensitive or 1..7, default MONDAY) back to its calendar date via `WeekFields.ISO`; rejects weeks that do not exist in that ISO week-year (e.g. 2021-W53). Read-only: not journalled |
 | `POST` | `/api/v1/utils/crypto/hash` | Compute cryptographic digest (SHA-224, SHA-256, SHA-384, SHA-512, MD5, SHA-1) or HMAC |
 | `POST` | `/api/v1/utils/crypto/base64` | Encode or decode standard / URL-safe Base64 strings |
@@ -167,11 +168,16 @@ utiltools_api/
 | `POST` | `/api/v1/utils/json/to-ndjson` | Export a JSON array as NDJSON / JSON Lines: one compact value per line, `lineCount` and `sizeBytes`, journalled as `JSON_TO_NDJSON` |
 | `POST` | `/api/v1/utils/json/from-ndjson` | Import NDJSON / JSON Lines into a JSON array: blank lines and CRLF tolerated, errors name the 1-based line number, 10000-record bound, journalled as `JSON_FROM_NDJSON` |
 | `POST` | `/api/v1/utils/json/csv-to-json` | Import CSV into a JSON array of objects with an optional `delimiter` and optional `headerMapping` header renames; first record supplies the keys, malformed CSV returns 400; journalled as `JSON_CSV_TO_JSON` |
+| `POST` | `/api/v1/utils/json/to-csv` | Export a flat-object JSON array as RFC 4180 CSV/TSV: first-seen header union, CRLF-separated records and quoted cells; rejects nested values |
+| `POST` | `/api/v1/utils/json/from-csv` | Import RFC 4180 CSV/TSV into a string-valued JSON array; hasHeader defaults to true, a UTF-8 BOM is tolerated and malformed text is rejected |
+| `POST` | `/api/v1/utils/json/flatten` | Collapse a JSON object tree into separator-joined dot-path keys in insertion order; reports leaf count and depth, rejecting keys that already carry the separator |
+| `POST` | `/api/v1/utils/json/unflatten` | Rebuild a nested object from separator-joined keys; rejects conflicting paths such as a with a.b, depth above 64 and more than 10000 keys |
 | `POST` | `/api/v1/utils/json/diff` | Compare two JSON documents and report `added`, `removed` and `changed` paths (with old/new values and a pinned `summary`) at any nesting level, journalled as `JSON_DIFF` |
 | `POST` | `/api/v1/utils/json/pointer` | Resolve one RFC 6901 JSON Pointer (`/a/b/0`, `~1` = `/`, `~0` = `~`, `""` = whole document) and report the addressed node with its `valueType`, journalled as `JSON_POINTER` |
 | `POST` | `/api/v1/utils/text/transform` | Apply a deterministic case/format operation (`UPPER`, `LOWER`, `TITLE`, `CAMEL`, `SNAKE`, `KEBAB`, `SLUG`, `SENTENCE_CASE`, `REVERSE`) to a string |
 | `POST` | `/api/v1/utils/text/normalize` | Compose or decompose Unicode text with `java.text.Normalizer` in form `NFC`, `NFD`, `NFKC` or `NFKD` (matched case-insensitively), echoing the form, the result, `changed` and the code-point `length`; a result that would exceed the 1,000,000-character bound is rejected with `400 BAD_REQUEST`; journalled as `TEXT_NORMALIZE` |
 | `POST` | `/api/v1/utils/text/stats` | Count characters, non-whitespace characters, words, lines and sentences (code-point aware) |
+| `POST` | `/api/v1/utils/text/truncate` | Bound text to maxLength code points, appending an ellipsis without splitting surrogate pairs; wordBoundary is required |
 | `POST` | `/api/v1/utils/text/replace` | Replace every (or, with `all=false`, the first) occurrence of a literal or regex `pattern`, reporting `replacements`, `changed` and code-point `length` |
 | `POST` | `/api/v1/utils/text/html-entities` | `ENCODE` a string for safe HTML embedding (`&`, `<`, `>`, `"`, `'`) or `DECODE` the five named entities plus decimal/hex numeric references, reporting `changed` and code-point `length` |
 | `POST` | `/api/v1/utils/text/word-frequency` | Count `totalWords`, `distinctWords` and a bounded `topWords` list (`limit` defaults to `10`, `caseSensitive` defaults to `false`, optional `ignoreWords`) in deterministic count-desc/word-asc order, journalled as `TEXT_WORD_FREQUENCY` |
@@ -186,7 +192,9 @@ utiltools_api/
 | `GET` | `/api/v1/utils/audit/entries/{id}` | Fetch a single journal entry (redacted request/result) |
 | `POST` | `/api/v1/utils/audit/entries/{id}/replay` | Replay a deterministic SUCCEEDED entry and verify the outcome |
 | `POST` | `/api/v1/utils/audit/verify` | Sweep-verify up to `limit` (default `20`, clamped to `max-entries`) SUCCEEDED entries in one pass and report per-entry `VERIFIED` / `MISMATCH` / `FAILED` / `SKIPPED` |
+| `POST` | `/api/v1/utils/audit/reaps` | Run one bounded reaper pass and report scanned, reaped and per-reason counts; dryRun mutates nothing and entryId targets one entry |
 | `GET` | `/api/v1/utils/audit/reaps` | List reaper tombstones (newest first) with optional `limit` (default `50`, clamped to `max-entries`) and `reason` filter; read-only |
+| `GET` | `/api/v1/utils/audit/quarantine-status` | Read the replay-lease quarantine threshold plus quarantined-tombstone and expired-lease counters; read-only counts only |
 | `POST` | `/api/v1/utils/contact/submissions` | Admit a contact submission into the bounded dispatch pool; `202` with a snapshot whose `status` is `QUEUED`; `409` `CONTACT_IDEMPOTENCY_CONFLICT` on a reused-key payload mismatch, `429` `CONTACT_QUEUE_FULL` when the pool is saturated |
 | `GET` | `/api/v1/utils/contact/submissions/{id}` | Fetch one submission snapshot: `QUEUED` / `DISPATCHING` / `DELIVERED` / `FAILED` / `DEAD_LETTERED` / `CANCELLED`; `404` `CONTACT_SUBMISSION_NOT_FOUND` |
 | `GET` | `/api/v1/utils/contact/submissions` | List submission snapshots newest first; optional `limit` (default `20`, clamped to `1..100`) |
@@ -195,6 +203,9 @@ utiltools_api/
 | `DELETE` | `/api/v1/utils/contact/submissions/{id}` | Withdraw a submission before the dispatcher starts: `200` with the `CANCELLED` snapshot; `404` `CONTACT_SUBMISSION_NOT_FOUND`; `409` `CONTACT_TRANSITION_CONFLICT` while dispatch is in flight or the row is terminal (`DELIVERED` / `FAILED`). A repeat cancel of an already-`CANCELLED` row is idempotent and re-answers `200` with its `CANCELLED` snapshot |
 | `GET` | `/api/v1/utils/maintenance/scheduler` | Read-only scheduler status: configured `poolSize`, `threadNamePrefix`, `awaitTerminationSeconds`, plus live `activeThreadCount`, `completedTaskCount`, `queueDepth`; never schedules, cancels, or mutates a maintenance pass |
 | `GET` | `/api/v1/utils/maintenance/passes` | Read-only per-pass quarantine status: one row per maintenance pass with `state` (`CLOSED` / `OPEN` / `HALF_OPEN`), `consecutiveFailures`, `lastOutcome`, `lastFailureAt`, `lastSuccessAt`, `nextProbeAt`, `succeeded`, `failed`, `skipped`, plus `auditSize`, `auditCapacity` and a bounded (`<= 20`) `recentTransitions` list of `at`, `pass`, `from`, `to`, `trigger`; never schedules, cancels, resets or mutates a maintenance pass |
+| `GET` | `/api/v1/utils/resilience` | Inspect live circuit breaker state, failure/success counters, cooldown, probe claim, transitions, per-fingerprint state and fallback cache stats |
+| `POST` | `/api/v1/utils/resilience/probe` | Drive one guarded JSONPath probe in the HALF_OPEN window for the X-Client-Fingerprint breaker |
+| `GET` | `/api/v1/utils/rate-limit/status` | Read the caller's sliding-window limit, remaining, resetAt and allowed without consuming rate limit budget |
 
 ---
 
