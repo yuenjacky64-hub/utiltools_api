@@ -553,6 +553,12 @@ public class ContactSubmissionService {
      * entry is closed exactly once, and its pending counter is released so the admission gate
      * frees up. A late completion from the superseded attempt is fenced out (INV-C1).
      *
+     * <p>Reclamation (REQ-02): the reaped attempt's dispatch worker is interrupted exactly once,
+     * while the registry lock is still held, so a thread parked inside {@code dispatch} releases
+     * its bounded delivery lane. Reclamation is best-effort — an interrupt-responsive dispatcher
+     * is released, an interrupt-hostile one keeps its lane until its call returns, and the reaper
+     * never joins, sleeps or otherwise blocks on it (INV-C11).</p>
+     *
      * @return the number of attempts reaped
      */
     int reapStaleDispatching() {
@@ -564,8 +570,19 @@ public class ContactSubmissionService {
                 if (submission.status == ContactStatus.DISPATCHING
                         && submission.executionLeaseExpiresAt != null
                         && !submission.executionLeaseExpiresAt.isAfter(now)) {
+                    // Capture the worker handle before terminalizing: terminalizeLocked nulls it.
+                    DispatchWorker captured = submission.dispatchWorker;
                     terminalizeLocked(submission, ContactStatus.FAILED,
                             CONTACT_DELIVERY_LEASE_EXPIRED, now);
+                    // Reclamation (REQ-02): release the lane the terminal row can no longer own.
+                    // At most one interrupt per reaped generation (INV-C8), issued inside this
+                    // critical section so the released worker's handle clear and finishAttempt
+                    // can never interleave with the sweep (INV-C9), and never waiting on it
+                    // (INV-C11).
+                    if (captured != null && captured.generation() == submission.attempt
+                            && captured.thread() != Thread.currentThread()) {
+                        captured.thread().interrupt();
+                    }
                     reaped++;
                 }
             }
@@ -831,6 +848,7 @@ public class ContactSubmissionService {
         Instant now = Instant.now(clock);
         submission.status = ContactStatus.DISPATCHING;
         submission.dispatchStarted = false; // new generation: the fence is reset with it
+        submission.dispatchWorker = null; // REQ-01: no handle can be inherited by a new generation
         submission.startedAt = now;
         submission.lastHeartbeatAt = now;
         submission.executionLeaseExpiresAt = now.plusSeconds(executionLeaseSeconds);
@@ -845,8 +863,14 @@ public class ContactSubmissionService {
      * live {@code DISPATCHING} attempt (a late task for an evicted, reaped, or superseded
      * attempt is a no-op), then calls the dispatcher outside the lock (REQ-06 / REQ-07). The
      * {@code DISPATCHING} stamp and the execution lease were already taken at admission.
+     *
+     * <p>The executing thread is published on the row (REQ-01) so the lease reaper can interrupt
+     * it, and both the handle and the thread's interrupt status are cleared in the {@code
+     * finally} (REQ-03) before the worker returns to the pool — the next task on that executor
+     * thread starts with {@code isInterrupted() == false} (INV-C9).</p>
      */
     private void runAttempt(String submissionId, int generation) {
+        Thread self = Thread.currentThread();
         synchronized (registryLock) {
             MutableSubmission submission = submissions.get(submissionId);
             if (submission == null || submission.attempt != generation
@@ -857,18 +881,45 @@ public class ContactSubmissionService {
             // REQ-03 fence write: under registryLock, immediately before the dispatcher call,
             // so cancel and worker start race to exactly one winner (INV-C-01).
             submission.dispatchStarted = true;
+            // REQ-01: the reaper addresses exactly this generation's worker through this handle.
+            submission.dispatchWorker = new DispatchWorker(self, generation);
         }
         boolean success;
         String boundedError;
         try {
-            dispatcher.dispatch(submissionId, generation);
-            success = true;
-            boundedError = null;
-        } catch (Exception e) {
-            // INV-C3: only the bounded code reaches the row, the journal, and the snapshots.
-            log.debug("contact dispatch attempt {} of {} failed", generation, submissionId, e);
-            success = false;
-            boundedError = CONTACT_DISPATCH_FAILED;
+            try {
+                dispatcher.dispatch(submissionId, generation);
+                success = true;
+                boundedError = null;
+            } catch (InterruptedException e) {
+                // REQ-03: a reaped attempt's interrupt is a dispatch failure, not a crash.
+                log.debug("contact dispatch attempt {} of {} interrupted by the lease reaper",
+                        generation, submissionId);
+                success = false;
+                boundedError = CONTACT_DISPATCH_FAILED;
+            } catch (Exception e) {
+                // INV-C3: only the bounded code reaches the row, the journal, and the snapshots.
+                log.debug("contact dispatch attempt {} of {} failed", generation, submissionId, e);
+                success = false;
+                boundedError = CONTACT_DISPATCH_FAILED;
+            }
+            if (Thread.interrupted()) {
+                // The interrupt landed after dispatch returned: still a reclaimed attempt.
+                success = false;
+                boundedError = CONTACT_DISPATCH_FAILED;
+            }
+        } finally {
+            // INV-C7: only clear a handle that still names this thread *and* this generation.
+            synchronized (registryLock) {
+                MutableSubmission submission = submissions.get(submissionId);
+                DispatchWorker held = submission == null ? null : submission.dispatchWorker;
+                if (held != null && held.thread() == self && held.generation() == generation) {
+                    submission.dispatchWorker = null;
+                }
+            }
+            // INV-C9: handle clear first, own interrupt flag clear second, so nothing leaks into
+            // the next task this pooled thread runs.
+            Thread.interrupted();
         }
         finishAttempt(submissionId, generation, success, boundedError);
     }
@@ -918,6 +969,8 @@ public class ContactSubmissionService {
         submission.error = error;
         submission.lastHeartbeatAt = null;
         submission.executionLeaseExpiresAt = null;
+        // REQ-01: a terminal row owns no worker, so a handle can never outlive its live attempt.
+        submission.dispatchWorker = null;
         // REQ-02: a retryable FAILED attempt below the budget gets its deterministic schedule;
         // anything else (DELIVERED, budget-exhausted, quarantined, shutdown-cancelled) carries
         // none.
@@ -1107,6 +1160,30 @@ public class ContactSubmissionService {
     }
 
     /**
+     * Generation-scoped dispatch worker handle (REQ-01): the executor thread currently inside
+     * {@link ContactDispatcher#dispatch} plus the generation it is dispatching. Immutable, and
+     * read/written only under {@link #registryLock}, so the thread and its generation can never
+     * be observed half-written and one write clears both (INV-C7).
+     */
+    private static final class DispatchWorker {
+        private final Thread thread;
+        private final int generation;
+
+        DispatchWorker(Thread thread, int generation) {
+            this.thread = thread;
+            this.generation = generation;
+        }
+
+        Thread thread() {
+            return thread;
+        }
+
+        int generation() {
+            return generation;
+        }
+    }
+
+    /**
      * Mutable registry row: every attempt-mutable field is touched only under
      * {@link #registryLock} (INV-C1), and the journal-entry map is the exactly-once close
      * bookkeeping (INV-C2).
@@ -1137,6 +1214,9 @@ public class ContactSubmissionService {
         // winner (INV-C-01); a fenced loser returns without dispatch and without a
         // pendingAttempts write (INV-C-02/03).
         boolean dispatchStarted;
+        /** REQ-01: the executor thread inside {@code dispatch} for {@link #attempt}, or null;
+         *  read and written only under {@link #registryLock}. */
+        DispatchWorker dispatchWorker;
 
         ContactStatus status = ContactStatus.QUEUED;
         int attempt = 1;
