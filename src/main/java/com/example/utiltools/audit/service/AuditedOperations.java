@@ -75,6 +75,8 @@ import com.example.utiltools.text.dto.TextTransformRequest;
 import com.example.utiltools.text.dto.TextTransformResponse;
 import com.example.utiltools.text.dto.TextTruncateRequest;
 import com.example.utiltools.text.dto.TextTruncateResponse;
+import com.example.utiltools.text.dto.TextSimilarityRequest;
+import com.example.utiltools.text.dto.TextSimilarityResponse;
 import com.example.utiltools.text.dto.TextWordFrequencyRequest;
 import com.example.utiltools.text.dto.TextWordFrequencyResponse;
 import com.example.utiltools.text.exception.RegexTimeoutException;
@@ -276,6 +278,10 @@ public class AuditedOperations {
         return record(OperationType.TEXT_WORD_FREQUENCY, request, () -> textService.wordFrequency(request));
     }
 
+    public TextSimilarityResponse similarity(TextSimilarityRequest request) {
+        return record(OperationType.TEXT_SIMILARITY, request, () -> textService.similarity(request));
+    }
+
     public TextTruncateResponse truncate(TextTruncateRequest request) {
         return record(OperationType.TEXT_TRUNCATE, request, () -> textService.truncate(request));
     }
@@ -324,6 +330,7 @@ public class AuditedOperations {
             case TEXT_HTML_ENTITIES -> textService.htmlEntities((TextHtmlEntitiesRequest) request);
             case TEXT_TRUNCATE -> textService.truncate((TextTruncateRequest) request);
             case TEXT_WORD_FREQUENCY -> textService.wordFrequency((TextWordFrequencyRequest) request);
+            case TEXT_SIMILARITY -> textService.similarity((TextSimilarityRequest) request);
             // Asynchronous batch hashing is audit-only: a BATCH_HASH entry can never be replayed,
             // because there is no servlet-bound payload to re-run and the operation is
             // non-deterministic. Defence in depth: claimReplay refuses the same entries.
