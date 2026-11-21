@@ -20,6 +20,7 @@ import com.example.utiltools.text.dto.TextTruncateResponse;
 import com.example.utiltools.text.dto.TextWordFrequencyRequest;
 import com.example.utiltools.text.dto.TextWordFrequencyResponse;
 import com.example.utiltools.text.dto.TokenizerScheme;
+import com.example.utiltools.text.exception.RegexTimeoutException;
 import com.example.utiltools.text.service.TextService;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validation;
@@ -28,6 +29,10 @@ import jakarta.validation.ValidatorFactory;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Set;
 
@@ -37,6 +42,39 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class TextServiceTest {
 
     private final TextService service = new TextService();
+
+    /** Clock that advances exactly one configured step on every {@code millis()} read. */
+    private static final class SteppingClock extends Clock {
+        private final long stepMs;
+        private long nowMs;
+
+        SteppingClock(long startMs, long stepMs) {
+            this.nowMs = startMs;
+            this.stepMs = stepMs;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return Instant.ofEpochMilli(millis());
+        }
+
+        @Override
+        public long millis() {
+            long now = nowMs;
+            nowMs += stepMs;
+            return now;
+        }
+    }
 
     @Test
     @DisplayName("every allowed operation maps its documented input to its documented output")
@@ -1050,8 +1088,8 @@ class TextServiceTest {
     }
 
     @Test
-    @DisplayName("diff - one replaced word is a single CHANGED token with a span on both sides (REQ-04, DOD-01)")
-    void shouldReportSingleTokenChange() {
+    @DisplayName("diff - one replaced word is a single CHANGED token with a span on both sides (REQ-04, DOD-08)")
+    void shouldPairRemovalAndAdditionAsOneChange() {
         TextDiffResponse response = service.diff(new TextDiffRequest("kitten", "sitting"));
 
         assertThat(response.identical()).isFalse();
@@ -1071,7 +1109,7 @@ class TextServiceTest {
     }
 
     @Test
-    @DisplayName("diff - unchanged tokens are skipped and the addresses stay structural (REQ-04, DOD-01)")
+    @DisplayName("diff - unchanged tokens are skipped and the addresses stay structural (REQ-04, DOD-08)")
     void shouldReportAddedAndRemovedTokens() {
         TextDiffResponse removal = service.diff(new TextDiffRequest("alpha beta gamma", "alpha beta"));
 
@@ -1107,7 +1145,7 @@ class TextServiceTest {
     }
 
     @Test
-    @DisplayName("diff - identical inputs report no differences (REQ-04, DOD-01)")
+    @DisplayName("diff - identical inputs report no differences (REQ-04, DOD-02)")
     void shouldReportIdenticalInputs() {
         TextDiffResponse response = service.diff(new TextDiffRequest("Hello, World!", "Hello, World!"));
 
