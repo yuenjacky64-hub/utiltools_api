@@ -683,6 +683,11 @@ public class TextService {
         if (pattern == null || pattern.isBlank()) {
             throw new IllegalArgumentException("pattern is required when tokenizer is 'regex'");
         }
+        // Measured in UTF-16 code units, exactly like the retired ^[\s\S]{1,512}$ constraint, and
+        // checked before compilation so a rejected pattern can never be echoed back in full.
+        if (pattern.length() > 512) {
+            throw new IllegalArgumentException("pattern must be 1..512 characters");
+        }
         try {
             return Pattern.compile(pattern);
         } catch (PatternSyntaxException e) {

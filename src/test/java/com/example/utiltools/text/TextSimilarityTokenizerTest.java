@@ -5,7 +5,6 @@ import com.example.utiltools.text.dto.TextSimilarityResponse;
 import com.example.utiltools.text.dto.TokenizerScheme;
 import com.example.utiltools.text.exception.RegexTimeoutException;
 import com.example.utiltools.text.service.TextService;
-import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validation;
 import jakarta.validation.Validator;
 import jakarta.validation.ValidatorFactory;
@@ -195,7 +194,7 @@ class TextSimilarityTokenizerTest {
     }
 
     @Test
-    @DisplayName("similarity - tokenizer binds case-insensitively and pattern is bounded 1..512 (DOD-01)")
+    @DisplayName("similarity - tokenizer binds case-insensitively and no bean validation touches pattern (DOD-01, DOD-06)")
     void shouldValidateTokenizerAndPatternFields() {
         assertThat(TokenizerScheme.fromWire(" digit ")).isEqualTo(TokenizerScheme.DIGIT);
         assertThat(TokenizerScheme.fromWire("ALPHANUM")).isEqualTo(TokenizerScheme.ALPHANUM);
@@ -211,19 +210,44 @@ class TextSimilarityTokenizerTest {
             assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
                     TokenizerScheme.LETTER, null))).isEmpty();
 
+            // REQ-01: pattern carries no bean-validation constraint, so neither an empty value nor an
+            // over-long one for the regex scheme is a @Valid failure any more...
             assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
-                    TokenizerScheme.REGEX, "")))
-                    .extracting(ConstraintViolation::getMessage)
-                    .contains("pattern must be 1..512 characters");
+                    TokenizerScheme.REGEX, ""))).isEmpty();
 
             assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
-                    TokenizerScheme.REGEX, "a".repeat(513))))
-                    .extracting(ConstraintViolation::getMessage)
-                    .contains("pattern must be 1..512 characters");
+                    TokenizerScheme.REGEX, "a".repeat(513)))).isEmpty();
 
             assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
                     TokenizerScheme.REGEX, "a".repeat(512)))).isEmpty();
+
+            // ...and an arbitrary pattern with a predefined scheme binds cleanly too (the reported bug).
+            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
+                    TokenizerScheme.LETTER, "anything"))).isEmpty();
         }
+    }
+
+    @Test
+    @DisplayName("similarity - the retired 1..512 bound survives in the service for regex only (DOD-05)")
+    void shouldBoundRegexPatternLengthInService() {
+        assertThatThrownBy(() -> similarity("abc", "abd", null, TokenizerScheme.REGEX, ""))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("pattern is required when tokenizer is 'regex'");
+
+        assertThatThrownBy(() -> similarity("abc", "abd", null, TokenizerScheme.REGEX, "a".repeat(513)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("pattern must be 1..512 characters");
+
+        assertThat(similarity("abc", "abd", null, TokenizerScheme.REGEX, "a".repeat(512))).isNotNull();
+
+        TextSimilarityResponse withoutPattern = similarity("abc123", "abc456", null, TokenizerScheme.LETTER, null);
+        TextSimilarityResponse overLongPattern =
+                similarity("abc123", "abc456", null, TokenizerScheme.LETTER, "a".repeat(513));
+
+        assertThat(overLongPattern.distance()).isEqualTo(withoutPattern.distance());
+        assertThat(overLongPattern.maxLength()).isEqualTo(withoutPattern.maxLength());
+        assertThat(overLongPattern.similarity()).isEqualTo(withoutPattern.similarity());
+        assertThat(overLongPattern.identical()).isEqualTo(withoutPattern.identical());
     }
 
     @Test
