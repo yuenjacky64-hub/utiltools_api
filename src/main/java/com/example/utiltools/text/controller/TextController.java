@@ -95,7 +95,8 @@ public class TextController {
                     + "truncated prefix plus the ellipsis and is guaranteed never to exceed maxLength code points nor split a "
                     + "surrogate pair. A null ellipsis defaults to '…'; an empty ellipsis uses no marker. wordBoundary=true "
                     + "cuts at the last whitespace before the limit and trims trailing space (falling back to a hard cut when "
-                    + "no word boundary fits); wordBoundary=false (the default) hard-cuts. Every call is journalled as "
+                    + "no word boundary fits); wordBoundary=false hard-cuts. wordBoundary is required and a missing or null "
+                    + "value is rejected with VALIDATION_ERROR. Every call is journalled as "
                     + "TEXT_TRUNCATE and can be replayed.")
     public ApiResponse<TextTruncateResponse> truncate(@Valid @RequestBody TextTruncateRequest request) {
         return ApiResponse.success(auditedOperations.truncate(request), "Text truncated successfully");

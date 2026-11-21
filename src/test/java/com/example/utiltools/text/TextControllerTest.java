@@ -691,7 +691,7 @@ class TextControllerTest {
         mockMvc.perform(post("/api/v1/utils/text/truncate")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"text": "   ", "maxLength": 10}
+                                {"text": "   ", "maxLength": 10, "wordBoundary": false}
                                 """))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))
@@ -701,7 +701,7 @@ class TextControllerTest {
         mockMvc.perform(post("/api/v1/utils/text/truncate")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"text": "hello"}
+                                {"text": "hello", "wordBoundary": false}
                                 """))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
@@ -710,11 +710,35 @@ class TextControllerTest {
         mockMvc.perform(post("/api/v1/utils/text/truncate")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"text": "hello", "maxLength": 0}
+                                {"text": "hello", "maxLength": 0, "wordBoundary": false}
                                 """))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
                 .andExpect(jsonPath("$.details", hasItem("maxLength must be at least 1")));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/truncate - a null or missing wordBoundary returns 400 VALIDATION_ERROR")
+    void shouldRejectNullWordBoundaryWith400ValidationError() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/truncate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "hello", "maxLength": 5, "wordBoundary": null}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("wordBoundary is required")));
+
+        mockMvc.perform(post("/api/v1/utils/text/truncate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"text": "hello", "maxLength": 5}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("wordBoundary is required")));
     }
 
     @Test
@@ -723,7 +747,7 @@ class TextControllerTest {
         mockMvc.perform(post("/api/v1/utils/text/truncate")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"text": "abcdefghij", "maxLength": 1}
+                                {"text": "abcdefghij", "maxLength": 1, "wordBoundary": false}
                                 """))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.success").value(false))

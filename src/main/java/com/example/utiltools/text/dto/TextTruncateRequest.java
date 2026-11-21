@@ -13,8 +13,8 @@ import jakarta.validation.constraints.Size;
  * @param maxLength    the maximum code-point count of the result, ellipsis included; required, 1..1000000
  * @param ellipsis     optional marker appended when truncation happens; {@code null} defaults to "…"
  *                     and an empty value means no marker; at most 16 code points
- * @param wordBoundary optional; {@code true} cuts at the last whitespace before the limit,
- *                     {@code false} (the default when absent) hard-cuts
+ * @param wordBoundary required; {@code true} cuts at the last whitespace before the limit,
+ *                     {@code false} hard-cuts
  */
 public record TextTruncateRequest(
         @NotBlank(message = "text is required")
@@ -29,5 +29,6 @@ public record TextTruncateRequest(
         @Size(max = 16, message = "ellipsis must be at most 16 code points")
         String ellipsis,
 
+        @NotNull(message = "wordBoundary is required")
         Boolean wordBoundary
 ) {}
