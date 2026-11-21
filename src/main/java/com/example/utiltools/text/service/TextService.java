@@ -1,5 +1,8 @@
 package com.example.utiltools.text.service;
 
+import com.example.utiltools.text.dto.TextDiffDetail;
+import com.example.utiltools.text.dto.TextDiffRequest;
+import com.example.utiltools.text.dto.TextDiffResponse;
 import com.example.utiltools.text.dto.TextReplaceRequest;
 import com.example.utiltools.text.dto.TextSimilarityRequest;
 import com.example.utiltools.text.dto.TextSimilarityResponse;
@@ -23,9 +26,11 @@ import org.springframework.beans.factory.annotation.Value;
 
 import java.text.Normalizer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -62,6 +67,24 @@ public class TextService {
 
     /** Hard bound on each {@link #similarity(TextSimilarityRequest)} input, in code points. */
     public static final int MAX_SIMILARITY_CODE_POINTS = 2000;
+
+    /**
+     * Hard bound on each {@link #diff(TextDiffRequest)} input, in code points. Equal to
+     * {@link #MAX_SIMILARITY_CODE_POINTS} on purpose: the two routes read the same request shapes, so a
+     * payload accepted by one is accepted by the other.
+     */
+    public static final int MAX_TEXT_DIFF_CODE_POINTS = 2000;
+
+    /**
+     * Hard bound on the token-pair matrix {@link #diff(TextDiffRequest)} builds, i.e. on
+     * {@code (leftTokens + 1) × (rightTokens + 1)}. At 2000 code points an input can hold 2000
+     * single-code-point tokens, so the widest reachable matrix is 4_004_001 pairs; this bound is what
+     * keeps the longest-common-subsequence table (one byte per cell) inside a few megabytes.
+     */
+    public static final int MAX_TEXT_DIFF_CELLS = 1_000_000;
+
+    /** Hard bound on the change entries {@link #diff(TextDiffRequest)} may report. */
+    public static final int MAX_TEXT_DIFF_CHANGES = 1000;
 
     private static final String ALLOWED_ACTIONS = "ENCODE, DECODE";
 
@@ -729,6 +752,357 @@ public class TextService {
             current = swap;
         }
         return previous[shortSide.length];
+    }
+
+    /**
+     * Report the added, removed and changed tokens between the request's {@code left} and
+     * {@code right} text — the per-change companion of {@link #similarity(TextSimilarityRequest)}, and
+     * the text-diff half of the {@code POST /api/v1/utils/text/diff} contract (REQ-04).
+     *
+     * <p><b>Tokenization.</b> The selected scheme (default {@code letter}, the project's
+     * letter/digit run tokenizer) is applied to the <em>raw</em> input, so every token keeps its true
+     * offset: folding for the comparison happens per token ({@link Locale#ROOT} lowercasing unless
+     * {@code caseSensitive} is {@code true}) and never shifts a position. {@code regex} matches are read
+     * through a {@link BudgetedCharSequence}, so a catastrophic pattern answers
+     * {@link RegexTimeoutException} instead of stalling the request.</p>
+     *
+     * <p><b>Algorithm.</b> The longest common subsequence of the two token lists yields the edit script
+     * in left-to-right order — two script entries with the same folded token match, so a repeated word
+     * is never reported as a change. Unchanged prefixes and suffixes are trimmed before the
+     * ({@value #MAX_TEXT_DIFF_CELLS} cell bounded) table is allocated, which is what keeps ordinary
+     * "one word edited inside a sentence" requests at a handful of cells. Inside one maximal run of
+     * removals followed by one maximal run of additions the pairing is index-wise: the first removed
+     * token with the first added token, and so on; a pair is {@code CHANGED}, a surplus removal is
+     * {@code REMOVED} and a surplus addition is {@code ADDED}. Runs are therefore paired only with the
+     * run that replaces them.</p>
+     *
+     * <p><b>Positions.</b> Each token carries a {@code line[L].token[T]} address ({@code L} counts
+     * {@code U+000A} separators, {@code T} counts the scheme's tokens earlier on that line) and a
+     * half-open code-point span into the request's own raw string, so a supplementary character counts
+     * as one code point. A detail whose side is untouched carries {@code -1}-{@code -1} and a
+     * {@code null} token.</p>
+     *
+     * <p><b>Result.</b> {@code added} and {@code removed} are immutable lists in discovery order and
+     * {@code changed} is a {@link LinkedHashMap} keyed by {@code path}, all holding a full
+     * {@link TextDiffDetail}; {@code summary} is {@code "<a> added, <r> removed, <c> changed"} and
+     * {@code identical} is true iff nothing changed. Nothing here depends on the wall clock, the locale
+     * or the audit trail, so replaying the journalled request reproduces the same
+     * {@link TextDiffResponse} and replay reports {@code VERIFIED}.</p>
+     *
+     * @throws IllegalArgumentException when a side is longer than
+     *         {@value #MAX_TEXT_DIFF_CODE_POINTS} code points (<em>"left must be at most 2000 code
+     *         points"</em>), when the matrix would exceed {@value #MAX_TEXT_DIFF_CELLS} cells
+     *         (<em>"text diff exceeds the 1000000-token-pair budget"</em>), when more than
+     *         {@value #MAX_TEXT_DIFF_CHANGES} changes would be reported (<em>"diff must not contain more
+     *         than 1000 changes"</em>), or when a {@code regex} request carries no compilable pattern
+     * @throws RegexTimeoutException when a {@code regex} token evaluation exhausts its budget
+     */
+    public TextDiffResponse diff(TextDiffRequest request) {
+        boolean caseSensitive = Boolean.TRUE.equals(request.caseSensitive());
+        TokenizerScheme scheme = request.tokenizer() == null ? TokenizerScheme.LETTER : request.tokenizer();
+        String left = request.left();
+        String right = request.right();
+        // Bound check on the raw inputs, before folding, tokenizing and before any matrix row is allocated.
+        if (left.codePointCount(0, left.length()) > MAX_TEXT_DIFF_CODE_POINTS) {
+            throw new IllegalArgumentException("left must be at most 2000 code points");
+        }
+        if (right.codePointCount(0, right.length()) > MAX_TEXT_DIFF_CODE_POINTS) {
+            throw new IllegalArgumentException("right must be at most 2000 code points");
+        }
+        Pattern custom = scheme == TokenizerScheme.REGEX ? compileCustomPattern(request.pattern()) : null;
+        // Effective budget: a request may tighten the configured ceiling, never raise it. Computed once
+        // so both inputs share one deadline and one reported budget.
+        int requestedTimeoutMs = request.timeoutMs() == null ? 0 : request.timeoutMs();
+        int budgetMs = requestedTimeoutMs > 0 ? Math.min(requestedTimeoutMs, regexTimeoutMs) : regexTimeoutMs;
+        long deadlineMs = scheme == TokenizerScheme.REGEX ? clock.millis() + budgetMs : 0L;
+        List<DiffToken> leftTokens = diffTokens(left, scheme, custom, caseSensitive, deadlineMs, budgetMs);
+        List<DiffToken> rightTokens = diffTokens(right, scheme, custom, caseSensitive, deadlineMs, budgetMs);
+
+        int prefix = commonPrefixLength(leftTokens, rightTokens);
+        int suffix = commonSuffixLength(leftTokens, rightTokens, prefix);
+        List<DiffToken> leftMiddle = leftTokens.subList(prefix, leftTokens.size() - suffix);
+        List<DiffToken> rightMiddle = rightTokens.subList(prefix, rightTokens.size() - suffix);
+        List<EditStep> script = editScript(leftMiddle, rightMiddle);
+
+        List<TextDiffDetail> added = new ArrayList<>();
+        List<TextDiffDetail> removed = new ArrayList<>();
+        Map<String, TextDiffDetail> changed = new LinkedHashMap<>();
+        int reported = 0;
+        int index = 0;
+        while (index < script.size()) {
+            if (script.get(index).kind() == STEP_MATCH) {
+                index++;
+                continue;
+            }
+            // One run of consecutive non-matching steps. The backtracking script may emit the
+            // insertions of a substitution before its removal, so the run is split by kind first and
+            // the two lists are then paired positionally: old item i against new item i.
+            int runStart = index;
+            while (index < script.size() && script.get(index).kind() != STEP_MATCH) {
+                index++;
+            }
+            List<DiffToken> runRemovals = new ArrayList<>();
+            List<DiffToken> runAdditions = new ArrayList<>();
+            for (int step = runStart; step < index; step++) {
+                EditStep edit = script.get(step);
+                if (edit.kind() == STEP_REMOVE) {
+                    runRemovals.add(leftMiddle.get(edit.leftIndex()));
+                } else {
+                    runAdditions.add(rightMiddle.get(edit.rightIndex()));
+                }
+            }
+            int paired = Math.min(runRemovals.size(), runAdditions.size());
+            for (int pair = 0; pair < paired; pair++) {
+                reported = requireChangeSlot(reported);
+                DiffToken oldToken = runRemovals.get(pair);
+                changed.put(oldToken.path(), changedDetail(oldToken, runAdditions.get(pair)));
+            }
+            for (int surplus = paired; surplus < runRemovals.size(); surplus++) {
+                reported = requireChangeSlot(reported);
+                removed.add(removedDetail(runRemovals.get(surplus)));
+            }
+            for (int surplus = paired; surplus < runAdditions.size(); surplus++) {
+                reported = requireChangeSlot(reported);
+                added.add(addedDetail(runAdditions.get(surplus)));
+            }
+        }
+        boolean identical = added.isEmpty() && removed.isEmpty() && changed.isEmpty();
+        String summary = identical
+                ? "No differences found"
+                : added.size() + " added, " + removed.size() + " removed, " + changed.size() + " changed";
+        return new TextDiffResponse(List.copyOf(added), List.copyOf(removed),
+                Collections.unmodifiableMap(changed), summary, identical, caseSensitive);
+    }
+
+    /** One token of a diff input: its text, its folded comparison form, its span and its address. */
+    private record DiffToken(String raw, String folded, int startCodePoint, int endCodePoint, int line,
+            int tokenIndex) {
+
+        /** Structural address of this token, {@code line[L].token[T]}, both indexes zero-based. */
+        String path() {
+            return "line[" + line + "].token[" + tokenIndex + "]";
+        }
+    }
+
+    /** One entry of the edit script: {@code STEP_MATCH}, {@code STEP_REMOVE} or {@code STEP_ADD}. */
+    private record EditStep(byte kind, int leftIndex, int rightIndex) {
+    }
+
+    private static final byte STEP_MATCH = 0;
+
+    private static final byte STEP_REMOVE = 1;
+
+    private static final byte STEP_ADD = 2;
+
+    /**
+     * Tokenize one diff side into {@link DiffToken}s without folding the text itself, so every reported
+     * position is a position in the caller's string. Line and per-line token counters are advanced over
+     * the gaps and the token bodies in order, which is why the address of a token is the same whether
+     * the {@code U+000A} it follows sits inside the previous token or between two tokens.
+     */
+    private List<DiffToken> diffTokens(String raw, TokenizerScheme scheme, Pattern custom, boolean caseSensitive,
+            long deadlineMs, int budgetMs) {
+        List<int[]> ranges = scheme == TokenizerScheme.REGEX
+                ? regexTokenRanges(new BudgetedCharSequence(raw, clock, deadlineMs, budgetMs), custom)
+                : schemeTokenRanges(raw, scheme);
+        List<DiffToken> tokens = new ArrayList<>(ranges.size());
+        int line = 0;
+        int tokenIndexInLine = 0;
+        int charCursor = 0;
+        int codePointCursor = 0;
+        for (int[] range : ranges) {
+            int charStart = range[0];
+            int charEnd = range[1];
+            for (int index = charCursor; index < charStart; index++) {
+                if (raw.charAt(index) == '\n') {
+                    line++;
+                    tokenIndexInLine = 0;
+                }
+            }
+            int startCodePoint = codePointCursor + raw.codePointCount(charCursor, charStart);
+            String token = raw.substring(charStart, charEnd);
+            tokens.add(new DiffToken(token, foldWord(token, caseSensitive), startCodePoint,
+                    startCodePoint + raw.codePointCount(charStart, charEnd), line, tokenIndexInLine));
+            tokenIndexInLine++;
+            for (int index = charStart; index < charEnd; index++) {
+                if (raw.charAt(index) == '\n') {
+                    line++;
+                    tokenIndexInLine = 0;
+                }
+            }
+            charCursor = charEnd;
+            codePointCursor = tokens.get(tokens.size() - 1).endCodePoint();
+        }
+        return tokens;
+    }
+
+    /**
+     * Char ranges of the tokens one predefined scheme keeps, in ascending order and never overlapping.
+     * Unlike {@link #schemeTokens} this walks the raw text, so the ranges are usable offsets into the
+     * caller's string; {@code letter} keeps the same letter/digit runs {@link #tokenize(String)} keeps.
+     */
+    private static List<int[]> schemeTokenRanges(String raw, TokenizerScheme scheme) {
+        List<int[]> ranges = new ArrayList<>();
+        int start = -1;
+        int currentKind = 0;
+        for (int index = 0; index < raw.length(); ) {
+            int codePoint = raw.codePointAt(index);
+            if (isDiffSchemeToken(scheme, codePoint)) {
+                int kind = tokenKind(scheme, codePoint);
+                if (start >= 0 && kind != currentKind) {
+                    ranges.add(new int[] {start, index});
+                    start = -1;
+                }
+                if (start < 0) {
+                    start = index;
+                }
+                currentKind = kind;
+            } else if (start >= 0) {
+                ranges.add(new int[] {start, index});
+                start = -1;
+            }
+            index += Character.charCount(codePoint);
+        }
+        if (start >= 0) {
+            ranges.add(new int[] {start, raw.length()});
+        }
+        return ranges;
+    }
+
+    /**
+     * Code points a predefined scheme keeps in the raw-text scan. {@code letter} is included here (it
+     * keeps letter/digit runs) whereas {@link #isSchemeToken} returns false for it because that method
+     * serves {@link #schemeTokens}, which handles {@code letter} with {@link #tokenize(String)}.
+     */
+    private static boolean isDiffSchemeToken(TokenizerScheme scheme, int codePoint) {
+        return switch (scheme) {
+            case LETTER, ALPHANUM -> Character.isLetterOrDigit(codePoint);
+            case DIGIT -> Character.isDigit(codePoint);
+            case WHITESPACE -> !Character.isWhitespace(codePoint);
+            case REGEX -> false;
+        };
+    }
+
+    /** Char ranges of the non-empty regex matches of {@code pattern}; the match order is ascending. */
+    private static List<int[]> regexTokenRanges(CharSequence subject, Pattern pattern) {
+        List<int[]> ranges = new ArrayList<>();
+        Matcher matcher = pattern.matcher(subject);
+        while (matcher.find()) {
+            if (matcher.end() > matcher.start()) {
+                ranges.add(new int[] {matcher.start(), matcher.end()});
+            }
+        }
+        return ranges;
+    }
+
+    /** Length of the longest run of folded-equal tokens both sides start with. */
+    private static int commonPrefixLength(List<DiffToken> left, List<DiffToken> right) {
+        int limit = Math.min(left.size(), right.size());
+        int prefix = 0;
+        while (prefix < limit && left.get(prefix).folded().equals(right.get(prefix).folded())) {
+            prefix++;
+        }
+        return prefix;
+    }
+
+    /** Length of the longest run of folded-equal tokens both sides end with, ignoring the prefix. */
+    private static int commonSuffixLength(List<DiffToken> left, List<DiffToken> right, int prefix) {
+        int limit = Math.min(left.size() - prefix, right.size() - prefix);
+        int suffix = 0;
+        while (suffix < limit
+                && left.get(left.size() - 1 - suffix).folded()
+                        .equals(right.get(right.size() - 1 - suffix).folded())) {
+            suffix++;
+        }
+        return suffix;
+    }
+
+    /**
+     * Longest-common-subsequence edit script of two token lists, in left-to-right order. One byte per
+     * cell records the backtracking direction and two int rows carry the lengths, so the allocation is
+     * {@code (n + 1) × (m + 1)} bytes plus {@code 2 × (m + 1)} ints — bounded up front by
+     * {@link #MAX_TEXT_DIFF_CELLS}, checked before a single row is allocated.
+     *
+     * @throws IllegalArgumentException when the matrix would exceed the cell budget
+     */
+    private static List<EditStep> editScript(List<DiffToken> left, List<DiffToken> right) {
+        int rows = left.size();
+        int columns = right.size();
+        int width = columns + 1;
+        long cells = (long) (rows + 1) * width;
+        if (cells > MAX_TEXT_DIFF_CELLS) {
+            throw new IllegalArgumentException(
+                    "text diff exceeds the " + MAX_TEXT_DIFF_CELLS + "-token-pair budget");
+        }
+        byte[] direction = new byte[(int) cells];
+        int[] previous = new int[width];
+        int[] current = new int[width];
+        for (int row = 1; row <= rows; row++) {
+            current[0] = 0;
+            String token = left.get(row - 1).folded();
+            for (int column = 1; column <= columns; column++) {
+                if (token.equals(right.get(column - 1).folded())) {
+                    current[column] = previous[column - 1] + 1;
+                    direction[row * width + column] = STEP_MATCH;
+                } else if (previous[column] >= current[column - 1]) {
+                    current[column] = previous[column];
+                    direction[row * width + column] = STEP_REMOVE;
+                } else {
+                    current[column] = current[column - 1];
+                    direction[row * width + column] = STEP_ADD;
+                }
+            }
+            int[] swap = previous;
+            previous = current;
+            current = swap;
+        }
+        List<EditStep> reversed = new ArrayList<>();
+        int row = rows;
+        int column = columns;
+        while (row > 0 || column > 0) {
+            byte step = direction[row * width + column];
+            if (row > 0 && column > 0 && step == STEP_MATCH) {
+                reversed.add(new EditStep(STEP_MATCH, row - 1, column - 1));
+                row--;
+                column--;
+            } else if (row > 0 && (column == 0 || step == STEP_REMOVE)) {
+                reversed.add(new EditStep(STEP_REMOVE, row - 1, -1));
+                row--;
+            } else {
+                reversed.add(new EditStep(STEP_ADD, -1, column - 1));
+                column--;
+            }
+        }
+        Collections.reverse(reversed);
+        return reversed;
+    }
+
+    /** Count one more reported change, failing before the {@value #MAX_TEXT_DIFF_CHANGES}th is emitted. */
+    private static int requireChangeSlot(int reported) {
+        if (reported >= MAX_TEXT_DIFF_CHANGES) {
+            throw new IllegalArgumentException(
+                    "diff must not contain more than " + MAX_TEXT_DIFF_CHANGES + " changes");
+        }
+        return reported + 1;
+    }
+
+    /** An {@code ADDED} detail: a token that exists only in {@code right}. */
+    private static TextDiffDetail addedDetail(DiffToken token) {
+        return new TextDiffDetail(token.path(), TextDiffDetail.ADDED, null, token.raw(),
+                -1, -1, token.startCodePoint(), token.endCodePoint());
+    }
+
+    /** A {@code REMOVED} detail: a token that exists only in {@code left}. */
+    private static TextDiffDetail removedDetail(DiffToken token) {
+        return new TextDiffDetail(token.path(), TextDiffDetail.REMOVED, token.raw(), null,
+                token.startCodePoint(), token.endCodePoint(), -1, -1);
+    }
+
+    /** A {@code CHANGED} detail: both tokens and both spans, addressed by the {@code left} token. */
+    private static TextDiffDetail changedDetail(DiffToken oldToken, DiffToken newToken) {
+        return new TextDiffDetail(oldToken.path(), TextDiffDetail.CHANGED, oldToken.raw(), newToken.raw(),
+                oldToken.startCodePoint(), oldToken.endCodePoint(),
+                newToken.startCodePoint(), newToken.endCodePoint());
     }
 
     public TextTruncateResponse truncate(TextTruncateRequest request) {
