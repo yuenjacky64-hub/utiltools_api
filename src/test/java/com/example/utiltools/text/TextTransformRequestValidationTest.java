@@ -22,7 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TextTransformRequestValidationTest {
 
     private static final String SUPPORTED_OPERATIONS_MESSAGE =
-            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE";
+            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE, TOGGLE_CASE";
 
     private static final String TEXT_TOO_LONG_MESSAGE = "text must be at most 1000000 characters";
 
@@ -35,10 +35,11 @@ class TextTransformRequestValidationTest {
     private static final String SLUG = "SLUG";
     private static final String SENTENCE_CASE = "SENTENCE_CASE";
     private static final String REVERSE = "REVERSE";
+    private static final String TOGGLE_CASE = "TOGGLE_CASE";
 
     /** Mirrors {@code TextService}'s {@code switch} labels: an accepted value must land on one of them. */
     private static final List<String> SWITCH_LABELS =
-            List.of(UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE);
+            List.of(UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE, TOGGLE_CASE);
 
     @Test
     @DisplayName("text of exactly 1000000 characters passes @Size, 1000001 is rejected, null stays @NotBlank-only")
@@ -84,8 +85,8 @@ class TextTransformRequestValidationTest {
     }
 
     @Test
-    @DisplayName("all nine operations pass validation in lower, mixed and upper case and survive the service normalisation")
-    void shouldAcceptAllNineOperationsInAnyCase() {
+    @DisplayName("all ten operations pass validation in lower, mixed and upper case and survive the service normalisation")
+    void shouldAcceptAllTenOperationsInAnyCase() {
         try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
             Validator validator = factory.getValidator();
 
@@ -114,7 +115,7 @@ class TextTransformRequestValidationTest {
             Validator validator = factory.getValidator();
 
             for (String candidate : List.of(" sentence_case ", "UPPER ", " SLUG", "SLUGGISH", "UPPER_CASE",
-                    "FOLD", "TITLEX", "")) {
+                    "FOLD", "TITLEX", "", "TOGGLE", "TOGGLECASE", "TOGGLE_CASES", " toggle_case ")) {
                 Set<ConstraintViolation<TextTransformRequest>> violations =
                         validator.validate(new TextTransformRequest("hello", candidate));
 

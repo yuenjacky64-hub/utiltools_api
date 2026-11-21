@@ -52,7 +52,7 @@ public class TextService {
 
     private static final int DEFAULT_REGEX_TIMEOUT_MS = 200;
 
-    private static final String ALLOWED_OPERATIONS = "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE";
+    private static final String ALLOWED_OPERATIONS = "UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE, TOGGLE_CASE";
 
     private static final String ALLOWED_FORMS = "NFC, NFD, NFKC, NFKD";
 
@@ -81,6 +81,7 @@ public class TextService {
     private static final String SLUG = "SLUG";
     private static final String SENTENCE_CASE = "SENTENCE_CASE";
     private static final String REVERSE = "REVERSE";
+    private static final String TOGGLE_CASE = "TOGGLE_CASE";
 
     /** Wall-clock budget (ms) shared by both regex passes of {@link #replace}. */
     private final int regexTimeoutMs;
@@ -115,6 +116,7 @@ public class TextService {
             case SLUG -> slug(text);
             case SENTENCE_CASE -> sentenceCase(text);
             case REVERSE -> reverseByCodePoints(text);
+            case TOGGLE_CASE -> toggleCase(text);
             default -> throw new IllegalArgumentException("Unsupported operation '" + request.operation()
                     + "'. Allowed values: " + ALLOWED_OPERATIONS);
         };
@@ -902,6 +904,28 @@ public class TextService {
             reversed.appendCodePoint(codePoints[i]);
         }
         return reversed.toString();
+    }
+
+    /**
+     * Inverts the case of every lower- or upper-case code point; all other code points
+     * (digits, punctuation, symbols, uncased letters, title-case code points, emoji) are
+     * copied through in place. Character-level mapping only, so the result never depends
+     * on the default locale and a journalled result always replays identically.
+     */
+    private static String toggleCase(String text) {
+        StringBuilder out = new StringBuilder(text.length());
+        for (int i = 0; i < text.length(); ) {
+            int cp = text.codePointAt(i);
+            i += Character.charCount(cp);
+            if (Character.isUpperCase(cp)) {
+                out.appendCodePoint(Character.toLowerCase(cp));
+            } else if (Character.isLowerCase(cp)) {
+                out.appendCodePoint(Character.toUpperCase(cp));
+            } else {
+                out.appendCodePoint(cp);
+            }
+        }
+        return out.toString();
     }
 
     /** Copies one separator-free segment, upper-casing its first letter/digit when starting a sentence. */
