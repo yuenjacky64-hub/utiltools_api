@@ -213,11 +213,12 @@ class BatchJobControllerTest {
 
     /**
      * DOD-01 / REQ-02 / REQ-05: the new operator route answers 200 with the aggregate projection and
-     * is a pure read - the registry is byte-identical before and after the call.
+     * is a pure read - the registry size and a representative row snapshot (the single-job GET body)
+     * are byte-identical before and after the call.
      */
     @Test
-    @DisplayName("GET /api/v1/utils/jobs/quarantine-status - should return 200 with the projection and mutate nothing")
-    void shouldReturn200WithJobsQuarantineStatus() throws Exception {
+    @DisplayName("GET /api/v1/utils/jobs/quarantine-status - should report the aggregate and mutate nothing")
+    void quarantineStatusReportsAggregateAndMutatesNothing() throws Exception {
         String jobId = com.jayway.jsonpath.JsonPath.read(mockMvc.perform(post("/api/v1/utils/jobs/hash")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
@@ -230,6 +231,10 @@ class BatchJobControllerTest {
 
         List<BatchHashJobResponse> registryBefore =
                 jobService.listJobs(null, BatchHashJobService.MAX_LIST_LIMIT);
+        String rowSnapshotBefore = com.jayway.jsonpath.JsonPath.read(
+                mockMvc.perform(get("/api/v1/utils/jobs/{jobId}", jobId))
+                        .andExpect(status().isOk())
+                        .andReturn().getResponse().getContentAsString(), "$.data").toString();
 
         mockMvc.perform(get("/api/v1/utils/jobs/quarantine-status"))
                 .andExpect(status().isOk())
@@ -241,8 +246,43 @@ class BatchJobControllerTest {
                 .andExpect(jsonPath("$.data.queuedCount").isNumber())
                 .andExpect(jsonPath("$.data.retainedJobCount").value(registryBefore.size()));
 
-        assertThat(jobService.listJobs(null, BatchHashJobService.MAX_LIST_LIMIT))
-                .isEqualTo(registryBefore);
+        List<BatchHashJobResponse> registryAfter =
+                jobService.listJobs(null, BatchHashJobService.MAX_LIST_LIMIT);
+        assertThat(registryAfter).isEqualTo(registryBefore);
+        assertThat(com.jayway.jsonpath.JsonPath.read(
+                mockMvc.perform(get("/api/v1/utils/jobs/{jobId}", jobId))
+                        .andExpect(status().isOk())
+                        .andReturn().getResponse().getContentAsString(), "$.data").toString())
+                .isEqualTo(rowSnapshotBefore);
+    }
+
+    /**
+     * DOD-02 / REQ-02 / DOD-15: the literal mapping wins over {@code @GetMapping("/{jobId}")} with a
+     * live row in the registry (a template capture would answer 404 JOB_NOT_FOUND), and the payload
+     * carries counts only - no job-snapshot key leaks through.
+     */
+    @Test
+    @DisplayName("GET /api/v1/utils/jobs/quarantine-status - should not be shadowed by the {jobId} route")
+    void quarantineStatusIsNotShadowedByJobIdRoute() throws Exception {
+        String jobId = com.jayway.jsonpath.JsonPath.read(mockMvc.perform(post("/api/v1/utils/jobs/hash")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"algorithm": "SHA-256", "items": ["bravo"]}
+                                """))
+                .andExpect(status().isAccepted())
+                .andReturn().getResponse().getContentAsString(), "$.data.jobId");
+        awaitStatus(jobService, jobId, JobStatus.COMPLETED);
+        int registrySize = jobService.listJobs(null, BatchHashJobService.MAX_LIST_LIMIT).size();
+        assertThat(registrySize).isGreaterThanOrEqualTo(1);
+
+        mockMvc.perform(get("/api/v1/utils/jobs/quarantine-status"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.retainedJobCount").value(registrySize))
+                .andExpect(jsonPath("$.data.jobId").doesNotExist())
+                .andExpect(jsonPath("$.data.status").doesNotExist())
+                .andExpect(jsonPath("$.data.id").doesNotExist())
+                .andExpect(jsonPath("$.error").doesNotExist());
     }
 
     /**

@@ -2,7 +2,7 @@
 
 [![Java](https://img.shields.io/badge/Java-21%20LTS-orange.svg?logo=openjdk)](https://openjdk.org/projects/jdk/21/)
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4%20(3.4.2)-brightgreen.svg?logo=springboot)](https://spring.io/projects/spring-boot)
-[![Build & Tests](https://img.shields.io/badge/Tests-939%20Passed%20(100%25)-success.svg)](https://junit.org/junit5/)
+[![Build & Tests](https://img.shields.io/badge/Tests-990%20Passed%20(100%25)-success.svg)](https://junit.org/junit5/)
 [![OpenAPI](https://img.shields.io/badge/OpenAPI-3.0%20%2F%20Swagger%20UI-blue.svg?logo=swagger)](http://localhost:8080/swagger-ui/index.html)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
@@ -68,7 +68,7 @@ flowchart TD
 - **Framework**: **Spring Boot 4** (`spring-boot-starter-web`, `spring-boot-starter-validation`)
 - **JSON Processing**: Jackson (`ObjectMapper`) & Jayway `json-path`
 - **Documentation**: OpenAPI 3.0 & Swagger UI (`springdoc-openapi-starter-webmvc-ui`)
-- **Testing**: JUnit 5, MockMvc, AssertJ (100% test pass rate across 939 unit and integration tests)
+- **Testing**: JUnit 5, MockMvc, AssertJ (100% test pass rate across 990 unit and integration tests)
 
 ---
 
