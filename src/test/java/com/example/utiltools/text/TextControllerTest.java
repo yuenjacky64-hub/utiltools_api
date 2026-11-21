@@ -1344,8 +1344,8 @@ class TextControllerTest {
     }
 
     @Test
-    @DisplayName("POST /api/v1/utils/text/similarity - an over-long pattern is a bean-validation failure for every "
-            + "scheme and is not journalled (REQ-01 / DOD-03)")
+    @DisplayName("POST /api/v1/utils/text/similarity - an over-long pattern with tokenizer=regex is a bean-validation "
+            + "failure and is not journalled (REQ-01 / DOD-02)")
     void shouldRejectOverLongPatternAtTheValidationBoundary() throws Exception {
         int entriesBefore = journal.size();
 
@@ -1361,7 +1361,7 @@ class TextControllerTest {
         // @Valid runs before the controller body, so the rejection leaves no journal entry behind.
         assertThat(journal.size()).isEqualTo(entriesBefore);
 
-        // 512 characters stays inside the @Size boundary, so the regex request still succeeds.
+        // 512 characters stays inside the cap, so the regex request still succeeds.
         mockMvc.perform(post("/api/v1/utils/text/similarity")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"regex\", "
@@ -1371,21 +1371,23 @@ class TextControllerTest {
     }
 
     @Test
-    @DisplayName("POST /api/v1/utils/text/similarity - the @Size bound is scheme-independent, a shorter pattern with "
-            + "tokenizer=letter is still ignored (REQ-01 / DOD-03)")
-    void similarityValidatesPatternSizeForNonRegexTokenizerToo() throws Exception {
+    @DisplayName("POST /api/v1/utils/text/similarity - the pattern cap is regex-only, an over-long pattern with "
+            + "tokenizer=letter is ignored and journalled (REQ-01 / DOD-01)")
+    void similarityIgnoresOverLongPatternForNonRegexTokenizer() throws Exception {
         int entriesBefore = journal.size();
 
+        // The cap is scheme-aware: a predefined tokenizer never uses the pattern, so its length is irrelevant.
         mockMvc.perform(post("/api/v1/utils/text/similarity")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"letter\", "
                                 + "\"pattern\": \"" + "a".repeat(513) + "\"}"))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
-                .andExpect(jsonPath("$.message").value("Validation failed"))
-                .andExpect(jsonPath("$.details", hasItem("pattern must be at most 512 characters")));
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.distance").value(1))
+                .andExpect(jsonPath("$.data.maxLength").value(3));
 
-        assertThat(journal.size()).isEqualTo(entriesBefore);
+        // ...and the accepted call is journalled like any other, so it stays replayable.
+        assertThat(journal.size()).isEqualTo(entriesBefore + 1);
 
         // Within the bound, a pattern sent with a predefined scheme is ignored exactly as before.
         mockMvc.perform(post("/api/v1/utils/text/similarity")
@@ -1395,6 +1397,60 @@ class TextControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.distance").value(1))
                 .andExpect(jsonPath("$.data.maxLength").value(3));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/similarity - pattern length is validated only for tokenizer=regex "
+            + "(REQ-01 / DOD-01, DOD-02, DOD-03)")
+    void similarityPatternSizeIsSchemeAware() throws Exception {
+        int entriesBefore = journal.size();
+
+        // DOD-01: tokenizer=letter + a 600-character pattern is accepted and the pattern is discarded, so the
+        // result is identical to the same call without a pattern.
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"letter\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.distance").value(1))
+                .andExpect(jsonPath("$.data.maxLength").value(3));
+
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"letter\", "
+                                + "\"pattern\": \"" + "a".repeat(600) + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.data.distance").value(1))
+                .andExpect(jsonPath("$.data.maxLength").value(3));
+
+        // DOD-02: tokenizer=regex + a 600-character pattern is still rejected by bean validation, before the
+        // controller body runs, so no journal entry is written.
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"regex\", "
+                                + "\"pattern\": \"" + "a".repeat(600) + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.message").value("Validation failed"))
+                .andExpect(jsonPath("$.details", hasItem("pattern must be at most 512 characters")));
+
+        assertThat(journal.size()).isEqualTo(entriesBefore + 2);
+
+        // DOD-03: tokenizer=regex + a 300-character pattern stays inside the cap and succeeds.
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"left\": \"abc\", \"right\": \"abd\", \"tokenizer\": \"regex\", "
+                                + "\"pattern\": \"" + "a".repeat(300) + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
+
+        // An omitted tokenizer defaults to letter, so a 600-character pattern is ignored there too.
+        mockMvc.perform(post("/api/v1/utils/text/similarity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"left\": \"abc\", \"right\": \"abd\", "
+                                + "\"pattern\": \"" + "a".repeat(600) + "\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true));
     }
 
     @Test

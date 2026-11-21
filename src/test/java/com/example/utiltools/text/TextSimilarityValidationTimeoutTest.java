@@ -69,8 +69,8 @@ class TextSimilarityValidationTimeoutTest {
     }
 
     @Test
-    @DisplayName("similarity request - pattern is capped at 512 characters and timeoutMs is bounded to 0..60000 "
-            + "(REQ-01, REQ-02 / DOD-01)")
+    @DisplayName("similarity request - pattern is capped at 512 characters for the regex scheme only and timeoutMs "
+            + "is bounded to 0..60000 (REQ-01, REQ-02 / DOD-06)")
     void similarityRequestPatternAndTimeoutConstraints() {
         try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
             Validator validator = factory.getValidator();
@@ -84,10 +84,11 @@ class TextSimilarityValidationTimeoutTest {
                     TokenizerScheme.REGEX, "a".repeat(513), null, null)))
                     .containsExactly(PATTERN_TOO_LONG);
 
-            // The constraint is scheme-independent: a predefined tokenizer does not exempt the pattern.
+            // The cap is regex-only: a predefined tokenizer ignores the pattern, so no length is a violation.
             assertThat(messages(validator, new TextSimilarityRequest("abc", "abd", null,
-                    TokenizerScheme.LETTER, "a".repeat(513), null, null)))
-                    .containsExactly(PATTERN_TOO_LONG);
+                    TokenizerScheme.LETTER, "a".repeat(513), null, null))).isEmpty();
+            assertThat(messages(validator, new TextSimilarityRequest("abc", "abd", null,
+                    TokenizerScheme.LETTER, "a".repeat(600), null, null))).isEmpty();
 
             // timeoutMs is optional: absent, explicit null, zero and the configured ceiling are all valid.
             assertThat(messages(validator, new TextSimilarityRequest("abc", "abd", null,

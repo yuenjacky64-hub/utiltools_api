@@ -121,8 +121,9 @@ public class TextController {
                     + "programme, plus maxLength and similarity = 1 - distance/maxLength rounded to 6 decimals. "
                     + "caseSensitive defaults to false, in which case both inputs are folded with Locale.ROOT first. "
                     + "Each input is bounded at 2000 code points; a longer one returns 400 BAD_REQUEST. "
-                    + "pattern is optional, at most 512 characters (a longer one returns 400 VALIDATION_ERROR) and only "
-                    + "used by tokenizer=regex. The optional timeoutMs tightens the regex wall-clock budget (0 or absent "
+                    + "pattern is optional and only used by tokenizer=regex; for that scheme it is at most 512 "
+                    + "characters (a longer one returns 400 VALIDATION_ERROR), while a pattern sent with a predefined "
+                    + "tokenizer is ignored whatever its length. The optional timeoutMs tightens the regex wall-clock budget (0 or absent "
                     + "means the configured budget); an exhausted budget returns 422 REGEX_TIMEOUT. "
                     + "Every call is journalled as TEXT_SIMILARITY and can be replayed.")
     public ApiResponse<TextSimilarityResponse> similarity(@Valid @RequestBody TextSimilarityRequest request) {
