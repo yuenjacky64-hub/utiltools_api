@@ -6,6 +6,8 @@ import com.example.utiltools.common.RequestContext;
 import com.example.utiltools.common.ReplayConflictException;
 import com.example.utiltools.crypto.dto.Base32Request;
 import com.example.utiltools.crypto.dto.Base32Response;
+import com.example.utiltools.crypto.dto.Base58Request;
+import com.example.utiltools.crypto.dto.Base58Response;
 import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
@@ -170,6 +172,10 @@ public class AuditedOperations {
         return record(OperationType.CRYPTO_BASE32, request, () -> cryptoService.base32(request));
     }
 
+    public Base58Response base58(Base58Request request) {
+        return record(OperationType.CRYPTO_BASE58, request, () -> cryptoService.base58(request));
+    }
+
     public UrlResponse url(UrlRequest request) {
         return record(OperationType.CRYPTO_URL, request, () -> cryptoService.url(request));
     }
@@ -297,6 +303,7 @@ public class AuditedOperations {
             case CRYPTO_HASH -> cryptoService.hash((HashRequest) request);
             case CRYPTO_BASE64 -> cryptoService.base64((Base64Request) request);
             case CRYPTO_BASE32 -> cryptoService.base32((Base32Request) request);
+            case CRYPTO_BASE58 -> cryptoService.base58((Base58Request) request);
             case CRYPTO_URL -> cryptoService.url((UrlRequest) request);
             case CRYPTO_URL_PARSE -> cryptoService.parseUrl((UrlParseRequest) request);
             case CRYPTO_UUID -> cryptoService.generateUuids(intOf(request, "count"), booleanOf(request, "compact"),

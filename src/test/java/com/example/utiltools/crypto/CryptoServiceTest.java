@@ -2,6 +2,8 @@ package com.example.utiltools.crypto;
 
 import com.example.utiltools.crypto.dto.Base32Request;
 import com.example.utiltools.crypto.dto.Base32Response;
+import com.example.utiltools.crypto.dto.Base58Request;
+import com.example.utiltools.crypto.dto.Base58Response;
 import com.example.utiltools.crypto.dto.Base64Request;
 import com.example.utiltools.crypto.dto.Base64Response;
 import com.example.utiltools.crypto.dto.HashRequest;
@@ -861,6 +863,103 @@ class CryptoServiceTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Invalid action");
     }
+    @Test
+    @DisplayName("base58 - should encode and decode the known Bitcoin-alphabet vector")
+    void base58ShouldEncodeAndDecodeKnownVector() {
+        assertThat(cryptoService.base58(new Base58Request("ENCODE", "Hello World!")).result())
+                .isEqualTo("2NEpo7TZRRrLZSi2U");
+        assertThat(cryptoService.base58(new Base58Request("encode", "Hello World!")))
+                .isEqualTo(new Base58Response("ENCODE", "2NEpo7TZRRrLZSi2U"));
+        assertThat(cryptoService.base58(new Base58Request("DECODE", "2NEpo7TZRRrLZSi2U")))
+                .isEqualTo(new Base58Response("DECODE", "Hello World!"));
+        for (String sample : List.of("f", "fo", "foo", "foobar", "The quick brown fox", "Gr\u00fc\u00dfe \u2603")) {
+            String encoded = cryptoService.base58(new Base58Request("ENCODE", sample)).result();
+            assertThat(encoded).doesNotContain("0", "O", "I", "l");
+            assertThat(cryptoService.base58(new Base58Request("DECODE", encoded)).result()).isEqualTo(sample);
+        }
+    }
+
+    @Test
+    @DisplayName("base58 - should preserve leading zero bytes and round-trip Unicode")
+    void base58ShouldPreserveLeadingZeroBytesAndUnicode() {
+        String nulPrefixed = "\u0000A";
+        String encoded = cryptoService.base58(new Base58Request("ENCODE", nulPrefixed)).result();
+        assertThat(encoded).startsWith("1");
+        assertThat(encoded).isEqualTo("1" + cryptoService.base58(new Base58Request("ENCODE", "A")).result());
+        assertThat(cryptoService.base58(new Base58Request("DECODE", encoded)).result()).isEqualTo(nulPrefixed);
+
+        String threeZeros = "\u0000\u0000\u0000hello";
+        String threeEncoded = cryptoService.base58(new Base58Request("ENCODE", threeZeros)).result();
+        assertThat(threeEncoded).startsWith("111");
+        assertThat(threeEncoded).doesNotStartWith("1111");
+        assertThat(cryptoService.base58(new Base58Request("DECODE", threeEncoded)).result()).isEqualTo(threeZeros);
+
+        for (String sample : List.of("Gr\u00fc\u00dfe", "\u65e5\u672c\u8a9e", "\ud83d\ude80 rocket", " caf\u00e9 ")) {
+            String roundTrip = cryptoService.base58(new Base58Request("DECODE",
+                    cryptoService.base58(new Base58Request("ENCODE", sample)).result())).result();
+            assertThat(roundTrip).isEqualTo(sample);
+        }
+    }
+
+    @Test
+    @DisplayName("base58 - should be deterministic across repeated calls")
+    void base58ShouldBeDeterministicAcrossRepeatedCalls() {
+        String encoded = cryptoService.base58(new Base58Request("ENCODE", "determinism \u2603")).result();
+        for (int i = 0; i < 5; i++) {
+            assertThat(cryptoService.base58(new Base58Request("ENCODE", "determinism \u2603")).result())
+                    .isEqualTo(encoded);
+        }
+        String decoded = cryptoService.base58(new Base58Request("DECODE", encoded)).result();
+        for (int i = 0; i < 5; i++) {
+            assertThat(cryptoService.base58(new Base58Request("DECODE", encoded)).result()).isEqualTo(decoded);
+        }
+    }
+
+    @Test
+    @DisplayName("base58 - should reject invalid alphabet characters, invalid UTF-8 and bad actions")
+    void base58ShouldRejectInvalidInput() {
+        assertThatThrownBy(() -> cryptoService.base58(new Base58Request("DECODE", "0OIl")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("outside the Bitcoin Base58 alphabet");
+        assertThatThrownBy(() -> cryptoService.base58(new Base58Request("DECODE", "2NEpo7T+Z")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("outside the Bitcoin Base58 alphabet");
+        assertThatThrownBy(() -> cryptoService.base58(new Base58Request("DECODE", "5Q")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("not valid UTF-8");
+        assertThatThrownBy(() -> cryptoService.base58(new Base58Request("ROT13", "foobar")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("ENCODE or DECODE");
+        assertThatThrownBy(() -> cryptoService.base58(new Base58Request("ENCODE", "   ")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("content must not be blank");
+        assertThatThrownBy(() -> cryptoService.base58(null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("action must not be blank");
+    }
+
+    @Test
+    @DisplayName("base58 - should enforce the 8192-character cap in the service guard")
+    void base58ShouldEnforceContentCapInServiceGuard() {
+        String atCap = "a".repeat(8192);
+        // ENCODE grows 8192 bytes to ~11190 Base58 chars, so only the encode side can sit at the cap.
+        String atCapEncoded = cryptoService.base58(new Base58Request("ENCODE", atCap)).result();
+        assertThat(atCapEncoded).isNotEmpty();
+        // 5000 bytes encode to ~6830 Base58 chars, comfortably inside the decode-side cap.
+        String decodableAtCap = "a".repeat(5000);
+        assertThat(cryptoService.base58(new Base58Request("DECODE",
+                cryptoService.base58(new Base58Request("ENCODE", decodableAtCap)).result())).result())
+                .isEqualTo(decodableAtCap);
+
+        String overCap = "a".repeat(8193);
+        assertThatThrownBy(() -> cryptoService.base58(new Base58Request("ENCODE", overCap)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("at most 8192 characters");
+        assertThatThrownBy(() -> cryptoService.base58(new Base58Request("DECODE", "1".repeat(8193))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("at most 8192 characters");
+    }
+
     // --- JWT decode (decode-only) -------------------------------------------------------------
 
     private static final String JWT_HEADER_SEGMENT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
