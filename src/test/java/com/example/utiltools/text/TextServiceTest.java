@@ -56,6 +56,8 @@ class TextServiceTest {
                 .isEqualTo(new TextTransformResponse("SENTENCE_CASE", "Hello, world!", true, 13));
         assertThat(service.transform(new TextTransformRequest("Hello, World!", "REVERSE")))
                 .isEqualTo(new TextTransformResponse("REVERSE", "!dlroW ,olleH", true, 13));
+        assertThat(service.transform(new TextTransformRequest("Hello, World!", "TOGGLE_CASE")))
+                .isEqualTo(new TextTransformResponse("TOGGLE_CASE", "hELLO, wORLD!", true, 13));
 
         // case-insensitive operation, echoed back upper-case
         assertThat(service.transform(new TextTransformRequest("Hello, World!", " snake ")))
@@ -210,7 +212,7 @@ class TextServiceTest {
                     validator.validate(new TextTransformRequest("Hello", " "));
             assertThat(operationViolations).extracting(ConstraintViolation::getMessage)
                     .containsExactlyInAnyOrder("operation is required",
-                            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE");
+                            "Supported operations: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE, TOGGLE_CASE");
 
             Set<ConstraintViolation<TextStatsRequest>> statsViolations =
                     validator.validate(new TextStatsRequest(""));
@@ -224,7 +226,7 @@ class TextServiceTest {
     void shouldRejectUnknownOperation() {
         assertThatThrownBy(() -> service.transform(new TextTransformRequest("secret body", "shout")))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("Unsupported operation 'shout'. Allowed values: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE")
+                .hasMessage("Unsupported operation 'shout'. Allowed values: UPPER, LOWER, TITLE, CAMEL, SNAKE, KEBAB, SLUG, SENTENCE_CASE, REVERSE, TOGGLE_CASE")
                 .hasMessageNotContaining("secret body");
     }
 
@@ -255,6 +257,52 @@ class TextServiceTest {
         // the emoji stays one intact code point (0x1F30D) leading the result: no isolated surrogates
         int[] codePoints = response.result().codePoints().toArray();
         assertThat(codePoints).containsExactly(0x1F30D, ' ', 'o', 'l', 'l', 'e', 'H');
+    }
+
+    @Test
+    @DisplayName("TOGGLE_CASE inverts every letter of mixed-case, all-caps and all-lowercase input")
+    void shouldToggleCaseInvertEachLetter() {
+        assertThat(service.transform(new TextTransformRequest("Hello", "TOGGLE_CASE")))
+                .isEqualTo(new TextTransformResponse("TOGGLE_CASE", "hELLO", true, 5));
+
+        assertThat(service.transform(new TextTransformRequest("ABC", "TOGGLE_CASE")))
+                .isEqualTo(new TextTransformResponse("TOGGLE_CASE", "abc", true, 3));
+
+        assertThat(service.transform(new TextTransformRequest("abc", "TOGGLE_CASE")))
+                .isEqualTo(new TextTransformResponse("TOGGLE_CASE", "ABC", true, 3));
+
+        assertThat(service.transform(new TextTransformRequest("MiXeD cAsE", "TOGGLE_CASE")))
+                .isEqualTo(new TextTransformResponse("TOGGLE_CASE", "mIxEd CaSe", true, 10));
+
+        // case-insensitive operation, echoed back upper-case
+        assertThat(service.transform(new TextTransformRequest("Hello", "toggle_case")).operation())
+                .isEqualTo("TOGGLE_CASE");
+    }
+
+    @Test
+    @DisplayName("TOGGLE_CASE leaves digits, punctuation, whitespace, symbols and emoji in place")
+    void shouldToggleCaseLeaveNonCasedCodePointsInPlace() {
+        assertThat(service.transform(new TextTransformRequest("ABC123", "TOGGLE_CASE")))
+                .isEqualTo(new TextTransformResponse("TOGGLE_CASE", "abc123", true, 6));
+
+        assertThat(service.transform(new TextTransformRequest("a1!B 2?c", "TOGGLE_CASE")))
+                .isEqualTo(new TextTransformResponse("TOGGLE_CASE", "A1!b 2?C", true, 8));
+
+        TextTransformResponse emoji = service.transform(new TextTransformRequest("Hi 🌍", "TOGGLE_CASE"));
+        assertThat(emoji.result()).isEqualTo("hI 🌍");
+        assertThat(emoji.changed()).isTrue();
+        assertThat(emoji.length()).isEqualTo(4);
+    }
+
+    @Test
+    @DisplayName("TOGGLE_CASE reports changed=false for letter-free input and copies title-case code points through")
+    void shouldToggleCaseReportChangedOnlyWhenLettersInvert() {
+        assertThat(service.transform(new TextTransformRequest("12345 !?", "TOGGLE_CASE")))
+                .isEqualTo(new TextTransformResponse("TOGGLE_CASE", "12345 !?", false, 8));
+
+        // U+01C5 is a title-case code point: neither upper- nor lower-case, so it is copied as-is
+        assertThat(service.transform(new TextTransformRequest("\u01C5", "TOGGLE_CASE")))
+                .isEqualTo(new TextTransformResponse("TOGGLE_CASE", "\u01C5", false, 1));
     }
 
     @Test
