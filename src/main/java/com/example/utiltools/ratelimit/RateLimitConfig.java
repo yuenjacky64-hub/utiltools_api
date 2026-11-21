@@ -1,6 +1,8 @@
 package com.example.utiltools.ratelimit;
 
 import java.time.Clock;
+import com.example.utiltools.scheduling.MaintenancePassGuard;
+import com.example.utiltools.scheduling.MaintenancePass;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -37,6 +39,19 @@ public class RateLimitConfig {
     @Autowired
     private RateLimitProperties properties;
 
+    // Provider, not the bean itself: this class declares the Clock bean the guard needs, so eager
+    // injection here would make config <-> guard circular. Falls back to the documented defaults.
+    @Autowired(required = false)
+    private ObjectProvider<MaintenancePassGuard> passGuardProvider;
+
+    private final MaintenancePassGuard defaultGuard = MaintenancePassGuard.defaults();
+
+    private MaintenancePassGuard guard() {
+        MaintenancePassGuard resolved =
+                passGuardProvider == null ? null : passGuardProvider.getIfAvailable();
+        return resolved != null ? resolved : defaultGuard;
+    }
+
     @Bean
     public Clock clock() {
         return Clock.systemUTC();
@@ -57,6 +72,11 @@ public class RateLimitConfig {
 
     @Scheduled(fixedDelayString = "${utiltools.ratelimit.cleanup-interval-ms:30000}")
     public void evictIdleBuckets() {
+        MaintenancePassGuard guard = guard();
+        guard.run(MaintenancePass.RATE_LIMIT_EVICT_IDLE_BUCKETS, this::evictIdleBucketsPass);
+    }
+
+    private void evictIdleBucketsPass() {
         if (!properties.enabled()) {
             return;
         }

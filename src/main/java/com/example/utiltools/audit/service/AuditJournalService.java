@@ -23,6 +23,8 @@ import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import com.example.utiltools.scheduling.MaintenancePassGuard;
+import com.example.utiltools.scheduling.MaintenancePass;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -83,6 +85,16 @@ public class AuditJournalService {
     /** Rollbacks of one entry's replay claim allowed before the entry is quarantined; REQ-05. */
     private final int replayLeaseQuarantineThreshold;
     private final Clock clock;
+
+    /** Per-pass quarantine; a real guard with the documented defaults outside Spring (REQ-03). */
+    private MaintenancePassGuard guard = MaintenancePassGuard.defaults();
+
+    @Autowired(required = false)
+    void setMaintenancePassGuard(MaintenancePassGuard guard) {
+        if (guard != null) {
+            this.guard = guard;
+        }
+    }
 
     private final Object lock = new Object();
     private final LinkedHashMap<String, JournalRecord> entries = new LinkedHashMap<>();
@@ -243,7 +255,7 @@ public class AuditJournalService {
      */
     @Scheduled(fixedDelayString = "${utiltools.audit.cleanup-interval-ms:60000}")
     public void reapJournal() {
-        reap();
+        guard.run(MaintenancePass.AUDIT_JOURNAL_REAP, this::reap);
     }
 
     /**

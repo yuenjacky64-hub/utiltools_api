@@ -19,6 +19,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
+import com.example.utiltools.scheduling.MaintenancePassGuard;
+import com.example.utiltools.scheduling.MaintenancePass;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -211,6 +213,16 @@ public class BatchHashJobService {
     private final int maxRetainedJobs;
 
     private final Clock clock;
+
+    /** Per-pass quarantine; a real guard with the documented defaults outside Spring (REQ-03). */
+    private MaintenancePassGuard guard = MaintenancePassGuard.defaults();
+
+    @Autowired(required = false)
+    void setMaintenancePassGuard(MaintenancePassGuard guard) {
+        if (guard != null) {
+            this.guard = guard;
+        }
+    }
 
     /**
      * Serializes concurrent drain callers only. Workers never take it, so it cannot deadlock with
@@ -1509,6 +1521,10 @@ public class BatchHashJobService {
 
     @Scheduled(fixedDelayString = "${utiltools.jobs.cleanup-interval-ms:60000}")
     public void evictExpiredJobs() {
+        guard.run(MaintenancePass.JOBS_EVICT_EXPIRED_JOBS, this::evictExpiredJobRetention);
+    }
+
+    private void evictExpiredJobRetention() {
         evictExpiredJobs(Instant.now(clock).minusSeconds(retentionSeconds));
     }
 
@@ -1631,6 +1647,10 @@ public class BatchHashJobService {
 
     @Scheduled(fixedDelayString = "${utiltools.jobs.execution-reaper-interval-ms:5000}")
     public void reapExpiredExecutions() {
+        guard.run(MaintenancePass.JOBS_REAP_EXPIRED_EXECUTIONS, this::reapExpiredExecutionLeases);
+    }
+
+    private void reapExpiredExecutionLeases() {
         reapExpiredExecutions(Instant.now(clock));
     }
 
