@@ -1,5 +1,8 @@
 package com.example.utiltools.text;
 
+import com.example.utiltools.text.dto.TextDiffDetail;
+import com.example.utiltools.text.dto.TextDiffRequest;
+import com.example.utiltools.text.dto.TextDiffResponse;
 import com.example.utiltools.text.dto.TextHtmlEntitiesRequest;
 import com.example.utiltools.text.dto.TextHtmlEntitiesResponse;
 import com.example.utiltools.text.dto.TextNormalizeRequest;
@@ -1044,5 +1047,172 @@ class TextServiceTest {
             assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null, null, null, List.of("the"))))
                     .isEmpty();
         }
+    }
+
+    @Test
+    @DisplayName("diff - one replaced word is a single CHANGED token with a span on both sides (REQ-04, DOD-01)")
+    void shouldReportSingleTokenChange() {
+        TextDiffResponse response = service.diff(new TextDiffRequest("kitten", "sitting"));
+
+        assertThat(response.identical()).isFalse();
+        assertThat(response.caseSensitive()).isFalse();
+        assertThat(response.added()).isEmpty();
+        assertThat(response.removed()).isEmpty();
+        assertThat(response.changed()).containsOnlyKeys("line[0].token[0]");
+        TextDiffDetail detail = response.changed().get("line[0].token[0]");
+        assertThat(detail.changeType()).isEqualTo(TextDiffDetail.CHANGED);
+        assertThat(detail.oldToken()).isEqualTo("kitten");
+        assertThat(detail.newToken()).isEqualTo("sitting");
+        assertThat(detail.oldStartCodePoint()).isEqualTo(0);
+        assertThat(detail.oldEndCodePoint()).isEqualTo(6);
+        assertThat(detail.newStartCodePoint()).isEqualTo(0);
+        assertThat(detail.newEndCodePoint()).isEqualTo(7);
+        assertThat(response.summary()).isEqualTo("0 added, 0 removed, 1 changed");
+    }
+
+    @Test
+    @DisplayName("diff - unchanged tokens are skipped and the addresses stay structural (REQ-04, DOD-01)")
+    void shouldReportAddedAndRemovedTokens() {
+        TextDiffResponse removal = service.diff(new TextDiffRequest("alpha beta gamma", "alpha beta"));
+
+        assertThat(removal.changed()).isEmpty();
+        assertThat(removal.added()).isEmpty();
+        assertThat(removal.removed()).hasSize(1);
+        TextDiffDetail detail = removal.removed().get(0);
+        assertThat(detail.path()).isEqualTo("line[0].token[2]");
+        assertThat(detail.changeType()).isEqualTo(TextDiffDetail.REMOVED);
+        assertThat(detail.oldToken()).isEqualTo("gamma");
+        assertThat(detail.newToken()).isNull();
+        assertThat(detail.oldStartCodePoint()).isEqualTo(11);
+        assertThat(detail.oldEndCodePoint()).isEqualTo(16);
+        assertThat(detail.newStartCodePoint()).isEqualTo(-1);
+        assertThat(detail.newEndCodePoint()).isEqualTo(-1);
+        assertThat(removal.summary()).isEqualTo("0 added, 1 removed, 0 changed");
+
+        TextDiffResponse addition = service.diff(new TextDiffRequest("alpha beta", "alpha beta gamma"));
+
+        assertThat(addition.changed()).isEmpty();
+        assertThat(addition.removed()).isEmpty();
+        assertThat(addition.added()).hasSize(1);
+        TextDiffDetail added = addition.added().get(0);
+        assertThat(added.path()).isEqualTo("line[0].token[2]");
+        assertThat(added.changeType()).isEqualTo(TextDiffDetail.ADDED);
+        assertThat(added.oldToken()).isNull();
+        assertThat(added.newToken()).isEqualTo("gamma");
+        assertThat(added.oldStartCodePoint()).isEqualTo(-1);
+        assertThat(added.oldEndCodePoint()).isEqualTo(-1);
+        assertThat(added.newStartCodePoint()).isEqualTo(11);
+        assertThat(added.newEndCodePoint()).isEqualTo(16);
+        assertThat(addition.summary()).isEqualTo("1 added, 0 removed, 0 changed");
+    }
+
+    @Test
+    @DisplayName("diff - identical inputs report no differences (REQ-04, DOD-01)")
+    void shouldReportIdenticalInputs() {
+        TextDiffResponse response = service.diff(new TextDiffRequest("Hello, World!", "Hello, World!"));
+
+        assertThat(response.identical()).isTrue();
+        assertThat(response.added()).isEmpty();
+        assertThat(response.removed()).isEmpty();
+        assertThat(response.changed()).isEmpty();
+        assertThat(response.summary()).isEqualTo("No differences found");
+    }
+
+    @Test
+    @DisplayName("diff - default folding makes Hello/hello identical, caseSensitive=true reports a change (REQ-04, DOD-02)")
+    void shouldFoldDiffCaseUnlessCaseSensitive() {
+        assertThat(service.diff(new TextDiffRequest("Hello", "hello")).identical()).isTrue();
+        assertThat(service.diff(new TextDiffRequest("Hello", "hello", true)))
+                .extracting(TextDiffResponse::identical, TextDiffResponse::caseSensitive)
+                .containsExactly(false, true);
+    }
+
+    @Test
+    @DisplayName("diff - a supplementary code point counts as one position, not two (REQ-04, DOD-03)")
+    void shouldUseCodePointPositions() {
+        TextDiffResponse response = service.diff(new TextDiffRequest("\uD83D\uDC4D one", "\uD83D\uDC4D two"));
+
+        // The emoji is not a LETTER token, so "one" is token 0 — but it starts at code point 2, not
+        // at UTF-16 offset 3: the surrogate pair is a single position.
+        assertThat(response.changed()).containsOnlyKeys("line[0].token[0]");
+        TextDiffDetail detail = response.changed().get("line[0].token[0]");
+        assertThat(detail.oldToken()).isEqualTo("one");
+        assertThat(detail.oldStartCodePoint()).isEqualTo(2);
+        assertThat(detail.oldEndCodePoint()).isEqualTo(5);
+        assertThat(detail.newStartCodePoint()).isEqualTo(2);
+        assertThat(detail.newEndCodePoint()).isEqualTo(5);
+    }
+
+    @Test
+    @DisplayName("diff - line breaks advance the line index of the reported path (REQ-04, DOD-03)")
+    void shouldAddressChangesPerLine() {
+        TextDiffResponse response = service.diff(new TextDiffRequest("alpha\nbeta\ngamma", "alpha\nbeta\ndelta"));
+
+        assertThat(response.changed()).containsOnlyKeys("line[2].token[0]");
+        TextDiffDetail detail = response.changed().get("line[2].token[0]");
+        assertThat(detail.oldStartCodePoint()).isEqualTo(11);
+        assertThat(detail.oldEndCodePoint()).isEqualTo(16);
+        assertThat(detail.newStartCodePoint()).isEqualTo(11);
+        assertThat(detail.newEndCodePoint()).isEqualTo(16);
+    }
+
+    @Test
+    @DisplayName("diff - an input over 2000 code points fails the code-point bound (REQ-01, DOD-04)")
+    void shouldRejectDiffInputsOverTheCodePointBound() {
+        assertThatThrownBy(() -> service.diff(new TextDiffRequest("a".repeat(2001), "abc")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("left must be at most 2000 code points");
+        assertThatThrownBy(() -> service.diff(new TextDiffRequest("abc", "a".repeat(2001))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("right must be at most 2000 code points");
+
+        // 2000 supplementary code points are 4000 UTF-16 units and still inside the code-point bound.
+        assertThat(service.diff(new TextDiffRequest("\uD83D\uDC4D".repeat(2000), "\uD83D\uDC4D".repeat(2000)))
+                .identical()).isTrue();
+    }
+
+    @Test
+    @DisplayName("diff - blank sides and an over-long pattern are bean-validation failures (REQ-01, DOD-04)")
+    void shouldValidateDiffRequest() {
+        try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
+            Validator validator = factory.getValidator();
+
+            assertThat(validator.validate(new TextDiffRequest("  ", "abc")))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("left is required");
+
+            assertThat(validator.validate(new TextDiffRequest("abc", "")))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("right is required");
+
+            assertThat(validator.validate(new TextDiffRequest("a".repeat(2001), "abc")))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("left must be at most 2000 characters");
+
+            assertThat(validator.validate(new TextDiffRequest("abc", "abd", null, null, "a".repeat(513), null)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("pattern must be at most 512 characters");
+
+            assertThat(validator.validate(new TextDiffRequest("abc", "abd", null, null, null, -1)))
+                    .extracting(ConstraintViolation::getMessage)
+                    .contains("timeoutMs must be at least 0");
+
+            assertThat(validator.validate(new TextDiffRequest("abc", "abd"))).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("diff - the same request always yields the same result, so a journal replay can verify it (REQ-04, DOD-05)")
+    void shouldBeDeterministicForReplay() {
+        TextDiffRequest request = new TextDiffRequest("the quick brown fox", "the quick red fox", null,
+                TokenizerScheme.WHITESPACE, null, null);
+
+        TextDiffResponse first = service.diff(request);
+        TextDiffResponse second = service.diff(request);
+
+        assertThat(second).isEqualTo(first);
+        assertThat(first.changed()).containsOnlyKeys("line[0].token[2]");
+        assertThat(first.changed().get("line[0].token[2]").oldToken()).isEqualTo("brown");
+        assertThat(first.changed().get("line[0].token[2]").newToken()).isEqualTo("red");
     }
 }

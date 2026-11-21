@@ -1424,4 +1424,203 @@ class TextControllerTest {
                 .andExpect(jsonPath("$.data.similarity").value(1.0))
                 .andExpect(jsonPath("$.data.identical").value(true));
     }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/diff - returns the changed token with both spans and a summary (DOD-01)")
+    void shouldDiffTwoTexts() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "the quick brown fox", "right": "the quick red fox"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.success").value(true))
+                .andExpect(jsonPath("$.message").value("Text diff computed successfully"))
+                .andExpect(jsonPath("$.data.summary").value("0 added, 0 removed, 1 changed"))
+                .andExpect(jsonPath("$.data.identical").value(false))
+                .andExpect(jsonPath("$.data.caseSensitive").value(false))
+                .andExpect(jsonPath("$.data.added").isEmpty())
+                .andExpect(jsonPath("$.data.removed").isEmpty())
+                .andExpect(jsonPath("$.data.changed['line[0].token[2]'].changeType").value("CHANGED"))
+                .andExpect(jsonPath("$.data.changed['line[0].token[2]'].oldToken").value("brown"))
+                .andExpect(jsonPath("$.data.changed['line[0].token[2]'].newToken").value("red"))
+                .andExpect(jsonPath("$.data.changed['line[0].token[2]'].oldStartCodePoint").value(10))
+                .andExpect(jsonPath("$.data.changed['line[0].token[2]'].oldEndCodePoint").value(15))
+                .andExpect(jsonPath("$.data.changed['line[0].token[2]'].newStartCodePoint").value(10))
+                .andExpect(jsonPath("$.data.changed['line[0].token[2]'].newEndCodePoint").value(13));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/diff - added and removed tokens carry one span and report identical=false (DOD-01)")
+    void shouldReportAddedAndRemovedTokensOverHttp() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "alpha beta gamma", "right": "alpha beta"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.summary").value("0 added, 1 removed, 0 changed"))
+                .andExpect(jsonPath("$.data.added").isEmpty())
+                .andExpect(jsonPath("$.data.removed[0].path").value("line[0].token[2]"))
+                .andExpect(jsonPath("$.data.removed[0].changeType").value("REMOVED"))
+                .andExpect(jsonPath("$.data.removed[0].oldToken").value("gamma"))
+                .andExpect(jsonPath("$.data.removed[0].newToken").doesNotExist())
+                .andExpect(jsonPath("$.data.removed[0].oldStartCodePoint").value(11))
+                .andExpect(jsonPath("$.data.removed[0].oldEndCodePoint").value(16))
+                .andExpect(jsonPath("$.data.removed[0].newStartCodePoint").value(-1))
+                .andExpect(jsonPath("$.data.removed[0].newEndCodePoint").value(-1));
+
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "alpha beta", "right": "alpha beta gamma"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.summary").value("1 added, 0 removed, 0 changed"))
+                .andExpect(jsonPath("$.data.removed").isEmpty())
+                .andExpect(jsonPath("$.data.added[0].path").value("line[0].token[2]"))
+                .andExpect(jsonPath("$.data.added[0].changeType").value("ADDED"))
+                .andExpect(jsonPath("$.data.added[0].oldToken").doesNotExist())
+                .andExpect(jsonPath("$.data.added[0].newToken").value("gamma"))
+                .andExpect(jsonPath("$.data.added[0].newStartCodePoint").value(11))
+                .andExpect(jsonPath("$.data.added[0].newEndCodePoint").value(16));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/diff - identical inputs answer identical=true and identical=false for a folded pair (DOD-02)")
+    void shouldReportIdenticalTexts() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "Hello, World!", "right": "Hello, World!"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.identical").value(true))
+                .andExpect(jsonPath("$.data.summary").value("No differences found"))
+                .andExpect(jsonPath("$.data.added").isEmpty())
+                .andExpect(jsonPath("$.data.removed").isEmpty())
+                .andExpect(jsonPath("$.data.changed").isEmpty());
+
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "Hello", "right": "hello"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.identical").value(true));
+
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "Hello", "right": "hello", "caseSensitive": true}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.identical").value(false))
+                .andExpect(jsonPath("$.data.caseSensitive").value(true))
+                .andExpect(jsonPath("$.data.changed['line[0].token[0]'].newToken").value("hello"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/diff - a supplementary character counts as one code-point position (DOD-03)")
+    void shouldReportCodePointPositionsOverHttp() throws Exception {
+        String body = objectMapper.writeValueAsString(java.util.Map.of(
+                "left", "\uD83D\uDC4D one", "right", "\uD83D\uDC4D two"));
+
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.changed['line[0].token[0]'].oldStartCodePoint").value(2))
+                .andExpect(jsonPath("$.data.changed['line[0].token[0]'].oldEndCodePoint").value(5))
+                .andExpect(jsonPath("$.data.changed['line[0].token[0]'].newEndCodePoint").value(5));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/utils/text/diff - a side over 2000 characters returns 400 VALIDATION_ERROR (DOD-03)")
+    void shouldRejectOverBoundDiffInput() throws Exception {
+        int entriesBefore = journal.size();
+        String body = objectMapper.writeValueAsString(java.util.Map.of(
+                "left", "a".repeat(2001), "right", "abc"));
+
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.success").value(false))
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("left must be at most 2000 characters")));
+
+        // A request refused by bean validation never reaches the service, so nothing is journalled.
+        assertThat(journal.size()).isEqualTo(entriesBefore);
+    }
+
+    @DisplayName("POST /api/v1/utils/text/diff - non-text payloads return 400 and blank sides are VALIDATION_ERROR (DOD-04)")
+    void shouldRejectNonTextDiffPayloads() throws Exception {
+        int entriesBefore = journal.size();
+
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "abc"}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.details", hasItem("right is required")));
+
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": 12, "right": true}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.message").value(containsString("Malformed JSON request body")));
+
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.TEXT_PLAIN)
+                        .content("not json"))
+                .andExpect(status().isBadRequest());
+
+        assertThat(journal.size()).isEqualTo(entriesBefore);
+    }
+
+    @Test
+    @DisplayName("a diff call is journalled as TEXT_DIFF and replays as VERIFIED without a new entry (DOD-05)")
+    void shouldJournalAndReplayTextDiff() throws Exception {
+        mockMvc.perform(post("/api/v1/utils/text/diff")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"left": "the quick brown fox", "right": "the quick red fox"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.summary").value("0 added, 0 removed, 1 changed"));
+
+        MvcResult entries = mockMvc.perform(get("/api/v1/utils/audit/entries"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].operation").value("TEXT_DIFF"))
+                .andExpect(jsonPath("$.data[0].state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data[0].result.summary").value("0 added, 0 removed, 1 changed"))
+                .andReturn();
+
+        JsonNode entry = objectMapper.readTree(entries.getResponse().getContentAsString()).get("data").get(0);
+        String id = entry.get("id").asText();
+        AuditEntry before = journal.find(id).orElseThrow();
+        Instant completedAt = before.completedAt();
+        int sizeBefore = journal.size();
+
+        mockMvc.perform(post("/api/v1/utils/audit/entries/{id}/replay", id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.operation").value("TEXT_DIFF"))
+                .andExpect(jsonPath("$.data.state").value("SUCCEEDED"))
+                .andExpect(jsonPath("$.data.result.summary").value("0 added, 0 removed, 1 changed"))
+                .andExpect(jsonPath("$.data.result.changed['line[0].token[2]'].oldToken").value("brown"))
+                .andExpect(jsonPath("$.data.replay.state").value("VERIFIED"))
+                .andExpect(jsonPath("$.data.replay.detail").value("results match"));
+
+        AuditEntry after = journal.find(id).orElseThrow();
+        assertThat(after.operation()).isEqualTo(OperationType.TEXT_DIFF);
+        assertThat(after.completedAt()).isEqualTo(completedAt);
+        assertThat(after.result()).isEqualTo(before.result());
+        assertThat(journal.size()).isEqualTo(sizeBefore);
+    }
 }
