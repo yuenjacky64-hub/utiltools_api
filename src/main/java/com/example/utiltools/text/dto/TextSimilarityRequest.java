@@ -1,6 +1,9 @@
 package com.example.utiltools.text.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.AssertTrue;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
@@ -19,13 +22,17 @@ import java.util.List;
  * same asymmetry applies to {@code ignoreWords}: its entry caps are bean validation, so an over-cap
  * list answers {@code 400 VALIDATION_ERROR} and is <em>not</em> journalled.</p>
  *
- * <p>{@code pattern} carries exactly <em>one</em> bean-validation constraint, the scheme-independent
- * {@code @Size(max = 512)}: a longer pattern fails {@code @Valid} whatever the {@code tokenizer} is, so
- * it answers {@code 400 VALIDATION_ERROR} and is <em>not</em> journalled. The remaining pattern checks
- * stay in {@code TextService} and apply to the {@code regex} scheme alone — a missing, blank,
- * over-512-character or non-compiling pattern reaching the service directly (replay, other in-process
- * callers) still answers {@code 400 BAD_REQUEST} and is journalled as a {@code FAILED}
- * {@code TEXT_SIMILARITY} entry, while a pattern sent with any predefined scheme is ignored.</p>
+ * <p>{@code pattern} carries exactly <em>one</em> bean-validation constraint, the <em>scheme-aware</em>
+ * {@code @AssertTrue} property constraint on {@link #isPatternSizeWithinLimit()} (the derived,
+ * non-wire property {@code patternSizeWithinLimit}): the 512-character cap fires only when the bound
+ * {@code tokenizer} is {@code regex}, so a longer pattern sent with a predefined scheme (or with no
+ * tokenizer at all) is accepted and simply ignored by the service, while a longer pattern sent with
+ * {@code tokenizer=regex} answers {@code 400 VALIDATION_ERROR} and is <em>not</em> journalled. The
+ * remaining pattern checks stay in {@code TextService} and apply to the {@code regex} scheme alone — a
+ * missing, blank, over-512-character or non-compiling pattern reaching the service directly (replay,
+ * other in-process callers) still answers {@code 400 BAD_REQUEST} and is journalled as a
+ * {@code FAILED} {@code TEXT_SIMILARITY} entry, while a pattern sent with any predefined scheme is
+ * ignored.</p>
  *
  * @param left          the first text to compare; must be non-blank and at most 2000 code points
  * @param right         the second text to compare; must be non-blank and at most 2000 code points
@@ -41,9 +48,11 @@ import java.util.List;
  *                      <em>selects</em> tokens — everything else is discarded — and the consecutive
  *                      tokens are compared joined by one space
  * @param pattern       optional; the regular expression whose non-empty matches are the tokens when
- *                      {@code tokenizer} is {@code regex}. At most 512 characters — a longer value is a
- *                      {@code 400 VALIDATION_ERROR} for every scheme and is not journalled. Required for
- *                      the {@code regex} scheme — a missing or blank value, or one that does not compile,
+ *                      {@code tokenizer} is {@code regex}. At most 512 characters <em>for the
+ *                      {@code regex} scheme only</em> — a longer value with {@code tokenizer=regex} is a
+ *                      {@code 400 VALIDATION_ERROR} and is not journalled, while a longer value sent
+ *                      with a predefined tokenizer is accepted and ignored. Required for the
+ *                      {@code regex} scheme — a missing or blank value, or one that does not compile,
  *                      is rejected as {@code 400 BAD_REQUEST} by {@code TextService}; ignored for every
  *                      predefined scheme
  * @param ignoreWords   optional words excluded from <em>both</em> inputs before the distance is
@@ -73,7 +82,6 @@ public record TextSimilarityRequest(
 
         TokenizerScheme tokenizer,
 
-        @Size(max = 512, message = "pattern must be at most 512 characters")
         String pattern,
 
         @Valid
@@ -102,5 +110,17 @@ public record TextSimilarityRequest(
     public TextSimilarityRequest(String left, String right, Boolean caseSensitive, TokenizerScheme tokenizer,
                                  String pattern, List<String> ignoreWords) {
         this(left, right, caseSensitive, tokenizer, pattern, ignoreWords, null);
+    }
+
+    /**
+     * The 512-character cap is a {@code regex}-scheme rule: every predefined tokenizer ignores {@code pattern},
+     * so a longer value must not fail {@code @Valid}. Measured in UTF-16 code units, exactly like the retired
+     * {@code @Size(max = 512)} and like {@code TextService.compileCustomPattern}.
+     */
+    @AssertTrue(message = "pattern must be at most 512 characters")
+    @JsonIgnore
+    @Schema(hidden = true)
+    public boolean isPatternSizeWithinLimit() {
+        return tokenizer != TokenizerScheme.REGEX || pattern == null || pattern.length() <= 512;
     }
 }

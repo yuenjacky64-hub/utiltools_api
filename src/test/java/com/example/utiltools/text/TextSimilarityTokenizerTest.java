@@ -5,6 +5,10 @@ import com.example.utiltools.text.dto.TextSimilarityResponse;
 import com.example.utiltools.text.dto.TokenizerScheme;
 import com.example.utiltools.text.exception.RegexTimeoutException;
 import com.example.utiltools.text.service.TextService;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.Validation;
 import jakarta.validation.Validator;
 import jakarta.validation.ValidatorFactory;
@@ -194,8 +198,8 @@ class TextSimilarityTokenizerTest {
     }
 
     @Test
-    @DisplayName("similarity - tokenizer binds case-insensitively and pattern carries only the @Size(max=512) "
-            + "constraint whatever the scheme (REQ-01, DOD-01)")
+    @DisplayName("similarity - tokenizer binds case-insensitively and the 512-character pattern cap is a regex-only "
+            + "@AssertTrue property on patternSizeWithinLimit (REQ-01, DOD-05)")
     void shouldValidateTokenizerAndPatternFields() {
         assertThat(TokenizerScheme.fromWire(" digit ")).isEqualTo(TokenizerScheme.DIGIT);
         assertThat(TokenizerScheme.fromWire("ALPHANUM")).isEqualTo(TokenizerScheme.ALPHANUM);
@@ -211,9 +215,9 @@ class TextSimilarityTokenizerTest {
             assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
                     TokenizerScheme.LETTER, null))).isEmpty();
 
-            // REQ-01: pattern now carries exactly one bean-validation constraint, @Size(max = 512), which is
-            // scheme-independent: an empty value stays legal (the service owns "required for regex"), a
-            // 513-character value fails @Valid for every scheme, and 512 is the inclusive boundary.
+            // REQ-01: the cap is now the scheme-aware @AssertTrue property patternSizeWithinLimit, so it fires
+            // only for tokenizer=regex. An empty value stays legal everywhere (the service owns "required for
+            // regex"), 512 is the inclusive boundary and 513/600 are one violation on the derived property.
             assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
                     TokenizerScheme.REGEX, ""))).isEmpty();
 
@@ -221,15 +225,28 @@ class TextSimilarityTokenizerTest {
                     TokenizerScheme.REGEX, "a".repeat(513))))
                     .singleElement()
                     .satisfies(violation -> {
-                        assertThat(violation.getPropertyPath().toString()).isEqualTo("pattern");
+                        assertThat(violation.getPropertyPath().toString()).isEqualTo("patternSizeWithinLimit");
                         assertThat(violation.getMessage()).isEqualTo("pattern must be at most 512 characters");
                     });
 
             assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
-                    TokenizerScheme.LETTER, "a".repeat(513))))
+                    TokenizerScheme.REGEX, "a".repeat(600))))
                     .singleElement()
-                    .satisfies(violation ->
-                            assertThat(violation.getMessage()).isEqualTo("pattern must be at most 512 characters"));
+                    .satisfies(violation -> {
+                        assertThat(violation.getPropertyPath().toString()).isEqualTo("patternSizeWithinLimit");
+                        assertThat(violation.getMessage()).isEqualTo("pattern must be at most 512 characters");
+                    });
+
+            // A predefined scheme ignores the pattern, so any length passes @Valid ...
+            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
+                    TokenizerScheme.LETTER, "a".repeat(513)))).isEmpty();
+
+            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
+                    TokenizerScheme.LETTER, "a".repeat(600)))).isEmpty();
+
+            // ...and so does an absent/null tokenizer, which must be treated as non-regex by the predicate.
+            assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
+                    null, "a".repeat(600)))).isEmpty();
 
             assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
                     TokenizerScheme.REGEX, "a".repeat(512)))).isEmpty();
@@ -238,6 +255,24 @@ class TextSimilarityTokenizerTest {
             assertThat(validator.validate(new TextSimilarityRequest("abc", "abd", null,
                     TokenizerScheme.LETTER, "anything"))).isEmpty();
         }
+    }
+
+    @Test
+    @DisplayName("similarity - the derived patternSizeWithinLimit property stays off the wire and out of the "
+            + "journalled payload (REQ-01, DOD-08)")
+    void shouldKeepSimilarityJournalPayloadShape() throws NoSuchMethodException {
+        JsonNode payload = new ObjectMapper().valueToTree(new TextSimilarityRequest("abc", "abd", null,
+                TokenizerScheme.REGEX, "a".repeat(600), null, 0));
+
+        assertThat(payload.fieldNames()).toIterable()
+                .containsExactlyInAnyOrder("left", "right", "caseSensitive", "tokenizer", "pattern",
+                        "ignoreWords", "timeoutMs");
+        assertThat(payload.has("patternSizeWithinLimit")).isFalse();
+
+        assertThat(TextSimilarityRequest.class.getMethod("isPatternSizeWithinLimit").isAnnotationPresent(JsonIgnore.class))
+                .isTrue();
+        assertThat(TextSimilarityRequest.class.getMethod("isPatternSizeWithinLimit")
+                .getAnnotation(Schema.class).hidden()).isTrue();
     }
 
     @Test
